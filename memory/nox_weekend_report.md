@@ -1,13 +1,13 @@
 # NØX ORIGIN — WEEKEND INTELLIGENCE REPORT
 
-Generated: 2026-08-28T16:11:06.603916+00:00
+Generated: 2026-08-30T08:29:49.768529+00:00
 
 ## 1. Executive Summary
 
-- Observations recorded: 10
-- Decisions recorded: 8
-- Actions recorded: 10
-- Learning records: 8
+- Observations recorded: 11
+- Decisions recorded: 9
+- Actions recorded: 11
+- Learning records: 9
 - Different action types: 2
 - Different action titles: 5
 - Agents observed: 35
