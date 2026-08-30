@@ -1,6 +1,6 @@
 # NØX ORIGIN — LEARNING V11 REPORT
 
-Generated: 2026-08-30T08:48:34.900133+00:00
+Generated: 2026-08-30T18:34:25.862949+00:00
 
 ## 1. Learning Overview
 
