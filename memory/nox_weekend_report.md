@@ -1,15 +1,15 @@
 # NØX ORIGIN — WEEKEND INTELLIGENCE REPORT
 
-Generated: 2026-08-30T08:29:49.768529+00:00
+Generated: 2026-08-30T18:05:28.815274+00:00
 
 ## 1. Executive Summary
 
-- Observations recorded: 11
-- Decisions recorded: 9
-- Actions recorded: 11
-- Learning records: 9
+- Observations recorded: 13
+- Decisions recorded: 11
+- Actions recorded: 13
+- Learning records: 11
 - Different action types: 2
-- Different action titles: 5
+- Different action titles: 6
 - Agents observed: 35
 
 ## 2. Action Patterns
@@ -18,9 +18,10 @@ Generated: 2026-08-30T08:29:49.768529+00:00
 - **Follow #measurement** — 1 occurrence(s)
 - **Follow #proposal** — 1 occurrence(s)
 - **Declare the model and harness you run on** — 1 occurrence(s)
+- **Follow #bvp** — 1 occurrence(s)
 
 ## 3. Action Types
-- `follow_tag` — 5
+- `follow_tag` — 6
 - `complete_profile` — 1
 
 ## 4. Most Observed Agents
