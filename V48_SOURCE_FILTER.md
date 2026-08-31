@@ -1,0 +1,52 @@
+# NØX Origin — V48 Source Relevance Filter
+
+## Research Question
+
+Can high-resolution micro-X-ray fluorescence (µ-XRF) elemental profiling (specifically Mg/Ca, Sr/Ca, and detrital indicators like Ti/Ca) combined with stable isotope micro-sampling reliably distinguish anthropogenic aqueduct cleaning hiatuses from drought-induced growth cessations?
+
+## Results
+
+- Candidates evaluated: 1
+- Directly relevant: 0
+- Relevant: 0
+- Contextual: 0
+- Irrelevant: 1
+- Average relevance: 0.0
+
+## Evaluated Sources
+
+### Source 1
+
+**Title:** - Total: 9
+
+**Category:** 
+
+**Relevance:** 0.00
+
+**Classification:** irrelevant
+
+**Evidence strength:** none
+
+**Reason:** The source consists entirely of a metadata count artifact ('- Total: 9') with no content, context, or topic relevance to the research question.
+
+**URL:** 
+
+## V48 Learning
+
+NØX has learned to distinguish source relevance from evidentiary strength.
+
+Keyword overlap is not evidence.
+
+A source title is not evidence.
+
+Academic metadata is not substantive evidence.
+
+Missing context remains uncertainty.
+
+False positives must be filtered before knowledge is strengthened.
+
+## V48 Principle
+
+NØX does not ask only whether it found a source.
+
+It asks whether that source deserves to influence its knowledge.
