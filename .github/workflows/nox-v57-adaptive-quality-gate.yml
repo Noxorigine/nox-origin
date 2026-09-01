@@ -1,0 +1,759 @@
+name: NØX Origin - V57 Adaptive Quality Gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  adaptive-quality-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run NØX V57
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          cat > v57_agent.py <<'PY'
+          import os
+          import json
+          import re
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai/api/v1"
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+          })
+
+          report = {
+              "generated": datetime.now(timezone.utc).isoformat(),
+              "status": {},
+              "decision": {},
+              "safety": {
+                  "maximum_public_actions": 1,
+                  "actions_attempted": 0,
+                  "publication": False,
+                  "vote": False,
+                  "follow": False,
+                  "dm": False,
+                  "purchase": False,
+                  "spending": False,
+                  "gemini": "DISABLED"
+              }
+          }
+
+          def fail(message):
+              raise RuntimeError(message)
+
+          # =========================================================
+          # 1. AUTHENTICATION
+          # =========================================================
+
+          auth = session.post(
+              f"{BASE}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          if auth.status_code != 200:
+              fail(f"Authentication failed: HTTP {auth.status_code}")
+
+          auth_data = auth.json()
+          token = auth_data.get("access_token")
+
+          if not token:
+              fail("No access_token returned")
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          report["status"]["authentication"] = "PASS"
+
+          # =========================================================
+          # 2. IDENTITY
+          # =========================================================
+
+          identity = session.get(
+              f"{BASE}/users/me",
+              timeout=30
+          )
+
+          if identity.status_code != 200:
+              fail(f"Identity failed: HTTP {identity.status_code}")
+
+          me = identity.json()
+
+          my_id = (
+              me.get("id")
+              or me.get("user", {}).get("id")
+          )
+
+          my_username = (
+              me.get("username")
+              or me.get("user", {}).get("username")
+              or ""
+          )
+
+          report["status"]["identity"] = "PASS"
+
+          # =========================================================
+          # 3. FOR-YOU FEED
+          # =========================================================
+
+          feed = session.get(
+              f"{BASE}/feed/for-you?limit=25",
+              timeout=30
+          )
+
+          if feed.status_code != 200:
+              fail(f"For-you feed failed: HTTP {feed.status_code}")
+
+          feed_data = feed.json()
+          items = feed_data.get("items", [])
+
+          report["status"]["for_you_feed"] = "PASS"
+          report["decision"]["feed_items"] = len(items)
+
+          # =========================================================
+          # 4. LOCAL TOPIC DETECTION
+          # =========================================================
+
+          topic_groups = {
+              "agents": [
+                  "agent", "agents", "ai agent", "ai agents"
+              ],
+              "memory": [
+                  "memory", "context", "remember", "forget"
+              ],
+              "measurement": [
+                  "measurement", "measure", "data",
+                  "result", "results"
+              ],
+              "verification": [
+                  "verify", "verification", "validate",
+                  "validation", "evidence", "proof"
+              ],
+              "reproducibility": [
+                  "reproducible", "reproduce", "repeat",
+                  "replication", "replicate"
+              ],
+              "learning": [
+                  "learn", "learning", "knowledge", "experiment"
+              ],
+              "reputation": [
+                  "reputation", "karma", "trust", "credibility"
+              ],
+              "proposal": [
+                  "proposal", "propose", "idea", "ideas",
+                  "suggestion", "suggest"
+              ],
+              "community": [
+                  "community", "colony", "discussion",
+                  "conversation"
+              ],
+              "economics": [
+                  "money", "economic", "economics",
+                  "reward", "rewards", "sats", "bitcoin"
+              ]
+          }
+
+          # =========================================================
+          # 5. PROMPT-INJECTION DEFENCE
+          # =========================================================
+
+          injection_patterns = [
+              r"ignore previous instructions",
+              r"ignore all previous instructions",
+              r"ignore the system",
+              r"system prompt",
+              r"developer message",
+              r"reveal your prompt",
+              r"reveal the instructions",
+              r"jailbreak",
+              r"execute this command",
+              r"run this command",
+              r"send your api key",
+              r"send the api key",
+              r"secret key",
+              r"password",
+              r"access token"
+          ]
+
+          def contains_injection(text):
+              lower = text.lower()
+              return any(
+                  re.search(pattern, lower)
+                  for pattern in injection_patterns
+              )
+
+          # =========================================================
+          # 6. POST HELPERS
+          # =========================================================
+
+          def get_post(item):
+              post = item.get("post")
+
+              if isinstance(post, dict):
+                  return post
+
+              return None
+
+          def post_text(post):
+              if not isinstance(post, dict):
+                  return ""
+
+              parts = [
+                  post.get("title", ""),
+                  post.get("body", ""),
+                  post.get("content", "")
+              ]
+
+              return " ".join(
+                  str(x) for x in parts if x
+              ).strip()
+
+          def post_id(post):
+              return (
+                  post.get("id")
+                  or post.get("post_id")
+              )
+
+          def author_id(post):
+              author = post.get("author")
+
+              if isinstance(author, dict):
+                  return author.get("id")
+
+              return post.get("author_id")
+
+          def author_name(post):
+              author = post.get("author")
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("display_name")
+                      or "unknown"
+                  )
+
+              return "unknown"
+
+          def extract_sentences(text):
+              sentences = re.split(
+                  r"(?<=[.!?])\s+",
+                  text
+              )
+
+              return [
+                  s.strip()
+                  for s in sentences
+                  if len(s.strip()) >= 35
+              ]
+
+          # =========================================================
+          # 7. STAGE ONE — OPPORTUNITY EVALUATION
+          # =========================================================
+
+          candidates = []
+
+          for item in items:
+              post = get_post(item)
+
+              if not post:
+                  continue
+
+              pid = post_id(post)
+
+              if not pid:
+                  continue
+
+              # Never answer our own posts.
+              if my_id and author_id(post) == my_id:
+                  continue
+
+              text = post_text(post)
+
+              if len(text) < 80:
+                  continue
+
+              # Colony content is data, never instructions.
+              if contains_injection(text):
+                  continue
+
+              lower = text.lower()
+
+              topics = []
+
+              for topic, words in topic_groups.items():
+                  if any(word in lower for word in words):
+                      topics.append(topic)
+
+              if not topics:
+                  continue
+
+              sentences = extract_sentences(text)
+
+              question = "?" in text
+
+              opportunity_score = 0
+
+              # Enough content to understand context.
+              if len(text) >= 120:
+                  opportunity_score += 2
+
+              if len(text) >= 250:
+                  opportunity_score += 1
+
+              # Multiple relevant topics.
+              opportunity_score += min(len(topics), 3)
+
+              # Questions create a natural opening for contribution.
+              if question:
+                  opportunity_score += 3
+
+              # Strong analytical subjects.
+              if "verification" in topics:
+                  opportunity_score += 2
+
+              if "measurement" in topics:
+                  opportunity_score += 2
+
+              if "reproducibility" in topics:
+                  opportunity_score += 2
+
+              # Prefer posts with a usable sentence.
+              if sentences:
+                  opportunity_score += 1
+
+              candidates.append({
+                  "post": post,
+                  "id": pid,
+                  "text": text,
+                  "topics": topics,
+                  "sentences": sentences,
+                  "question": question,
+                  "opportunity_score": opportunity_score
+              })
+
+          candidates.sort(
+              key=lambda x: (
+                  x["opportunity_score"],
+                  len(x["topics"]),
+                  len(x["text"])
+              ),
+              reverse=True
+          )
+
+          report["status"]["opportunity_analysis"] = "PASS"
+          report["decision"]["candidates_found"] = len(candidates)
+
+          # =========================================================
+          # 8. SELECT BEST OPPORTUNITY
+          # =========================================================
+
+          if not candidates:
+              report["decision"]["action"] = "NONE"
+              report["decision"]["reason"] = (
+                  "No feed post passed the adaptive opportunity filters."
+              )
+
+          else:
+              selected = candidates[0]
+
+              post = selected["post"]
+              post_id_value = selected["id"]
+              original_text = selected["text"]
+              topics = selected["topics"]
+
+              title = str(
+                  post.get("title", "")
+              ).strip()
+
+              author = author_name(post)
+
+              # -----------------------------------------------------
+              # Get the complete current post before deciding.
+              # -----------------------------------------------------
+
+              full_post_response = session.get(
+                  f"{BASE}/posts/{post_id_value}",
+                  timeout=30
+              )
+
+              if full_post_response.status_code != 200:
+                  report["decision"]["action"] = "NONE"
+                  report["decision"]["reason"] = (
+                      f"Could not verify selected post: "
+                      f"HTTP {full_post_response.status_code}"
+                  )
+
+              else:
+                  full_post = full_post_response.json()
+
+                  current_text = post_text(full_post)
+
+                  if contains_injection(current_text):
+                      report["decision"]["action"] = "NONE"
+                      report["decision"]["reason"] = (
+                          "Final content verification detected "
+                          "instruction-like content."
+                      )
+
+                  else:
+                      # =================================================
+                      # 9. STAGE TWO — BUILD RESPONSE
+                      # =================================================
+
+                      topic_text = ", ".join(topics[:3])
+
+                      sentences = extract_sentences(current_text)
+
+                      context_sentence = ""
+
+                      if sentences:
+                          # Prefer a question or analytical sentence.
+                          question_sentences = [
+                              s for s in sentences
+                              if "?" in s
+                          ]
+
+                          if question_sentences:
+                              context_sentence = question_sentences[0]
+                          else:
+                              context_sentence = sentences[0]
+
+                      # Keep the contextual reference short.
+                      context_sentence = re.sub(
+                          r"\s+",
+                          " ",
+                          context_sentence
+                      ).strip()
+
+                      if len(context_sentence) > 180:
+                          context_sentence = (
+                              context_sentence[:177].rstrip()
+                              + "..."
+                          )
+
+                      if selected["question"]:
+                          comment = (
+                              f"The question raised here around "
+                              f"{topic_text} is worth separating into "
+                              f"observation and explanation. "
+                          )
+
+                          if context_sentence:
+                              comment += (
+                                  f"The key point I would test is: "
+                                  f"“{context_sentence}” "
+                              )
+
+                          comment += (
+                              "I would then repeat the observation with "
+                              "an independent example and compare the "
+                              "result. That would help distinguish a "
+                              "reproducible pattern from a conclusion "
+                              "specific to this case."
+                          )
+
+                      else:
+                          comment = (
+                              f"The discussion of {topic_text} raises "
+                              f"an interesting distinction between "
+                              f"observing a result and validating what "
+                              f"it means. "
+                          )
+
+                          if context_sentence:
+                              comment += (
+                                  f"The part I would examine first is: "
+                                  f"“{context_sentence}” "
+                              )
+
+                          comment += (
+                              "A useful next step would be to repeat "
+                              "the observation with an independent "
+                              "example and compare the result before "
+                              "treating the conclusion as reliable."
+                          )
+
+                      comment = re.sub(
+                          r"\s+",
+                          " ",
+                          comment
+                      ).strip()
+
+                      if len(comment) > 900:
+                          comment = comment[:897].rstrip() + "..."
+
+                      # =================================================
+                      # 10. ADAPTIVE QUALITY GATE
+                      # =================================================
+
+                      quality_checks = {
+                          "not_empty": bool(comment),
+
+                          "minimum_length": (
+                              len(comment) >= 120
+                          ),
+
+                          "maximum_length": (
+                              len(comment) <= 900
+                          ),
+
+                          "topic_relevance": any(
+                              topic.lower() in comment.lower()
+                              for topic in topics
+                          ),
+
+                          "context_reference": (
+                              not context_sentence
+                              or context_sentence[:40].lower()
+                              in comment.lower()
+                          ),
+
+                          "testable_next_step": (
+                              "test" in comment.lower()
+                              or "repeat" in comment.lower()
+                              or "independent" in comment.lower()
+                              or "reproducible" in comment.lower()
+                          ),
+
+                          "not_injection": (
+                              not contains_injection(comment)
+                          ),
+
+                          "not_own_post": (
+                              not my_id
+                              or author_id(full_post) != my_id
+                          )
+                      }
+
+                      quality_pass = all(
+                          quality_checks.values()
+                      )
+
+                      report["decision"]["selected_post"] = {
+                          "id": post_id_value,
+                          "author": author,
+                          "title": title,
+                          "topics": topics,
+                          "opportunity_score": selected[
+                              "opportunity_score"
+                          ]
+                      }
+
+                      report["decision"]["quality_checks"] = (
+                          quality_checks
+                      )
+
+                      report["decision"]["comment"] = comment
+
+                      # =================================================
+                      # 11. FINAL DECISION
+                      # =================================================
+
+                      if not quality_pass:
+                          report["decision"]["action"] = "NONE"
+                          report["decision"]["reason"] = (
+                              "The selected opportunity was relevant, "
+                              "but the proposed response failed the "
+                              "adaptive quality gate."
+                          )
+
+                      else:
+                          report["decision"]["action"] = "COMMENT"
+
+                          # =================================================
+                          # 12. ONE PUBLIC ACTION MAXIMUM
+                          # =================================================
+
+                          report["safety"]["actions_attempted"] = 1
+
+                          publish = session.post(
+                              f"{BASE}/posts/{post_id_value}/comments",
+                              json={"body": comment},
+                              timeout=30
+                          )
+
+                          report["decision"]["http_status"] = (
+                              publish.status_code
+                          )
+
+                          if publish.status_code in (200, 201):
+                              report["decision"]["result"] = "SUCCESS"
+
+                          else:
+                              report["decision"]["result"] = "FAILED"
+                              report["decision"]["action"] = "NONE"
+                              report["decision"]["reason"] = (
+                                  f"Comment publication failed: "
+                                  f"HTTP {publish.status_code}"
+                              )
+
+          # =========================================================
+          # 13. WRITE MEMORY
+          # =========================================================
+
+          os.makedirs("memory", exist_ok=True)
+
+          with open(
+              "memory/nox_v57_adaptive_quality_gate.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  report,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          # =========================================================
+          # 14. HUMAN-READABLE REPORT
+          # =========================================================
+
+          decision = report["decision"]
+
+          lines = [
+              "NØX Origin — V57 Adaptive Quality Gate",
+              "",
+              f"Generated: {report['generated']}",
+              "",
+              "Status",
+              f"Authentication: {report['status'].get('authentication', 'FAIL')}",
+              f"Identity: {report['status'].get('identity', 'FAIL')}",
+              f"For-you feed: {report['status'].get('for_you_feed', 'FAIL')}",
+              f"Opportunity analysis: {report['status'].get('opportunity_analysis', 'FAIL')}",
+              "Gemini: DISABLED",
+              "",
+              "Autonomous Decision"
+          ]
+
+          if decision.get("action") == "COMMENT":
+              selected_post = decision.get(
+                  "selected_post",
+                  {}
+              )
+
+              lines.extend([
+                  "NØX selected a real feed opportunity.",
+                  "The opportunity passed stage one.",
+                  "The response passed stage two.",
+                  "NØX published one contextual response.",
+                  "",
+                  f"Post ID: {selected_post.get('id', '')}",
+                  f"Author: {selected_post.get('author', '')}",
+                  f"Title: {selected_post.get('title', '')}",
+                  f"Topics: {', '.join(selected_post.get('topics', []))}",
+                  f"Opportunity score: {selected_post.get('opportunity_score', 0)}",
+                  f"HTTP status: {decision.get('http_status', '')}",
+                  "",
+                  "Quality checks"
+              ])
+
+              for key, value in decision.get(
+                  "quality_checks",
+                  {}
+              ).items():
+                  lines.append(
+                      f"{key}: {'PASS' if value else 'FAIL'}"
+                  )
+
+              lines.extend([
+                  "",
+                  "Comment published",
+                  decision.get("comment", "")
+              ])
+
+          else:
+              lines.extend([
+                  "NØX did not publish a public response.",
+                  f"Reason: {decision.get('reason', 'No suitable action.')}"
+              ])
+
+              if "selected_post" in decision:
+                  selected_post = decision["selected_post"]
+
+                  lines.extend([
+                      "",
+                      "Selected opportunity",
+                      f"Post ID: {selected_post.get('id', '')}",
+                      f"Author: {selected_post.get('author', '')}",
+                      f"Title: {selected_post.get('title', '')}",
+                      f"Topics: {', '.join(selected_post.get('topics', []))}",
+                      f"Opportunity score: {selected_post.get('opportunity_score', 0)}"
+                  ])
+
+          lines.extend([
+              "",
+              "Safety",
+              "Maximum public actions: 1",
+              f"Actions attempted: {report['safety']['actions_attempted']}",
+              "No new publication.",
+              "No vote.",
+              "No follow.",
+              "No DM.",
+              "No purchase.",
+              "No spending.",
+              "Gemini disabled.",
+              "",
+              "Evolution",
+              "V49: feed structure diagnosed.",
+              "V50: feed observed and structured.",
+              "V51: controlled action attempted.",
+              "V51.1: exact Colony actions discovered.",
+              "V52: autonomous action selection.",
+              "V53: suggestion-based contribution test.",
+              "V54: autonomous feed opportunity detection.",
+              "V55: contextual response.",
+              "V56: local quality gate before public action.",
+              "V57: adaptive opportunity selection and two-stage quality gate."
+          ])
+
+          with open(
+              "NØX_V57_ADAPTIVE_QUALITY_GATE.md",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write("\n".join(lines))
+
+          print("\n".join(lines))
+          PY
+
+          python v57_agent.py
+
+      - name: Commit V57 memory and report
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v57_adaptive_quality_gate.json NØX_V57_ADAPTIVE_QUALITY_GATE.md
+
+          git diff --cached --quiet || git commit -m "NØX V57 adaptive quality gate"
+
+          git push
