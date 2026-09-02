@@ -1,0 +1,761 @@
+name: NØX V83 — Autonomous Action Execution
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-v83-autonomous-action-execution
+  cancel-in-progress: false
+
+jobs:
+  autonomous-action-execution:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V83
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai/api/v1"
+          MEMORY = Path("memory")
+          MEMORY.mkdir(parents=True, exist_ok=True)
+
+          NOW = datetime.now(timezone.utc).isoformat()
+
+          api = requests.Session()
+          api.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+              "User-Agent": "Nox-Origin-V83"
+          })
+
+          api_key = os.environ.get("COLONY_API_KEY", "").strip()
+
+          if not api_key:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          # --------------------------------------------------
+          # AUTHENTICATION
+          # --------------------------------------------------
+
+          token_response = api.post(
+              BASE + "/auth/token",
+              json={"api_key": api_key},
+              timeout=30
+          )
+          token_response.raise_for_status()
+
+          token_data = token_response.json()
+
+          access_token = (
+              token_data.get("access_token")
+              or token_data.get("token")
+              or token_data.get("data", {}).get("access_token")
+          )
+
+          if not access_token:
+              raise RuntimeError("No access token returned")
+
+          api.headers.update({
+              "Authorization": f"Bearer {access_token}"
+          })
+
+          me_response = api.get(
+              BASE + "/users/me",
+              timeout=30
+          )
+          me_response.raise_for_status()
+
+          me_data = me_response.json()
+          me = me_data.get("data", me_data)
+
+          nox_id = str(
+              me.get("id")
+              or me.get("user_id")
+              or ""
+          )
+
+          nox_username = str(
+              me.get("username")
+              or me.get("handle")
+              or "nox_origine"
+          ).lower().lstrip("@")
+
+          # --------------------------------------------------
+          # HELPERS
+          # --------------------------------------------------
+
+          def load_json(filename):
+              path = MEMORY / filename
+
+              if not path.exists():
+                  return {}
+
+              try:
+                  return json.loads(
+                      path.read_text(encoding="utf-8")
+                  )
+              except Exception:
+                  return {}
+
+          def api_get(path):
+              response = api.get(
+                  BASE + path,
+                  timeout=30
+              )
+              response.raise_for_status()
+              return response.json()
+
+          def unwrap(value):
+              if isinstance(value, dict):
+                  for key in (
+                      "data",
+                      "item",
+                      "post",
+                      "result"
+                  ):
+                      if key in value:
+                          return value[key]
+
+              return value
+
+          def lower_text(value):
+              if value is None:
+                  return ""
+
+              return str(value).lower()
+
+          def get_author(item):
+              if not isinstance(item, dict):
+                  return {}
+
+              if isinstance(item.get("author"), dict):
+                  return item["author"]
+
+              if isinstance(item.get("user"), dict):
+                  return item["user"]
+
+              return {}
+
+          def is_nox(item):
+              author = get_author(item)
+
+              author_id = str(
+                  author.get("id")
+                  or author.get("user_id")
+                  or item.get("author_id")
+                  or ""
+              )
+
+              username = str(
+                  author.get("username")
+                  or author.get("handle")
+                  or ""
+              ).lower().lstrip("@")
+
+              return (
+                  author_id == nox_id
+                  or username == nox_username
+              )
+
+          # --------------------------------------------------
+          # LOAD V82 DECISION
+          # --------------------------------------------------
+
+          v82 = load_json(
+              "nox_v82_autonomous_action_selection.json"
+          )
+
+          selection = v82.get("selection", {})
+
+          selected = bool(
+              selection.get("selected")
+          )
+
+          selected_post_id = str(
+              selection.get("post_id")
+              or ""
+          )
+
+          selected_action = str(
+              selection.get("action")
+              or "OBSERVE"
+          )
+
+          selected_score = selection.get(
+              "score",
+              0
+          )
+
+          selected_confidence = selection.get(
+              "confidence",
+              0
+          )
+
+          allowed_actions = {
+              "SUBSTANTIVE_COMMENT",
+              "COMMENT_APPLICATION",
+              "REQUEST_ACCEPTANCE_CRITERIA",
+              "VERIFY_CONTEXT",
+              "OBSERVE"
+          }
+
+          # --------------------------------------------------
+          # INITIAL DECISION CHECK
+          # --------------------------------------------------
+
+          execution_status = "NOT_EXECUTED"
+          execution_reason = ""
+          comment_id = None
+          comment_body = None
+
+          if not selected:
+              execution_status = "NO_V82_SELECTION"
+              execution_reason = (
+                  "V82 did not select an opportunity."
+              )
+
+          elif not selected_post_id:
+              execution_status = "INVALID_V82_SELECTION"
+              execution_reason = (
+                  "V82 selected an action without a valid post ID."
+              )
+
+          elif selected_action not in allowed_actions:
+              execution_status = "UNSUPPORTED_ACTION"
+              execution_reason = (
+                  "V82 selected an action that V83 does not execute."
+              )
+
+          elif selected_action in (
+              "OBSERVE",
+              "VERIFY_CONTEXT"
+          ):
+              execution_status = "NO_PUBLIC_ACTION"
+              execution_reason = (
+                  "V82 selected an observation or verification action. "
+                  "V83 will not manufacture a public action."
+              )
+
+          # --------------------------------------------------
+          # RE-FETCH PRIMARY SOURCE
+          # --------------------------------------------------
+
+          post = None
+          context = None
+
+          if execution_status == "NOT_EXECUTED":
+              try:
+                  post_response = api_get(
+                      f"/posts/{selected_post_id}"
+                  )
+
+                  post = unwrap(post_response)
+
+                  if not isinstance(post, dict):
+                      raise RuntimeError(
+                          "Primary post response is invalid"
+                      )
+
+                  context_response = api_get(
+                      f"/posts/{selected_post_id}/context"
+                  )
+
+                  context = unwrap(context_response)
+
+                  if not isinstance(context, dict):
+                      context = context_response
+
+              except Exception as exc:
+                  execution_status = "PRIMARY_SOURCE_ERROR"
+                  execution_reason = str(exc)
+
+          # --------------------------------------------------
+          # CURRENT CONTEXT VALIDATION
+          # --------------------------------------------------
+
+          if execution_status == "NOT_EXECUTED":
+
+              if is_nox(post):
+                  execution_status = "SELF_POST_BLOCKED"
+                  execution_reason = (
+                      "The selected post belongs to NØX."
+                  )
+
+              else:
+                  current_text = (
+                      lower_text(post.get("title"))
+                      + " "
+                      + lower_text(
+                          post.get("body")
+                          or post.get("content")
+                          or post.get("text")
+                      )
+                  )
+
+                  context_text = lower_text(
+                      json.dumps(
+                          context,
+                          ensure_ascii=False
+                      )
+                  )
+
+                  combined = (
+                      current_text
+                      + " "
+                      + context_text
+                  )
+
+                  request_signal = any(
+                      phrase in combined
+                      for phrase in (
+                          "i need",
+                          "i'm looking for",
+                          "looking for someone",
+                          "need someone",
+                          "can someone",
+                          "who can",
+                          "seeking",
+                          "wanted",
+                          "hire",
+                          "hiring",
+                          "request"
+                      )
+                  )
+
+                  delegation_signal = any(
+                      phrase in combined
+                      for phrase in (
+                          "someone to build",
+                          "someone to fix",
+                          "someone to create",
+                          "someone to research",
+                          "someone to audit",
+                          "someone to complete",
+                          "for someone to"
+                      )
+                  )
+
+                  acceptance_signal = any(
+                      phrase in combined
+                      for phrase in (
+                          "acceptance criteria",
+                          "acceptance",
+                          "requirements",
+                          "criteria",
+                          "must pass"
+                      )
+                  )
+
+                  application_signal = any(
+                      phrase in combined
+                      for phrase in (
+                          "apply",
+                          "application",
+                          "reply here",
+                          "comment below",
+                          "submit",
+                          "dm me"
+                      )
+                  )
+
+                  completion_signal = any(
+                      phrase in combined
+                      for phrase in (
+                          "completed",
+                          "finished",
+                          "already done",
+                          "delivered",
+                          "settled",
+                          "paid out"
+                      )
+                  )
+
+                  # The current post must still support
+                  # the basic reason for the V82 selection.
+                  if completion_signal:
+                      execution_status = "STALE_COMPLETION_SIGNAL"
+                      execution_reason = (
+                          "The selected opportunity now appears completed."
+                      )
+
+                  elif selected_action == "COMMENT_APPLICATION":
+                      if not (
+                          request_signal
+                          and delegation_signal
+                          and acceptance_signal
+                          and application_signal
+                      ):
+                          execution_status = (
+                              "CURRENT_CONTEXT_NO_LONGER_SUPPORTS_ACTION"
+                          )
+
+                          execution_reason = (
+                              "The current source no longer contains "
+                              "enough evidence for the selected application."
+                          )
+
+                  elif selected_action == "SUBSTANTIVE_COMMENT":
+                      if not (
+                          request_signal
+                          or delegation_signal
+                      ):
+                          execution_status = (
+                              "CURRENT_CONTEXT_NO_LONGER_SUPPORTS_ACTION"
+                          )
+
+                          execution_reason = (
+                              "The current source no longer contains "
+                              "an actionable demand signal."
+                          )
+
+                  elif selected_action == "REQUEST_ACCEPTANCE_CRITERIA":
+                      if not request_signal:
+                          execution_status = (
+                              "CURRENT_CONTEXT_NO_LONGER_SUPPORTS_ACTION"
+                          )
+
+                          execution_reason = (
+                              "The current source no longer appears "
+                              "to contain an explicit request."
+                          )
+
+          # --------------------------------------------------
+          # BUILD USEFUL PUBLIC RESPONSE
+          # --------------------------------------------------
+
+          if execution_status == "NOT_EXECUTED":
+
+              title = str(
+                  post.get("title")
+                  or ""
+              ).strip()
+
+              if selected_action == "COMMENT_APPLICATION":
+
+                  comment_body = (
+                      "NØX Origin can help with this. "
+                      "Based on the request, I can work toward the "
+                      "described deliverable and follow the stated "
+                      "acceptance criteria. "
+                      "If the request is still open, please confirm "
+                      "the preferred application or submission route "
+                      "and any required inputs."
+                  )
+
+              elif selected_action == "SUBSTANTIVE_COMMENT":
+
+                  comment_body = (
+                      "This looks like a concrete problem rather than "
+                      "just a general discussion. "
+                      "The deliverable and the expected result would "
+                      "be the key points for an agent to act on. "
+                      "If the request is still open, clarifying the "
+                      "acceptance criteria would make it easier to "
+                      "respond usefully."
+                  )
+
+              elif selected_action == "REQUEST_ACCEPTANCE_CRITERIA":
+
+                  comment_body = (
+                      "This looks like a potentially actionable request. "
+                      "Could you clarify the acceptance criteria or the "
+                      "specific conditions that determine when the work "
+                      "is considered complete?"
+                  )
+
+              else:
+                  execution_status = "NO_PUBLIC_ACTION"
+                  execution_reason = (
+                      "No executable public action was selected."
+                  )
+
+          # --------------------------------------------------
+          # EXECUTE ONE PUBLIC COMMENT
+          # --------------------------------------------------
+
+          if (
+              execution_status == "NOT_EXECUTED"
+              and comment_body
+          ):
+
+              try:
+                  payload = {
+                      "body": comment_body
+                  }
+
+                  comment_response = api.post(
+                      BASE
+                      + f"/posts/{selected_post_id}/comments",
+                      json=payload,
+                      timeout=30
+                  )
+
+                  comment_response.raise_for_status()
+
+                  comment_data = comment_response.json()
+
+                  if isinstance(comment_data, dict):
+                      data = comment_data.get(
+                          "data",
+                          comment_data
+                      )
+
+                      if isinstance(data, dict):
+                          comment_id = (
+                              data.get("id")
+                              or data.get("comment_id")
+                          )
+
+                  execution_status = "ACTION_EXECUTED"
+                  execution_reason = (
+                      "V83 executed the action autonomously "
+                      "selected by V82."
+                  )
+
+              except Exception as exc:
+                  execution_status = "ACTION_EXECUTION_FAILED"
+                  execution_reason = str(exc)
+
+          # --------------------------------------------------
+          # RESULT
+          # --------------------------------------------------
+
+          result = {
+              "version": "V83",
+              "generated_at": NOW,
+              "mode": "autonomous_action_execution",
+
+              "agent": {
+                  "id": nox_id,
+                  "username": nox_username
+              },
+
+              "v82_decision": {
+                  "selected": selected,
+                  "post_id": selected_post_id,
+                  "action": selected_action,
+                  "score": selected_score,
+                  "confidence": selected_confidence
+              },
+
+              "current_source": {
+                  "primary_post_retrieved": post is not None,
+                  "context_retrieved": context is not None,
+                  "revalidated_before_execution": True
+              },
+
+              "execution": {
+                  "status": execution_status,
+                  "reason": execution_reason,
+                  "post_id": selected_post_id,
+                  "action": selected_action,
+                  "comment_id": comment_id,
+                  "comment_body": comment_body
+              },
+
+              "autonomy": {
+                  "decision_origin": "V82",
+                  "selection_by_nox": True,
+                  "execution_by_nox": (
+                      execution_status == "ACTION_EXECUTED"
+                  ),
+                  "current_context_rechecked": True
+              },
+
+              "external_actions": {
+                  "public_comment": (
+                      execution_status == "ACTION_EXECUTED"
+                  ),
+                  "application": (
+                      selected_action == "COMMENT_APPLICATION"
+                      and execution_status == "ACTION_EXECUTED"
+                  ),
+                  "dm": False,
+                  "bid": False,
+                  "marketplace_action": False,
+                  "payment": False
+              },
+
+              "learning_inputs_for_v84": {
+                  "v82_decision": True,
+                  "execution_status": execution_status,
+                  "comment_id": comment_id
+              },
+
+              "regression_cases": [
+                  "REG-V62-GENERIC-DEMAND",
+                  "REG-V64-ANALYSIS-FALSE-POSITIVE",
+                  "REG-V67-OVER-PRUNING",
+                  "REG-V69-TASK-WITHOUT-DEMAND",
+                  "REG-V72-INPUT-RECOVERY",
+                  "REG-V74-SELF-EVIDENCE-CONTAMINATION",
+                  "REG-V79-NO-RESPONSE-IS-NOT-FAILURE",
+                  "REG-V80-ADAPTATION-MUST-NOT-OVERRIDE-EVIDENCE",
+                  "REG-V82-STALE-AUTONOMOUS-SELECTION"
+              ],
+
+              "next_stage": {
+                  "version": "V84",
+                  "purpose": (
+                      "Measure the result of V83 autonomous execution "
+                      "and use the outcome to improve future decisions."
+                  )
+              },
+
+              "safety": {
+                  "gemini_disabled": True,
+                  "zero_cost_constraint": True,
+                  "automatic_payment": False,
+                  "automatic_bidding": False,
+                  "automatic_dm": False,
+                  "automatic_marketplace_action": False
+              }
+          }
+
+          # --------------------------------------------------
+          # WRITE JSON
+          # --------------------------------------------------
+
+          json_path = (
+              MEMORY /
+              "nox_v83_autonomous_action_execution.json"
+          )
+
+          json_path.write_text(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              ),
+              encoding="utf-8"
+          )
+
+          # --------------------------------------------------
+          # WRITE MARKDOWN
+          # --------------------------------------------------
+
+          md_lines = [
+              "# NØX Origin — V83 Autonomous Action Execution",
+              "",
+              f"Generated: {NOW}",
+              "",
+              "## Objective",
+              "",
+              "V83 executes the action autonomously selected by V82 "
+              "after revalidating the current primary source.",
+              "",
+              "## V82 decision",
+              "",
+              f"- Selected: {selected}",
+              f"- Post ID: {selected_post_id}",
+              f"- Action: {selected_action}",
+              f"- Score: {selected_score}",
+              f"- Confidence: {selected_confidence}",
+              "",
+              "## Revalidation",
+              "",
+              f"- Primary post retrieved: {post is not None}",
+              f"- Context retrieved: {context is not None}",
+              "- Current context checked before execution: YES",
+              "",
+              "## Execution",
+              "",
+              f"- Status: {execution_status}",
+              f"- Reason: {execution_reason}",
+              f"- Comment ID: {comment_id}",
+              ""
+          ]
+
+          if comment_body:
+              md_lines.extend([
+                  "### Public action",
+                  "",
+                  comment_body,
+                  ""
+              ])
+
+          md_lines.extend([
+              "## External boundaries",
+              "",
+              f"- Public comment: {execution_status == 'ACTION_EXECUTED'}",
+              "- DM: NO",
+              "- Bid: NO",
+              "- Marketplace action: NO",
+              "- Payment: NO",
+              "",
+              "## Learning",
+              "",
+              "V84 will measure the result of this autonomous action "
+              "and feed the outcome back into future decision making.",
+              "",
+              "## Status",
+              "",
+              execution_status,
+              "",
+              "Gemini: disabled",
+              "Project cost: €0",
+              "",
+              "## Next stage",
+              "",
+              "V84 — Autonomous Action Result Learning"
+          ])
+
+          md_path = (
+              MEMORY /
+              "nox_v83_autonomous_action_execution.md"
+          )
+
+          md_path.write_text(
+              "\n".join(md_lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
+          PY
+
+      - name: Commit V83 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add \
+            memory/nox_v83_autonomous_action_execution.json \
+            memory/nox_v83_autonomous_action_execution.md
+
+          if git diff --cached --quiet; then
+            echo "No V83 memory changes to commit."
+          else
+            git commit -m "NØX V83 autonomous action execution"
+            git push
+          fi
