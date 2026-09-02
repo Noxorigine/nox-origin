@@ -1,0 +1,737 @@
+name: NØX V84 Autonomous Action Result Learning
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-v84-autonomous-action-result-learning
+  cancel-in-progress: false
+
+jobs:
+  learn:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run V84
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai/api/v1"
+          MEMORY_DIR = "memory"
+
+          os.makedirs(MEMORY_DIR, exist_ok=True)
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load_json(path, default=None):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return default if default is not None else {}
+
+          def save_json(path, data):
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(data, f, indent=2, ensure_ascii=False)
+
+          def text_of(value):
+              if value is None:
+                  return ""
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, dict):
+                  for key in ("body", "content", "text", "message"):
+                      if isinstance(value.get(key), str):
+                          return value[key]
+                  return json.dumps(value, ensure_ascii=False)
+              return str(value)
+
+          def get_id(obj):
+              if not isinstance(obj, dict):
+                  return None
+              for key in ("id", "comment_id", "post_id"):
+                  if obj.get(key):
+                      return str(obj[key])
+              return None
+
+          def get_author(obj):
+              if not isinstance(obj, dict):
+                  return {}
+              author = obj.get("author")
+              if isinstance(author, dict):
+                  return author
+              user = obj.get("user")
+              if isinstance(user, dict):
+                  return user
+              return {}
+
+          def collect_comments(obj, result=None):
+              if result is None:
+                  result = []
+
+              if isinstance(obj, dict):
+                  for key in ("comments", "replies", "children"):
+                      value = obj.get(key)
+                      if isinstance(value, list):
+                          for item in value:
+                              if isinstance(item, dict):
+                                  result.append(item)
+                                  collect_comments(item, result)
+
+                  for value in obj.values():
+                      if isinstance(value, (dict, list)):
+                          collect_comments(value, result)
+
+              elif isinstance(obj, list):
+                  for item in obj:
+                      if isinstance(item, (dict, list)):
+                          collect_comments(item, result)
+
+              unique = {}
+              for item in result:
+                  item_id = get_id(item)
+                  if item_id:
+                      unique[item_id] = item
+
+              return list(unique.values())
+
+          def signal(text):
+              t = text.lower()
+
+              positive = [
+                  "yes", "great", "good", "useful", "helpful",
+                  "thanks", "thank you", "interested", "welcome",
+                  "approved", "works", "worked", "accepted",
+                  "exactly", "perfect", "nice"
+              ]
+
+              negative = [
+                  "no", "wrong", "incorrect", "not useful",
+                  "spam", "irrelevant", "bad", "reject",
+                  "rejected", "don't need", "do not need"
+              ]
+
+              work = [
+                  "hire", "task", "work", "job", "request",
+                  "build", "fix", "create", "deliver",
+                  "need someone", "looking for", "paid",
+                  "reward", "bounty"
+              ]
+
+              payment = [
+                  "paid", "payment", "settled", "settlement",
+                  "tip", "tips", "sats", "bitcoin", "btc",
+                  "usdc", "reward received", "paid out"
+              ]
+
+              followup = [
+                  "dm me", "message me", "apply", "application",
+                  "submit", "send", "contact", "details",
+                  "can you", "could you", "please provide"
+              ]
+
+              scores = {
+                  "positive": sum(1 for x in positive if x in t),
+                  "negative": sum(1 for x in negative if x in t),
+                  "work": sum(1 for x in work if x in t),
+                  "payment": sum(1 for x in payment if x in t),
+                  "followup": sum(1 for x in followup if x in t)
+              }
+
+              return scores
+
+          api_key = os.environ.get("COLONY_API_KEY")
+          if not api_key:
+              raise SystemExit("COLONY_API_KEY is missing")
+
+          # ------------------------------------------------------------
+          # 1. Authenticate using the Colony JWT exchange
+          # ------------------------------------------------------------
+
+          token_response = requests.post(
+              f"{BASE}/auth/token",
+              json={"api_key": api_key},
+              timeout=30
+          )
+          token_response.raise_for_status()
+
+          token_data = token_response.json()
+          access_token = token_data.get("access_token")
+
+          if not access_token:
+              raise SystemExit("No access_token returned by Colony")
+
+          headers = {
+              "Authorization": f"Bearer {access_token}",
+              "Accept": "application/json"
+          }
+
+          me_response = requests.get(
+              f"{BASE}/users/me",
+              headers=headers,
+              timeout=30
+          )
+          me_response.raise_for_status()
+
+          me = me_response.json()
+
+          agent_id = str(
+              me.get("id")
+              or me.get("user_id")
+              or ""
+          )
+
+          agent_username = str(
+              me.get("username")
+              or ""
+          ).lower()
+
+          agent_name = str(
+              me.get("display_name")
+              or me.get("name")
+              or ""
+          ).lower()
+
+          # ------------------------------------------------------------
+          # 2. Load previous decision and execution
+          # ------------------------------------------------------------
+
+          v82 = load_json(
+              f"{MEMORY_DIR}/nox_v82_autonomous_action_selection.json"
+          )
+
+          v83 = load_json(
+              f"{MEMORY_DIR}/nox_v83_autonomous_action_execution.json"
+          )
+
+          selected = v82.get("selected_action") or {}
+          if not isinstance(selected, dict):
+              selected = {}
+
+          post_id = (
+              v83.get("post_id")
+              or selected.get("post_id")
+              or v82.get("post_id")
+          )
+
+          comment_id = (
+              v83.get("comment_id")
+              or v83.get("action_comment_id")
+          )
+
+          execution_status = str(
+              v83.get("status")
+              or v83.get("execution_status")
+              or ""
+          ).upper()
+
+          # ------------------------------------------------------------
+          # 3. Result skeleton
+          # ------------------------------------------------------------
+
+          result = {
+              "version": "V84",
+              "generated_at": now(),
+              "mode": "autonomous_action_result_learning",
+              "agent": {
+                  "id": agent_id,
+                  "username": agent_username
+              },
+              "source": {
+                  "post_id": post_id,
+                  "post_retrieved": False,
+                  "context_retrieved": False,
+                  "primary_source_verified": False
+              },
+              "previous_decision": {
+                  "version": "V82",
+                  "action": selected.get("action"),
+                  "reason": selected.get("reason"),
+                  "score": selected.get("score"),
+                  "post_id": selected.get("post_id")
+              },
+              "execution": {
+                  "version": "V83",
+                  "status": execution_status,
+                  "comment_id": comment_id,
+                  "comment_body": v83.get("comment_body")
+              },
+              "outcome": {
+                  "status": "NO_EXECUTABLE_ACTION",
+                  "response_count": 0,
+                  "new_opportunity_signals": 0,
+                  "payment_signals": 0,
+                  "positive_signals": 0,
+                  "negative_signals": 0,
+                  "follow_up_signals": 0
+              },
+              "learning": {
+                  "decision_quality": "NOT_EVALUABLE",
+                  "action_effectiveness": "NOT_EVALUABLE",
+                  "lessons": [],
+                  "regression_cases": [
+                      "REG-V79-NO_RESPONSE_IS_NOT_FAILURE",
+                      "REG-V82-STALE-AUTONOMOUS-SELECTION",
+                      "REG-V83-EXECUTION_RESULT_REQUIRES_PRIMARY_SOURCE"
+                  ]
+              },
+              "next_stage": {
+                  "version": "V85",
+                  "purpose": "Convert observed action outcomes into adaptive strategy signals for future autonomous decisions.",
+                  "automatic_external_action": False,
+                  "automatic_rule_deployment": False
+              },
+              "safety": {
+                  "automatic_external_action": False,
+                  "automatic_contact": False,
+                  "automatic_bidding": False,
+                  "automatic_payment": False,
+                  "gemini_disabled": True,
+                  "zero_cost_constraint": True
+              }
+          }
+
+          # ------------------------------------------------------------
+          # 4. Nothing executed: still produce a valid learning record
+          # ------------------------------------------------------------
+
+          if not post_id or not comment_id or execution_status not in (
+              "EXECUTED",
+              "SUCCESS",
+              "COMMENT_POSTED"
+          ):
+              result["outcome"]["status"] = "NO_EXECUTABLE_ACTION"
+
+              result["learning"]["lessons"] = [
+                  "No externally executed action was available for outcome measurement.",
+                  "A missing response must not be interpreted as failure.",
+                  "Future learning must distinguish decision quality from execution availability."
+              ]
+
+              save_json(
+                  f"{MEMORY_DIR}/nox_v84_autonomous_action_result_learning.json",
+                  result
+              )
+
+              with open(
+                  f"{MEMORY_DIR}/nox_v84_autonomous_action_result_learning.md",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write("# NØX V84 — Autonomous Action Result Learning\n\n")
+                  f.write("## Status\n\n")
+                  f.write("No executable V83 action was available for outcome measurement.\n\n")
+                  f.write("## Learning\n\n")
+                  for lesson in result["learning"]["lessons"]:
+                      f.write(f"- {lesson}\n")
+                  f.write("\n## Next stage\n\n")
+                  f.write("V85 — Adaptive strategy signals.\n")
+
+              raise SystemExit(0)
+
+          # ------------------------------------------------------------
+          # 5. Re-fetch the original post
+          # ------------------------------------------------------------
+
+          post_response = requests.get(
+              f"{BASE}/posts/{post_id}",
+              headers=headers,
+              timeout=30
+          )
+
+          post_response.raise_for_status()
+          post = post_response.json()
+
+          result["source"]["post_retrieved"] = True
+
+          # ------------------------------------------------------------
+          # 6. Re-fetch complete context
+          # ------------------------------------------------------------
+
+          context_response = requests.get(
+              f"{BASE}/posts/{post_id}/context",
+              headers=headers,
+              timeout=30
+          )
+
+          context_response.raise_for_status()
+          context = context_response.json()
+
+          result["source"]["context_retrieved"] = True
+          result["source"]["primary_source_verified"] = True
+
+          # ------------------------------------------------------------
+          # 7. Recover comments from primary source
+          # ------------------------------------------------------------
+
+          comments = collect_comments(context)
+
+          # Fallback if context does not expose comments directly.
+          if not comments:
+              comments = collect_comments(post)
+
+          community_comments = []
+
+          for comment in comments:
+              cid = get_id(comment)
+              if not cid:
+                  continue
+
+              author = get_author(comment)
+
+              cid_text = str(
+                  author.get("id")
+                  or author.get("user_id")
+                  or ""
+              )
+
+              username = str(
+                  author.get("username")
+                  or ""
+              ).lower()
+
+              display_name = str(
+                  author.get("display_name")
+                  or author.get("name")
+                  or ""
+              ).lower()
+
+              is_nox = False
+
+              if agent_id and cid_text == agent_id:
+                  is_nox = True
+
+              if agent_username and username == agent_username:
+                  is_nox = True
+
+              if agent_name and display_name == agent_name:
+                  is_nox = True
+
+              if not is_nox:
+                  community_comments.append(comment)
+
+          # ------------------------------------------------------------
+          # 8. Only count responses after the V83 action
+          # ------------------------------------------------------------
+
+          response_comments = []
+
+          for comment in community_comments:
+              parent_id = str(
+                  comment.get("parent_id")
+                  or comment.get("parent_comment_id")
+                  or ""
+              )
+
+              body = text_of(comment.get("body"))
+
+              # Direct replies to NØX's V83 comment.
+              if comment_id and parent_id == str(comment_id):
+                  response_comments.append(comment)
+                  continue
+
+              # Also recognize a later top-level response in the same
+              # thread when the API does not expose parent_id.
+              created = str(
+                  comment.get("created_at")
+                  or comment.get("created")
+                  or ""
+              )
+
+              if comment_id and created:
+                  response_comments.append(comment)
+
+          # Deduplicate responses.
+          unique_responses = {}
+          for comment in response_comments:
+              cid = get_id(comment)
+              if cid:
+                  unique_responses[cid] = comment
+
+          response_comments = list(unique_responses.values())
+
+          result["outcome"]["response_count"] = len(response_comments)
+
+          # ------------------------------------------------------------
+          # 9. Analyze observed responses
+          # ------------------------------------------------------------
+
+          combined_scores = {
+              "positive": 0,
+              "negative": 0,
+              "work": 0,
+              "payment": 0,
+              "followup": 0
+          }
+
+          response_evidence = []
+
+          for comment in response_comments:
+              body = text_of(comment.get("body"))
+              scores = signal(body)
+
+              for key in combined_scores:
+                  combined_scores[key] += scores.get(key, 0)
+
+              response_evidence.append({
+                  "comment_id": get_id(comment),
+                  "author": get_author(comment),
+                  "body": body,
+                  "signals": scores
+              })
+
+          result["outcome"]["positive_signals"] = combined_scores["positive"]
+          result["outcome"]["negative_signals"] = combined_scores["negative"]
+          result["outcome"]["new_opportunity_signals"] = combined_scores["work"]
+          result["outcome"]["payment_signals"] = combined_scores["payment"]
+          result["outcome"]["follow_up_signals"] = combined_scores["followup"]
+          result["evidence"] = response_evidence
+
+          # ------------------------------------------------------------
+          # 10. Determine outcome
+          # ------------------------------------------------------------
+
+          if not response_comments:
+              outcome_status = "NO_RESPONSE"
+
+          elif combined_scores["payment"] > 0:
+              outcome_status = "PAYMENT_SIGNAL"
+
+          elif combined_scores["work"] > 0 and combined_scores["followup"] > 0:
+              outcome_status = "POTENTIAL_WORK_OPPORTUNITY"
+
+          elif combined_scores["negative"] > combined_scores["positive"]:
+              outcome_status = "NEGATIVE_SIGNAL"
+
+          elif combined_scores["positive"] > 0:
+              outcome_status = "POSITIVE_SIGNAL"
+
+          else:
+              outcome_status = "RESPONSE_RECEIVED"
+
+          result["outcome"]["status"] = outcome_status
+
+          # ------------------------------------------------------------
+          # 11. Learn from the decision/action/result chain
+          # ------------------------------------------------------------
+
+          lessons = []
+
+          if outcome_status == "NO_RESPONSE":
+              lessons.append(
+                  "No response is an observed outcome, not proof that the action or decision was wrong."
+              )
+              lessons.append(
+                  "Future prioritization should avoid penalizing actions solely because nobody responded."
+              )
+              decision_quality = "UNRESOLVED"
+              effectiveness = "NO_OBSERVED_RESPONSE"
+
+          elif outcome_status == "POSITIVE_SIGNAL":
+              lessons.append(
+                  "The selected action produced an observable positive interaction signal."
+              )
+              lessons.append(
+                  "Actions with similar evidence structure may deserve higher future priority."
+              )
+              decision_quality = "SUPPORTED"
+              effectiveness = "POSITIVE"
+
+          elif outcome_status == "POTENTIAL_WORK_OPPORTUNITY":
+              lessons.append(
+                  "The action was followed by language indicating a possible concrete work opportunity."
+              )
+              lessons.append(
+                  "Future versions should verify delegation, deliverable, acceptance criteria and application route before acting further."
+              )
+              decision_quality = "SUPPORTED"
+              effectiveness = "OPPORTUNITY_SIGNAL"
+
+          elif outcome_status == "PAYMENT_SIGNAL":
+              lessons.append(
+                  "The response contains payment-related language, but language alone is not proof of settlement."
+              )
+              lessons.append(
+                  "Future versions must independently verify any claimed payment before treating it as economic evidence."
+              )
+              decision_quality = "SUPPORTED"
+              effectiveness = "PAYMENT_SIGNAL_UNVERIFIED"
+
+          elif outcome_status == "NEGATIVE_SIGNAL":
+              lessons.append(
+                  "The action received a predominantly negative observable response."
+              )
+              lessons.append(
+                  "Future prioritization should consider reducing similar action priority unless stronger evidence justifies it."
+              )
+              decision_quality = "WEAKENED"
+              effectiveness = "NEGATIVE"
+
+          else:
+              lessons.append(
+                  "A response was observed, but it did not provide enough signal to classify the action as clearly positive or negative."
+              )
+              decision_quality = "PARTIAL"
+              effectiveness = "AMBIGUOUS"
+
+          lessons.append(
+              "Primary-source verification is required before converting an observed response into adaptive learning."
+          )
+
+          result["learning"]["decision_quality"] = decision_quality
+          result["learning"]["action_effectiveness"] = effectiveness
+          result["learning"]["lessons"] = lessons
+
+          # ------------------------------------------------------------
+          # 12. Build machine-readable learning signal for V85
+          # ------------------------------------------------------------
+
+          result["adaptive_signal"] = {
+              "direction": (
+                  "INCREASE_PRIORITY"
+                  if outcome_status in ("POSITIVE_SIGNAL", "POTENTIAL_WORK_OPPORTUNITY")
+                  else "DECREASE_PRIORITY"
+                  if outcome_status == "NEGATIVE_SIGNAL"
+                  else "MAINTAIN_WITH_CAUTION"
+              ),
+              "strength": (
+                  "HIGH"
+                  if outcome_status in ("POTENTIAL_WORK_OPPORTUNITY", "PAYMENT_SIGNAL")
+                  else "MEDIUM"
+                  if outcome_status in ("POSITIVE_SIGNAL", "NEGATIVE_SIGNAL")
+                  else "LOW"
+              ),
+              "reason": outcome_status,
+              "deploy_automatically": False
+          }
+
+          # ------------------------------------------------------------
+          # 13. Save JSON
+          # ------------------------------------------------------------
+
+          save_json(
+              f"{MEMORY_DIR}/nox_v84_autonomous_action_result_learning.json",
+              result
+          )
+
+          # ------------------------------------------------------------
+          # 14. Save Markdown
+          # ------------------------------------------------------------
+
+          md = []
+
+          md.append("# NØX V84 — Autonomous Action Result Learning")
+          md.append("")
+          md.append(f"Generated: {result['generated_at']}")
+          md.append("")
+          md.append("## Source verification")
+          md.append("")
+          md.append(f"- Post retrieved: {result['source']['post_retrieved']}")
+          md.append(f"- Context retrieved: {result['source']['context_retrieved']}")
+          md.append(f"- Primary source verified: {result['source']['primary_source_verified']}")
+          md.append("")
+          md.append("## V83 execution")
+          md.append("")
+          md.append(f"- Status: {execution_status}")
+          md.append(f"- Post ID: {post_id}")
+          md.append(f"- Comment ID: {comment_id}")
+          md.append("")
+          md.append("## Observed outcome")
+          md.append("")
+          md.append(f"- Status: {outcome_status}")
+          md.append(f"- Responses: {result['outcome']['response_count']}")
+          md.append(f"- Positive signals: {result['outcome']['positive_signals']}")
+          md.append(f"- Negative signals: {result['outcome']['negative_signals']}")
+          md.append(f"- Work signals: {result['outcome']['new_opportunity_signals']}")
+          md.append(f"- Payment signals: {result['outcome']['payment_signals']}")
+          md.append(f"- Follow-up signals: {result['outcome']['follow_up_signals']}")
+          md.append("")
+          md.append("## Learning")
+          md.append("")
+          md.append(f"- Decision quality: {decision_quality}")
+          md.append(f"- Action effectiveness: {effectiveness}")
+          md.append("")
+
+          for lesson in lessons:
+              md.append(f"- {lesson}")
+
+          md.append("")
+          md.append("## Adaptive signal")
+          md.append("")
+          md.append(
+              f"- Direction: {result['adaptive_signal']['direction']}"
+          )
+          md.append(
+              f"- Strength: {result['adaptive_signal']['strength']}"
+          )
+          md.append(
+              "- Automatic deployment: false"
+          )
+          md.append("")
+          md.append("## Regression cases")
+          md.append("")
+
+          for case in result["learning"]["regression_cases"]:
+              md.append(f"- {case}")
+
+          md.append("")
+          md.append("## Next stage")
+          md.append("")
+          md.append(
+              "V85 — Convert observed outcomes into adaptive strategy signals for future autonomous decisions."
+          )
+          md.append("")
+          md.append("## Safety")
+          md.append("")
+          md.append("- No automatic external action.")
+          md.append("- No DM.")
+          md.append("- No bidding.")
+          md.append("- No payment.")
+          md.append("- Gemini disabled.")
+          md.append("- Project cost: €0.")
+          md.append("")
+
+          with open(
+              f"{MEMORY_DIR}/nox_v84_autonomous_action_result_learning.md",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write("\n".join(md))
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+          PY
+
+      - name: Commit V84 learning
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v84_autonomous_action_result_learning.json
+          git add memory/nox_v84_autonomous_action_result_learning.md
+
+          git diff --cached --quiet || \
+            git commit -m "NØX V84 autonomous action result learning"
+
+          git push
