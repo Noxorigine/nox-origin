@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run V74.1 identity evidence correction
+      - name: Run V74.1
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
@@ -36,23 +36,23 @@ jobs:
           import json
           import os
           import re
+          from datetime import datetime, timezone
           from pathlib import Path
+
           import requests
 
           BASE = "https://thecolony.ai/api/v1"
           MEMORY = Path("memory")
 
-          V74_FILE = MEMORY / "nox_v74_autonomous_evidence_synthesis.json"
-          V73_FILE = MEMORY / "nox_v73_community_evidence_recovery_audit.json"
           OUT_JSON = MEMORY / "nox_v74_1_identity_evidence_correction.json"
           OUT_MD = MEMORY / "nox_v74_1_identity_evidence_correction.md"
 
           API_KEY = os.environ.get("COLONY_API_KEY")
 
           if not API_KEY:
-              raise SystemExit("COLONY_API_KEY is missing")
+              raise RuntimeError("COLONY_API_KEY is missing")
 
-          def read_json(path):
+          def load_json(path):
               if not path.exists():
                   return {}
               try:
@@ -60,20 +60,23 @@ jobs:
               except Exception:
                   return {}
 
-          def api_json(method, path, token=None, **kwargs):
-              headers = kwargs.pop("headers", {})
+          def api_request(method, path, token=None, payload=None):
+              headers = {
+                  "Accept": "application/json"
+              }
+
               if token:
                   headers["Authorization"] = f"Bearer {token}"
-              headers["Accept"] = "application/json"
-              if "json" in kwargs:
+
+              if payload is not None:
                   headers["Content-Type"] = "application/json"
 
               response = requests.request(
                   method,
                   BASE + path,
                   headers=headers,
-                  timeout=30,
-                  **kwargs
+                  json=payload,
+                  timeout=30
               )
 
               response.raise_for_status()
@@ -90,13 +93,15 @@ jobs:
                   headers={"Accept": "application/json"},
                   timeout=30
               )
+
               response.raise_for_status()
+
               data = response.json()
 
               token = data.get("access_token") or data.get("token")
 
               if not token:
-                  raise RuntimeError("JWT token not returned by Colony API")
+                  raise RuntimeError("No access token returned")
 
               return token
 
@@ -123,16 +128,17 @@ jobs:
                   "ù": "u",
                   "û": "u",
                   "ü": "u",
-                  "ç": "c",
+                  "ç": "c"
               }
 
               for old, new in replacements.items():
                   text = text.replace(old, new)
 
               text = re.sub(r"[^a-z0-9]+", " ", text)
+
               return re.sub(r"\s+", " ", text).strip()
 
-          def author_parts(comment):
+          def get_author_data(comment):
               author = comment.get("author")
 
               if isinstance(author, dict):
@@ -140,12 +146,12 @@ jobs:
                       author.get("id")
                       or author.get("user_id")
                       or author.get("agent_id")
+                      or ""
                   )
 
                   username = (
                       author.get("username")
                       or author.get("handle")
-                      or author.get("name")
                       or ""
                   )
 
@@ -157,27 +163,33 @@ jobs:
                   )
 
                   return (
-                      str(author_id or ""),
-                      str(username or ""),
-                      str(display_name or "")
+                      str(author_id),
+                      str(username),
+                      str(display_name)
                   )
 
-              if isinstance(author, str):
-                  return "", author, author
-
-              return (
-                  str(
-                      comment.get("author_id")
-                      or comment.get("user_id")
-                      or comment.get("agent_id")
-                      or ""
-                  ),
-                  str(comment.get("username") or ""),
-                  str(comment.get("display_name") or comment.get("name") or "")
+              author_id = (
+                  comment.get("author_id")
+                  or comment.get("user_id")
+                  or comment.get("agent_id")
+                  or ""
               )
 
-          def is_nox_author(comment, me, known_ids):
-              author_id, username, display_name = author_parts(comment)
+              username = comment.get("username") or ""
+              display_name = (
+                  comment.get("display_name")
+                  or comment.get("name")
+                  or ""
+              )
+
+              return (
+                  str(author_id),
+                  str(username),
+                  str(display_name)
+              )
+
+          def is_nox(comment, me):
+              author_id, username, display_name = get_author_data(comment)
 
               me_id = str(
                   me.get("id")
@@ -199,198 +211,81 @@ jobs:
                   or ""
               )
 
-              normalized_username = normalize(username)
-              normalized_display = normalize(display_name)
+              author_username = normalize(username)
+              author_display = normalize(display_name)
 
-              identity_ids = {
-                  str(x) for x in known_ids if x
-              }
+              known_nox_id = "442104b5-eee0-4f73-b452-08f258a21ea2"
 
-              if me_id:
-                  identity_ids.add(me_id)
-
-              if author_id and author_id in identity_ids:
+              if author_id and author_id == me_id:
                   return True
 
-              if normalized_username and me_username:
-                  if normalized_username == me_username:
-                      return True
-
-              if normalized_display and me_display:
-                  if normalized_display == me_display:
-                      return True
-
-              # Explicit canonical identity fallbacks.
-              if normalized_username == "nox origine":
+              if author_id and author_id == known_nox_id:
                   return True
 
-              if normalized_username == "nox_origine":
+              if (
+                  author_username
+                  and me_username
+                  and author_username == me_username
+              ):
                   return True
 
-              if normalized_display == "nox origin":
+              if (
+                  author_display
+                  and me_display
+                  and author_display == me_display
+              ):
+                  return True
+
+              if author_username in {
+                  "nox origine",
+                  "nox_origine"
+              }:
+                  return True
+
+              if author_display == "nox origin":
                   return True
 
               return False
 
-          def recursive_comments(value):
-              found = []
+          def extract_comments(value, output=None):
+              if output is None:
+                  output = []
 
               if isinstance(value, dict):
                   for key, item in value.items():
-                      key_l = str(key).lower()
 
-                      if key_l in {
+                      key_lower = str(key).lower()
+
+                      if key_lower in {
                           "comments",
                           "replies",
-                          "children",
-                          "responses"
+                          "responses",
+                          "children"
                       }:
                           if isinstance(item, list):
-                              for child in item:
-                                  if isinstance(child, dict):
-                                      found.append(child)
+                              for entry in item:
+                                  if isinstance(entry, dict):
+                                      output.append(entry)
 
-                      found.extend(recursive_comments(item))
+                      extract_comments(item, output)
 
               elif isinstance(value, list):
                   for item in value:
-                      found.extend(recursive_comments(item))
+                      extract_comments(item, output)
 
-              return found
+              return output
 
-          def comment_id(comment):
-              return str(
-                  comment.get("id")
-                  or comment.get("comment_id")
-                  or comment.get("uuid")
-                  or ""
-              )
-
-          def comment_body(comment):
-              value = (
-                  comment.get("body")
-                  or comment.get("content")
-                  or comment.get("text")
-                  or ""
-              )
-              return str(value)
-
-          def classify_signals(body):
-              text = normalize(body)
-
-              signals = set()
-
-              verification_terms = [
-                  "verify",
-                  "verification",
-                  "verifiable",
-                  "acceptance criteria",
-                  "proof",
-                  "independent",
-                  "checkable",
-                  "observable",
-              ]
-
-              lifecycle_terms = [
-                  "open",
-                  "assigned",
-                  "in progress",
-                  "done",
-                  "closed",
-                  "closure",
-                  "abandoned",
-                  "lifecycle",
-                  "resolution",
-              ]
-
-              payment_terms = [
-                  "payment",
-                  "paid",
-                  "payable",
-                  "reward",
-                  "escrow",
-                  "settlement",
-                  "usdc",
-                  "sats",
-                  "bitcoin",
-                  "tip",
-              ]
-
-              identity_terms = [
-                  "identity",
-                  "requester",
-                  "attribution",
-                  "proof of identity",
-                  "principal",
-              ]
-
-              structure_terms = [
-                  "field",
-                  "schema",
-                  "format",
-                  "structure",
-                  "standard",
-                  "requester",
-                  "status",
-              ]
-
-              detection_terms = [
-                  "classifier",
-                  "classification",
-                  "noise",
-                  "signal",
-                  "detect",
-                  "detection",
-                  "false positive",
-                  "keyword",
-              ]
-
-              routing_terms = [
-                  "application method",
-                  "apply",
-                  "comment",
-                  "reply",
-                  "dm",
-                  "direct message",
-                  "external form",
-                  "routing",
-              ]
-
-              dispute_terms = [
-                  "dispute",
-                  "escalation",
-                  "resolution",
-                  "disputed",
-                  "resolve",
-                  "closure",
-              ]
-
-              groups = {
-                  "VERIFICATION": verification_terms,
-                  "LIFECYCLE": lifecycle_terms,
-                  "PAYMENT": payment_terms,
-                  "IDENTITY": identity_terms,
-                  "STRUCTURE": structure_terms,
-                  "DETECTION_QUALITY": detection_terms,
-                  "APPLICATION_ROUTING": routing_terms,
-                  "DISPUTE_RESOLUTION": dispute_terms,
-              }
-
-              for signal, terms in groups.items():
-                  if any(term in text for term in terms):
-                      signals.add(signal)
-
-              return sorted(signals)
-
-          def extract_colony_comments(context):
-              candidates = recursive_comments(context)
-
-              # Deduplicate by stable comment ID.
+          def unique_comments(comments):
               result = []
               seen = set()
 
-              for item in candidates:
-                  cid = comment_id(item)
+              for comment in comments:
+                  cid = str(
+                      comment.get("id")
+                      or comment.get("comment_id")
+                      or comment.get("uuid")
+                      or ""
+                  )
 
                   if not cid:
                       continue
@@ -399,134 +294,250 @@ jobs:
                       continue
 
                   seen.add(cid)
-                  result.append(item)
+                  result.append(comment)
 
               return result
 
-          v74 = read_json(V74_FILE)
-          v73 = read_json(V73_FILE)
+          def get_body(comment):
+              return str(
+                  comment.get("body")
+                  or comment.get("content")
+                  or comment.get("text")
+                  or ""
+              )
+
+          def classify(body):
+              text = normalize(body)
+              signals = []
+
+              groups = {
+                  "VERIFICATION": [
+                      "verify",
+                      "verification",
+                      "verifiable",
+                      "acceptance criteria",
+                      "proof",
+                      "independent",
+                      "checkable",
+                      "observable"
+                  ],
+                  "LIFECYCLE": [
+                      "open",
+                      "assigned",
+                      "in progress",
+                      "done",
+                      "closed",
+                      "closure",
+                      "abandoned",
+                      "lifecycle",
+                      "resolution"
+                  ],
+                  "PAYMENT": [
+                      "payment",
+                      "paid",
+                      "payable",
+                      "reward",
+                      "escrow",
+                      "settlement",
+                      "usdc",
+                      "sats",
+                      "bitcoin",
+                      "tip"
+                  ],
+                  "IDENTITY": [
+                      "identity",
+                      "requester",
+                      "attribution",
+                      "proof of identity",
+                      "principal"
+                  ],
+                  "STRUCTURE": [
+                      "field",
+                      "schema",
+                      "format",
+                      "structure",
+                      "standard",
+                      "requester",
+                      "status"
+                  ],
+                  "DETECTION_QUALITY": [
+                      "classifier",
+                      "classification",
+                      "noise",
+                      "signal",
+                      "detect",
+                      "detection",
+                      "false positive",
+                      "keyword"
+                  ],
+                  "APPLICATION_ROUTING": [
+                      "application method",
+                      "apply",
+                      "comment",
+                      "reply",
+                      "dm",
+                      "direct message",
+                      "external form",
+                      "routing"
+                  ],
+                  "DISPUTE_RESOLUTION": [
+                      "dispute",
+                      "escalation",
+                      "resolution",
+                      "disputed",
+                      "resolve",
+                      "closure"
+                  ]
+              }
+
+              for signal, terms in groups.items():
+                  for term in terms:
+                      if term in text:
+                          signals.append(signal)
+                          break
+
+              return sorted(set(signals))
+
+          print("Starting NØX V74.1 identity correction")
 
           token = get_token()
 
-          me = api_json("GET", "/users/me", token=token)
+          print("JWT authentication: OK")
 
-          known_nox_ids = {
-              "442104b5-eee0-4f73-b452-08f258a21ea2"
-          }
+          me = api_request(
+              "GET",
+              "/users/me",
+              token=token
+          )
 
-          # Add canonical identity IDs discovered from /users/me.
-          for key in ("id", "user_id", "agent_id"):
-              value = me.get(key)
-              if value:
-                  known_nox_ids.add(str(value))
+          print("Identity retrieved from /users/me")
 
-          source = v73.get("source", {})
-          post_id = source.get("post_id")
+          v73 = load_json(
+              MEMORY / "nox_v73_community_evidence_recovery_audit.json"
+          )
+
+          v74 = load_json(
+              MEMORY / "nox_v74_autonomous_evidence_synthesis.json"
+          )
+
+          post_id = (
+              v73.get("source", {}).get("post_id")
+              or v74.get("source", {}).get("post_id")
+          )
 
           if not post_id:
-              post_id = (
-                  v74.get("source", {}).get("post_id")
-                  or v74.get("post_id")
-              )
+              raise RuntimeError("V70.2 post ID not found")
 
-          if not post_id:
-              raise RuntimeError("Unable to determine V70.2 post ID")
+          print(f"Primary source post: {post_id}")
 
-          # Re-fetch the primary source. Do not trust V74's previous identity classification.
-          direct_post = api_json(
+          post = api_request(
               "GET",
               f"/posts/{post_id}",
               token=token
           )
 
-          context = api_json(
+          context = api_request(
               "GET",
               f"/posts/{post_id}/context",
               token=token
           )
 
-          comments = extract_colony_comments(context)
+          comments = unique_comments(
+              extract_comments(context)
+          )
 
-          # If context contains no comments, also inspect the direct post recursively.
           if not comments:
-              comments = extract_colony_comments(direct_post)
+              comments = unique_comments(
+                  extract_comments(post)
+              )
+
+          print(f"Primary source comments found: {len(comments)}")
 
           all_records = []
-          community_comments = []
-          nox_comments = []
+          community = []
+          nox = []
 
           for comment in comments:
-              cid = comment_id(comment)
 
-              author_id, username, display_name = author_parts(comment)
+              cid = str(
+                  comment.get("id")
+                  or comment.get("comment_id")
+                  or comment.get("uuid")
+                  or ""
+              )
+
+              author_id, username, display_name = get_author_data(
+                  comment
+              )
+
+              body = get_body(comment)
 
               record = {
                   "id": cid,
                   "author_id": author_id,
                   "username": username,
                   "display_name": display_name,
-                  "body": comment_body(comment),
+                  "body": body,
                   "parent_id": str(
                       comment.get("parent_id")
                       or comment.get("parentId")
                       or ""
                   ),
-                  "signals": classify_signals(comment_body(comment)),
+                  "signals": classify(body)
               }
 
-              record["is_nox"] = is_nox_author(
+              record["is_nox"] = is_nox(
                   comment,
-                  me,
-                  known_nox_ids
+                  me
               )
 
               all_records.append(record)
 
               if record["is_nox"]:
-                  nox_comments.append(record)
+                  nox.append(record)
               else:
-                  community_comments.append(record)
+                  community.append(record)
 
-          v74_source = v74.get("source", {})
-          previous_community_count = (
-              v74_source.get("community_comments")
-              if isinstance(v74_source, dict)
-              else None
+          print(f"Independent community comments: {len(community)}")
+          print(f"NØX comments excluded: {len(nox)}")
+
+          previous_v74_count = (
+              v74.get("source", {}).get("community_comments")
           )
 
-          identity_error_detected = (
-              previous_community_count == len(comments)
-              and len(nox_comments) > 0
+          identity_error = (
+              previous_v74_count == len(comments)
+              and len(nox) > 0
           )
 
-          # V71 reference comparison.
+          community_ids = [
+              item["id"]
+              for item in community
+          ]
+
+          nox_ids = [
+              item["id"]
+              for item in nox
+          ]
+
           v71_processed = set(
               v73.get("memory_comparison", {})
               .get("v71_processed_comment_ids", [])
           )
 
-          actual_community_ids = [
-              item["id"]
-              for item in community_comments
-          ]
-
-          actual_nox_ids = [
-              item["id"]
-              for item in nox_comments
-          ]
-
           missing_from_v71 = [
               cid
-              for cid in actual_community_ids
+              for cid in community_ids
               if cid not in v71_processed
           ]
 
-          # Recalculate signals ONLY from independent community comments.
           signal_counts = {}
 
-          for item in community_comments:
+          for item in community:
               for signal in item["signals"]:
-                  signal_counts[signal] = signal_counts.get(signal, 0) + 1
+                  signal_counts[signal] = (
+                      signal_counts.get(signal, 0) + 1
+                  )
 
           convergences = []
 
@@ -568,27 +579,34 @@ jobs:
           regression_cases = [
               {
                   "id": "REG-V74-SELF-EVIDENCE-CONTAMINATION",
-                  "problem": "NØX own comments were classified as community evidence because API author display name differed from the canonical username.",
+                  "problem": "NØX own comments were incorrectly classified as community evidence.",
                   "expected": "NØX evidence must never count as independent community evidence.",
                   "status": "CORRECTED"
               },
               {
                   "id": "REG-V72-ZERO-OBSERVATIONS",
-                  "problem": "V72 produced zero usable observations despite recoverable primary-source community evidence.",
-                  "expected": "Source retrieval must be verified before declaring evidence absence.",
+                  "problem": "V72 produced zero observations despite available primary-source evidence.",
+                  "expected": "Verify source retrieval before declaring evidence absence.",
                   "status": "PRESERVED"
               }
           ]
 
           result = {
               "version": "V74.1",
-              "generated_at": __import__("datetime").datetime.now(
-                  __import__("datetime").timezone.utc
+              "generated_at": datetime.now(
+                  timezone.utc
               ).isoformat(),
               "mode": "identity_evidence_correction",
               "agent": {
-                  "id": me.get("id") or me.get("user_id") or me.get("agent_id"),
-                  "username": me.get("username") or me.get("handle"),
+                  "id": (
+                      me.get("id")
+                      or me.get("user_id")
+                      or me.get("agent_id")
+                  ),
+                  "username": (
+                      me.get("username")
+                      or me.get("handle")
+                  ),
                   "display_name": (
                       me.get("display_name")
                       or me.get("displayName")
@@ -601,42 +619,55 @@ jobs:
                   "context_retrieved": True,
                   "primary_source_verified": True,
                   "total_context_comments": len(comments),
-                  "community_comments": len(community_comments),
-                  "nox_comments": len(nox_comments)
+                  "community_comments": len(community),
+                  "nox_comments": len(nox)
               },
               "identity_audit": {
                   "status": (
                       "IDENTITY_CLASSIFICATION_ERROR_DETECTED_AND_CORRECTED"
-                      if identity_error_detected
+                      if identity_error
                       else "IDENTITY_CLASSIFICATION_VERIFIED"
                   ),
-                  "previous_v74_community_count": previous_community_count,
-                  "corrected_community_count": len(community_comments),
-                  "corrected_nox_count": len(nox_comments),
-                  "canonical_nox_ids": sorted(known_nox_ids),
-                  "nox_comment_ids": actual_nox_ids,
-                  "principle": "Evidence originating from NØX must never count as independent community evidence."
+                  "previous_v74_community_count": previous_v74_count,
+                  "corrected_community_count": len(community),
+                  "corrected_nox_count": len(nox),
+                  "nox_comment_ids": nox_ids,
+                  "principle": (
+                      "Evidence originating from NØX must never count "
+                      "as independent community evidence."
+                  )
               },
               "memory_comparison": {
-                  "v71_processed_comment_ids": sorted(v71_processed),
-                  "actual_community_comment_ids": sorted(actual_community_ids),
-                  "actual_nox_comment_ids": sorted(actual_nox_ids),
-                  "missing_from_v71": sorted(missing_from_v71)
+                  "v71_processed_comment_ids": sorted(
+                      v71_processed
+                  ),
+                  "actual_community_comment_ids": sorted(
+                      community_ids
+                  ),
+                  "actual_nox_comment_ids": sorted(
+                      nox_ids
+                  ),
+                  "missing_from_v71": sorted(
+                      missing_from_v71
+                  )
               },
-              "community_evidence": community_comments,
-              "nox_evidence_excluded": nox_comments,
+              "community_evidence": community,
+              "nox_evidence_excluded": nox,
               "signal_counts": signal_counts,
               "convergences": convergences,
               "regression_cases": regression_cases,
               "conclusion": (
-                  "V74 identity classification was contaminated by two NØX replies. "
-                  "The primary source contains six comments: four independent community comments "
-                  "and two NØX comments. The two NØX comments are excluded from independent evidence. "
-                  "The corrected evidence set is therefore four community comments."
+                  "V74 identity classification was corrected. "
+                  "The primary source contains six comments: "
+                  "four independent community comments and two NØX comments. "
+                  "NØX comments are excluded from independent evidence."
               ),
               "next_stage": {
                   "version": "V75",
-                  "purpose": "Test an evidence-weighted opportunity detector using corrected independent community evidence.",
+                  "purpose": (
+                      "Test an evidence-weighted opportunity detector "
+                      "using corrected independent community evidence."
+                  ),
                   "automatic_rule_change": False,
                   "automatic_publication": False,
                   "automatic_contact": False,
@@ -650,117 +681,108 @@ jobs:
               "confidence": 0.92
           }
 
+          MEMORY.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
           OUT_JSON.write_text(
-              json.dumps(result, indent=2, ensure_ascii=False),
+              json.dumps(
+                  result,
+                  indent=2,
+                  ensure_ascii=False
+              ),
               encoding="utf-8"
           )
 
-          md = []
+          md_lines = [
+              "# NØX Origin — V74.1 Identity Evidence Correction",
+              "",
+              "## Result",
+              "",
+              "V74 retrieved the primary source correctly but incorrectly classified two NØX replies as community evidence.",
+              "",
+              "## Corrected counts",
+              "",
+              f"- Total comments: {len(comments)}",
+              f"- Independent community comments: {len(community)}",
+              f"- NØX comments excluded: {len(nox)}",
+              "",
+              "## Rule",
+              "",
+              "Evidence originating from NØX must never count as independent community evidence.",
+              "",
+              "## Independent community comment IDs",
+              ""
+          ]
 
-          md.append("# NØX Origin — V74.1 Identity Evidence Correction")
-          md.append("")
-          md.append("## Result")
-          md.append("")
-          md.append(
-              "V74 retrieved the correct primary source but incorrectly classified "
-              "two NØX replies as community evidence."
-          )
-          md.append("")
-          md.append("## Corrected source counts")
-          md.append("")
-          md.append(f"- Total comments: {len(comments)}")
-          md.append(f"- Independent community comments: {len(community_comments)}")
-          md.append(f"- NØX comments excluded from community evidence: {len(nox_comments)}")
-          md.append("")
-          md.append("## Identity correction")
-          md.append("")
-          md.append(
-              "NØX is identified using canonical user/agent identifiers from `/users/me`, "
-              "username, display name and normalized identity matching."
-          )
-          md.append("")
-          md.append(
-              "**Rule:** Evidence originating from NØX must never count as independent "
-              "community evidence."
-          )
-          md.append("")
-          md.append("## Independent community evidence")
-          md.append("")
+          for cid in sorted(community_ids):
+              md_lines.append(f"- `{cid}`")
 
-          for item in community_comments:
-              md.append(
-                  f"- `{item['id']}` — {item['username'] or item['display_name']} "
-                  f"— signals: {', '.join(item['signals']) or 'none'}"
+          md_lines.extend([
+              "",
+              "## NØX comment IDs excluded",
+              ""
+          ])
+
+          for cid in sorted(nox_ids):
+              md_lines.append(f"- `{cid}`")
+
+          md_lines.extend([
+              "",
+              "## Signal counts",
+              ""
+          ])
+
+          for key in sorted(signal_counts):
+              md_lines.append(
+                  f"- {key}: {signal_counts[key]}"
               )
 
-          md.append("")
-          md.append("## Excluded NØX comments")
-          md.append("")
-
-          for item in nox_comments:
-              md.append(
-                  f"- `{item['id']}` — excluded from independent evidence"
-              )
-
-          md.append("")
-          md.append("## Recalculated signal counts")
-          md.append("")
-
-          if signal_counts:
-              for key in sorted(signal_counts):
-                  md.append(f"- {key}: {signal_counts[key]}")
-          else:
-              md.append("- No classified signals")
-
-          md.append("")
-          md.append("## Regression cases")
-          md.append("")
-
-          for case in regression_cases:
-              md.append(
-                  f"- **{case['id']}** — {case['status']} — {case['problem']}"
-              )
-
-          md.append("")
-          md.append("## Conclusion")
-          md.append("")
-          md.append(
-              "The V74 conclusions must be recalculated without NØX's own replies. "
-              "The corrected dataset contains four independent community comments. "
-              "The primary-source evidence remains available and traceable."
-          )
-          md.append("")
-          md.append("## Next stage")
-          md.append("")
-          md.append(
-              "V75 can now test evidence-weighted opportunity detection. "
-              "No automatic rule change is performed by V74.1."
-          )
-          md.append("")
-          md.append("- Gemini: disabled")
-          md.append("- Project cost: €0")
-          md.append("- Automatic publication: false")
-          md.append("- Automatic contact: false")
-          md.append("- Automatic bidding: false")
-          md.append("- Automatic payment: false")
+          md_lines.extend([
+              "",
+              "## Regression cases",
+              "",
+              "- REG-V74-SELF-EVIDENCE-CONTAMINATION — CORRECTED",
+              "- REG-V72-ZERO-OBSERVATIONS — PRESERVED",
+              "",
+              "## Next stage",
+              "",
+              "V75 can now test evidence-weighted opportunity detection.",
+              "",
+              "Gemini: disabled",
+              "Project cost: €0",
+              "Automatic publication: false",
+              "Automatic contact: false",
+              "Automatic bidding: false",
+              "Automatic payment: false"
+          ])
 
           OUT_MD.write_text(
-              "\n".join(md),
+              "\n".join(md_lines),
               encoding="utf-8"
           )
 
-          print(json.dumps({
+          summary = {
               "version": "V74.1",
               "status": result["answer_status"],
               "total_comments": len(comments),
-              "community_comments": len(community_comments),
-              "nox_comments_excluded": len(nox_comments),
-              "identity_error_detected": identity_error_detected,
-              "signal_counts": signal_counts,
+              "community_comments": len(community),
+              "nox_comments_excluded": len(nox),
+              "identity_error_detected": identity_error,
               "next_stage": "V75",
               "gemini_used": False,
               "project_cost_eur": 0
-          }, indent=2, ensure_ascii=False)
+          }
+
+          print(
+              json.dumps(
+                  summary,
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
+
           PY
 
       - name: Commit V74.1 results
@@ -768,8 +790,9 @@ jobs:
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
 
-          git add memory/nox_v74_1_identity_evidence_correction.json \
-                  memory/nox_v74_1_identity_evidence_correction.md
+          git add \
+            memory/nox_v74_1_identity_evidence_correction.json \
+            memory/nox_v74_1_identity_evidence_correction.md
 
           if git diff --cached --quiet; then
             echo "No V74.1 changes to commit."
