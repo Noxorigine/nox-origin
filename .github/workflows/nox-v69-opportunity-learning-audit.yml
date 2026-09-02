@@ -41,12 +41,15 @@ jobs:
           VERSION = "V69"
 
           API_KEY = os.environ.get("COLONY_API_KEY")
+
           if not API_KEY:
               raise RuntimeError("COLONY_API_KEY is missing")
 
-          BASE_URL = "https://www.thecolony.cc/api/v1"
+          # The Colony API
+          BASE_URL = "https://thecolony.ai/api/v1"
 
           session = requests.Session()
+
           session.headers.update({
               "Accept": "application/json",
               "Content-Type": "application/json"
@@ -62,9 +65,14 @@ jobs:
               timeout=30
           )
 
-          auth.raise_for_status()
+          if auth.status_code != 200:
+              print("Authentication failed.")
+              print("HTTP status:", auth.status_code)
+              print("Response:", auth.text[:1000])
+              auth.raise_for_status()
 
           auth_data = auth.json()
+
           token = (
               auth_data.get("access_token")
               or auth_data.get("token")
@@ -72,11 +80,15 @@ jobs:
           )
 
           if not token:
-              raise RuntimeError("No authentication token returned")
+              raise RuntimeError(
+                  "Authentication succeeded but no access token was returned"
+              )
 
           session.headers.update({
               "Authorization": f"Bearer {token}"
           })
+
+          print("Authentication successful.")
 
           # ------------------------------------------------------------
           # FETCH SOURCES
@@ -87,7 +99,13 @@ jobs:
                   f"{BASE_URL}{path}",
                   timeout=30
               )
-              response.raise_for_status()
+
+              if response.status_code != 200:
+                  print("GET failed:", path)
+                  print("HTTP status:", response.status_code)
+                  print("Response:", response.text[:1000])
+                  response.raise_for_status()
+
               return response.json()
 
           feed_data = get_json("/feed/for-you")
@@ -108,6 +126,7 @@ jobs:
                   "feed"
               ):
                   value = data.get(key)
+
                   if isinstance(value, list):
                       return value
 
@@ -116,17 +135,21 @@ jobs:
           feed_items = extract_items(feed_data)
           public_items = extract_items(public_data)
 
+          print("For-you feed:", len(feed_items))
+          print("Public posts:", len(public_items))
+
           # ------------------------------------------------------------
-          # STABLE-ID DEDUPLICATION
+          # MERGE SOURCES
           # ------------------------------------------------------------
 
           combined = []
 
-          for source_name, items in (
+          for source_name, source_items in (
               ("for_you_feed", feed_items),
               ("public_posts", public_items)
           ):
-              for item in items:
+              for item in source_items:
+
                   if not isinstance(item, dict):
                       combined.append({
                           "_invalid": True,
@@ -137,30 +160,40 @@ jobs:
 
                   enriched = dict(item)
                   enriched["_source"] = source_name
+
                   combined.append(enriched)
+
+          # ------------------------------------------------------------
+          # STABLE-ID DEDUPLICATION
+          # ------------------------------------------------------------
 
           seen_ids = set()
           items = []
 
           for item in combined:
-              item_id = item.get("id")
 
               if item.get("_invalid"):
                   items.append(item)
                   continue
 
+              item_id = item.get("id")
+
               if item_id:
                   if item_id in seen_ids:
                       continue
+
                   seen_ids.add(item_id)
 
               items.append(item)
+
+          print("Deduplicated items:", len(items))
 
           # ------------------------------------------------------------
           # TEXT EXTRACTION
           # ------------------------------------------------------------
 
           def text_of(item):
+
               if not isinstance(item, dict):
                   return ""
 
@@ -174,13 +207,14 @@ jobs:
                   "description"
               ):
                   value = item.get(key)
+
                   if isinstance(value, str):
                       values.append(value)
 
               return " ".join(values).strip()
 
           # ------------------------------------------------------------
-          # SIGNALS
+          # SIGNAL DEFINITIONS
           # ------------------------------------------------------------
 
           explicit_delegation = [
@@ -284,7 +318,11 @@ jobs:
           ]
 
           def matches(patterns, text):
-              return [p for p in patterns if re.search(p, text, re.I)]
+              return [
+                  pattern
+                  for pattern in patterns
+                  if re.search(pattern, text, re.I)
+              ]
 
           # ------------------------------------------------------------
           # CLASSIFICATION
@@ -293,7 +331,9 @@ jobs:
           records = []
 
           for item in items:
+
               if item.get("_invalid"):
+
                   records.append({
                       "id": None,
                       "classification": "INVALID_SOURCE_ITEM",
@@ -303,18 +343,50 @@ jobs:
                       "source": item.get("_source"),
                       "metadata_preserved": True
                   })
+
                   continue
 
               text = text_of(item)
 
-              delegation_hits = matches(explicit_delegation, text)
-              recovery_hits = matches(recovery_patterns, text)
-              task_hits = matches(concrete_task, text)
-              compensation_hits = matches(compensation, text)
-              completion_hits = matches(completion, text)
-              service_hits = matches(service_offer, text)
-              seeking_hits = matches(agent_seeking, text)
-              discussion_hits = matches(discussion, text)
+              delegation_hits = matches(
+                  explicit_delegation,
+                  text
+              )
+
+              recovery_hits = matches(
+                  recovery_patterns,
+                  text
+              )
+
+              task_hits = matches(
+                  concrete_task,
+                  text
+              )
+
+              compensation_hits = matches(
+                  compensation,
+                  text
+              )
+
+              completion_hits = matches(
+                  completion,
+                  text
+              )
+
+              service_hits = matches(
+                  service_offer,
+                  text
+              )
+
+              seeking_hits = matches(
+                  agent_seeking,
+                  text
+              )
+
+              discussion_hits = matches(
+                  discussion,
+                  text
+              )
 
               score = 0
 
@@ -339,22 +411,43 @@ jobs:
               if seeking_hits:
                   score -= 35
 
-              if discussion_hits and not delegation_hits and not recovery_hits:
+              if (
+                  discussion_hits
+                  and not delegation_hits
+                  and not recovery_hits
+              ):
                   score -= 20
 
               if not task_hits:
                   score -= 20
 
+              # --------------------------------------------------------
+              # BASE CLASSIFICATION
+              # --------------------------------------------------------
+
               if delegation_hits and task_hits:
+
                   classification = "STRONG_OPPORTUNITY_SIGNAL"
+
               elif recovery_hits and task_hits:
+
                   classification = "RECOVERY_SIGNAL"
+
               elif task_hits:
+
                   classification = "TASK_WITHOUT_DEMAND"
+
               elif compensation_hits:
+
                   classification = "COMPENSATION_WITHOUT_DEMAND"
+
               else:
+
                   classification = "NO_ACTIONABLE_SIGNAL"
+
+              # --------------------------------------------------------
+              # EXCLUSION OVERRIDES
+              # --------------------------------------------------------
 
               if completion_hits:
                   classification = "COMPLETED_OR_ALREADY_DONE"
@@ -364,6 +457,10 @@ jobs:
 
               if seeking_hits:
                   classification = "AGENT_SEEKING_WORK"
+
+              # --------------------------------------------------------
+              # RECORD
+              # --------------------------------------------------------
 
               records.append({
                   "id": item.get("id"),
@@ -393,52 +490,66 @@ jobs:
           counts = {}
 
           for record in records:
+
               classification = record["classification"]
-              counts[classification] = counts.get(classification, 0) + 1
+
+              counts[classification] = (
+                  counts.get(classification, 0) + 1
+              )
 
           strong = [
-              r for r in records
-              if r["classification"] == "STRONG_OPPORTUNITY_SIGNAL"
+              record
+              for record in records
+              if record["classification"]
+              == "STRONG_OPPORTUNITY_SIGNAL"
           ]
 
           recovery = [
-              r for r in records
-              if r["classification"] == "RECOVERY_SIGNAL"
+              record
+              for record in records
+              if record["classification"]
+              == "RECOVERY_SIGNAL"
           ]
 
           suspicious = [
-              r for r in records
-              if (
-                  r.get("classification") in (
-                      "TASK_WITHOUT_DEMAND",
-                      "COMPENSATION_WITHOUT_DEMAND"
-                  )
+              record
+              for record in records
+              if record["classification"]
+              in (
+                  "TASK_WITHOUT_DEMAND",
+                  "COMPENSATION_WITHOUT_DEMAND"
               )
           ]
 
           completed = [
-              r for r in records
-              if r.get("classification") == "COMPLETED_OR_ALREADY_DONE"
+              record
+              for record in records
+              if record["classification"]
+              == "COMPLETED_OR_ALREADY_DONE"
           ]
 
           learning_findings = []
 
           if not strong:
+
               learning_findings.append(
                   "No strong opportunity signal was observed in the current sample."
               )
 
           if not recovery:
+
               learning_findings.append(
                   "The recovery lane did not recover an atypical delegated opportunity."
               )
 
           if suspicious:
+
               learning_findings.append(
                   "Task or compensation language appears without sufficient delegation."
               )
 
           if completed:
+
               learning_findings.append(
                   "Completion signals remain important exclusion evidence."
               )
@@ -463,13 +574,17 @@ jobs:
               "Prepare a machine-readable standard for genuine work requests."
           ]
 
+          # ------------------------------------------------------------
+          # OUTPUT
+          # ------------------------------------------------------------
+
           output = {
               "version": VERSION,
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "mode": "opportunity_learning_audit",
               "objective": (
-                  "Measure opportunity-detection weaknesses and convert observed "
-                  "errors into evidence for future controlled improvement."
+                  "Measure opportunity-detection weaknesses and convert "
+                  "observed errors into evidence for future controlled improvement."
               ),
               "scope": {
                   "personalized_feed": True,
@@ -501,8 +616,8 @@ jobs:
               "next_stage": {
                   "version": "V70",
                   "purpose": (
-                      "Generate a non-binding structured WORK REQUEST standard "
-                      "based on the learning audit."
+                      "Generate a non-binding structured WORK REQUEST "
+                      "standard based on the learning audit."
                   ),
                   "automatic_publication": False,
                   "automatic_contact": False,
@@ -523,11 +638,16 @@ jobs:
 
           os.makedirs("memory", exist_ok=True)
 
+          output_file = (
+              "memory/nox_v69_opportunity_learning_audit.json"
+          )
+
           with open(
-              "memory/nox_v69_opportunity_learning_audit.json",
+              output_file,
               "w",
               encoding="utf-8"
           ) as f:
+
               json.dump(
                   output,
                   f,
@@ -535,13 +655,21 @@ jobs:
                   indent=2
               )
 
-          print(json.dumps(output, ensure_ascii=False, indent=2))
+          print(json.dumps(
+              output,
+              ensure_ascii=False,
+              indent=2
+          ))
           PY
 
       - name: Commit V69 learning audit
         run: |
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
+
           git add memory/nox_v69_opportunity_learning_audit.json
-          git diff --cached --quiet || git commit -m "NØX V69 opportunity learning audit"
+
+          git diff --cached --quiet || \
+            git commit -m "NØX V69 opportunity learning audit"
+
           git push
