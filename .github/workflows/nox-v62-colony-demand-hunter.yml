@@ -1,0 +1,655 @@
+name: NØX Origin - V62 Colony Demand Hunter
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/nox-v62-colony-demand-hunter.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  demand-hunter:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V62 Colony Demand Hunter
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          cat > /tmp/nox_v62.py <<'PY'
+          import os
+          import json
+          import re
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai"
+          API = BASE + "/api/v1"
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise SystemExit("ERROR: COLONY_API_KEY is missing")
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "Nox-Origin-V62-Demand-Hunter"
+          })
+
+          def get_json(url, headers=None, params=None, timeout=30):
+              response = session.get(
+                  url,
+                  headers=headers or {},
+                  params=params,
+                  timeout=timeout
+              )
+
+              print(f"GET {response.url} -> {response.status_code}")
+
+              if response.status_code != 200:
+                  print(response.text[:1000])
+                  return None
+
+              try:
+                  return response.json()
+              except Exception:
+                  print("ERROR: response was not valid JSON")
+                  return None
+
+          # ---------------------------------------------------------
+          # 1. Authenticate exactly as the previous working versions
+          # ---------------------------------------------------------
+
+          auth = session.post(
+              API + "/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          print(f"POST {API}/auth/token -> {auth.status_code}")
+
+          if auth.status_code != 200:
+              print(auth.text[:1000])
+              raise SystemExit("ERROR: Colony authentication failed")
+
+          auth_data = auth.json()
+          token = auth_data.get("access_token")
+
+          if not token:
+              raise SystemExit("ERROR: access_token missing")
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json"
+          }
+
+          # ---------------------------------------------------------
+          # 2. Fetch personalised feed
+          # ---------------------------------------------------------
+
+          feed = get_json(
+              API + "/feed/for-you",
+              headers=headers,
+              params={
+                  "limit": 50,
+                  "kinds": "posts"
+              }
+          )
+
+          # ---------------------------------------------------------
+          # 3. Also fetch newest public posts.
+          #    This gives V62 a broader observation surface than V61.
+          # ---------------------------------------------------------
+
+          public_posts = get_json(
+              API + "/posts",
+              params={
+                  "sort": "new",
+                  "limit": 50
+              }
+          )
+
+          def extract_items(payload):
+              if payload is None:
+                  return []
+
+              if isinstance(payload, list):
+                  return payload
+
+              if isinstance(payload, dict):
+                  for key in (
+                      "items",
+                      "posts",
+                      "data",
+                      "results",
+                      "feed"
+                  ):
+                      value = payload.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+          feed_items = extract_items(feed)
+          public_items = extract_items(public_posts)
+
+          print(f"Feed items: {len(feed_items)}")
+          print(f"Public items: {len(public_items)}")
+
+          # ---------------------------------------------------------
+          # 4. Merge and deduplicate
+          # ---------------------------------------------------------
+
+          all_items = []
+          seen_ids = set()
+
+          for item in feed_items + public_items:
+              if not isinstance(item, dict):
+                  continue
+
+              item_id = (
+                  item.get("id")
+                  or item.get("post_id")
+                  or item.get("uuid")
+              )
+
+              if item_id:
+                  if item_id in seen_ids:
+                      continue
+                  seen_ids.add(item_id)
+
+              all_items.append(item)
+
+          # ---------------------------------------------------------
+          # 5. Deterministic demand classification
+          # ---------------------------------------------------------
+
+          BUYER_REQUEST_PATTERNS = [
+              r"\bi need\b",
+              r"\bwe need\b",
+              r"\blooking for someone\b",
+              r"\blooking for an? (agent|developer|researcher|writer|designer)\b",
+              r"\bseeking someone\b",
+              r"\bseeking an? (agent|developer|researcher|writer|designer)\b",
+              r"\bcan someone\b",
+              r"\bcan anybody\b",
+              r"\bdoes anyone\b",
+              r"\bwho can\b",
+              r"\bneed someone to\b",
+              r"\bneed an? (agent|developer|researcher|writer|designer)\b",
+              r"\bhelp wanted\b",
+              r"\bneed help\b",
+              r"\brequest for help\b",
+              r"\bplease build\b",
+              r"\bplease fix\b",
+              r"\bplease research\b",
+              r"\bplease analyze\b",
+              r"\bplease write\b",
+              r"\bcommission\b",
+              r"\bcommissioned\b"
+          ]
+
+          REWARD_PATTERNS = [
+              r"\bbounty\b",
+              r"\breward\b",
+              r"\bpaid task\b",
+              r"\bpaid work\b",
+              r"\bpay(?:ing|ment)?\b",
+              r"\bsats?\b",
+              r"\bsatoshis\b",
+              r"\blightning\b",
+              r"\busdc\b",
+              r"\busdt\b",
+              r"\bbtc\b",
+              r"\bbitcoin\b",
+              r"\bmsats\b",
+              r"\b\d[\d,\.]*\s*(sats?|sat|usdc|usdt|btc)\b"
+          ]
+
+          TASK_PATTERNS = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bdevelop(?:ment)?\b",
+              r"\bfix\b",
+              r"\bdebug\b",
+              r"\bcode\b",
+              r"\bcoding\b",
+              r"\bscript\b",
+              r"\bautomation\b",
+              r"\bscrap(?:e|ing)\b",
+              r"\bresearch\b",
+              r"\banaly[sz]e\b",
+              r"\banalysis\b",
+              r"\breport\b",
+              r"\bwrite\b",
+              r"\bwriting\b",
+              r"\btranslate\b",
+              r"\blocali[sz]e\b",
+              r"\bverify\b",
+              r"\btest\b",
+              r"\bdata\b",
+              r"\bapi\b",
+              r"\bintegration\b",
+              r"\baudit\b"
+          ]
+
+          SERVICE_OFFER_PATTERNS = [
+              r"\bfor hire\b",
+              r"\boffering\b",
+              r"\boffer(?:ing)? my\b",
+              r"\bi can\b",
+              r"\bi will\b",
+              r"\bavailable for hire\b",
+              r"\bhire me\b",
+              r"\bmy services\b",
+              r"\bservices\b",
+              r"\bmy rate\b",
+              r"\bpricing\b",
+              r"\bprice list\b",
+              r"\bwhat i deliver\b",
+              r"\baccepting clients\b",
+              r"\bopen for work\b",
+              r"\bavailable for work\b"
+          ]
+
+          AGENT_SEEKING_WORK_PATTERNS = [
+              r"\blooking for work\b",
+              r"\blooking for paid work\b",
+              r"\bseeking work\b",
+              r"\bseeking paid work\b",
+              r"\bneed clients\b",
+              r"\blooking for clients\b",
+              r"\bwant clients\b",
+              r"\bavailable for tasks\b",
+              r"\bavailable for paid tasks\b"
+          ]
+
+          META_PATTERNS = [
+              r"\btest posting\b",
+              r"\btest post\b",
+              r"\btesting the ui\b",
+              r"\bupdated ui\b",
+              r"\bexample\b",
+              r"\bdemo\b",
+              r"\bjust testing\b",
+              r"\btest\b.*\bui\b"
+          ]
+
+          CAPABILITIES = {
+              "research": [
+                  "research", "investigation", "literature",
+                  "competitive analysis", "market research"
+              ],
+              "writing": [
+                  "write", "writing", "report", "documentation",
+                  "docs", "copy", "technical writing"
+              ],
+              "python": [
+                  "python", "script", "automation", "scraping"
+              ],
+              "api": [
+                  "api", "openapi", "integration", "endpoint"
+              ],
+              "data": [
+                  "data", "dataset", "analysis", "analytics",
+                  "csv", "json"
+              ],
+              "verification": [
+                  "verify", "verification", "qa", "testing",
+                  "audit", "validation"
+              ],
+              "workflow": [
+                  "workflow", "github actions", "github action",
+                  "automation", "pipeline"
+              ]
+          }
+
+          def matches(patterns, text):
+              return [p for p in patterns if re.search(p, text, re.I)]
+
+          def first_nonempty(item, keys, default=""):
+              for key in keys:
+                  value = item.get(key)
+                  if value is not None and str(value).strip():
+                      return str(value).strip()
+              return default
+
+          def author_name(item):
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return first_nonempty(
+                      author,
+                      ["username", "name", "display_name"],
+                      "unknown"
+                  )
+
+              return first_nonempty(
+                  item,
+                  ["author_username", "username", "author_name"],
+                  "unknown"
+              )
+
+          def classify(item):
+              title = first_nonempty(
+                  item,
+                  ["title", "name"],
+                  ""
+              )
+
+              body = first_nonempty(
+                  item,
+                  ["body", "content", "description", "text"],
+                  ""
+              )
+
+              post_type = first_nonempty(
+                  item,
+                  ["post_type", "type"],
+                  ""
+              ).lower()
+
+              text = f"{title}\n{body}".strip()
+
+              buyer_hits = matches(BUYER_REQUEST_PATTERNS, text)
+              reward_hits = matches(REWARD_PATTERNS, text)
+              task_hits = matches(TASK_PATTERNS, text)
+              service_hits = matches(SERVICE_OFFER_PATTERNS, text)
+              work_hits = matches(AGENT_SEEKING_WORK_PATTERNS, text)
+              meta_hits = matches(META_PATTERNS, text)
+
+              score = 0
+
+              # Strong negatives first.
+              score -= min(len(service_hits) * 8, 30)
+              score -= min(len(work_hits) * 10, 30)
+              score -= min(len(meta_hits) * 8, 24)
+
+              # Positive buyer evidence.
+              score += min(len(buyer_hits) * 12, 36)
+              score += min(len(reward_hits) * 7, 21)
+              score += min(len(task_hits) * 5, 20)
+
+              if post_type in ("paid_task", "human_request"):
+                  score += 15
+
+              # A reward without a buyer request is not sufficient.
+              if reward_hits and not buyer_hits:
+                  score -= 12
+
+              # A task without a requester is not sufficient.
+              if task_hits and not buyer_hits:
+                  score -= 5
+
+              # Capability match.
+              capability_matches = []
+
+              lower = text.lower()
+
+              for capability, keywords in CAPABILITIES.items():
+                  if any(keyword in lower for keyword in keywords):
+                      capability_matches.append(capability)
+
+              capability_score = min(len(capability_matches) * 4, 16)
+
+              # Determine classification.
+              if service_hits and not buyer_hits:
+                  classification = "SERVICE_OFFER"
+
+              elif work_hits and not buyer_hits:
+                  classification = "AGENT_SEEKING_WORK"
+
+              elif meta_hits and not buyer_hits:
+                  classification = "META_OR_TEST"
+
+              elif buyer_hits and task_hits:
+                  classification = "BUYER_REQUEST"
+
+              elif post_type in ("paid_task", "human_request") and buyer_hits:
+                  classification = "BUYER_REQUEST"
+
+              else:
+                  classification = "UNCLEAR"
+
+              # Genuine demand requires multiple independent signals.
+              genuine = (
+                  classification == "BUYER_REQUEST"
+                  and len(buyer_hits) >= 1
+                  and len(task_hits) >= 1
+                  and score >= 20
+                  and not service_hits
+                  and not work_hits
+                  and not meta_hits
+              )
+
+              # Confidence is intentionally conservative.
+              if genuine:
+                  confidence = min(
+                      10,
+                      5
+                      + len(buyer_hits)
+                      + min(len(task_hits), 2)
+                      + (2 if reward_hits else 0)
+                      + (1 if post_type in ("paid_task", "human_request") else 0)
+                  )
+              elif classification in (
+                  "SERVICE_OFFER",
+                  "AGENT_SEEKING_WORK",
+                  "META_OR_TEST"
+              ):
+                  confidence = 9
+              else:
+                  confidence = 3
+
+              final_score = score + capability_score
+
+              return {
+                  "id": first_nonempty(
+                      item,
+                      ["id", "post_id", "uuid"],
+                      ""
+                  ),
+                  "title": title,
+                  "requester": author_name(item),
+                  "post_type": post_type,
+                  "classification": classification,
+                  "genuine_demand": genuine,
+                  "score": final_score,
+                  "base_demand_score": score,
+                  "capability_score": capability_score,
+                  "confidence": confidence,
+                  "capability_match": capability_matches,
+                  "signals": {
+                      "buyer_request": buyer_hits,
+                      "reward": reward_hits,
+                      "task": task_hits,
+                      "service_offer": service_hits,
+                      "agent_seeking_work": work_hits,
+                      "meta_or_test": meta_hits
+                  },
+                  "evidence": {
+                      "title": title,
+                      "body_excerpt": body[:1000]
+                  },
+                  "task_summary": body[:500],
+                  "reward": [
+                      text_fragment
+                      for text_fragment in reward_hits[:5]
+                  ]
+              }
+
+          classified = []
+
+          for item in all_items:
+              try:
+                  classified.append(classify(item))
+              except Exception as exc:
+                  print(f"Classification error: {exc}")
+
+          demands = [
+              x for x in classified
+              if x.get("genuine_demand") is True
+          ]
+
+          demands.sort(
+              key=lambda x: (
+                  x.get("score", 0),
+                  x.get("confidence", 0)
+              ),
+              reverse=True
+          )
+
+          rejected = [
+              x for x in classified
+              if not x.get("genuine_demand")
+          ]
+
+          # ---------------------------------------------------------
+          # 6. Final recommendation
+          # ---------------------------------------------------------
+
+          if demands:
+              recommendation = {
+                  "action": "MANUAL_REVIEW_REQUIRED",
+                  "reason": (
+                      "A genuine buyer/requester demand was detected. "
+                      "NØX must not contact the requester automatically."
+                  ),
+                  "top_demand_id": demands[0].get("id"),
+                  "top_demand_score": demands[0].get("score", 0)
+              }
+          else:
+              recommendation = {
+                  "action": "NO_ACTION",
+                  "reason": (
+                      "No sufficiently reliable buyer demand was detected "
+                      "in the scanned Colony content."
+                  ),
+                  "top_demand_id": None,
+                  "top_demand_score": 0
+              }
+
+          # ---------------------------------------------------------
+          # 7. Output memory
+          # ---------------------------------------------------------
+
+          output = {
+              "version": "V62",
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+
+              "mode": "demand_hunter_only",
+
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+
+              "actions_taken": [],
+              "gemini_used": False,
+
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(all_items)
+              },
+
+              "total_scanned": len(classified),
+              "real_demands": len(demands),
+              "rejected_or_unclear": len(rejected),
+
+              "recommendation": recommendation,
+
+              "demands": [
+                  {
+                      **demand,
+                      "next_step": "MANUAL_REVIEW"
+                  }
+                  for demand in demands[:10]
+              ],
+
+              "rejected_items": rejected[:100]
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          output_path = "memory/nox_v62_demand_hunter.json"
+
+          with open(
+              output_path,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print("")
+          print("========================================")
+          print("NØX ORIGIN V62 - DEMAND HUNTER")
+          print("========================================")
+          print(f"Scanned: {len(classified)}")
+          print(f"Real demands: {len(demands)}")
+          print(f"Rejected/unclear: {len(rejected)}")
+          print(f"Gemini used: False")
+          print("Public actions: []")
+          print(f"Recommendation: {recommendation['action']}")
+          print(f"Memory: {output_path}")
+          print("========================================")
+
+          if demands:
+              print("")
+              print("TOP DEMANDS")
+              print("----------------------------------------")
+
+              for demand in demands[:5]:
+                  print(
+                      f"- {demand['title']} | "
+                      f"{demand['requester']} | "
+                      f"score={demand['score']} | "
+                      f"confidence={demand['confidence']}"
+                  )
+
+          PY
+
+          python /tmp/nox_v62.py
+
+      - name: Save V62 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v62_demand_hunter.json
+
+          if git diff --cached --quiet; then
+            echo "No V62 memory changes to commit."
+          else
+            git commit -m "NØX V62 Colony Demand Hunter"
+            git push
+          fi
