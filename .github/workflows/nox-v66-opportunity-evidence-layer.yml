@@ -1,0 +1,995 @@
+name: NØX V66 - Opportunity Evidence Layer
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 * * * *"
+
+jobs:
+  opportunity-evidence:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V66 opportunity evidence layer
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import json
+          from datetime import datetime, timezone
+          import requests
+
+          BASE_URL = "https://thecolony.ai/api/v1"
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          VERSION = "V66"
+          MODE = "opportunity_evidence_layer"
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "NØX-Origin-V66"
+          })
+
+          # =========================================================
+          # AUTHENTICATION
+          # =========================================================
+
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          if auth.status_code != 200:
+              raise RuntimeError(
+                  f"Authentication failed: HTTP {auth.status_code} - "
+                  f"{auth.text[:500]}"
+              )
+
+          auth_data = auth.json()
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError(
+                  "Authentication succeeded but no token was returned"
+              )
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          # =========================================================
+          # FETCH
+          # =========================================================
+
+          def fetch_json(url):
+              response = session.get(url, timeout=30)
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"Fetch failed: HTTP {response.status_code} - "
+                      f"{response.text[:500]}"
+                  )
+
+              return response.json()
+
+          feed_data = fetch_json(f"{BASE_URL}/feed/for-you")
+          posts_data = fetch_json(f"{BASE_URL}/posts")
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in (
+                      "items",
+                      "posts",
+                      "data",
+                      "results",
+                      "feed"
+                  ):
+                      value = data.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+          feed_items = extract_items(feed_data)
+          public_items = extract_items(posts_data)
+
+          # =========================================================
+          # NORMALIZATION
+          # =========================================================
+
+          def clean_text(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              return str(value).strip()
+
+          def requester_name(item):
+              requester = item.get("requester")
+
+              if isinstance(requester, dict):
+                  return (
+                      requester.get("username")
+                      or requester.get("display_name")
+                      or requester.get("id")
+                      or "unknown"
+                  )
+
+              if requester:
+                  return clean_text(requester)
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("display_name")
+                      or author.get("id")
+                      or "unknown"
+                  )
+
+              if author:
+                  return clean_text(author)
+
+              return "unknown"
+
+          def get_title(item):
+              return clean_text(
+                  item.get("title")
+                  or item.get("name")
+                  or ""
+              )
+
+          def get_body(item):
+              return clean_text(
+                  item.get("body")
+                  or item.get("content")
+                  or item.get("text")
+                  or ""
+              )
+
+          def get_post_type(item):
+              return clean_text(
+                  item.get("post_type")
+                  or item.get("type")
+                  or "post"
+              ).lower()
+
+          # =========================================================
+          # EVIDENCE PATTERNS
+          #
+          # IMPORTANT:
+          # V66 does NOT treat generic words such as request, pay,
+          # code, test, build or design as demand evidence.
+          # Evidence must be contextual.
+          # =========================================================
+
+          STRONG_DELEGATION = [
+              r"\bi\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bwe\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bneed\s+someone\s+to\b",
+              r"\bneed\s+an\s+agent\s+to\b",
+              r"\blooking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bi'?m\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bwe'?re\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bcan\s+anyone\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwho\s+can\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwho\s+could\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwe\s+are\s+hiring\b",
+              r"\bwe'?re\s+hiring\b"
+          ]
+
+          OPEN_TASK_CONTEXT = [
+              r"\btask\s*:\s*",
+              r"\bjob\s*:\s*",
+              r"\bcommission\s*:\s*",
+              r"\bbrief\s*:\s*",
+              r"\bopen\s+task\b",
+              r"\bavailable\s+task\b",
+              r"\bopen\s+job\b",
+              r"\bavailable\s+job\b",
+              r"\bpaid\s+task\b",
+              r"\bpaid\s+job\b",
+              r"\bfreelance\s+task\b",
+              r"\bfreelance\s+job\b"
+          ]
+
+          CONCRETE_TASK = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bimplement\b",
+              r"\bwrite\b",
+              r"\bfix\b",
+              r"\bdebug\b",
+              r"\baudit\b",
+              r"\bresearch\b",
+              r"\bdesign\b",
+              r"\bscrape\b",
+              r"\bcollect\b",
+              r"\bextract\b",
+              r"\banaly[sz]e\b",
+              r"\btest\b",
+              r"\bintegrat(?:e|ion)\b",
+              r"\bautomate\b",
+              r"\bverify\b",
+              r"\btranslate\b",
+              r"\bcompile\b",
+              r"\bdeploy\b"
+          ]
+
+          COMPENSATION_CONTEXT = [
+              r"\bbudget\s*[:=]\s*",
+              r"\breward\s*[:=]\s*",
+              r"\bpayment\s*[:=]\s*",
+              r"\bpay\s*[:=]\s*",
+              r"\bpaid\s+\$?\d",
+              r"\b\d+(?:\.\d+)?\s*(?:usd|usdc|sat|sats|satoshi|btc)\b",
+              r"\b\d+(?:\.\d+)?\s*(?:\$|€)\b"
+          ]
+
+          COMPLETION = [
+              r"\bcompleted\b",
+              r"\bfinished\b",
+              r"\bdelivered\b",
+              r"\bsettled\b",
+              r"\bshipped\b",
+              r"\balready\s+(?:built|created|implemented|completed|delivered|finished)\b"
+          ]
+
+          PAYMENT_RECEIPT = [
+              r"\bpayment\s+(?:received|settled|confirmed)\b",
+              r"\bhire\s+settled\b",
+              r"\bcompleted\s+hire\b",
+              r"\bpayment\b.{0,50}\bcompleted\b",
+              r"\bcompleted\b.{0,50}\bpayment\b"
+          ]
+
+          SERVICE_OFFER = [
+              r"\bi\s+can\s+(?:build|create|write|fix|audit|research|design|develop|scrape|implement)\b",
+              r"\bi\s+offer\b",
+              r"\bmy\s+service\b",
+              r"\bavailable\s+for\s+(?:hire|work)\b",
+              r"\bfor\s+hire\b",
+              r"\baccepting\s+(?:work|commissions|jobs)\b"
+          ]
+
+          AGENT_SEEKING = [
+              r"\bi'?m\s+looking\s+for\s+work\b",
+              r"\blooking\s+for\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bseeking\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bneed\s+(?:work|tasks|jobs|commissions)\b"
+          ]
+
+          PROMOTIONAL = [
+              r"\bpromo(?:tion)?\b",
+              r"\blisting\b",
+              r"\baffiliate\b",
+              r"\bdiscount\b",
+              r"\bpromotional\b"
+          ]
+
+          DISCUSSION = [
+              r"\bwhy\b",
+              r"\bhow\s+do\s+(?:you|agents)\b",
+              r"\bwhat\s+do\s+you\s+think\b",
+              r"\bdiscussion\b",
+              r"\bfindings?\b",
+              r"\banalysis\b",
+              r"\bobserved\b",
+              r"\bstudy\b",
+              r"\bframework\b",
+              r"\bbenchmark\b",
+              r"\bpaper\b",
+              r"\bthe\s+problem\s+is\b",
+              r"\bthis\s+means\b",
+              r"\bi\s+will\s+no\s+longer\b"
+          ]
+
+          # =========================================================
+          # MATCHING
+          # =========================================================
+
+          def matches(patterns, text):
+              found = []
+
+              for pattern in patterns:
+                  if re.search(pattern, text, re.IGNORECASE):
+                      found.append(pattern)
+
+              return found
+
+          # =========================================================
+          # CLASSIFY ONE ITEM
+          # =========================================================
+
+          def classify(item):
+              item_id = clean_text(
+                  item.get("id")
+                  or item.get("uuid")
+                  or ""
+              )
+
+              title = get_title(item)
+              body = get_body(item)
+              post_type = get_post_type(item)
+              requester = requester_name(item)
+
+              text = f"{title}\n{body}".strip()
+
+              result = {
+                  "id": item_id,
+                  "title": title,
+                  "requester": requester,
+                  "post_type": post_type,
+                  "evidence_level": "NOT_A_DEMAND",
+                  "classification": "NOT_A_DEMAND",
+                  "genuine_demand": False,
+                  "score": 0,
+                  "confidence": 0,
+                  "signals": {
+                      "delegation": [],
+                      "open_task": [],
+                      "task": [],
+                      "compensation": [],
+                      "completion": [],
+                      "payment_receipt": [],
+                      "service_offer": [],
+                      "agent_seeking": [],
+                      "promotional": [],
+                      "discussion": []
+                  },
+                  "evidence": [],
+                  "rejection_reason": ""
+              }
+
+              # -----------------------------------------------------
+              # INVALID SOURCE
+              # -----------------------------------------------------
+
+              if not item_id and not title and not body:
+                  result["classification"] = "INVALID_SOURCE_ITEM"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 10
+                  result["rejection_reason"] = (
+                      "Source item has no usable ID, title, or body; "
+                      "retained for traceability."
+                  )
+                  return result
+
+              delegation = matches(STRONG_DELEGATION, text)
+              open_task = matches(OPEN_TASK_CONTEXT, text)
+              tasks = matches(CONCRETE_TASK, text)
+              compensation = matches(COMPENSATION_CONTEXT, text)
+              completion = matches(COMPLETION, text)
+              payment_receipt = matches(PAYMENT_RECEIPT, text)
+              service_offer = matches(SERVICE_OFFER, text)
+              agent_seeking = matches(AGENT_SEEKING, text)
+              promotional = matches(PROMOTIONAL, text)
+              discussion = matches(DISCUSSION, text)
+
+              result["signals"]["delegation"] = delegation
+              result["signals"]["open_task"] = open_task
+              result["signals"]["task"] = tasks
+              result["signals"]["compensation"] = compensation
+              result["signals"]["completion"] = completion
+              result["signals"]["payment_receipt"] = payment_receipt
+              result["signals"]["service_offer"] = service_offer
+              result["signals"]["agent_seeking"] = agent_seeking
+              result["signals"]["promotional"] = promotional
+              result["signals"]["discussion"] = discussion
+
+              # -----------------------------------------------------
+              # HARD EXCLUSIONS
+              # -----------------------------------------------------
+
+              if payment_receipt:
+                  result["classification"] = "PAYMENT_RECEIPT"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 10
+                  result["evidence"].append(
+                      "payment_receipt_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Evidence describes a completed or settled "
+                      "payment rather than an open opportunity."
+                  )
+                  return result
+
+              if completion and not delegation and not open_task:
+                  result["classification"] = "COMPLETED_WORK"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 9
+                  result["evidence"].append(
+                      "completed_work_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Evidence describes completed work rather than "
+                      "an open task."
+                  )
+                  return result
+
+              if service_offer and not delegation and not open_task:
+                  result["classification"] = "SERVICE_OFFER"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 8
+                  result["evidence"].append(
+                      "service_offer_context"
+                  )
+                  result["rejection_reason"] = (
+                      "The author appears to offer services rather "
+                      "than delegate work."
+                  )
+                  return result
+
+              if agent_seeking and not delegation and not open_task:
+                  result["classification"] = "AGENT_SEEKING_WORK"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 8
+                  result["evidence"].append(
+                      "agent_seeking_context"
+                  )
+                  result["rejection_reason"] = (
+                      "The author is seeking work rather than "
+                      "requesting work from another agent."
+                  )
+                  return result
+
+              if promotional and not delegation and not open_task:
+                  result["classification"] = "PROMOTIONAL"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 8
+                  result["evidence"].append(
+                      "promotional_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Promotional or listing content without an "
+                      "actionable buyer request."
+                  )
+                  return result
+
+              # -----------------------------------------------------
+              # EVIDENCE SCORING
+              # -----------------------------------------------------
+
+              score = 0
+
+              if delegation:
+                  score += 40
+                  result["evidence"].append(
+                      "explicit_delegation"
+                  )
+
+              if open_task:
+                  score += 35
+                  result["evidence"].append(
+                      "open_task_context"
+                  )
+
+              if tasks:
+                  score += min(15, len(tasks) * 5)
+                  result["evidence"].append(
+                      "concrete_task"
+                  )
+
+              if compensation:
+                  score += 15
+                  result["evidence"].append(
+                      "compensation_context"
+                  )
+
+              # Strong direct requester context.
+              direct_need = bool(
+                  re.search(
+                      r"\b(?:i|we)\s+(?:need|want|require)\b",
+                      text,
+                      re.IGNORECASE
+                  )
+              )
+
+              executor_context = bool(
+                  re.search(
+                      r"\b(?:someone|agent|developer|person|freelancer)\s+to\b",
+                      text,
+                      re.IGNORECASE
+                  )
+              )
+
+              if direct_need:
+                  score += 10
+                  result["evidence"].append(
+                      "direct_need_context"
+                  )
+
+              if executor_context:
+                  score += 10
+                  result["evidence"].append(
+                      "executor_context"
+                  )
+
+              # Analytical content reduces confidence.
+              if discussion and not delegation and not open_task:
+                  score -= 25
+
+              if post_type in {
+                  "analysis",
+                  "finding",
+                  "discussion"
+              }:
+                  if not delegation and not open_task:
+                      score -= 20
+
+              score = max(0, min(score, 100))
+              result["score"] = score
+
+              # -----------------------------------------------------
+              # THREE-LEVEL EVIDENCE GATE
+              # -----------------------------------------------------
+
+              has_context = bool(
+                  delegation or open_task
+              )
+
+              has_task = bool(tasks)
+
+              has_compensation = bool(compensation)
+
+              # -----------------------------------------------------
+              # GREEN: CONFIRMED_DEMAND
+              #
+              # Requires:
+              # - explicit delegation/open task
+              # - concrete task
+              # - sufficient score
+              # - no exclusion
+              # -----------------------------------------------------
+
+              if (
+                  has_context
+                  and has_task
+                  and score >= 60
+                  and not completion
+                  and not payment_receipt
+                  and not service_offer
+                  and not agent_seeking
+                  and not promotional
+              ):
+                  result["evidence_level"] = "CONFIRMED_DEMAND"
+                  result["classification"] = (
+                      "OPEN_PAID_TASK"
+                      if has_compensation
+                      else "BUYER_REQUEST"
+                  )
+                  result["genuine_demand"] = True
+
+                  confidence = 6
+
+                  if delegation:
+                      confidence += 1
+
+                  if open_task:
+                      confidence += 1
+
+                  if tasks:
+                      confidence += 1
+
+                  if compensation:
+                      confidence += 1
+
+                  result["confidence"] = min(10, confidence)
+                  result["rejection_reason"] = ""
+
+                  return result
+
+              # -----------------------------------------------------
+              # YELLOW: POTENTIAL_DEMAND
+              #
+              # This is intentionally broader.
+              #
+              # It does NOT trigger an action.
+              # It only tells the human:
+              # "Look at this one."
+              # -----------------------------------------------------
+
+              potential_score = 0
+
+              if delegation:
+                  potential_score += 40
+
+              if open_task:
+                  potential_score += 35
+
+              if tasks:
+                  potential_score += min(15, len(tasks) * 5)
+
+              if compensation:
+                  potential_score += 15
+
+              if direct_need:
+                  potential_score += 10
+
+              if executor_context:
+                  potential_score += 10
+
+              potential_score = max(
+                  0,
+                  min(potential_score, 100)
+              )
+
+              if (
+                  has_context
+                  and has_task
+                  and potential_score >= 40
+                  and not completion
+                  and not payment_receipt
+                  and not service_offer
+                  and not agent_seeking
+                  and not promotional
+              ):
+                  result["evidence_level"] = "POTENTIAL_DEMAND"
+                  result["classification"] = "POTENTIAL_DEMAND"
+                  result["genuine_demand"] = False
+                  result["score"] = potential_score
+                  result["confidence"] = 6
+                  result["rejection_reason"] = (
+                      "Potential actionable demand detected, but "
+                      "evidence is insufficient for confirmation. "
+                      "Manual review required."
+                  )
+
+                  return result
+
+              # -----------------------------------------------------
+              # RED: NOT_A_DEMAND
+              # -----------------------------------------------------
+
+              if discussion or post_type in {
+                  "analysis",
+                  "finding",
+                  "discussion"
+              }:
+                  result["classification"] = "NOT_A_DEMAND"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = min(
+                      10,
+                      5 + len(discussion)
+                  )
+                  result["rejection_reason"] = (
+                      "Content is analytical/discussion-oriented and "
+                      "does not contain sufficient delegated-work evidence."
+                  )
+              else:
+                  result["classification"] = "NOT_A_DEMAND"
+                  result["evidence_level"] = "NOT_A_DEMAND"
+                  result["confidence"] = 5
+                  result["rejection_reason"] = (
+                      "No sufficiently strong contextual evidence of "
+                      "an open delegated task."
+                  )
+
+              return result
+
+          # =========================================================
+          # COLLECT + DEDUPLICATE
+          # =========================================================
+
+          combined = []
+
+          for index, item in enumerate(feed_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "for_you_feed"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "for_you_feed",
+                      "_source_index": index
+                  })
+
+          for index, item in enumerate(public_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "public_posts"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "public_posts",
+                      "_source_index": index
+                  })
+
+          deduplicated = []
+          seen_ids = set()
+
+          for item in combined:
+              item_id = clean_text(
+                  item.get("id")
+                  or item.get("uuid")
+                  or ""
+              )
+
+              # Only stable IDs can deduplicate.
+              # Missing IDs are preserved.
+              if item_id:
+                  if item_id in seen_ids:
+                      continue
+
+                  seen_ids.add(item_id)
+
+              deduplicated.append(item)
+
+          # =========================================================
+          # ANALYSIS
+          # =========================================================
+
+          analyzed = []
+
+          for item in deduplicated:
+              result = classify(item)
+
+              result["source"] = item.get(
+                  "_source",
+                  "unknown"
+              )
+
+              result["source_index"] = item.get(
+                  "_source_index"
+              )
+
+              analyzed.append(result)
+
+          # =========================================================
+          # COUNTS
+          # =========================================================
+
+          confirmed = [
+              item for item in analyzed
+              if item["evidence_level"] == "CONFIRMED_DEMAND"
+          ]
+
+          potential = [
+              item for item in analyzed
+              if item["evidence_level"] == "POTENTIAL_DEMAND"
+          ]
+
+          not_demands = [
+              item for item in analyzed
+              if item["evidence_level"] == "NOT_A_DEMAND"
+          ]
+
+          classification_counts = {}
+
+          for item in analyzed:
+              cls = item["classification"]
+
+              classification_counts[cls] = (
+                  classification_counts.get(cls, 0) + 1
+              )
+
+          # =========================================================
+          # TOP CANDIDATES
+          # =========================================================
+
+          top_confirmed = None
+          top_potential = None
+
+          if confirmed:
+              top_confirmed = sorted(
+                  confirmed,
+                  key=lambda x: (
+                      x["score"],
+                      x["confidence"]
+                  ),
+                  reverse=True
+              )[0]
+
+          if potential:
+              top_potential = sorted(
+                  potential,
+                  key=lambda x: (
+                      x["score"],
+                      x["confidence"]
+                  ),
+                  reverse=True
+              )[0]
+
+          # =========================================================
+          # RECOMMENDATION
+          # =========================================================
+
+          if top_confirmed:
+              recommendation_action = "MANUAL_REVIEW_REQUIRED"
+              recommendation_reason = (
+                  "A confirmed actionable demand was detected. "
+                  "NØX must not contact the requester automatically."
+              )
+              top_id = top_confirmed["id"]
+              top_score = top_confirmed["score"]
+
+          elif top_potential:
+              recommendation_action = "POTENTIAL_DEMAND_REVIEW"
+              recommendation_reason = (
+                  "Potential actionable demand detected. "
+                  "Manual review is required before any action."
+              )
+              top_id = top_potential["id"]
+              top_score = top_potential["score"]
+
+          else:
+              recommendation_action = "NO_ACTION"
+              recommendation_reason = (
+                  "V66 found no sufficiently evidenced actionable "
+                  "work demand in the scanned Colony content."
+              )
+              top_id = None
+              top_score = 0
+
+          # =========================================================
+          # OUTPUT
+          # =========================================================
+
+          generated_at = datetime.now(
+              timezone.utc
+          ).isoformat()
+
+          output = {
+              "version": VERSION,
+              "generated_at": generated_at,
+              "mode": MODE,
+              "objective": (
+                  "Evaluate work opportunities using multiple independent "
+                  "evidence levels while preserving complete traceability "
+                  "and avoiding automatic external action."
+              ),
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+              "actions_taken": [],
+              "gemini_used": False,
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(deduplicated)
+              },
+              "total_scanned": len(analyzed),
+              "confirmed_demands": len(confirmed),
+              "potential_demands": len(potential),
+              "not_a_demand": len(not_demands),
+              "rejected_or_unclear": (
+                  len(analyzed) - len(confirmed)
+              ),
+              "classification_counts": classification_counts,
+              "evidence_levels": {
+                  "CONFIRMED_DEMAND": {
+                      "meaning": (
+                          "Strong contextual evidence of an open "
+                          "delegated task."
+                      ),
+                      "threshold": 60
+                  },
+                  "POTENTIAL_DEMAND": {
+                      "meaning": (
+                          "Credible signals exist, but evidence "
+                          "is insufficient for confirmation."
+                      ),
+                      "threshold": 40
+                  },
+                  "NOT_A_DEMAND": {
+                      "meaning": (
+                          "No sufficiently credible delegated-work "
+                          "evidence."
+                      )
+                  }
+              },
+              "v66_rules": {
+                  "generic_words_are_not_demand_proof": True,
+                  "contextual_delegation_required": True,
+                  "concrete_task_required": True,
+                  "multiple_evidence_signals_preferred": True,
+                  "confirmed_requires_high_evidence": True,
+                  "potential_requires_manual_review": True,
+                  "completed_work_excluded": True,
+                  "payment_receipts_excluded": True,
+                  "service_offers_excluded": True,
+                  "agent_seeking_work_excluded": True,
+                  "promotional_content_excluded": True,
+                  "metadata_preserved": True,
+                  "invalid_items_preserved": True,
+                  "stable_id_only_deduplication": True,
+                  "automatic_contact_disabled": True,
+                  "automatic_payment_disabled": True,
+                  "gemini_disabled": True
+              },
+              "recommendation": {
+                  "action": recommendation_action,
+                  "reason": recommendation_reason,
+                  "top_demand_id": top_id,
+                  "top_demand_score": top_score
+              },
+              "items": analyzed
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          output_path = (
+              "memory/"
+              "nox_v66_opportunity_evidence_layer.json"
+          )
+
+          with open(
+              output_path,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(
+              json.dumps(
+                  output,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+
+          PY
+
+      - name: Commit V66 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v66_opportunity_evidence_layer.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX V66 opportunity evidence layer memory"
+            git push
+          fi
