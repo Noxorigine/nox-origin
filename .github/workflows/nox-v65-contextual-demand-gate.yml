@@ -1,0 +1,779 @@
+name: NØX V65 - Contextual Demand Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 * * * *"
+
+jobs:
+  demand-hunter:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V65 contextual demand gate
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import json
+          from datetime import datetime, timezone
+          import requests
+
+          BASE_URL = "https://thecolony.ai/api/v1"
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          VERSION = "V65"
+          MODE = "contextual_demand_gate"
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "NØX-Origin-V65"
+          })
+
+          # ---------------------------------------------------------
+          # AUTHENTICATION
+          # ---------------------------------------------------------
+
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          if auth.status_code != 200:
+              raise RuntimeError(
+                  f"Authentication failed: HTTP {auth.status_code} - {auth.text[:500]}"
+              )
+
+          auth_data = auth.json()
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError("Authentication succeeded but no token was returned")
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          # ---------------------------------------------------------
+          # FETCH
+          # ---------------------------------------------------------
+
+          def fetch_json(url):
+              response = session.get(url, timeout=30)
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"Fetch failed: HTTP {response.status_code} - {response.text[:500]}"
+                  )
+
+              return response.json()
+
+          feed_data = fetch_json(f"{BASE_URL}/feed/for-you")
+          posts_data = fetch_json(f"{BASE_URL}/posts")
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in (
+                      "items",
+                      "posts",
+                      "data",
+                      "results",
+                      "feed"
+                  ):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+          feed_items = extract_items(feed_data)
+          public_items = extract_items(posts_data)
+
+          # ---------------------------------------------------------
+          # NORMALIZATION
+          # ---------------------------------------------------------
+
+          def clean_text(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              return str(value).strip()
+
+          def requester_name(item):
+              requester = item.get("requester")
+
+              if isinstance(requester, dict):
+                  return (
+                      requester.get("username")
+                      or requester.get("display_name")
+                      or requester.get("id")
+                      or "unknown"
+                  )
+
+              if requester:
+                  return clean_text(requester)
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("display_name")
+                      or author.get("id")
+                      or "unknown"
+                  )
+
+              if author:
+                  return clean_text(author)
+
+              return "unknown"
+
+          def get_title(item):
+              return clean_text(
+                  item.get("title")
+                  or item.get("name")
+                  or ""
+              )
+
+          def get_body(item):
+              return clean_text(
+                  item.get("body")
+                  or item.get("content")
+                  or item.get("text")
+                  or ""
+              )
+
+          def get_post_type(item):
+              return clean_text(
+                  item.get("post_type")
+                  or item.get("type")
+                  or "post"
+              ).lower()
+
+          # ---------------------------------------------------------
+          # PATTERNS
+          #
+          # IMPORTANT V65 RULE:
+          # Generic words such as "request", "pay", "code", "design",
+          # "test", "build", etc. NEVER constitute demand proof alone.
+          # ---------------------------------------------------------
+
+          EXPLICIT_DELEGATION_PATTERNS = [
+              r"\bi\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person|help)\b",
+              r"\bwe\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person|help)\b",
+              r"\bneed\s+someone\s+to\b",
+              r"\bneed\s+an\s+agent\s+to\b",
+              r"\blooking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bi'?m\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bwe'?re\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bcan\s+anyone\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwould\s+anyone\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwho\s+can\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwho\s+could\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e)\b",
+              r"\bwe\s+are\s+hiring\b",
+              r"\bwe'?re\s+hiring\b",
+              r"\bjob\s+for\s+(?:an?\s+)?agent\b",
+              r"\btask\s+for\s+(?:an?\s+)?agent\b",
+              r"\btask\s*:\s*",
+              r"\bjob\s*:\s*",
+              r"\bcommission\s*:\s*",
+              r"\bbrief\s*:\s*"
+          ]
+
+          EXPLICIT_OPEN_TASK_PATTERNS = [
+              r"\bavailable\s+task\b",
+              r"\bopen\s+task\b",
+              r"\bopen\s+job\b",
+              r"\bpaid\s+task\b",
+              r"\bpaid\s+job\b",
+              r"\bpaid\s+commission\b",
+              r"\bcontract\s+work\b",
+              r"\bfreelance\s+task\b",
+              r"\bfreelance\s+job\b",
+              r"\bwork\s+available\b"
+          ]
+
+          CONCRETE_TASK_PATTERNS = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bimplement\b",
+              r"\bwrite\b",
+              r"\bfix\b",
+              r"\bdebug\b",
+              r"\baudit\b",
+              r"\bresearch\b",
+              r"\bdesign\b",
+              r"\bscrape\b",
+              r"\bcollect\b",
+              r"\bextract\b",
+              r"\banaly[sz]e\b",
+              r"\btest\b",
+              r"\bintegrat(?:e|ion)\b",
+              r"\bautomate\b",
+              r"\bverify\b",
+              r"\btranslate\b",
+              r"\bcompile\b",
+              r"\bdeploy\b"
+          ]
+
+          COMPENSATION_PATTERNS = [
+              r"\bbudget\s*[:=]\s*",
+              r"\breward\s*[:=]\s*",
+              r"\bpayment\s*[:=]\s*",
+              r"\bpay\s*[:=]\s*",
+              r"\bpaid\s+\$?\d",
+              r"\b\d+(?:\.\d+)?\s*(?:usd|usdc|sat|sats|satoshi|btc)\b",
+              r"\b\d+(?:\.\d+)?\s*(?:\$|€)\b"
+          ]
+
+          COMPLETION_PATTERNS = [
+              r"\bcompleted\b",
+              r"\bfinished\b",
+              r"\bdelivered\b",
+              r"\bsettled\b",
+              r"\bshipped\b",
+              r"\balready\s+(?:built|created|implemented|completed|delivered|finished)\b",
+              r"\bpayment\s+received\b",
+              r"\bpaid\s+out\b",
+              r"\bhire\s+settled\b"
+          ]
+
+          PAYMENT_RECEIPT_PATTERNS = [
+              r"\bpayment\s+(?:received|settled|confirmed)\b",
+              r"\bhire\s+settled\b",
+              r"\bcompleted\s+hire\b",
+              r"\b(?:paid|payment)\b.{0,50}\bcompleted\b",
+              r"\bcompleted\b.{0,50}\b(?:paid|payment)\b"
+          ]
+
+          SERVICE_OFFER_PATTERNS = [
+              r"\bi\s+can\s+(?:build|create|write|fix|audit|research|design|develop|scrape|implement)\b",
+              r"\bi\s+offer\b",
+              r"\bmy\s+service\b",
+              r"\bavailable\s+for\s+(?:hire|work)\b",
+              r"\bfor\s+hire\b",
+              r"\baccepting\s+(?:work|commissions|jobs)\b"
+          ]
+
+          AGENT_SEEKING_PATTERNS = [
+              r"\bi'?m\s+looking\s+for\s+work\b",
+              r"\blooking\s+for\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bseeking\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bneed\s+(?:work|tasks|jobs|commissions)\b"
+          ]
+
+          PROMOTIONAL_PATTERNS = [
+              r"\bpromo(?:tion)?\b",
+              r"\blisting\b",
+              r"\baffiliate\b",
+              r"\bdiscount\b",
+              r"\bproduct\s+review\b",
+              r"\bpromotional\b"
+          ]
+
+          DISCUSSION_PATTERNS = [
+              r"\bwhy\b",
+              r"\bhow\s+do\s+(?:you|agents)\b",
+              r"\bwhat\s+do\s+you\s+think\b",
+              r"\bdiscussion\b",
+              r"\bfindings?\b",
+              r"\banalysis\b",
+              r"\bobserved\b",
+              r"\bstudy\b",
+              r"\bframework\b",
+              r"\bbenchmark\b",
+              r"\bpaper\b",
+              r"\bthe\s+problem\s+is\b",
+              r"\bthis\s+means\b",
+              r"\bI\s+will\s+no\s+longer\b"
+          ]
+
+          # ---------------------------------------------------------
+          # MATCHING HELPERS
+          # ---------------------------------------------------------
+
+          def matches(patterns, text):
+              found = []
+
+              for pattern in patterns:
+                  if re.search(pattern, text, re.IGNORECASE):
+                      found.append(pattern)
+
+              return found
+
+          # ---------------------------------------------------------
+          # CLASSIFICATION
+          # ---------------------------------------------------------
+
+          def classify(item):
+              item_id = clean_text(item.get("id") or item.get("uuid") or "")
+              title = get_title(item)
+              body = get_body(item)
+              post_type = get_post_type(item)
+              requester = requester_name(item)
+
+              text = f"{title}\n{body}".strip()
+
+              result = {
+                  "id": item_id,
+                  "title": title,
+                  "requester": requester,
+                  "post_type": post_type,
+                  "classification": "UNCLEAR",
+                  "genuine_demand": False,
+                  "score": 0,
+                  "confidence": 0,
+                  "signals": {
+                      "explicit_delegation": [],
+                      "open_task": [],
+                      "task": [],
+                      "compensation": [],
+                      "completion": [],
+                      "payment_receipt": [],
+                      "service_offer": [],
+                      "agent_seeking": [],
+                      "promotional": [],
+                      "discussion": []
+                  },
+                  "rejection_reason": ""
+              }
+
+              # Invalid source preservation
+              if not item_id and not title and not body:
+                  result["classification"] = "INVALID_SOURCE_ITEM"
+                  result["confidence"] = 10
+                  result["rejection_reason"] = (
+                      "Source item has no usable ID, title, or body; "
+                      "retained for traceability."
+                  )
+                  return result
+
+              explicit = matches(EXPLICIT_DELEGATION_PATTERNS, text)
+              open_task = matches(EXPLICIT_OPEN_TASK_PATTERNS, text)
+              tasks = matches(CONCRETE_TASK_PATTERNS, text)
+              compensation = matches(COMPENSATION_PATTERNS, text)
+              completion = matches(COMPLETION_PATTERNS, text)
+              payment_receipt = matches(PAYMENT_RECEIPT_PATTERNS, text)
+              service_offer = matches(SERVICE_OFFER_PATTERNS, text)
+              agent_seeking = matches(AGENT_SEEKING_PATTERNS, text)
+              promotional = matches(PROMOTIONAL_PATTERNS, text)
+              discussion = matches(DISCUSSION_PATTERNS, text)
+
+              result["signals"]["explicit_delegation"] = explicit
+              result["signals"]["open_task"] = open_task
+              result["signals"]["task"] = tasks
+              result["signals"]["compensation"] = compensation
+              result["signals"]["completion"] = completion
+              result["signals"]["payment_receipt"] = payment_receipt
+              result["signals"]["service_offer"] = service_offer
+              result["signals"]["agent_seeking"] = agent_seeking
+              result["signals"]["promotional"] = promotional
+              result["signals"]["discussion"] = discussion
+
+              # -----------------------------------------------------
+              # STRONG EXCLUSIONS FIRST
+              # -----------------------------------------------------
+
+              if payment_receipt:
+                  result["classification"] = "PAYMENT_RECEIPT"
+                  result["confidence"] = 10
+                  result["rejection_reason"] = (
+                      "Evidence describes a completed or settled payment, "
+                      "not an open task."
+                  )
+                  return result
+
+              if completion and not explicit and not open_task:
+                  result["classification"] = "COMPLETED_WORK"
+                  result["confidence"] = min(10, 6 + len(completion))
+                  result["rejection_reason"] = (
+                      "Evidence describes completed work rather than "
+                      "an open actionable demand."
+                  )
+                  return result
+
+              if service_offer and not explicit:
+                  result["classification"] = "SERVICE_OFFER"
+                  result["confidence"] = min(10, 6 + len(service_offer))
+                  result["rejection_reason"] = (
+                      "Content offers services rather than requesting "
+                      "work from another agent."
+                  )
+                  return result
+
+              if agent_seeking and not explicit:
+                  result["classification"] = "AGENT_SEEKING_WORK"
+                  result["confidence"] = 8
+                  result["rejection_reason"] = (
+                      "The author is seeking work rather than delegating "
+                      "a concrete task."
+                  )
+                  return result
+
+              if promotional and not explicit:
+                  result["classification"] = "PROMOTIONAL"
+                  result["confidence"] = 8
+                  result["rejection_reason"] = (
+                      "Promotional or listing content without an actionable "
+                      "buyer request."
+                  )
+                  return result
+
+              # -----------------------------------------------------
+              # DEMAND SCORING
+              #
+              # V65 deliberately gives almost all weight to CONTEXTUAL
+              # DELEGATION, not generic task vocabulary.
+              # -----------------------------------------------------
+
+              score = 0
+
+              if explicit:
+                  score += 30
+
+              if open_task:
+                  score += 25
+
+              if tasks:
+                  score += min(15, len(tasks) * 5)
+
+              if compensation:
+                  score += 15
+
+              # Direct first-person/plural delegation receives bonus
+              direct_context = bool(
+                  re.search(
+                      r"\b(?:i|we)\s+(?:need|want|require)\b",
+                      text,
+                      re.IGNORECASE
+                  )
+              )
+
+              executor_context = bool(
+                  re.search(
+                      r"\b(?:someone|agent|developer|person|freelancer)\s+to\b",
+                      text,
+                      re.IGNORECASE
+                  )
+              )
+
+              if direct_context:
+                  score += 10
+
+              if executor_context:
+                  score += 10
+
+              # Discussion prose is a strong negative when no explicit
+              # delegation structure exists.
+              if discussion and not explicit and not open_task:
+                  score -= 25
+
+              # Analytical post types require stronger proof.
+              if post_type in {"analysis", "finding", "discussion"}:
+                  if not explicit and not open_task:
+                      score -= 20
+
+              # Generic task words alone are intentionally insufficient.
+              if not explicit and not open_task:
+                  score = min(score, 15)
+
+              score = max(0, min(score, 100))
+
+              result["score"] = score
+
+              # -----------------------------------------------------
+              # GENUINE DEMAND GATE
+              # -----------------------------------------------------
+
+              strong_context = bool(explicit or open_task)
+              concrete_work = bool(tasks)
+              compensation_or_open = bool(compensation or open_task)
+
+              genuine = (
+                  strong_context
+                  and concrete_work
+                  and score >= 50
+                  and not completion
+                  and not payment_receipt
+                  and not service_offer
+                  and not agent_seeking
+                  and not promotional
+              )
+
+              if genuine:
+                  if compensation_or_open:
+                      result["classification"] = "OPEN_PAID_TASK"
+                  else:
+                      result["classification"] = "BUYER_REQUEST"
+
+                  result["genuine_demand"] = True
+
+                  confidence = 5
+                  if explicit:
+                      confidence += 2
+                  if tasks:
+                      confidence += 1
+                  if compensation:
+                      confidence += 1
+                  if direct_context or executor_context:
+                      confidence += 1
+
+                  result["confidence"] = min(10, confidence)
+                  result["rejection_reason"] = ""
+                  return result
+
+              # -----------------------------------------------------
+              # NON-DEMAND CLASSIFICATION
+              # -----------------------------------------------------
+
+              if discussion or post_type in {"analysis", "finding", "discussion"}:
+                  result["classification"] = "DISCUSSION"
+                  result["confidence"] = min(
+                      10,
+                      5 + len(discussion)
+                  )
+                  result["rejection_reason"] = (
+                      "Content is analytical/discussion-oriented and lacks "
+                      "sufficiently explicit delegation of work."
+                  )
+              else:
+                  result["classification"] = "UNCLEAR"
+                  result["confidence"] = 5
+                  result["rejection_reason"] = (
+                      "No sufficiently strong contextual requester intent "
+                      "combined with a concrete open task."
+                  )
+
+              return result
+
+          # ---------------------------------------------------------
+          # DEDUPLICATION
+          # ---------------------------------------------------------
+
+          combined = []
+
+          for index, item in enumerate(feed_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "for_you_feed"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "for_you_feed",
+                      "_source_index": index,
+                      "_invalid": True
+                  })
+
+          for index, item in enumerate(public_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "public_posts"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "public_posts",
+                      "_source_index": index,
+                      "_invalid": True
+                  })
+
+          deduplicated = []
+          seen_ids = set()
+
+          for item in combined:
+              item_id = clean_text(
+                  item.get("id")
+                  or item.get("uuid")
+                  or ""
+              )
+
+              # Stable-ID-only deduplication.
+              # Items without IDs are NEVER silently removed.
+              if item_id:
+                  if item_id in seen_ids:
+                      continue
+
+                  seen_ids.add(item_id)
+
+              deduplicated.append(item)
+
+          # ---------------------------------------------------------
+          # ANALYZE
+          # ---------------------------------------------------------
+
+          analyzed = []
+
+          for item in deduplicated:
+              result = classify(item)
+              result["source"] = item.get("_source", "unknown")
+              result["source_index"] = item.get("_source_index")
+              analyzed.append(result)
+
+          # ---------------------------------------------------------
+          # SUMMARY
+          # ---------------------------------------------------------
+
+          real_demands = [
+              item for item in analyzed
+              if item["genuine_demand"]
+          ]
+
+          classification_counts = {}
+
+          for item in analyzed:
+              cls = item["classification"]
+              classification_counts[cls] = (
+                  classification_counts.get(cls, 0) + 1
+              )
+
+          top_demand = None
+
+          if real_demands:
+              top_demand = sorted(
+                  real_demands,
+                  key=lambda x: (
+                      x["score"],
+                      x["confidence"]
+                  ),
+                  reverse=True
+              )[0]
+
+          generated_at = datetime.now(timezone.utc).isoformat()
+
+          output = {
+              "version": VERSION,
+              "generated_at": generated_at,
+              "mode": MODE,
+              "objective": (
+                  "Detect genuine actionable work opportunities by requiring "
+                  "contextual delegation plus a concrete task, while "
+                  "preserving complete traceability."
+              ),
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+              "actions_taken": [],
+              "gemini_used": False,
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(deduplicated)
+              },
+              "total_scanned": len(analyzed),
+              "real_demands": len(real_demands),
+              "rejected_or_unclear": len(analyzed) - len(real_demands),
+              "classification_counts": classification_counts,
+              "v65_rules": {
+                  "generic_request_word_is_not_demand": True,
+                  "generic_task_word_is_not_demand": True,
+                  "generic_payment_word_is_not_demand": True,
+                  "contextual_delegation_required": True,
+                  "concrete_task_required": True,
+                  "completed_work_excluded": True,
+                  "payment_receipts_excluded": True,
+                  "service_offers_excluded": True,
+                  "agent_seeking_work_excluded": True,
+                  "promotional_content_excluded": True,
+                  "metadata_preserved": True,
+                  "invalid_items_preserved": True,
+                  "stable_id_only_deduplication": True
+              },
+              "recommendation": {
+                  "action": (
+                      "MANUAL_REVIEW_REQUIRED"
+                      if real_demands
+                      else "NO_ACTION"
+                  ),
+                  "reason": (
+                      "A sufficiently reliable contextual work demand "
+                      "was detected. NØX must not contact the requester "
+                      "automatically."
+                      if real_demands
+                      else
+                      "V65 found no sufficiently reliable contextual "
+                      "delegated work demand in the scanned Colony content."
+                  ),
+                  "top_demand_id": (
+                      top_demand["id"] if top_demand else None
+                  ),
+                  "top_demand_score": (
+                      top_demand["score"] if top_demand else 0
+                  )
+              },
+              "items": analyzed
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          output_path = (
+              "memory/"
+              "nox_v65_contextual_demand_gate.json"
+          )
+
+          with open(output_path, "w", encoding="utf-8") as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(json.dumps(output, ensure_ascii=False, indent=2))
+
+          PY
+
+      - name: Commit V65 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v65_contextual_demand_gate.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX V65 contextual demand gate memory"
+            git push
+          fi
