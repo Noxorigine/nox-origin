@@ -1,0 +1,449 @@
+name: NØX V61 — Demand Discovery
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  demand-discovery:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V61 Demand Discovery
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          cat > /tmp/nox_v61.py <<'PY'
+          import os
+          import json
+          import re
+          from datetime import datetime, timezone
+          import requests
+
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          BASE_URL = "https://thecolony.ai/api/v1"
+
+          session = requests.Session()
+          session.headers.update({
+              "Content-Type": "application/json",
+              "Accept": "application/json"
+          })
+
+          # ---------------------------------------------------------
+          # 1. Authentication
+          # ---------------------------------------------------------
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          print("Auth status:", auth.status_code)
+
+          if auth.status_code != 200:
+              print(auth.text[:2000])
+              raise RuntimeError("Authentication failed")
+
+          auth_data = auth.json()
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError("No JWT token returned")
+
+          session.headers["Authorization"] = f"Bearer {token}"
+
+          # ---------------------------------------------------------
+          # 2. Fetch open marketplace items
+          # ---------------------------------------------------------
+          response = session.get(
+              f"{BASE_URL}/marketplace/tasks",
+              params={
+                  "status": "open",
+                  "sort": "new",
+                  "limit": 100,
+                  "offset": 0
+              },
+              timeout=30
+          )
+
+          print("Marketplace status:", response.status_code)
+
+          if response.status_code != 200:
+              print(response.text[:3000])
+              raise RuntimeError("Marketplace request failed")
+
+          data = response.json()
+
+          if isinstance(data, list):
+              items = data
+          elif isinstance(data, dict):
+              items = (
+                  data.get("tasks")
+                  or data.get("items")
+                  or data.get("results")
+                  or data.get("data")
+                  or []
+              )
+          else:
+              items = []
+
+          print("Raw marketplace items:", len(items))
+
+          # ---------------------------------------------------------
+          # 3. Demand language
+          # ---------------------------------------------------------
+          DEMAND_PATTERNS = [
+              r"\bi need\b",
+              r"\bwe need\b",
+              r"\blooking for\b",
+              r"\bneed someone\b",
+              r"\bcan someone\b",
+              r"\bseeking\b",
+              r"\bseeking help\b",
+              r"\bhelp wanted\b",
+              r"\bwant someone\b",
+              r"\bwant a developer\b",
+              r"\bneed a developer\b",
+              r"\bneed an agent\b",
+              r"\bneed a bot\b",
+              r"\bneed this built\b",
+              r"\bbuild this for me\b",
+              r"\bplease build\b",
+              r"\bplease create\b",
+              r"\bpaid task\b",
+              r"\bpaid work\b",
+              r"\bbounty\b",
+              r"\breward\b",
+              r"\btask for\b",
+              r"\bcommission\b",
+              r"\bwho can\b",
+              r"\bdoes anyone know\b"
+          ]
+
+          SUPPLY_PATTERNS = [
+              r"\bfor hire\b",
+              r"\boffering\b",
+              r"\bi can\b",
+              r"\bi will\b",
+              r"\bavailable for hire\b",
+              r"\bavailable\b.*\bservices\b",
+              r"\bservices\b",
+              r"\bmy services\b",
+              r"\bhire me\b",
+              r"\bfreelance\b",
+              r"\boffer\b",
+              r"\bproviding\b"
+          ]
+
+          META_PATTERNS = [
+              r"\btest posting\b",
+              r"\btest post\b",
+              r"\btesting\b",
+              r"\bui test\b",
+              r"\btest\b.*\bui\b"
+          ]
+
+          ECONOMIC_PATTERNS = [
+              r"\bsats?\b",
+              r"\bsatoshi\b",
+              r"\blightning\b",
+              r"\bbitcoin\b",
+              r"\bbtc\b",
+              r"\busdc\b",
+              r"\busdt\b",
+              r"\busd\b",
+              r"\bpayment\b",
+              r"\bpaid\b",
+              r"\breward\b",
+              r"\bbounty\b",
+              r"\bprice\b",
+              r"\bpay\b"
+          ]
+
+          CAPABILITY_PATTERNS = {
+              "python": r"\bpython\b",
+              "api": r"\bapi\b|\bopenapi\b",
+              "automation": r"\bautomation\b|\bautomate\b",
+              "research": r"\bresearch\b|\banalysis\b",
+              "data": r"\bdata\b|\bscraping\b|\bscrape\b",
+              "writing": r"\bwriting\b|\btechnical writing\b|\bdocumentation\b",
+              "coding": r"\bcoding\b|\bdeveloper\b|\bdevelopment\b|\bsoftware\b",
+              "verification": r"\bverification\b|\bqa\b|\btesting\b"
+          }
+
+          def text_of(item):
+              title = str(
+                  item.get("title")
+                  or item.get("name")
+                  or ""
+              )
+
+              description = str(
+                  item.get("description")
+                  or item.get("body")
+                  or item.get("content")
+                  or ""
+              )
+
+              return title, description, f"{title}\n{description}".strip()
+
+          def matches(patterns, text):
+              return [
+                  pattern
+                  for pattern in patterns
+                  if re.search(pattern, text, re.IGNORECASE)
+              ]
+
+          def capability_matches(text):
+              found = []
+              for name, pattern in CAPABILITY_PATTERNS.items():
+                  if re.search(pattern, text, re.IGNORECASE):
+                      found.append(name)
+              return found
+
+          # ---------------------------------------------------------
+          # 4. Analyse demand
+          # ---------------------------------------------------------
+          demands = []
+          rejected = []
+
+          for item in items:
+              title, description, text = text_of(item)
+
+              demand_hits = matches(DEMAND_PATTERNS, text)
+              supply_hits = matches(SUPPLY_PATTERNS, text)
+              meta_hits = matches(META_PATTERNS, text)
+              economic_hits = matches(ECONOMIC_PATTERNS, text)
+              capabilities = capability_matches(text)
+
+              score = 0
+
+              # Strong positive evidence: someone actually needs something.
+              score += min(len(demand_hits) * 5, 15)
+
+              # Economic evidence.
+              score += min(len(economic_hits) * 2, 6)
+
+              # Useful capability match.
+              score += min(len(capabilities) * 2, 6)
+
+              # Strong negative evidence: this is somebody selling services.
+              score -= min(len(supply_hits) * 7, 21)
+
+              # Meta/test content should not become an opportunity.
+              if meta_hits:
+                  score -= 20
+
+              # -----------------------------------------------------
+              # Hard classification rules
+              # -----------------------------------------------------
+              classification = "NOT_DEMAND"
+              confidence = 0
+
+              if meta_hits:
+                  classification = "META_OR_TEST"
+                  confidence = 9
+
+              elif supply_hits and not demand_hits:
+                  classification = "SERVICE_OFFER"
+                  confidence = 9
+
+              elif demand_hits:
+                  if score >= 15:
+                      classification = "REAL_DEMAND"
+                      confidence = min(10, 6 + score // 8)
+                  elif score >= 8:
+                      classification = "POTENTIAL_DEMAND"
+                      confidence = min(9, 5 + score // 8)
+                  else:
+                      classification = "UNCLEAR_DEMAND"
+                      confidence = 4
+
+              else:
+                  classification = "NOT_DEMAND"
+                  confidence = 8
+
+              # -----------------------------------------------------
+              # Economic qualification
+              # -----------------------------------------------------
+              reward_evidence = bool(economic_hits)
+
+              # A service offer is NEVER treated as demand merely
+              # because it contains a price or useful capability.
+              if classification in {"SERVICE_OFFER", "META_OR_TEST", "NOT_DEMAND"}:
+                  qualified = False
+              elif classification == "REAL_DEMAND":
+                  qualified = True
+              else:
+                  qualified = False
+
+              requester = (
+                  item.get("author")
+                  or item.get("author_name")
+                  or item.get("username")
+                  or item.get("creator")
+                  or item.get("agent")
+                  or "unknown"
+              )
+
+              item_id = (
+                  item.get("id")
+                  or item.get("task_id")
+                  or item.get("uuid")
+                  or ""
+              )
+
+              record = {
+                  "id": item_id,
+                  "title": title,
+                  "requester": requester,
+                  "classification": classification,
+                  "confidence": confidence,
+                  "score": score,
+                  "qualified": qualified,
+                  "reward_evidence": reward_evidence,
+                  "demand_signals": demand_hits,
+                  "supply_signals": supply_hits,
+                  "economic_signals": economic_hits,
+                  "capabilities": capabilities,
+                  "description": description[:2000]
+              }
+
+              if qualified:
+                  demands.append(record)
+              else:
+                  rejected.append(record)
+
+          # ---------------------------------------------------------
+          # 5. Sort strongest genuine demands first
+          # ---------------------------------------------------------
+          demands.sort(
+              key=lambda x: (
+                  x["score"],
+                  x["confidence"],
+                  len(x["economic_signals"])
+              ),
+              reverse=True
+          )
+
+          # ---------------------------------------------------------
+          # 6. Recommendation
+          # ---------------------------------------------------------
+          if demands:
+              top = demands[0]
+
+              recommendation = {
+                  "action": "MANUAL_REVIEW_REQUIRED",
+                  "reason": (
+                      "A genuine buyer/requester demand was detected. "
+                      "NØX must not contact, comment, bid, or act automatically."
+                  ),
+                  "top_demand_id": top["id"],
+                  "top_demand_score": top["score"]
+              }
+          else:
+              recommendation = {
+                  "action": "NO_ACTION",
+                  "reason": (
+                      "No sufficiently reliable buyer/requester demand "
+                      "was detected in the current marketplace sample."
+                  ),
+                  "top_demand_id": None,
+                  "top_demand_score": 0
+              }
+
+          # ---------------------------------------------------------
+          # 7. Build memory
+          # ---------------------------------------------------------
+          result = {
+              "version": "V61",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "mode": "demand_discovery_only",
+              "actions_taken": [],
+              "gemini_used": False,
+              "total_raw_items": len(items),
+              "real_demands": len(demands),
+              "rejected_or_unclear": len(rejected),
+              "recommendation": recommendation,
+              "demands": demands,
+              "rejected_items": rejected
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          with open(
+              "memory/nox_v61_demand.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print()
+          print("========== NØX V61 ==========")
+          print("Raw items:", len(items))
+          print("REAL DEMAND:", len(demands))
+          print("Rejected/unclear:", len(rejected))
+          print("Gemini:", False)
+          print("Actions:", [])
+          print("Recommendation:", recommendation["action"])
+
+          if demands:
+              print()
+              print("TOP REAL DEMAND")
+              print("Title:", demands[0]["title"])
+              print("Requester:", demands[0]["requester"])
+              print("Score:", demands[0]["score"])
+              print("Confidence:", demands[0]["confidence"])
+          else:
+              print()
+              print("NO RELIABLE BUYER DEMAND DETECTED")
+
+          print("==============================")
+
+          PY
+
+          python /tmp/nox_v61.py
+
+      - name: Commit V61 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v61_demand.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX V61 demand discovery"
+            git push
+          fi
