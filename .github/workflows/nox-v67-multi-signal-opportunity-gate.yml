@@ -1,0 +1,1116 @@
+name: NØX V67 - Multi Signal Opportunity Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 * * * *"
+
+jobs:
+  opportunity-gate:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V67 multi-signal opportunity gate
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import json
+          from datetime import datetime, timezone
+          import requests
+
+          BASE_URL = "https://thecolony.ai/api/v1"
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          VERSION = "V67"
+          MODE = "multi_signal_opportunity_gate"
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "NØX-Origin-V67"
+          })
+
+          # =========================================================
+          # AUTH
+          # =========================================================
+
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          if auth.status_code != 200:
+              raise RuntimeError(
+                  f"Authentication failed: HTTP {auth.status_code} - "
+                  f"{auth.text[:500]}"
+              )
+
+          auth_data = auth.json()
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError(
+                  "Authentication succeeded but no token was returned"
+              )
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          # =========================================================
+          # FETCH
+          # =========================================================
+
+          def fetch_json(url):
+              response = session.get(url, timeout=30)
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"Fetch failed: HTTP {response.status_code} - "
+                      f"{response.text[:500]}"
+                  )
+
+              return response.json()
+
+          feed_data = fetch_json(f"{BASE_URL}/feed/for-you")
+          posts_data = fetch_json(f"{BASE_URL}/posts")
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in (
+                      "items",
+                      "posts",
+                      "data",
+                      "results",
+                      "feed"
+                  ):
+                      value = data.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+          feed_items = extract_items(feed_data)
+          public_items = extract_items(posts_data)
+
+          # =========================================================
+          # NORMALIZATION
+          # =========================================================
+
+          def clean(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              return str(value).strip()
+
+          def item_id(item):
+              return clean(
+                  item.get("id")
+                  or item.get("uuid")
+                  or ""
+              )
+
+          def title(item):
+              return clean(
+                  item.get("title")
+                  or item.get("name")
+                  or ""
+              )
+
+          def body(item):
+              return clean(
+                  item.get("body")
+                  or item.get("content")
+                  or item.get("text")
+                  or ""
+              )
+
+          def post_type(item):
+              return clean(
+                  item.get("post_type")
+                  or item.get("type")
+                  or "post"
+              ).lower()
+
+          def requester(item):
+              value = item.get("requester")
+
+              if isinstance(value, dict):
+                  return (
+                      clean(value.get("username"))
+                      or clean(value.get("display_name"))
+                      or clean(value.get("id"))
+                      or "unknown"
+                  )
+
+              if value:
+                  return clean(value)
+
+              value = item.get("author")
+
+              if isinstance(value, dict):
+                  return (
+                      clean(value.get("username"))
+                      or clean(value.get("display_name"))
+                      or clean(value.get("id"))
+                      or "unknown"
+                  )
+
+              if value:
+                  return clean(value)
+
+              return "unknown"
+
+          # =========================================================
+          # STRUCTURAL SIGNALS
+          #
+          # These are stronger than isolated words.
+          # =========================================================
+
+          STRUCTURAL_PAID_TASK_TYPES = {
+              "human_request",
+              "paid_task"
+          }
+
+          STRUCTURAL_REQUEST_TYPES = {
+              "human_request",
+              "paid_task",
+              "request"
+          }
+
+          STRUCTURAL_NON_DEMAND_TYPES = {
+              "analysis",
+              "finding",
+              "discussion"
+          }
+
+          # =========================================================
+          # TEXT SIGNALS
+          # =========================================================
+
+          STRONG_DELEGATION = [
+              r"\bi\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person|a\s+freelancer)\b",
+              r"\bwe\s+need\s+(?:someone|an\s+agent|a\s+developer|a\s+person|a\s+freelancer)\b",
+              r"\bneed\s+someone\s+to\b",
+              r"\bneed\s+an\s+agent\s+to\b",
+              r"\blooking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person|a\s+freelancer)\b",
+              r"\bi'?m\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bwe'?re\s+looking\s+for\s+(?:someone|an\s+agent|a\s+developer|a\s+person)\b",
+              r"\bcan\s+anyone\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e|automate)\b",
+              r"\bwho\s+can\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e|automate)\b",
+              r"\bwho\s+could\s+(?:build|create|implement|write|fix|audit|research|design|develop|scrape|analy[sz]e|automate)\b",
+              r"\bwe\s+are\s+hiring\b",
+              r"\bwe'?re\s+hiring\b"
+          ]
+
+          MEDIUM_DELEGATION = [
+              r"\bi\s+need\s+help\s+(?:with|to)\b",
+              r"\bwe\s+need\s+help\s+(?:with|to)\b",
+              r"\bcould\s+use\s+help\s+(?:with|on)\b",
+              r"\bcan\s+someone\s+help\s+(?:with|me)\b",
+              r"\bhelp\s+wanted\b",
+              r"\bseeking\s+someone\s+to\b",
+              r"\bwant\s+someone\s+to\b",
+              r"\bwould\s+be\s+willing\s+to\s+(?:pay|hire)\b",
+              r"\bi'?m\s+trying\s+to\s+find\s+someone\b",
+              r"\banyone\s+interested\s+in\s+(?:doing|handling|building|creating|working\s+on)\b",
+              r"\bi\s+have\s+a\s+(?:task|job|project)\b",
+              r"\bthere\s+is\s+a\s+(?:task|job)\b"
+          ]
+
+          OPEN_TASK = [
+              r"\btask\s*:\s*",
+              r"\bjob\s*:\s*",
+              r"\bcommission\s*:\s*",
+              r"\bbrief\s*:\s*",
+              r"\bopen\s+task\b",
+              r"\bavailable\s+task\b",
+              r"\bopen\s+job\b",
+              r"\bavailable\s+job\b",
+              r"\bpaid\s+task\b",
+              r"\bpaid\s+job\b",
+              r"\bfreelance\s+task\b",
+              r"\bfreelance\s+job\b",
+              r"\bwork\s+available\b"
+          ]
+
+          CONCRETE_TASK = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bimplement\b",
+              r"\bwrite\b",
+              r"\bfix\b",
+              r"\bdebug\b",
+              r"\baudit\b",
+              r"\bresearch\b",
+              r"\bdesign\b",
+              r"\bscrape\b",
+              r"\bcollect\b",
+              r"\bextract\b",
+              r"\banaly[sz]e\b",
+              r"\btest\b",
+              r"\bintegrat(?:e|ion)\b",
+              r"\bautomate\b",
+              r"\bverify\b",
+              r"\btranslate\b",
+              r"\bcompile\b",
+              r"\bdeploy\b",
+              r"\bconfigure\b",
+              r"\bmonitor\b",
+              r"\bclassify\b"
+          ]
+
+          COMPENSATION = [
+              r"\bbudget\s*[:=]\s*",
+              r"\breward\s*[:=]\s*",
+              r"\bpayment\s*[:=]\s*",
+              r"\bpay\s*[:=]\s*",
+              r"\bpaid\s+\$?\d",
+              r"\b\d+(?:\.\d+)?\s*(?:usd|usdc|sat|sats|satoshi|btc)\b",
+              r"\b\d+(?:\.\d+)?\s*(?:\$|€)\b"
+          ]
+
+          COMPLETION = [
+              r"\bcompleted\b",
+              r"\bfinished\b",
+              r"\bdelivered\b",
+              r"\bsettled\b",
+              r"\bshipped\b",
+              r"\balready\s+(?:built|created|implemented|completed|delivered|finished)\b",
+              r"\balready\s+done\b"
+          ]
+
+          PAYMENT_RECEIPT = [
+              r"\bpayment\s+(?:received|settled|confirmed)\b",
+              r"\bhire\s+settled\b",
+              r"\bcompleted\s+hire\b",
+              r"\bpayment\b.{0,60}\bcompleted\b",
+              r"\bcompleted\b.{0,60}\bpayment\b",
+              r"\bpaid\s+out\b"
+          ]
+
+          SERVICE_OFFER = [
+              r"\bi\s+can\s+(?:build|create|write|fix|audit|research|design|develop|scrape|implement)\b",
+              r"\bi\s+offer\b",
+              r"\bmy\s+service\b",
+              r"\bavailable\s+for\s+(?:hire|work)\b",
+              r"\bfor\s+hire\b",
+              r"\baccepting\s+(?:work|commissions|jobs)\b"
+          ]
+
+          AGENT_SEEKING = [
+              r"\bi'?m\s+looking\s+for\s+work\b",
+              r"\blooking\s+for\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bseeking\s+(?:work|tasks|jobs|commissions)\b",
+              r"\bneed\s+(?:work|tasks|jobs|commissions)\b"
+          ]
+
+          # Deliberately narrow promotional detection.
+          PROMOTIONAL = [
+              r"\baffiliate\s+offer\b",
+              r"\bpromotional\s+offer\b",
+              r"\bdiscount\s+code\b",
+              r"\bsponsored\s+offer\b"
+          ]
+
+          DISCUSSION = [
+              r"\bwhy\b",
+              r"\bhow\s+do\s+(?:you|agents)\b",
+              r"\bwhat\s+do\s+you\s+think\b",
+              r"\bdiscussion\b",
+              r"\bfindings?\b",
+              r"\banalysis\b",
+              r"\bobserved\b",
+              r"\bstudy\b",
+              r"\bframework\b",
+              r"\bbenchmark\b",
+              r"\bpaper\b",
+              r"\bthe\s+problem\s+is\b",
+              r"\bthis\s+means\b",
+              r"\bi\s+will\s+no\s+longer\b"
+          ]
+
+          def find(patterns, text):
+              return [
+                  pattern
+                  for pattern in patterns
+                  if re.search(pattern, text, re.IGNORECASE)
+              ]
+
+          # =========================================================
+          # ANALYZE
+          # =========================================================
+
+          def analyze(item):
+              iid = item_id(item)
+              ttl = title(item)
+              bdy = body(item)
+              ptype = post_type(item)
+              author = requester(item)
+
+              text = f"{ttl}\n{bdy}".strip()
+
+              result = {
+                  "id": iid,
+                  "title": ttl,
+                  "requester": author,
+                  "post_type": ptype,
+                  "evidence_level": "NOT_A_DEMAND",
+                  "classification": "NOT_A_DEMAND",
+                  "genuine_demand": False,
+                  "score": 0,
+                  "confidence": 0,
+                  "signals": {
+                      "structural_paid_task": False,
+                      "structural_request": False,
+                      "strong_delegation": [],
+                      "medium_delegation": [],
+                      "open_task": [],
+                      "concrete_task": [],
+                      "compensation": [],
+                      "completion": [],
+                      "payment_receipt": [],
+                      "service_offer": [],
+                      "agent_seeking": [],
+                      "promotional": [],
+                      "discussion": []
+                  },
+                  "evidence": [],
+                  "rejection_reason": ""
+              }
+
+              # -----------------------------------------------------
+              # INVALID SOURCE
+              # -----------------------------------------------------
+
+              if not iid and not ttl and not bdy:
+                  result["classification"] = "INVALID_SOURCE_ITEM"
+                  result["confidence"] = 10
+                  result["rejection_reason"] = (
+                      "Source item has no usable ID, title, or body; "
+                      "retained for traceability."
+                  )
+                  return result
+
+              structural_paid = (
+                  ptype in STRUCTURAL_PAID_TASK_TYPES
+              )
+
+              structural_request = (
+                  ptype in STRUCTURAL_REQUEST_TYPES
+              )
+
+              strong = find(STRONG_DELEGATION, text)
+              medium = find(MEDIUM_DELEGATION, text)
+              open_task = find(OPEN_TASK, text)
+              concrete = find(CONCRETE_TASK, text)
+              compensation = find(COMPENSATION, text)
+              completion = find(COMPLETION, text)
+              payment = find(PAYMENT_RECEIPT, text)
+              service = find(SERVICE_OFFER, text)
+              seeking = find(AGENT_SEEKING, text)
+              promo = find(PROMOTIONAL, text)
+              discussion = find(DISCUSSION, text)
+
+              result["signals"]["structural_paid_task"] = structural_paid
+              result["signals"]["structural_request"] = structural_request
+              result["signals"]["strong_delegation"] = strong
+              result["signals"]["medium_delegation"] = medium
+              result["signals"]["open_task"] = open_task
+              result["signals"]["concrete_task"] = concrete
+              result["signals"]["compensation"] = compensation
+              result["signals"]["completion"] = completion
+              result["signals"]["payment_receipt"] = payment
+              result["signals"]["service_offer"] = service
+              result["signals"]["agent_seeking"] = seeking
+              result["signals"]["promotional"] = promo
+              result["signals"]["discussion"] = discussion
+
+              # -----------------------------------------------------
+              # HARD EXCLUSIONS
+              # -----------------------------------------------------
+
+              if payment:
+                  result["classification"] = "PAYMENT_RECEIPT"
+                  result["confidence"] = 10
+                  result["evidence"].append(
+                      "payment_receipt_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Completed or settled payment evidence."
+                  )
+                  return result
+
+              if (
+                  completion
+                  and not strong
+                  and not medium
+                  and not open_task
+                  and not structural_paid
+              ):
+                  result["classification"] = "COMPLETED_WORK"
+                  result["confidence"] = 10
+                  result["evidence"].append(
+                      "completed_work_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Evidence describes completed work rather than "
+                      "an open opportunity."
+                  )
+                  return result
+
+              if (
+                  service
+                  and not strong
+                  and not medium
+                  and not open_task
+                  and not structural_paid
+              ):
+                  result["classification"] = "SERVICE_OFFER"
+                  result["confidence"] = 9
+                  result["evidence"].append(
+                      "service_offer_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Author appears to offer services rather than "
+                      "delegate work."
+                  )
+                  return result
+
+              if (
+                  seeking
+                  and not strong
+                  and not medium
+                  and not open_task
+                  and not structural_paid
+              ):
+                  result["classification"] = "AGENT_SEEKING_WORK"
+                  result["confidence"] = 9
+                  result["evidence"].append(
+                      "agent_seeking_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Author is seeking work rather than assigning it."
+                  )
+                  return result
+
+              if (
+                  promo
+                  and not strong
+                  and not medium
+                  and not open_task
+                  and not structural_paid
+              ):
+                  result["classification"] = "PROMOTIONAL"
+                  result["confidence"] = 9
+                  result["evidence"].append(
+                      "promotional_context"
+                  )
+                  result["rejection_reason"] = (
+                      "Promotional content without actionable work "
+                      "delegation."
+                  )
+                  return result
+
+              # -----------------------------------------------------
+              # MULTI-SIGNAL SCORE
+              # -----------------------------------------------------
+
+              score = 0
+
+              if structural_paid:
+                  score += 55
+                  result["evidence"].append(
+                      "structural_paid_task_type"
+                  )
+
+              elif structural_request:
+                  score += 35
+                  result["evidence"].append(
+                      "structural_request_type"
+                  )
+
+              if strong:
+                  score += 40
+                  result["evidence"].append(
+                      "strong_delegation"
+                  )
+
+              if medium:
+                  score += 25
+                  result["evidence"].append(
+                      "contextual_delegation"
+                  )
+
+              if open_task:
+                  score += 35
+                  result["evidence"].append(
+                      "open_task_context"
+                  )
+
+              if concrete:
+                  score += min(20, len(concrete) * 5)
+                  result["evidence"].append(
+                      "concrete_task"
+                  )
+
+              if compensation:
+                  score += 20
+                  result["evidence"].append(
+                      "compensation_context"
+                  )
+
+              # Independent evidence bonus.
+              evidence_families = 0
+
+              if structural_paid or structural_request:
+                  evidence_families += 1
+
+              if strong or medium:
+                  evidence_families += 1
+
+              if open_task:
+                  evidence_families += 1
+
+              if concrete:
+                  evidence_families += 1
+
+              if compensation:
+                  evidence_families += 1
+
+              if evidence_families >= 3:
+                  score += 10
+                  result["evidence"].append(
+                      "multi_signal_confirmation_bonus"
+                  )
+
+              # Analytical post types receive a penalty only when
+              # there is no independent structural demand evidence.
+              if ptype in STRUCTURAL_NON_DEMAND_TYPES:
+                  if not structural_paid and not structural_request:
+                      score -= 30
+
+                  if not strong and not medium and not open_task:
+                      score -= 20
+
+              score = max(0, min(score, 100))
+              result["score"] = score
+
+              # -----------------------------------------------------
+              # CONFIRMED DEMAND
+              #
+              # Several independent paths are accepted:
+              #
+              # A) paid-task structural type + concrete task
+              # B) explicit delegation + concrete task
+              # C) open paid task + concrete task
+              # D) open task + compensation + concrete task
+              # -----------------------------------------------------
+
+              path_a = (
+                  structural_paid
+                  and bool(concrete)
+              )
+
+              path_b = (
+                  bool(strong)
+                  and bool(concrete)
+              )
+
+              path_c = (
+                  bool(open_task)
+                  and bool(concrete)
+                  and (
+                      bool(compensation)
+                      or structural_paid
+                  )
+              )
+
+              path_d = (
+                  bool(open_task)
+                  and bool(concrete)
+                  and bool(compensation)
+              )
+
+              confirmed_path = (
+                  path_a
+                  or path_b
+                  or path_c
+                  or path_d
+              )
+
+              if (
+                  confirmed_path
+                  and score >= 65
+                  and not payment
+                  and not completion
+                  and not service
+                  and not seeking
+                  and not promo
+              ):
+                  result["evidence_level"] = "CONFIRMED_DEMAND"
+                  result["classification"] = (
+                      "OPEN_PAID_TASK"
+                      if (
+                          structural_paid
+                          or compensation
+                          or re.search(
+                              r"\bpaid\b",
+                              text,
+                              re.IGNORECASE
+                          )
+                      )
+                      else "BUYER_REQUEST"
+                  )
+                  result["genuine_demand"] = True
+
+                  confidence = 6
+
+                  if structural_paid:
+                      confidence += 2
+
+                  if strong:
+                      confidence += 1
+
+                  if open_task:
+                      confidence += 1
+
+                  if compensation:
+                      confidence += 1
+
+                  if len(evidence_families) >= 3:
+                      confidence += 1
+
+                  result["confidence"] = min(
+                      10,
+                      confidence
+                  )
+
+                  return result
+
+              # -----------------------------------------------------
+              # POTENTIAL DEMAND
+              #
+              # Broader recall, but NEVER automatic action.
+              # -----------------------------------------------------
+
+              potential_score = score
+
+              potential_path_a = (
+                  bool(medium)
+                  and bool(concrete)
+              )
+
+              potential_path_b = (
+                  bool(open_task)
+                  and bool(concrete)
+              )
+
+              potential_path_c = (
+                  bool(compensation)
+                  and bool(concrete)
+                  and (
+                      bool(structural_request)
+                      or bool(medium)
+                      or bool(open_task)
+                  )
+              )
+
+              potential_path_d = (
+                  bool(structural_request)
+                  and bool(concrete)
+              )
+
+              potential_path = (
+                  potential_path_a
+                  or potential_path_b
+                  or potential_path_c
+                  or potential_path_d
+              )
+
+              if (
+                  potential_path
+                  and potential_score >= 40
+                  and not payment
+                  and not completion
+                  and not service
+                  and not seeking
+                  and not promo
+              ):
+                  result["evidence_level"] = "POTENTIAL_DEMAND"
+                  result["classification"] = "POTENTIAL_DEMAND"
+                  result["genuine_demand"] = False
+                  result["score"] = potential_score
+                  result["confidence"] = 6
+                  result["rejection_reason"] = (
+                      "Credible opportunity signals detected, but "
+                      "evidence is not strong enough for confirmation. "
+                      "Manual review required."
+                  )
+
+                  return result
+
+              # -----------------------------------------------------
+              # NOT A DEMAND
+              # -----------------------------------------------------
+
+              result["evidence_level"] = "NOT_A_DEMAND"
+              result["classification"] = "NOT_A_DEMAND"
+
+              if (
+                  ptype in STRUCTURAL_NON_DEMAND_TYPES
+                  and not structural_paid
+                  and not structural_request
+              ):
+                  result["confidence"] = 8
+                  result["rejection_reason"] = (
+                      "Analytical, finding, or discussion content "
+                      "without sufficient opportunity evidence."
+                  )
+
+              else:
+                  result["confidence"] = 5
+                  result["rejection_reason"] = (
+                      "No sufficiently independent evidence of an "
+                      "open delegated work opportunity."
+                  )
+
+              return result
+
+          # =========================================================
+          # MERGE SOURCES
+          # =========================================================
+
+          combined = []
+
+          for index, item in enumerate(feed_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "for_you_feed"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "for_you_feed",
+                      "_source_index": index
+                  })
+
+          for index, item in enumerate(public_items):
+              if isinstance(item, dict):
+                  copy = dict(item)
+                  copy["_source"] = "public_posts"
+                  copy["_source_index"] = index
+                  combined.append(copy)
+              else:
+                  combined.append({
+                      "_source": "public_posts",
+                      "_source_index": index
+                  })
+
+          # =========================================================
+          # STABLE-ID DEDUPLICATION
+          # =========================================================
+
+          deduplicated = []
+          seen_ids = set()
+
+          for item in combined:
+              iid = item_id(item)
+
+              if iid:
+                  if iid in seen_ids:
+                      continue
+
+                  seen_ids.add(iid)
+
+              # Items without IDs are NEVER silently dropped.
+              deduplicated.append(item)
+
+          # =========================================================
+          # ANALYZE ALL ITEMS
+          # =========================================================
+
+          analyzed = []
+
+          for item in deduplicated:
+              result = analyze(item)
+
+              result["source"] = item.get(
+                  "_source",
+                  "unknown"
+              )
+
+              result["source_index"] = item.get(
+                  "_source_index"
+              )
+
+              analyzed.append(result)
+
+          confirmed = [
+              x for x in analyzed
+              if x["evidence_level"] == "CONFIRMED_DEMAND"
+          ]
+
+          potential = [
+              x for x in analyzed
+              if x["evidence_level"] == "POTENTIAL_DEMAND"
+          ]
+
+          not_demand = [
+              x for x in analyzed
+              if x["evidence_level"] == "NOT_A_DEMAND"
+          ]
+
+          invalid = [
+              x for x in analyzed
+              if x["classification"] == "INVALID_SOURCE_ITEM"
+          ]
+
+          classification_counts = {}
+
+          for item in analyzed:
+              cls = item["classification"]
+
+              classification_counts[cls] = (
+                  classification_counts.get(cls, 0) + 1
+              )
+
+          # =========================================================
+          # RANK
+          # =========================================================
+
+          confirmed_sorted = sorted(
+              confirmed,
+              key=lambda x: (
+                  x["score"],
+                  x["confidence"]
+              ),
+              reverse=True
+          )
+
+          potential_sorted = sorted(
+              potential,
+              key=lambda x: (
+                  x["score"],
+                  x["confidence"]
+              ),
+              reverse=True
+          )
+
+          top_confirmed = (
+              confirmed_sorted[0]
+              if confirmed_sorted
+              else None
+          )
+
+          top_potential = (
+              potential_sorted[0]
+              if potential_sorted
+              else None
+          )
+
+          # =========================================================
+          # RECOMMENDATION
+          # =========================================================
+
+          if top_confirmed:
+              recommendation = {
+                  "action": "MANUAL_REVIEW_REQUIRED",
+                  "reason": (
+                      "Confirmed opportunity evidence detected. "
+                      "NØX must not contact, bid, comment, DM, or "
+                      "pay automatically."
+                  ),
+                  "top_demand_id": top_confirmed["id"],
+                  "top_demand_score": top_confirmed["score"]
+              }
+
+          elif top_potential:
+              recommendation = {
+                  "action": "POTENTIAL_DEMAND_REVIEW",
+                  "reason": (
+                      "Potential opportunity evidence detected. "
+                      "Human validation is required before any action."
+                  ),
+                  "top_demand_id": top_potential["id"],
+                  "top_demand_score": top_potential["score"]
+              }
+
+          else:
+              recommendation = {
+                  "action": "NO_ACTION",
+                  "reason": (
+                      "No sufficiently evidenced actionable opportunity "
+                      "was detected."
+                  ),
+                  "top_demand_id": None,
+                  "top_demand_score": 0
+              }
+
+          # =========================================================
+          # OUTPUT
+          # =========================================================
+
+          output = {
+              "version": VERSION,
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "mode": MODE,
+              "objective": (
+                  "Detect real work opportunities by combining "
+                  "structural, contextual, task and compensation "
+                  "evidence while preserving high precision."
+              ),
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+              "actions_taken": [],
+              "gemini_used": False,
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(deduplicated)
+              },
+              "total_scanned": len(analyzed),
+              "confirmed_demands": len(confirmed),
+              "potential_demands": len(potential),
+              "not_a_demand": len(not_demand),
+              "invalid_source_items": len(invalid),
+              "rejected_or_unclear": (
+                  len(analyzed) - len(confirmed)
+              ),
+              "classification_counts": classification_counts,
+              "evidence_levels": {
+                  "CONFIRMED_DEMAND": {
+                      "meaning": (
+                          "Strong evidence from multiple independent "
+                          "signals or a strong structural paid-task "
+                          "indicator plus a concrete task."
+                      ),
+                      "minimum_score": 65
+                  },
+                  "POTENTIAL_DEMAND": {
+                      "meaning": (
+                          "Credible opportunity signals exist but "
+                          "confirmation is not justified."
+                      ),
+                      "minimum_score": 40
+                  },
+                  "NOT_A_DEMAND": {
+                      "meaning": (
+                          "Insufficient evidence or excluded content."
+                      )
+                  }
+              },
+              "v67_rules": {
+                  "structural_post_types_used": True,
+                  "human_request_is_strong_signal": True,
+                  "paid_task_is_strong_signal": True,
+                  "generic_words_are_not_demand_proof": True,
+                  "multiple_independent_signals_required": True,
+                  "concrete_task_required_for_opportunity_levels": True,
+                  "compensation_is_contextual_evidence": True,
+                  "analytical_posts_penalized_without_structure": True,
+                  "completed_work_excluded": True,
+                  "payment_receipts_excluded": True,
+                  "service_offers_excluded": True,
+                  "agent_seeking_work_excluded": True,
+                  "promotional_content_excluded": True,
+                  "metadata_preserved": True,
+                  "invalid_items_preserved": True,
+                  "stable_id_only_deduplication": True,
+                  "automatic_contact_disabled": True,
+                  "automatic_bidding_disabled": True,
+                  "automatic_payment_disabled": True,
+                  "gemini_disabled": True
+              },
+              "recommendation": recommendation,
+              "items": analyzed
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          output_path = (
+              "memory/"
+              "nox_v67_multi_signal_opportunity_gate.json"
+          )
+
+          with open(
+              output_path,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(
+              json.dumps(
+                  output,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+
+          PY
+
+      - name: Commit V67 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v67_multi_signal_opportunity_gate.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX V67 multi signal opportunity gate memory"
+            git push
+          fi
