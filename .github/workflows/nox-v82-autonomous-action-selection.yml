@@ -1,0 +1,764 @@
+name: NØX V82 — Autonomous Action Selection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-v82-autonomous-action-selection
+  cancel-in-progress: false
+
+jobs:
+  autonomous-action-selection:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V82
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai/api/v1"
+          MEMORY = Path("memory")
+          MEMORY.mkdir(parents=True, exist_ok=True)
+
+          VERSION = "V82"
+          NOW = datetime.now(timezone.utc).isoformat()
+
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+              "User-Agent": "Nox-Origin-V82"
+          })
+
+          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          def load_json(filename, default=None):
+              path = MEMORY / filename
+              if not path.exists():
+                  return default if default is not None else {}
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return default if default is not None else {}
+
+          def api_get(path, params=None):
+              response = SESSION.get(
+                  BASE + path,
+                  params=params,
+                  timeout=30
+              )
+              response.raise_for_status()
+              return response.json()
+
+          def unwrap(value):
+              if isinstance(value, dict):
+                  for key in ("data", "items", "results", "posts", "suggestions"):
+                      if key in value:
+                          return value[key]
+              return value
+
+          def text(value):
+              if value is None:
+                  return ""
+              return str(value).lower()
+
+          def get_id(obj):
+              if not isinstance(obj, dict):
+                  return ""
+              for key in ("id", "post_id", "uuid"):
+                  if obj.get(key):
+                      return str(obj[key])
+              return ""
+
+          def get_author(obj):
+              if not isinstance(obj, dict):
+                  return {}
+              author = obj.get("author")
+              if isinstance(author, dict):
+                  return author
+              user = obj.get("user")
+              if isinstance(user, dict):
+                  return user
+              return {}
+
+          def is_nox(obj, nox_id, nox_username):
+              author = get_author(obj)
+              aid = str(
+                  author.get("id")
+                  or author.get("user_id")
+                  or obj.get("author_id")
+                  or ""
+              )
+              username = str(
+                  author.get("username")
+                  or author.get("handle")
+                  or ""
+              ).lower().lstrip("@")
+
+              return (
+                  aid == nox_id
+                  or username == nox_username
+              )
+
+          # ---------------------------------------------------------
+          # 1. AUTHENTICATION
+          # ---------------------------------------------------------
+
+          token_response = SESSION.post(
+              BASE + "/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+          token_response.raise_for_status()
+
+          token_data = token_response.json()
+
+          access_token = (
+              token_data.get("access_token")
+              or token_data.get("token")
+              or token_data.get("data", {}).get("access_token")
+          )
+
+          if not access_token:
+              raise RuntimeError("No access_token returned by Colony")
+
+          SESSION.headers.update({
+              "Authorization": f"Bearer {access_token}"
+          })
+
+          me = api_get("/users/me")
+          me_data = me.get("data", me) if isinstance(me, dict) else me
+
+          nox_id = str(
+              me_data.get("id")
+              or me_data.get("user_id")
+              or ""
+          )
+
+          nox_username = str(
+              me_data.get("username")
+              or me_data.get("handle")
+              or "nox_origine"
+          ).lower().lstrip("@")
+
+          # ---------------------------------------------------------
+          # 2. LOAD PREVIOUS LEARNING
+          # ---------------------------------------------------------
+
+          v75 = load_json(
+              "nox_v75_evidence_weighted_opportunity_detector.json"
+          )
+
+          v76 = load_json(
+              "nox_v76_contextual_opportunity_verifier.json"
+          )
+
+          v77 = load_json(
+              "nox_v77_action_readiness_engine.json"
+          )
+
+          v79 = load_json(
+              "nox_v79_action_result_learning.json"
+          )
+
+          v80 = load_json(
+              "nox_v80_adaptive_decision_learning.json"
+          )
+
+          v81 = load_json(
+              "nox_v81_adaptive_action_prioritization.json"
+          )
+
+          # ---------------------------------------------------------
+          # 3. CURRENT COLONY SIGNALS
+          #
+          # Small limits are intentional. V82 must remain lightweight
+          # and avoid unnecessarily large list payloads.
+          # ---------------------------------------------------------
+
+          feed_raw = api_get(
+              "/feed/for-you",
+              {"limit": 7}
+          )
+
+          suggestions_raw = api_get(
+              "/suggestions",
+              {"limit": 10}
+          )
+
+          posts_raw = api_get(
+              "/posts",
+              {"limit": 10}
+          )
+
+          feed_items = unwrap(feed_raw)
+          suggestions = unwrap(suggestions_raw)
+          public_posts = unwrap(posts_raw)
+
+          if not isinstance(feed_items, list):
+              feed_items = []
+
+          if not isinstance(suggestions, list):
+              suggestions = []
+
+          if not isinstance(public_posts, list):
+              public_posts = []
+
+          # ---------------------------------------------------------
+          # 4. BUILD CURRENT CANDIDATE SET
+          # ---------------------------------------------------------
+
+          candidates = {}
+
+          for item in feed_items + public_posts:
+              if not isinstance(item, dict):
+                  continue
+
+              if is_nox(item, nox_id, nox_username):
+                  continue
+
+              item_id = get_id(item)
+
+              if item_id:
+                  candidates[item_id] = item
+
+          # Suggestions may contain post references.
+          for suggestion in suggestions:
+              if not isinstance(suggestion, dict):
+                  continue
+
+              possible = (
+                  suggestion.get("post")
+                  or suggestion.get("item")
+                  or suggestion.get("target")
+                  or suggestion
+              )
+
+              if not isinstance(possible, dict):
+                  continue
+
+              if is_nox(possible, nox_id, nox_username):
+                  continue
+
+              item_id = get_id(possible)
+
+              if item_id and item_id not in candidates:
+                  candidates[item_id] = possible
+
+          # ---------------------------------------------------------
+          # 5. EXTRACT V81 PRIORITY INFORMATION
+          # ---------------------------------------------------------
+
+          v81_items = []
+
+          for key in (
+              "ranked_opportunities",
+              "opportunities",
+              "candidates",
+              "ranked_candidates",
+              "decisions"
+          ):
+              value = v81.get(key)
+
+              if isinstance(value, list):
+                  v81_items.extend(value)
+
+          v81_by_id = {}
+
+          for item in v81_items:
+              if not isinstance(item, dict):
+                  continue
+
+              pid = str(
+                  item.get("post_id")
+                  or item.get("id")
+                  or item.get("opportunity_id")
+                  or ""
+              )
+
+              if pid:
+                  v81_by_id[pid] = item
+
+          # ---------------------------------------------------------
+          # 6. SCORE CURRENT OPPORTUNITIES
+          # ---------------------------------------------------------
+
+          def score_post(post):
+              title = text(post.get("title"))
+              body = text(
+                  post.get("body")
+                  or post.get("content")
+                  or post.get("text")
+              )
+
+              combined = f"{title} {body}"
+
+              score = 0
+              evidence = []
+
+              explicit_request = any(
+                  phrase in combined
+                  for phrase in (
+                      "i need",
+                      "i'm looking for",
+                      "looking for someone",
+                      "looking for an agent",
+                      "need someone",
+                      "can someone",
+                      "who can",
+                      "wanted",
+                      "seeking",
+                      "hire",
+                      "hiring",
+                      "request"
+                  )
+              )
+
+              delegation = any(
+                  phrase in combined
+                  for phrase in (
+                      "for someone to",
+                      "someone to build",
+                      "someone to fix",
+                      "someone to create",
+                      "someone to research",
+                      "someone to audit",
+                      "someone to complete",
+                      "you can apply",
+                      "applications"
+                  )
+              )
+
+              deliverable = any(
+                  word in combined
+                  for word in (
+                      "deliverable",
+                      "deliver",
+                      "file",
+                      "report",
+                      "implementation",
+                      "prototype",
+                      "parser",
+                      "script",
+                      "dataset",
+                      "result"
+                  )
+              )
+
+              acceptance = any(
+                  phrase in combined
+                  for phrase in (
+                      "acceptance criteria",
+                      "must pass",
+                      "requirements",
+                      "criteria",
+                      "verified",
+                      "verification"
+                  )
+              )
+
+              reward = any(
+                  word in combined
+                  for word in (
+                      "reward",
+                      "paid",
+                      "payment",
+                      "pay",
+                      "sats",
+                      "sat",
+                      "btc",
+                      "usdc",
+                      "bounty",
+                      "compensation"
+                  )
+              )
+
+              deadline = any(
+                  word in combined
+                  for word in (
+                      "deadline",
+                      "by tomorrow",
+                      "by friday",
+                      "due",
+                      "before"
+                  )
+              )
+
+              application_route = any(
+                  phrase in combined
+                  for phrase in (
+                      "apply",
+                      "application",
+                      "reply here",
+                      "comment below",
+                      "send",
+                      "submit",
+                      "dm me"
+                  )
+              )
+
+              completion = any(
+                  phrase in combined
+                  for phrase in (
+                      "completed",
+                      "finished",
+                      "already done",
+                      "delivered",
+                      "settled",
+                      "paid out"
+                  )
+              )
+
+              analysis_only = (
+                  post.get("post_type") in ("analysis", "finding")
+                  and not explicit_request
+                  and not delegation
+              )
+
+              if explicit_request:
+                  score += 35
+                  evidence.append("EXPLICIT_REQUEST")
+
+              if delegation:
+                  score += 20
+                  evidence.append("DELEGATION")
+
+              if deliverable:
+                  score += 15
+                  evidence.append("DELIVERABLE")
+
+              if acceptance:
+                  score += 15
+                  evidence.append("ACCEPTANCE_CRITERIA")
+
+              if reward:
+                  score += 10
+                  evidence.append("REWARD_OR_COMPENSATION")
+
+              if deadline:
+                  score += 5
+                  evidence.append("DEADLINE")
+
+              if application_route:
+                  score += 5
+                  evidence.append("APPLICATION_ROUTE")
+
+              if completion:
+                  score -= 35
+                  evidence.append("COMPLETION_SIGNAL")
+
+              if analysis_only:
+                  score -= 20
+                  evidence.append("ANALYSIS_OR_FINDING_ONLY")
+
+              return score, evidence
+
+          scored = []
+
+          for pid, post in candidates.items():
+              score, evidence = score_post(post)
+
+              previous = v81_by_id.get(pid, {})
+
+              previous_priority = str(
+                  previous.get("priority")
+                  or previous.get("priority_level")
+                  or ""
+              ).upper()
+
+              previous_score = previous.get("score")
+              if isinstance(previous_score, (int, float)):
+                  score = max(score, int(previous_score))
+
+              # V80 learning modifies priority, but never creates
+              # opportunity evidence by itself.
+              direction = str(
+                  v80.get("adaptation", {}).get("direction")
+                  or v80.get("learning", {}).get("adaptation_direction")
+                  or v80.get("adaptation_direction")
+                  or ""
+              ).upper()
+
+              modifier = 0
+
+              if direction == "INCREASE_PRIORITY":
+                  modifier = 5
+              elif direction == "DECREASE_PRIORITY":
+                  modifier = -5
+
+              if previous_priority == "P1":
+                  modifier += 3
+              elif previous_priority == "P4":
+                  modifier -= 2
+
+              adaptive_score = score + modifier
+
+              scored.append({
+                  "post_id": pid,
+                  "title": post.get("title", ""),
+                  "post_type": post.get("post_type", ""),
+                  "base_score": score,
+                  "adaptive_modifier": modifier,
+                  "adaptive_score": adaptive_score,
+                  "evidence": evidence,
+                  "previous_v81_priority": previous_priority
+              })
+
+          scored.sort(
+              key=lambda x: x["adaptive_score"],
+              reverse=True
+          )
+
+          # ---------------------------------------------------------
+          # 7. CONTEXTUAL VERIFICATION OF TOP CANDIDATES
+          # ---------------------------------------------------------
+
+          verified = []
+
+          for candidate in scored[:5]:
+              pid = candidate["post_id"]
+
+              try:
+                  context_raw = api_get(
+                      f"/posts/{pid}/context"
+                  )
+
+                  context = (
+                      context_raw.get("data", context_raw)
+                      if isinstance(context_raw, dict)
+                      else context_raw
+                  )
+
+                  if isinstance(context, dict):
+                      candidate["context_retrieved"] = True
+
+                      context_text = json.dumps(
+                          context,
+                          ensure_ascii=False
+                      ).lower()
+
+                      context_bonus = 0
+
+                      if "acceptance" in context_text:
+                          context_bonus += 5
+
+                      if "deliverable" in context_text:
+                          context_bonus += 5
+
+                      if "application" in context_text:
+                          context_bonus += 3
+
+                      candidate["context_bonus"] = context_bonus
+                      candidate["final_score"] = (
+                          candidate["adaptive_score"]
+                          + context_bonus
+                      )
+
+                  else:
+                      candidate["context_retrieved"] = False
+                      candidate["context_bonus"] = 0
+                      candidate["final_score"] = (
+                          candidate["adaptive_score"]
+                      )
+
+              except Exception as exc:
+                  candidate["context_retrieved"] = False
+                  candidate["context_error"] = str(exc)
+                  candidate["context_bonus"] = 0
+                  candidate["final_score"] = (
+                      candidate["adaptive_score"]
+                  )
+
+              verified.append(candidate)
+
+          verified.sort(
+              key=lambda x: x["final_score"],
+              reverse=True
+          )
+
+          # ---------------------------------------------------------
+          # 8. AUTONOMOUS ARBITRATION
+          # ---------------------------------------------------------
+
+          selected = None
+
+          for candidate in verified:
+              evidence = set(candidate.get("evidence", []))
+              score = candidate.get("final_score", 0)
+
+              has_request = "EXPLICIT_REQUEST" in evidence
+              has_delegation = "DELEGATION" in evidence
+              has_completion = "COMPLETION_SIGNAL" in evidence
+              analysis_only = "ANALYSIS_OR_FINDING_ONLY" in evidence
+
+              if has_completion:
+                  continue
+
+              if analysis_only and not has_request:
+                  continue
+
+              if score >= 75 and (has_request or has_delegation):
+                  selected = candidate
+                  break
+
+              if score >= 55 and has_request:
+                  selected = candidate
+                  break
+
+          # ---------------------------------------------------------
+          # 9. SELECT ACTION AUTONOMOUSLY
+          # ---------------------------------------------------------
+
+          selected_action = "OBSERVE"
+          action_reason = "No sufficiently strong action candidate."
+
+          if selected:
+              evidence = set(selected.get("evidence", []))
+
+              has_acceptance = (
+                  "ACCEPTANCE_CRITERIA" in evidence
+              )
+
+              has_route = (
+                  "APPLICATION_ROUTE" in evidence
+              )
+
+              has_request = (
+                  "EXPLICIT_REQUEST" in evidence
+              )
+
+              has_delegation = (
+                  "DELEGATION" in evidence
+              )
+
+              if (
+                  has_request
+                  and has_delegation
+                  and has_route
+                  and has_acceptance
+              ):
+                  selected_action = "COMMENT_APPLICATION"
+                  action_reason = (
+                      "NØX selected a direct application because "
+                      "the opportunity contains delegation, "
+                      "acceptance evidence and an application route."
+                  )
+
+              elif has_request and not has_acceptance:
+                  selected_action = "REQUEST_ACCEPTANCE_CRITERIA"
+                  action_reason = (
+                      "NØX selected verification of acceptance criteria "
+                      "because the request appears real but its "
+                      "success conditions remain insufficiently explicit."
+                  )
+
+              elif has_request or has_delegation:
+                  selected_action = "SUBSTANTIVE_COMMENT"
+                  action_reason = (
+                      "NØX selected a useful substantive response "
+                      "because the opportunity has actionable demand "
+                      "but does not yet justify direct application."
+                  )
+
+              else:
+                  selected_action = "VERIFY_CONTEXT"
+                  action_reason = (
+                      "NØX selected additional context verification "
+                      "because the signal is promising but incomplete."
+                  )
+
+          # ---------------------------------------------------------
+          # 10. CONFIDENCE
+          # ---------------------------------------------------------
+
+          if selected:
+              score = selected.get("final_score", 0)
+
+              if score >= 85:
+                  confidence = 0.90
+              elif score >= 75:
+                  confidence = 0.82
+              elif score >= 65:
+                  confidence = 0.74
+              elif score >= 55:
+                  confidence = 0.64
+              else:
+                  confidence = 0.50
+          else:
+              confidence = 0.35
+
+          # ---------------------------------------------------------
+          # 11. AUTONOMY DECISION RECORD
+          # ---------------------------------------------------------
+
+          decision = {
+              "version": VERSION,
+              "generated_at": NOW,
+              "mode": "autonomous_action_selection",
+
+              "agent": {
+                  "id": nox_id,
+                  "username": nox_username
+              },
+
+              "autonomy": {
+                  "selection_is_autonomous": True,
+                  "arbitration_is_autonomous": True,
+                  "execution_is_deferred": True,
+                  "automatic_rule_deployment": False,
+                  "human_review_for_major_rule_change": True
+              },
+
+              "sources": {
+                  "personalized_feed": len(feed_items),
+                  "suggestions": len(suggestions),
+                  "public_posts": len(public_posts),
+                  "candidate_posts": len(candidates),
+                  "verified_candidates": len(verified)
+              },
+
+              "learning_inputs": {
+                  "v75_loaded": bool(v75),
+                  "v76_loaded": bool(v76),
+                  "v77_loaded": bool(v77),
+                  "v79_loaded": bool(v79),
+                  "v80_loaded": bool(v80),
+                  "v81_loaded": bool(v81)
+              },
+
+              "selection": {
+                  "selected": bool(selected),
+                  "post_id": selected.get("post_id") if selected else None,
+                  "title": selected.get("title") if selected else None,
+                  "post_type": selected.get("post_type") if selected else None,
+                  "score": selected.get("final_score") if selected else 0,
+                  "evidence": selected.get("evidence", []) if selected else [],
+                  "action": selected_action,
+                  "reason
