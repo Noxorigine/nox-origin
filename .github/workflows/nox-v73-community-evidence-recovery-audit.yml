@@ -99,7 +99,43 @@ jobs:
                       f"{response.text[:700]}"
                   )
 
-              return response.json()
+              try:
+                  return response.json()
+              except Exception as exc:
+                  fail(
+                      f"Invalid JSON returned by {url}: {exc}"
+                  )
+
+          def post_json(url, token, payload):
+              response = requests.post(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/json",
+                      "Content-Type": "application/json"
+                  },
+                  json=payload,
+                  timeout=30
+              )
+
+              if response.status_code >= 400:
+                  fail(
+                      f"POST {url} failed "
+                      f"{response.status_code}: "
+                      f"{response.text[:700]}"
+                  )
+
+              try:
+                  return response.json()
+              except Exception:
+                  return {}
+
+          def normalize(text):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(text)
+              ).strip()
 
           def extract_items(data):
               if isinstance(data, list):
@@ -112,7 +148,6 @@ jobs:
                   "items",
                   "posts",
                   "comments",
-                  "data",
                   "results"
               ]:
                   value = data.get(key)
@@ -126,6 +161,14 @@ jobs:
                       if nested:
                           return nested
 
+              data_value = data.get("data")
+
+              if isinstance(data_value, list):
+                  return data_value
+
+              if isinstance(data_value, dict):
+                  return extract_items(data_value)
+
               return []
 
           def item_id(item):
@@ -134,8 +177,8 @@ jobs:
 
               return str(
                   item.get("id")
-                  or item.get("post_id")
                   or item.get("comment_id")
+                  or item.get("post_id")
                   or ""
               )
 
@@ -153,10 +196,19 @@ jobs:
                       or ""
                   )
 
+              user = item.get("user")
+
+              if isinstance(user, dict):
+                  return str(
+                      user.get("username")
+                      or user.get("handle")
+                      or user.get("name")
+                      or ""
+                  )
+
               return str(
                   item.get("author_username")
                   or item.get("username")
-                  or item.get("user", {}).get("username", "")
                   or ""
               )
 
@@ -171,12 +223,79 @@ jobs:
                   or ""
               )
 
-          def normalize(text):
-              return re.sub(
-                  r"\s+",
-                  " ",
-                  str(text)
-              ).strip()
+          def item_parent_id(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              return str(
+                  item.get("parent_id")
+                  or item.get("parent_comment_id")
+                  or ""
+              )
+
+          def collect_comment_lists(data):
+              """
+              Search recursively for explicit comment arrays without
+              treating the main post object itself as a comment.
+              """
+              found = []
+
+              def walk(value, parent_key=""):
+                  if isinstance(value, dict):
+                      for key, child in value.items():
+                          key_lower = str(key).lower()
+
+                          if key_lower in {
+                              "comments",
+                              "replies",
+                              "children"
+                          } and isinstance(child, list):
+                              for item in child:
+                                  if isinstance(item, dict):
+                                      found.append(item)
+
+                          walk(child, key_lower)
+
+                  elif isinstance(value, list):
+                      for item in value:
+                          if isinstance(item, (dict, list)):
+                              walk(item, parent_key)
+
+              walk(data)
+
+              return found
+
+          def unique_comments(items):
+              result = []
+              seen = set()
+
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+
+                  cid = item_id(item)
+                  body = normalize(item_body(item))
+                  author = normalize(item_author(item))
+
+                  if not cid:
+                      continue
+
+                  if not body:
+                      continue
+
+                  if cid in seen:
+                      continue
+
+                  seen.add(cid)
+
+                  result.append({
+                      "id": cid,
+                      "author": author,
+                      "body": body,
+                      "parent_id": item_parent_id(item)
+                  })
+
+              return result
 
           # ---------------------------------------------------------
           # 1. API KEY
@@ -185,7 +304,9 @@ jobs:
           api_key = os.environ.get("COLONY_API_KEY")
 
           if not api_key:
-              fail("COLONY_API_KEY is missing.")
+              fail(
+                  "COLONY_API_KEY is missing."
+              )
 
           # ---------------------------------------------------------
           # 2. EXCHANGE API KEY FOR JWT
@@ -193,26 +314,35 @@ jobs:
 
           auth_response = requests.post(
               f"{BASE_URL}/auth/token",
-              json={"api_key": api_key},
+              json={
+                  "api_key": api_key
+              },
               timeout=30
           )
 
           if auth_response.status_code >= 400:
               fail(
-                  f"Authentication failed "
+                  "Authentication failed "
                   f"{auth_response.status_code}: "
                   f"{auth_response.text[:700]}"
               )
 
-          auth_data = auth_response.json()
+          try:
+              auth_data = auth_response.json()
+          except Exception as exc:
+              fail(
+                  f"Authentication response was not valid JSON: {exc}"
+              )
 
           token = auth_data.get("access_token")
 
           if not token:
-              fail("No access_token returned by The Colony.")
+              fail(
+                  "No access_token returned by The Colony."
+              )
 
           # ---------------------------------------------------------
-          # 3. VERIFY NØX
+          # 3. VERIFY NØX IDENTITY
           # ---------------------------------------------------------
 
           me = get_json(
@@ -220,15 +350,20 @@ jobs:
               token
           )
 
+          if isinstance(me.get("user"), dict):
+              me_user = me["user"]
+          else:
+              me_user = me
+
           nox_username = (
-              me.get("username")
-              or me.get("user", {}).get("username")
+              me_user.get("username")
+              or me.get("username")
               or "nox_origine"
           )
 
           nox_id = str(
-              me.get("id")
-              or me.get("user", {}).get("id")
+              me_user.get("id")
+              or me.get("id")
               or ""
           )
 
@@ -249,7 +384,7 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 5. IDENTIFY V70.2 POST
+          # 5. IDENTIFY V70.2 PUBLICATION
           # ---------------------------------------------------------
 
           post_id = ""
@@ -273,23 +408,23 @@ jobs:
               or "Proposal: a structured WORK_REQUEST format for executable tasks"
           )
 
-          # Check nested publication objects if necessary.
-          if not post_id:
+          # ---------------------------------------------------------
+          # 6. CHECK NESTED PUBLICATION OBJECTS
+          # ---------------------------------------------------------
 
+          if not post_id:
               for key in [
                   "publication",
                   "post",
                   "result",
                   "data"
               ]:
-
                   nested = publication.get(key)
 
                   if not isinstance(nested, dict):
                       continue
 
                   for id_key in possible_id_keys:
-
                       value = nested.get(id_key)
 
                       if value:
@@ -300,15 +435,16 @@ jobs:
                       break
 
           # ---------------------------------------------------------
-          # 6. FALLBACK: SEARCH RECENT POSTS
+          # 7. FALLBACK: SEARCH RECENT POSTS
           # ---------------------------------------------------------
 
           if not post_id:
-
               posts_data = get_json(
                   f"{BASE_URL}/posts",
                   token,
-                  params={"limit": 100}
+                  params={
+                      "limit": 100
+                  }
               )
 
               posts = extract_items(posts_data)
@@ -317,30 +453,31 @@ jobs:
                   publication_title
               ).lower()
 
-              for post in posts:
+              for candidate in posts:
+                  if not isinstance(candidate, dict):
+                      continue
 
                   title = normalize(
-                      post.get("title", "")
+                      candidate.get("title", "")
                   ).lower()
 
-                  author = item_author(
-                      post
+                  author = normalize(
+                      item_author(candidate)
                   ).lower()
 
                   if (
                       title == title_target
                       and (
-                          author == str(nox_username).lower()
+                          author == str(
+                              nox_username
+                          ).lower()
                           or author in [
                               "nox_origine",
                               "nøx origin"
                           ]
                       )
                   ):
-
-                      post_id = item_id(
-                          post
-                      )
+                      post_id = item_id(candidate)
                       break
 
           if not post_id:
@@ -349,7 +486,7 @@ jobs:
               )
 
           # ---------------------------------------------------------
-          # 7. FETCH DIRECT POST
+          # 8. FETCH DIRECT POST
           # ---------------------------------------------------------
 
           post = get_json(
@@ -358,7 +495,7 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 8. FETCH FULL CONTEXT
+          # 9. FETCH FULL PRIMARY-SOURCE CONTEXT
           # ---------------------------------------------------------
 
           context = get_json(
@@ -367,76 +504,51 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 9. EXTRACT COMMENTS FROM CONTEXT
+          # 10. EXTRACT COMMENTS
           # ---------------------------------------------------------
 
-          comments = []
+          comment_candidates = []
 
-          context_candidates = [
+          # Direct known structures first.
+          if isinstance(
               context.get("comments"),
-              context.get("data", {}).get("comments")
-              if isinstance(context.get("data"), dict)
-              else None,
-              context.get("post", {}).get("comments")
-              if isinstance(context.get("post"), dict)
-              else None
-          ]
-
-          for candidate in context_candidates:
-
-              if isinstance(candidate, list):
-                  comments.extend(candidate)
-
-          # Recursive fallback for unusual API structures.
-          if not comments:
-
-              comments = extract_items(
-                  context
+              list
+          ):
+              comment_candidates.extend(
+                  context["comments"]
               )
 
-          # ---------------------------------------------------------
-          # 10. NORMALIZE REAL COMMUNITY COMMENTS
-          # ---------------------------------------------------------
+          data = context.get("data")
 
-          real_comments = []
+          if isinstance(data, dict):
+              if isinstance(
+                  data.get("comments"),
+                  list
+              ):
+                  comment_candidates.extend(
+                      data["comments"]
+                  )
 
-          seen_comment_ids = set()
+          context_post = context.get("post")
 
-          for comment in comments:
+          if isinstance(context_post, dict):
+              if isinstance(
+                  context_post.get("comments"),
+                  list
+              ):
+                  comment_candidates.extend(
+                      context_post["comments"]
+                  )
 
-              if not isinstance(comment, dict):
-                  continue
-
-              cid = item_id(
-                  comment
+          # Recursive explicit-comment fallback.
+          if not comment_candidates:
+              comment_candidates.extend(
+                  collect_comment_lists(context)
               )
 
-              body = normalize(
-                  item_body(comment)
-              )
-
-              author = item_author(
-                  comment
-              )
-
-              if not cid:
-                  continue
-
-              if cid in seen_comment_ids:
-                  continue
-
-              seen_comment_ids.add(cid)
-
-              real_comments.append({
-                  "id": cid,
-                  "author": author,
-                  "body": body,
-                  "parent_id": str(
-                      comment.get("parent_id")
-                      or ""
-                  ),
-                  "raw": comment
-              })
+          comments = unique_comments(
+              comment_candidates
+          )
 
           # ---------------------------------------------------------
           # 11. SEPARATE COMMUNITY FROM NØX
@@ -445,22 +557,19 @@ jobs:
           community_comments = []
           nox_comments = []
 
-          for comment in real_comments:
-
+          for comment in comments:
               author = comment["author"].lower()
 
+              raw_author_id = ""
+
+              # The normalized comment no longer contains raw data,
+              # so identity is primarily determined by username here.
               is_nox = (
-                  author == str(nox_username).lower()
+                  author == str(
+                      nox_username
+                  ).lower()
                   or author == "nox_origine"
                   or author == "nøx origin"
-                  or (
-                      nox_id
-                      and str(
-                          comment["raw"].get("author_id")
-                          or comment["raw"].get("user_id")
-                          or ""
-                      ) == nox_id
-                  )
               )
 
               if is_nox:
@@ -478,18 +587,16 @@ jobs:
               "processed_comment_ids",
               "replied_comment_ids"
           ]:
-
               values = v71.get(key)
 
               if isinstance(values, list):
-
                   for value in values:
                       v71_processed_ids.add(
                           str(value)
                       )
 
           # ---------------------------------------------------------
-          # 13. COMPARE V71 WITH REAL API DATA
+          # 13. COMPARE V71 WITH PRIMARY SOURCE
           # ---------------------------------------------------------
 
           actual_community_ids = {
@@ -508,26 +615,27 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 14. RECOVER COMMUNITY EVIDENCE
+          # 14. RECOVER PRIMARY-SOURCE COMMUNITY EVIDENCE
           # ---------------------------------------------------------
 
           recovered_evidence = []
 
           for comment in community_comments:
-
-              evidence = {
+              recovered_evidence.append({
                   "comment_id": comment["id"],
                   "author": comment["author"],
                   "body": comment["body"],
-                  "parent_id": comment["parent_id"]
-              }
-
-              recovered_evidence.append(
-                  evidence
-              )
+                  "parent_id": comment["parent_id"],
+                  "source": {
+                      "post_id": post_id,
+                      "endpoint": (
+                          f"/posts/{post_id}/context"
+                      )
+                  }
+              })
 
           # ---------------------------------------------------------
-          # 15. SIGNAL ANALYSIS ON REAL COMMENTS
+          # 15. SIGNAL ANALYSIS ON PRIMARY-SOURCE COMMENTS
           # ---------------------------------------------------------
 
           real_text = " ".join(
@@ -551,9 +659,9 @@ jobs:
                   "acceptance criteria",
                   "checkable",
                   "independent",
-                  "verify"
+                  "verify",
+                  "validation"
               ]),
-
               "closure": contains_any([
                   "closure",
                   "closed",
@@ -565,7 +673,6 @@ jobs:
                   "escalation",
                   "assigned"
               ]),
-
               "payment": contains_any([
                   "payment",
                   "payable",
@@ -576,7 +683,6 @@ jobs:
                   "usdc",
                   "transaction"
               ]),
-
               "structure": contains_any([
                   "field",
                   "format",
@@ -587,7 +693,6 @@ jobs:
                   "task",
                   "deliverable"
               ]),
-
               "noise": contains_any([
                   "signal",
                   "noise",
@@ -599,17 +704,23 @@ jobs:
           }
 
           # ---------------------------------------------------------
-          # 16. AUDIT V72
+          # 16. AUDIT V72 INPUT
           # ---------------------------------------------------------
 
-          v72_observation_count = len(
-              v72.get("observations", [])
-              if isinstance(
-                  v72.get("observations"),
-                  list
-              )
-              else []
+          v72_observations = v72.get(
+              "observations",
+              []
           )
+
+          if isinstance(
+              v72_observations,
+              list
+          ):
+              v72_observation_count = len(
+                  v72_observations
+              )
+          else:
+              v72_observation_count = 0
 
           actual_count = len(
               community_comments
@@ -625,7 +736,7 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 17. IDENTIFY THE ACTUAL FAILURE
+          # 17. IDENTIFY ACTUAL FAILURE
           # ---------------------------------------------------------
 
           failure_reasons = []
@@ -633,19 +744,20 @@ jobs:
           if v72_recovery_failure:
               failure_reasons.append(
                   "V72 reported no usable community observation "
-                  "despite the V70.2 post containing community comments."
+                  "despite community comments being recoverable "
+                  "from the V70.2 primary source."
               )
 
           if missing_from_v71:
               failure_reasons.append(
-                  "Some real community comment IDs were not represented "
-                  "in V71 processed-comment memory."
+                  "Some real community comment IDs were not "
+                  "represented in V71 processed-comment memory."
               )
 
           if not community_comments:
               failure_reasons.append(
-                  "The V73 context response did not expose community "
-                  "comments in the expected structures."
+                  "The V73 primary-source context did not expose "
+                  "recoverable community comments."
               )
 
           if not failure_reasons:
@@ -658,40 +770,38 @@ jobs:
           # ---------------------------------------------------------
 
           if v72_recovery_failure:
-
               audit_status = (
                   "V72_INPUT_RECOVERY_FAILURE_CONFIRMED"
               )
 
               conclusion = (
-                  "V72 did not receive or recover the community evidence "
-                  "that was actually available on the V70.2 publication. "
-                  "Its confidence score and insufficient-evidence status "
-                  "therefore described an input-recovery failure rather "
-                  "than a genuine absence of community evidence."
+                  "V72 did not receive or recover the community "
+                  "evidence that was available on the V70.2 "
+                  "publication. Its insufficient-evidence result "
+                  "therefore described an input-recovery failure "
+                  "rather than a genuine absence of community evidence."
               )
 
           elif actual_count > 0:
-
               audit_status = (
                   "COMMUNITY_EVIDENCE_RECOVERED"
               )
 
               conclusion = (
-                  "V73 successfully recovered community evidence directly "
-                  "from the V70.2 publication and can use it to compare "
-                  "against previous memory."
+                  "V73 successfully recovered community evidence "
+                  "directly from the V70.2 publication and can use "
+                  "that evidence to audit previous memory and "
+                  "evolution decisions."
               )
 
           else:
-
               audit_status = (
                   "EVIDENCE_NOT_RECOVERED"
               )
 
               conclusion = (
-                  "V73 could not recover community comments from the "
-                  "available API context."
+                  "V73 could not recover community comments from "
+                  "the available primary-source API context."
               )
 
           # ---------------------------------------------------------
@@ -700,32 +810,40 @@ jobs:
 
           learning = [
               (
-                  "A local memory file must not be treated as the sole "
-                  "source of truth when the original external evidence "
-                  "can be retrieved."
+                  "A local memory file must not be treated as the "
+                  "sole source of truth when the original external "
+                  "evidence can be retrieved."
               ),
               (
                   "Before declaring insufficient evidence, NØX should "
-                  "verify whether the source itself contains recoverable "
-                  "evidence."
+                  "verify whether the original source itself contains "
+                  "recoverable evidence."
               ),
               (
-                  "Input-recovery failure and genuine evidence absence "
-                  "must be represented as different states."
+                  "Input-recovery failure and genuine evidence "
+                  "absence must be represented as different states."
               ),
               (
-                  "Direct source verification should precede confidence "
-                  "scoring whenever the source is accessible."
+                  "Direct source verification should precede "
+                  "confidence scoring whenever the source is accessible."
               )
           ]
 
           if actual_count > 0:
-
               learning.append(
                   (
-                      "The V70.2 publication currently contains "
+                      "The V70.2 primary source currently exposes "
                       f"{actual_count} community comment(s) recoverable "
-                      "through the source context."
+                      "through the context endpoint."
+                  )
+              )
+
+          if missing_from_v71:
+              learning.append(
+                  (
+                      "V71 memory did not fully represent the "
+                      "community evidence currently recoverable "
+                      "from the primary source."
                   )
               )
 
@@ -737,18 +855,20 @@ jobs:
               "version": "V74",
               "purpose": (
                   "Use recovered primary-source community evidence "
-                  "to rebuild and improve NØX's evolution proposal."
+                  "to rebuild and improve NØX's autonomous evolution proposal."
               ),
               "required_inputs": [
-                  "V73 recovered community comments",
+                  "V73 recovered primary-source community comments",
                   "V71 validation memory",
                   "V72 autonomous evolution proposal"
               ],
               "principles": [
                   "Primary source before local summary.",
                   "Evidence absence must be distinguished from retrieval failure.",
-                  "Community feedback must be traceable to source comments.",
-                  "Confidence must reflect evidence quality, not only quantity."
+                  "Every important community observation should remain traceable to a source comment.",
+                  "Confidence must reflect evidence quality and source accessibility, not only quantity.",
+                  "Community criticism, support, contradictions and proposed changes should be preserved as learning evidence.",
+                  "V72's retrieval failure should become a regression case for future versions."
               ]
           }
 
@@ -760,12 +880,10 @@ jobs:
               "version": "V73",
               "generated_at": now,
               "mode": "community_evidence_recovery_audit",
-
               "agent": {
                   "id": nox_id,
                   "username": nox_username
               },
-
               "source": {
                   "post_id": post_id,
                   "title": (
@@ -773,19 +891,17 @@ jobs:
                       or publication_title
                   ),
                   "direct_post_retrieved": True,
-                  "context_retrieved": True
+                  "context_retrieved": True,
+                  "primary_source_verified": True
               },
-
               "source_counts": {
-                  "total_context_comments": len(real_comments),
+                  "total_context_comments": len(comments),
                   "community_comments": actual_count,
                   "nox_comments": len(nox_comments)
               },
-
               "recovered_community_evidence": (
                   recovered_evidence
               ),
-
               "memory_comparison": {
                   "v71_processed_comment_ids": sorted(
                       v71_processed_ids
@@ -796,9 +912,7 @@ jobs:
                   "missing_from_v71": missing_from_v71,
                   "stale_in_v71": stale_in_v71
               },
-
               "real_signals": real_signals,
-
               "v72_audit": {
                   "v72_observation_count": (
                       v72_observation_count
@@ -809,15 +923,10 @@ jobs:
                   ),
                   "audit_status": audit_status
               },
-
               "failure_reasons": failure_reasons,
-
               "conclusion": conclusion,
-
               "learning": learning,
-
               "v74_proposal": v74_proposal,
-
               "decision": {
                   "automatic_rule_change": False,
                   "automatic_publication": False,
@@ -827,19 +936,16 @@ jobs:
                   "gemini": False,
                   "human_decision_required_before_rule_deployment": True
               },
-
               "answer_status": (
                   "PRIMARY_SOURCE_EVIDENCE_RECOVERED"
-                  if actual_count > 0
+                  if evidence_recovery_success
                   else "EVIDENCE_NOT_RECOVERED"
               ),
-
               "confidence": (
                   0.94
-                  if actual_count > 0
+                  if evidence_recovery_success
                   else 0.30
               ),
-
               "safety": {
                   "automatic_external_action": False,
                   "automatic_rule_change": False,
@@ -877,4 +983,432 @@ jobs:
           md = []
 
           md.append(
-              "# NØX Origin — V73 Community Evidence
+              "# NØX Origin — V73 Community Evidence Recovery Audit"
+          )
+
+          md.append("")
+
+          md.append(
+              f"Generated: {now}"
+          )
+
+          md.append("")
+
+          md.append(
+              "## Objective"
+          )
+
+          md.append("")
+
+          md.append(
+              "Recover community feedback directly from the V70.2 "
+              "publication, compare it with V71 memory, and determine "
+              "whether V72 failed because evidence was absent or "
+              "because evidence recovery failed."
+          )
+
+          md.append("")
+
+          md.append(
+              "## Primary source"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- Post ID: `{post_id}`"
+          )
+
+          md.append(
+              f"- Title: {post.get('title') or publication_title}"
+          )
+
+          md.append(
+              "- Direct post retrieved: YES"
+          )
+
+          md.append(
+              "- Full context retrieved: YES"
+          )
+
+          md.append(
+              "- Primary source verified: YES"
+          )
+
+          md.append("")
+
+          md.append(
+              "## Recovered comments"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- Total context comments: {len(comments)}"
+          )
+
+          md.append(
+              f"- Community comments: {actual_count}"
+          )
+
+          md.append(
+              f"- NØX comments: {len(nox_comments)}"
+          )
+
+          md.append("")
+
+          for index, comment in enumerate(
+              community_comments,
+              start=1
+          ):
+              md.append(
+                  f"### Community comment {index}"
+              )
+
+              md.append("")
+
+              md.append(
+                  f"- ID: `{comment['id']}`"
+              )
+
+              md.append(
+                  f"- Author: {comment['author'] or 'unknown'}"
+              )
+
+              md.append(
+                  f"- Parent ID: `{comment['parent_id']}`"
+              )
+
+              md.append("")
+
+              md.append(
+                  f"> {comment['body']}"
+              )
+
+              md.append("")
+
+          md.append(
+              "## V71 memory comparison"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- IDs stored by V71: {len(v71_processed_ids)}"
+          )
+
+          md.append(
+              f"- Actual community IDs: {len(actual_community_ids)}"
+          )
+
+          md.append(
+              f"- Missing from V71: {len(missing_from_v71)}"
+          )
+
+          md.append(
+              f"- Stale in V71: {len(stale_in_v71)}"
+          )
+
+          md.append("")
+
+          md.append(
+              "### Missing comment IDs"
+          )
+
+          md.append("")
+
+          if missing_from_v71:
+              for cid in missing_from_v71:
+                  md.append(
+                      f"- `{cid}`"
+                  )
+          else:
+              md.append(
+                  "- None"
+              )
+
+          md.append("")
+
+          md.append(
+              "## Real community signals"
+          )
+
+          md.append("")
+
+          for key, value in real_signals.items():
+              md.append(
+                  f"- {key}: {'YES' if value else 'NO'}"
+              )
+
+          md.append("")
+
+          md.append(
+              "## V72 audit"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- V72 observation count: {v72_observation_count}"
+          )
+
+          md.append(
+              f"- Actual community comment count: {actual_count}"
+          )
+
+          md.append(
+              " - Recovery failure confirmed: "
+              f"{'YES' if v72_recovery_failure else 'NO'}"
+          )
+
+          md.append(
+              f"- Audit status: `{audit_status}`"
+          )
+
+          md.append("")
+
+          md.append(
+              "### Conclusion"
+          )
+
+          md.append("")
+
+          md.append(
+              conclusion
+          )
+
+          md.append("")
+
+          md.append(
+              "## NØX learning"
+          )
+
+          md.append("")
+
+          for lesson in learning:
+              md.append(
+                  f"- {lesson}"
+              )
+
+          md.append("")
+
+          md.append(
+              "## Proposed V74 direction"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- Purpose: {v74_proposal['purpose']}"
+          )
+
+          md.append("")
+
+          md.append(
+              "Required inputs:"
+          )
+
+          for value in v74_proposal["required_inputs"]:
+              md.append(
+                  f"- {value}"
+              )
+
+          md.append("")
+
+          md.append(
+              "Principles:"
+          )
+
+          for value in v74_proposal["principles"]:
+              md.append(
+                  f"- {value}"
+              )
+
+          md.append("")
+
+          md.append(
+              "## Decision"
+          )
+
+          md.append("")
+
+          md.append(
+              "- Automatic rule change: NO"
+          )
+
+          md.append(
+              "- Automatic publication: NO"
+          )
+
+          md.append(
+              "- Automatic contact: NO"
+          )
+
+          md.append(
+              "- Automatic bidding: NO"
+          )
+
+          md.append(
+              "- Automatic payment: NO"
+          )
+
+          md.append(
+              "- Gemini: DISABLED"
+          )
+
+          md.append(
+              "- Project cost: €0"
+          )
+
+          md.append(
+              "- Human decision required before rule deployment: YES"
+          )
+
+          md.append("")
+
+          md.append(
+              "## Answer status"
+          )
+
+          md.append("")
+
+          md.append(
+              f"- Status: `{audit['answer_status']}`"
+          )
+
+          md.append(
+              f"- Confidence: {audit['confidence']}"
+          )
+
+          md.append("")
+
+          OUTPUT_MD.write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          # ---------------------------------------------------------
+          # 24. GIT COMMIT
+          # ---------------------------------------------------------
+
+          import subprocess
+
+          subprocess.run(
+              [
+                  "git",
+                  "config",
+                  "user.name",
+                  "NØX Origin"
+              ],
+              check=True
+          )
+
+          subprocess.run(
+              [
+                  "git",
+                  "config",
+                  "user.email",
+                  "nox-origin@users.noreply.github.com"
+              ],
+              check=True
+          )
+
+          subprocess.run(
+              [
+                  "git",
+                  "add",
+                  str(OUTPUT_JSON),
+                  str(OUTPUT_MD)
+              ],
+              check=True
+          )
+
+          status = subprocess.run(
+              [
+                  "git",
+                  "status",
+                  "--porcelain"
+              ],
+              capture_output=True,
+              text=True,
+              check=True
+          )
+
+          if status.stdout.strip():
+              subprocess.run(
+                  [
+                      "git",
+                      "commit",
+                      "-m",
+                      "NØX V73 community evidence recovery audit"
+                  ],
+                  check=True
+              )
+
+              subprocess.run(
+                  [
+                      "git",
+                      "push"
+                  ],
+                  check=True
+              )
+
+          # ---------------------------------------------------------
+          # 25. RUN SUMMARY
+          # ---------------------------------------------------------
+
+          print("")
+          print("==============================================")
+          print("NØX V73 COMMUNITY EVIDENCE RECOVERY AUDIT")
+          print("==============================================")
+          print(
+              f"Post ID: {post_id}"
+          )
+          print(
+              f"Community comments recovered: {actual_count}"
+          )
+          print(
+              f"NØX comments: {len(nox_comments)}"
+          )
+          print(
+              f"V71 stored IDs: {len(v71_processed_ids)}"
+          )
+          print(
+              f"Missing from V71: {len(missing_from_v71)}"
+          )
+          print(
+              f"V72 observations: {v72_observation_count}"
+          )
+          print(
+              "V72 recovery failure confirmed: "
+              f"{'YES' if v72_recovery_failure else 'NO'}"
+          )
+          print(
+              f"Audit status: {audit_status}"
+          )
+          print(
+              f"Answer status: {audit['answer_status']}"
+          )
+          print(
+              f"Confidence: {audit['confidence']}"
+          )
+          print(
+              "Automatic rule change: NO"
+          )
+          print(
+              "Automatic publication: NO"
+          )
+          print(
+              "Automatic contact: NO"
+          )
+          print(
+              "Automatic payment: NO"
+          )
+          print(
+              "Gemini: DISABLED"
+          )
+          print(
+              "Project cost: €0"
+          )
+          print("==============================================")
+          PY
