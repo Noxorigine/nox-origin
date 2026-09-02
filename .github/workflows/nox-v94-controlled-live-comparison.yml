@@ -1,0 +1,1252 @@
+name: NØX V94 — Controlled Live Comparison
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-v94-controlled-live-comparison
+  cancel-in-progress: false
+
+jobs:
+  controlled-live-comparison:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: python -m pip install requests
+
+      - name: Run V94
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import requests
+          from datetime import datetime, timezone
+
+          BASE_URL = "https://thecolony.ai/api/v1"
+          MEMORY = "memory"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load(name):
+              path = os.path.join(MEMORY, name)
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+          def save(name, data):
+              os.makedirs(MEMORY, exist_ok=True)
+              path = os.path.join(MEMORY, name)
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(
+                      data,
+                      f,
+                      indent=2,
+                      ensure_ascii=False
+                  )
+
+          def text(value):
+              if value is None:
+                  return ""
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, (int, float, bool)):
+                  return str(value)
+              try:
+                  return json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      sort_keys=True
+                  )
+              except Exception:
+                  return str(value)
+
+          def number(value, default=0.0):
+              try:
+                  return float(value)
+              except Exception:
+                  return default
+
+          def get_items(value):
+              if isinstance(value, list):
+                  return value
+
+              if isinstance(value, dict):
+                  for key in [
+                      "items",
+                      "posts",
+                      "data",
+                      "results",
+                      "suggestions"
+                  ]:
+                      if isinstance(value.get(key), list):
+                          return value[key]
+
+              return []
+
+          # ---------------------------------------------------------
+          # LOAD PREVIOUS NØX MEMORY
+          # ---------------------------------------------------------
+
+          v92 = load(
+              "nox_v92_autonomous_self_correction_proposal.json"
+          )
+
+          v93 = load(
+              "nox_v93_autonomous_self_correction_validation.json"
+          )
+
+          v90 = load(
+              "nox_v90_autonomous_decision_framework.json"
+          )
+
+          v91 = load(
+              "nox_v91_autonomous_decision_stability.json"
+          )
+
+          # ---------------------------------------------------------
+          # READ V92 SELECTED CORRECTION
+          # ---------------------------------------------------------
+
+          selected = v92.get(
+              "selected_correction",
+              {}
+          )
+
+          if not isinstance(selected, dict):
+              selected = {}
+
+          correction_id = text(
+              selected.get("id")
+          )
+
+          correction_name = text(
+              selected.get("name")
+          )
+
+          validation_status = text(
+              v93.get(
+                  "answer_status",
+                  v93.get(
+                      "validation",
+                      {}
+                  )
+              )
+          )
+
+          if isinstance(validation_status, dict):
+              validation_status = text(
+                  validation_status.get("status")
+              )
+
+          # ---------------------------------------------------------
+          # AUTHENTICATION
+          #
+          # The Colony currently documents JWT exchange for
+          # authenticated agent calls.
+          # ---------------------------------------------------------
+
+          api_key = os.environ.get(
+              "COLONY_API_KEY"
+          )
+
+          if not api_key:
+              raise RuntimeError(
+                  "COLONY_API_KEY secret is missing"
+              )
+
+          token_response = requests.post(
+              BASE_URL + "/auth/token",
+              json={"api_key": api_key},
+              timeout=20
+          )
+
+          token_response.raise_for_status()
+
+          token_data = token_response.json()
+
+          token = token_data.get(
+              "access_token"
+          )
+
+          if not token:
+              raise RuntimeError(
+                  "No access_token returned by Colony"
+              )
+
+          headers = {
+              "Authorization": "Bearer " + token,
+              "Accept": "application/json"
+          }
+
+          # ---------------------------------------------------------
+          # VERIFY IDENTITY
+          # ---------------------------------------------------------
+
+          me_response = requests.get(
+              BASE_URL + "/users/me",
+              headers=headers,
+              timeout=20
+          )
+
+          me_response.raise_for_status()
+
+          me = me_response.json()
+
+          my_id = text(
+              me.get("id")
+          )
+
+          my_username = text(
+              me.get("username")
+          )
+
+          # ---------------------------------------------------------
+          # FETCH SMALL LIVE SAMPLES
+          # ---------------------------------------------------------
+
+          live_sources = {
+              "for_you": [],
+              "suggestions": [],
+              "public_posts": []
+          }
+
+          errors = []
+
+          requests_to_make = [
+              (
+                  "for_you",
+                  BASE_URL
+                  + "/feed/for-you?limit=7"
+              ),
+              (
+                  "suggestions",
+                  BASE_URL
+                  + "/suggestions?limit=10"
+              ),
+              (
+                  "public_posts",
+                  BASE_URL
+                  + "/posts?limit=10"
+              )
+          ]
+
+          for name, url in requests_to_make:
+              try:
+                  response = requests.get(
+                      url,
+                      headers=headers,
+                      timeout=20
+                  )
+
+                  response.raise_for_status()
+
+                  live_sources[name] = get_items(
+                      response.json()
+                  )
+
+              except Exception as exc:
+                  errors.append({
+                      "source": name,
+                      "error": str(exc)
+                  })
+
+          # ---------------------------------------------------------
+          # NORMALIZE AND DEDUPLICATE
+          # ---------------------------------------------------------
+
+          candidates = {}
+          source_map = {}
+
+          for source_name, items in live_sources.items():
+
+              for item in items:
+
+                  if not isinstance(item, dict):
+                      continue
+
+                  post_id = text(
+                      item.get("id")
+                      or item.get("post_id")
+                  )
+
+                  if not post_id:
+                      continue
+
+                  author = item.get(
+                      "author",
+                      {}
+                  )
+
+                  if not isinstance(author, dict):
+                      author = {}
+
+                  author_id = text(
+                      item.get("author_id")
+                      or author.get("id")
+                  )
+
+                  author_username = text(
+                      item.get("author_username")
+                      or author.get("username")
+                  )
+
+                  if (
+                      author_id == my_id
+                      or (
+                          my_username
+                          and author_username == my_username
+                      )
+                  ):
+                      continue
+
+                  candidates[post_id] = item
+
+                  source_map.setdefault(
+                      post_id,
+                      []
+                  ).append(source_name)
+
+          # ---------------------------------------------------------
+          # SIGNAL EXTRACTION
+          # ---------------------------------------------------------
+
+          def build_case(item):
+              title = text(
+                  item.get("title")
+              )
+
+              body = text(
+                  item.get("body")
+                  or item.get("content")
+                  or item.get("text")
+              )
+
+              post_type = text(
+                  item.get("post_type")
+                  or item.get("type")
+              ).lower()
+
+              combined = (
+                  title
+                  + " "
+                  + body
+              ).lower()
+
+              request = any(
+                  term in combined
+                  for term in [
+                      "i need",
+                      "need someone",
+                      "looking for",
+                      "seeking",
+                      "can someone",
+                      "who can",
+                      "i'm looking",
+                      "help wanted",
+                      "work request",
+                      "request for"
+                  ]
+              )
+
+              delegation = any(
+                  term in combined
+                  for term in [
+                      "build this",
+                      "fix this",
+                      "create this",
+                      "please build",
+                      "please fix",
+                      "please create",
+                      "looking for someone",
+                      "hire",
+                      "hiring",
+                      "need an agent"
+                  ]
+              )
+
+              deliverable = any(
+                  term in combined
+                  for term in [
+                      "deliverable",
+                      "deliver",
+                      "output",
+                      "submit",
+                      "provide",
+                      "produce",
+                      "build",
+                      "fix",
+                      "create"
+                  ]
+              )
+
+              acceptance = any(
+                  term in combined
+                  for term in [
+                      "acceptance criteria",
+                      "must pass",
+                      "requirements",
+                      "criteria",
+                      "expected result",
+                      "success criteria"
+                  ]
+              )
+
+              reward = any(
+                  term in combined
+                  for term in [
+                      "reward",
+                      "paid",
+                      "payment",
+                      "pay",
+                      "sats",
+                      "bitcoin",
+                      "btc",
+                      "usdc",
+                      "usd"
+                  ]
+              )
+
+              completion = any(
+                  term in combined
+                  for term in [
+                      "completed",
+                      "finished",
+                      "done",
+                      "delivered",
+                      "shipped",
+                      "settled",
+                      "paid out"
+                  ]
+              )
+
+              analysis_only = (
+                  post_type in [
+                      "analysis",
+                      "finding"
+                  ]
+                  and not request
+                  and not delegation
+              )
+
+              atypical = (
+                  delegation
+                  and deliverable
+                  and reward
+                  and not completion
+              )
+
+              return {
+                  "request": request,
+                  "delegation": delegation,
+                  "deliverable": deliverable,
+                  "acceptance": acceptance,
+                  "reward": reward,
+                  "completion": completion,
+                  "analysis_only": analysis_only,
+                  "atypical": atypical,
+                  "post_type": post_type
+              }
+
+          # ---------------------------------------------------------
+          # CURRENT / BASELINE V90-STYLE SCORING
+          # ---------------------------------------------------------
+
+          def baseline_score(case):
+              score = 0
+
+              if case["request"]:
+                  score += 30
+
+              if case["delegation"]:
+                  score += 20
+
+              if case["deliverable"]:
+                  score += 15
+
+              if case["acceptance"]:
+                  score += 15
+
+              if case["reward"]:
+                  score += 10
+
+              if case["completion"]:
+                  score -= 35
+
+              if case["analysis_only"]:
+                  score -= 20
+
+              if (
+                  case["request"]
+                  and case["delegation"]
+              ):
+                  score += 5
+
+              if (
+                  case["acceptance"]
+                  and case["deliverable"]
+              ):
+                  score += 5
+
+              return score
+
+          def baseline_class(case, score):
+              if case["completion"]:
+                  return "EXCLUDE_COMPLETED"
+
+              if (
+                  case["request"]
+                  and case["delegation"]
+                  and case["deliverable"]
+                  and case["acceptance"]
+              ):
+                  return "HIGH_CONFIDENCE_OPPORTUNITY"
+
+              if (
+                  case["request"]
+                  and case["delegation"]
+              ):
+                  return "STRONG_OPPORTUNITY_CANDIDATE"
+
+              if (
+                  case["request"]
+                  or case["delegation"]
+              ):
+                  return "CONTEXTUAL_OPPORTUNITY"
+
+              if case["atypical"]:
+                  return "ATYPICAL_SIGNAL"
+
+              return "LOW_PRIORITY_SIGNAL"
+
+          # ---------------------------------------------------------
+          # SHADOW CORRECTION
+          #
+          # IMPORTANT:
+          # This never changes production rules.
+          # It only calculates an alternative decision.
+          # ---------------------------------------------------------
+
+          def corrected_score(case, correction):
+              score = baseline_score(case)
+
+              if correction == "CORR_A_EVIDENCE_CONVERGENCE":
+
+                  if (
+                      case["request"]
+                      and case["delegation"]
+                  ):
+                      score += 8
+
+                  if (
+                      case["request"]
+                      and case["delegation"]
+                      and case["deliverable"]
+                  ):
+                      score += 7
+
+                  if (
+                      case["request"]
+                      and case["delegation"]
+                      and case["deliverable"]
+                      and case["acceptance"]
+                  ):
+                      score += 10
+
+                  if (
+                      not case["request"]
+                      and not case["delegation"]
+                  ):
+                      score -= 10
+
+              elif correction == "CORR_B_ATYPICAL_RECOVERY":
+
+                  if case["atypical"]:
+                      score += 15
+
+              elif correction == "CORR_C_ACCEPTANCE_PRIORITY":
+
+                  if case["acceptance"]:
+                      score += 15
+
+                  if (
+                      case["request"]
+                      and case["delegation"]
+                      and not case["acceptance"]
+                  ):
+                      score -= 5
+
+              elif correction == "CORR_D_COMPLETION_EXCLUSION":
+
+                  if case["completion"]:
+                      score -= 25
+
+                  if (
+                      case["reward"]
+                      and not case["completion"]
+                  ):
+                      score -= 5
+
+              elif correction == "CORR_E_HISTORY_AS_MODIFIER":
+
+                  score = baseline_score(case)
+
+              return score
+
+          def corrected_class(case, score):
+              if case["completion"]:
+                  return "EXCLUDE_COMPLETED"
+
+              if (
+                  case["request"]
+                  and case["delegation"]
+                  and case["deliverable"]
+                  and case["acceptance"]
+                  and score >= 70
+              ):
+                  return "HIGH_CONFIDENCE_OPPORTUNITY"
+
+              if (
+                  case["request"]
+                  and case["delegation"]
+                  and score >= 55
+              ):
+                  return "STRONG_OPPORTUNITY_CANDIDATE"
+
+              if case["atypical"]:
+                  return "ATYPICAL_SIGNAL"
+
+              if (
+                  case["request"]
+                  or case["delegation"]
+              ):
+                  return "CONTEXTUAL_OPPORTUNITY"
+
+              return "LOW_PRIORITY_SIGNAL"
+
+          # ---------------------------------------------------------
+          # LIVE SHADOW EVALUATION
+          # ---------------------------------------------------------
+
+          evaluations = []
+
+          for post_id, item in candidates.items():
+
+              case = build_case(item)
+
+              base_score = baseline_score(
+                  case
+              )
+
+              base_class = baseline_class(
+                  case,
+                  base_score
+              )
+
+              shadow_score = corrected_score(
+                  case,
+                  correction_id
+              )
+
+              shadow_class = corrected_class(
+                  case,
+                  shadow_score
+              )
+
+              evaluations.append({
+                  "post_id": post_id,
+                  "title": text(
+                      item.get("title")
+                  ),
+                  "sources": source_map.get(
+                      post_id,
+                      []
+                  ),
+                  "signals": case,
+                  "baseline": {
+                      "score": base_score,
+                      "classification": base_class
+                  },
+                  "shadow_correction": {
+                      "score": shadow_score,
+                      "classification": shadow_class
+                  },
+                  "decision_changed": (
+                      base_class != shadow_class
+                  ),
+                  "score_changed": (
+                      base_score != shadow_score
+                  )
+              })
+
+          # ---------------------------------------------------------
+          # LIVE COMPARISON METRICS
+          # ---------------------------------------------------------
+
+          total = len(
+              evaluations
+          )
+
+          changed = sum(
+              1
+              for item in evaluations
+              if item["decision_changed"]
+          )
+
+          baseline_high = sum(
+              1
+              for item in evaluations
+              if item["baseline"]["classification"]
+              == "HIGH_CONFIDENCE_OPPORTUNITY"
+          )
+
+          shadow_high = sum(
+              1
+              for item in evaluations
+              if item["shadow_correction"]["classification"]
+              == "HIGH_CONFIDENCE_OPPORTUNITY"
+          )
+
+          baseline_atypical = sum(
+              1
+              for item in evaluations
+              if item["baseline"]["classification"]
+              == "ATYPICAL_SIGNAL"
+          )
+
+          shadow_atypical = sum(
+              1
+              for item in evaluations
+              if item["shadow_correction"]["classification"]
+              == "ATYPICAL_SIGNAL"
+          )
+
+          baseline_completed = sum(
+              1
+              for item in evaluations
+              if item["baseline"]["classification"]
+              == "EXCLUDE_COMPLETED"
+          )
+
+          shadow_completed = sum(
+              1
+              for item in evaluations
+              if item["shadow_correction"]["classification"]
+              == "EXCLUDE_COMPLETED"
+          )
+
+          # ---------------------------------------------------------
+          # DECISION QUALITY HEURISTICS
+          # ---------------------------------------------------------
+
+          harmful_changes = 0
+          potentially_useful_changes = 0
+
+          for item in evaluations:
+
+              case = item["signals"]
+
+              if not item["decision_changed"]:
+                  continue
+
+              new_class = item[
+                  "shadow_correction"
+              ]["classification"]
+
+              old_class = item[
+                  "baseline"
+              ]["classification"]
+
+              if (
+                  case["analysis_only"]
+                  and new_class
+                  not in [
+                      "LOW_PRIORITY_SIGNAL",
+                      "EXCLUDE_COMPLETED"
+                  ]
+              ):
+                  harmful_changes += 1
+
+              elif (
+                  case["completion"]
+                  and new_class
+                  != "EXCLUDE_COMPLETED"
+              ):
+                  harmful_changes += 1
+
+              elif (
+                  case["request"]
+                  and case["delegation"]
+                  and (
+                      new_class
+                      in [
+                          "HIGH_CONFIDENCE_OPPORTUNITY",
+                          "STRONG_OPPORTUNITY_CANDIDATE"
+                      ]
+                  )
+              ):
+                  potentially_useful_changes += 1
+
+              elif (
+                  case["atypical"]
+                  and new_class
+                  == "ATYPICAL_SIGNAL"
+              ):
+                  potentially_useful_changes += 1
+
+              elif (
+                  old_class
+                  == "LOW_PRIORITY_SIGNAL"
+                  and new_class
+                  in [
+                      "CONTEXTUAL_OPPORTUNITY",
+                      "ATYPICAL_SIGNAL"
+                  ]
+              ):
+                  potentially_useful_changes += 1
+
+          # ---------------------------------------------------------
+          # SHADOW RESULT
+          # ---------------------------------------------------------
+
+          if total == 0:
+              live_result = (
+                  "INSUFFICIENT_LIVE_EVIDENCE"
+              )
+
+          elif harmful_changes > 0:
+              live_result = (
+                  "CORRECTION_SHOWS_LIVE_REGRESSION_RISK"
+              )
+
+          elif potentially_useful_changes > 0:
+              live_result = (
+                  "CORRECTION_SHOWS_LIVE_BENEFIT_SIGNAL"
+              )
+
+          else:
+              live_result = (
+                  "CORRECTION_LIVE_NEUTRAL"
+              )
+
+          # ---------------------------------------------------------
+          # VALIDATION AUTHORITY
+          # ---------------------------------------------------------
+
+          if (
+              v93.get("validation", {}).get("status")
+              == "CORRECTION_VALIDATED_IN_SIMULATION"
+          ):
+              simulation_validated = True
+          else:
+              simulation_validated = (
+                  "CORRECTION_VALIDATED_IN_SIMULATION"
+                  in text(v93)
+              )
+
+          if (
+              live_result
+              == "CORRECTION_SHOWS_LIVE_BENEFIT_SIGNAL"
+              and harmful_changes == 0
+              and simulation_validated
+          ):
+              next_stage = (
+                  "V95_CONTROLLED_CORRECTION_CANDIDATE"
+              )
+
+              authority = (
+                  "READY_FOR_CONTROLLED_REVIEW"
+              )
+
+          elif (
+              live_result
+              == "CORRECTION_LIVE_NEUTRAL"
+          ):
+              next_stage = (
+                  "V95_MORE_LIVE_EVIDENCE"
+              )
+
+              authority = (
+                  "MORE_EVIDENCE_REQUIRED"
+              )
+
+          else:
+              next_stage = (
+                  "V95_CORRECTION_REFINEMENT"
+              )
+
+              authority = (
+                  "DO_NOT_DEPLOY"
+              )
+
+          # ---------------------------------------------------------
+          # CONFIDENCE
+          # ---------------------------------------------------------
+
+          confidence = 0.35
+
+          if simulation_validated:
+              confidence += 0.15
+
+          if total >= 5:
+              confidence += 0.10
+
+          if harmful_changes == 0:
+              confidence += 0.10
+
+          if potentially_useful_changes > 0:
+              confidence += 0.10
+
+          if number(
+              v91.get(
+                  "metrics",
+                  {}
+              ).get(
+                  "overall_stability",
+                  0
+              )
+          ) >= 0.70:
+              confidence += 0.05
+
+          confidence = min(
+              round(confidence, 3),
+              0.90
+          )
+
+          # ---------------------------------------------------------
+          # FINAL RESULT
+          # ---------------------------------------------------------
+
+          result = {
+              "version": "V94",
+              "generated_at": now(),
+              "mode": "controlled_live_shadow_comparison",
+
+              "agent": {
+                  "id": my_id,
+                  "username": my_username
+              },
+
+              "correction": {
+                  "id": correction_id,
+                  "name": correction_name,
+                  "simulation_validation": (
+                      validation_status
+                  )
+              },
+
+              "live_sources": {
+                  "for_you_count": len(
+                      live_sources["for_you"]
+                  ),
+                  "suggestions_count": len(
+                      live_sources["suggestions"]
+                  ),
+                  "public_posts_count": len(
+                      live_sources["public_posts"]
+                  ),
+                  "deduplicated_candidates": total
+              },
+
+              "comparison": {
+                  "decisions_changed": changed,
+                  "baseline_high_confidence": baseline_high,
+                  "shadow_high_confidence": shadow_high,
+                  "baseline_atypical": baseline_atypical,
+                  "shadow_atypical": shadow_atypical,
+                  "baseline_completed_excluded": (
+                      baseline_completed
+                  ),
+                  "shadow_completed_excluded": (
+                      shadow_completed
+                  ),
+                  "potentially_useful_changes": (
+                      potentially_useful_changes
+                  ),
+                  "harmful_changes": harmful_changes
+              },
+
+              "evaluations": evaluations,
+
+              "live_validation": {
+                  "status": live_result,
+                  "confidence": confidence,
+                  "authority": authority,
+                  "next_stage": next_stage
+              },
+
+              "pipeline": {
+                  "identity_verified": True,
+                  "primary_live_sources_used": True,
+                  "shadow_mode": True,
+                  "production_rules_changed": False
+              },
+
+              "autonomy": {
+                  "correction_selected_by_nox": True,
+                  "correction_tested_on_live_data": True,
+                  "shadow_comparison_autonomous": True,
+                  "automatic_rule_deployment": False,
+                  "automatic_external_action": False,
+                  "human_override": True
+              },
+
+              "safety": {
+                  "gemini_disabled": True,
+                  "automatic_external_action": False,
+                  "automatic_contact": False,
+                  "automatic_bidding": False,
+                  "automatic_payment": False,
+                  "production_rules_changed": False,
+                  "zero_cost_constraint": True,
+                  "human_override": True
+              },
+
+              "errors": errors,
+
+              "answer_status": live_result
+          }
+
+          # ---------------------------------------------------------
+          # SAVE JSON
+          # ---------------------------------------------------------
+
+          save(
+              "nox_v94_controlled_live_comparison.json",
+              result
+          )
+
+          # ---------------------------------------------------------
+          # SAVE MARKDOWN
+          # ---------------------------------------------------------
+
+          lines = []
+
+          lines.append(
+              "# NØX V94 — Controlled Live Comparison"
+          )
+          lines.append("")
+          lines.append(
+              "Generated: " + text(
+                  result["generated_at"]
+              )
+          )
+          lines.append("")
+
+          lines.append("## Correction under test")
+          lines.append("")
+          lines.append(
+              "- ID: " + correction_id
+          )
+          lines.append(
+              "- Name: " + correction_name
+          )
+          lines.append(
+              "- V93 validation: "
+              + validation_status
+          )
+          lines.append("")
+
+          lines.append("## Live data")
+          lines.append("")
+          lines.append(
+              "- For-you: "
+              + str(
+                  len(live_sources["for_you"])
+              )
+          )
+          lines.append(
+              "- Suggestions: "
+              + str(
+                  len(live_sources["suggestions"])
+              )
+          )
+          lines.append(
+              "- Public posts: "
+              + str(
+                  len(live_sources["public_posts"])
+              )
+          )
+          lines.append(
+              "- Deduplicated candidates: "
+              + str(total)
+          )
+          lines.append("")
+
+          lines.append("## Shadow comparison")
+          lines.append("")
+          lines.append(
+              "- Decisions changed: "
+              + str(changed)
+          )
+          lines.append(
+              "- Baseline high-confidence: "
+              + str(baseline_high)
+          )
+          lines.append(
+              "- Shadow high-confidence: "
+              + str(shadow_high)
+          )
+          lines.append(
+              "- Baseline atypical: "
+              + str(baseline_atypical)
+          )
+          lines.append(
+              "- Shadow atypical: "
+              + str(shadow_atypical)
+          )
+          lines.append(
+              "- Baseline completed excluded: "
+              + str(baseline_completed)
+          )
+          lines.append(
+              "- Shadow completed excluded: "
+              + str(shadow_completed)
+          )
+          lines.append(
+              "- Potentially useful changes: "
+              + str(
+                  potentially_useful_changes
+              )
+          )
+          lines.append(
+              "- Harmful changes: "
+              + str(
+                  harmful_changes
+              )
+          )
+          lines.append("")
+
+          lines.append("## Live validation")
+          lines.append("")
+          lines.append(
+              "- Status: "
+              + live_result
+          )
+          lines.append(
+              "- Confidence: "
+              + str(confidence)
+          )
+          lines.append(
+              "- Authority: "
+              + authority
+          )
+          lines.append(
+              "- Next stage: "
+              + next_stage
+          )
+          lines.append("")
+
+          lines.append("## Interpretation")
+          lines.append("")
+
+          if live_result == (
+              "CORRECTION_SHOWS_LIVE_BENEFIT_SIGNAL"
+          ):
+              lines.append(
+                  "The selected correction produced a useful "
+                  "signal on the live sample without detected "
+                  "harmful changes. This is evidence for a "
+                  "controlled next step, not permanent deployment."
+              )
+
+          elif live_result == (
+              "CORRECTION_SHOWS_LIVE_REGRESSION_RISK"
+          ):
+              lines.append(
+                  "The shadow correction introduced at least "
+                  "one detected regression risk. It must not "
+                  "be deployed in its current form."
+              )
+
+          elif live_result == (
+              "CORRECTION_LIVE_NEUTRAL"
+          ):
+              lines.append(
+                  "The correction did not produce a meaningful "
+                  "change on the current live sample. More "
+                  "evidence is required."
+              )
+
+          else:
+              lines.append(
+                  "The live sample was too small or unavailable "
+                  "to establish a reliable comparison."
+              )
+
+          lines.append("")
+
+          lines.append("## Safety")
+          lines.append("")
+          lines.append("- Shadow mode: enabled")
+          lines.append("- Production rules changed: false")
+          lines.append("- External action: disabled")
+          lines.append("- Contact: disabled")
+          lines.append("- Bidding: disabled")
+          lines.append("- Payments: disabled")
+          lines.append("- Gemini: disabled")
+          lines.append("- Project cost: €0")
+          lines.append("- Human override: enabled")
+
+          with open(
+              os.path.join(
+                  MEMORY,
+                  "nox_v94_controlled_live_comparison.md"
+              ),
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(
+                  "\n".join(lines)
+              )
+
+          print(
+              json.dumps(
+                  {
+                      "version": "V94",
+                      "status": live_result,
+                      "correction": correction_id,
+                      "candidates": total,
+                      "decisions_changed": changed,
+                      "useful_changes": (
+                          potentially_useful_changes
+                      ),
+                      "harmful_changes": harmful_changes,
+                      "confidence": confidence,
+                      "next_stage": next_stage
+                  },
+                  indent=2,
+                  ensure_ascii=False
+              )
+          )
+
+          PY
+
+      - name: Commit V94 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_v94_controlled_live_comparison.json
+          git add memory/nox_v94_controlled_live_comparison.md
+
+          git diff --cached --quiet || \
+            git commit -m "NØX V94 controlled live comparison"
+
+          git push
