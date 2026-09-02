@@ -1,0 +1,956 @@
+name: NØX V64 — Demand Evidence & Traceability Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  demand-evidence-traceability:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V64 demand evidence gate
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.cc/api/v1"
+          VERSION = "V64"
+          MEMORY_DIR = "memory"
+          MEMORY_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_v64_demand_evidence_traceability_gate.json"
+          )
+
+          os.makedirs(MEMORY_DIR, exist_ok=True)
+
+          api_key = os.environ.get("COLONY_API_KEY")
+          if not api_key:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "NØX-Origin-V64"
+          })
+
+          # ------------------------------------------------------------
+          # Authentication: Colony API key -> JWT
+          # ------------------------------------------------------------
+          auth = session.post(
+              f"{BASE}/auth/token",
+              json={"api_key": api_key},
+              timeout=30
+          )
+          auth.raise_for_status()
+
+          auth_data = auth.json()
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError(
+                  "No JWT token returned by Colony authentication"
+              )
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          def get_json(path):
+              response = session.get(
+                  f"{BASE}{path}",
+                  timeout=30
+              )
+              response.raise_for_status()
+              return response.json()
+
+          # ------------------------------------------------------------
+          # Same observation sources as V63
+          # ------------------------------------------------------------
+          feed_data = get_json("/feed/for-you")
+          public_data = get_json("/posts")
+
+          def extract_items(payload):
+              if isinstance(payload, list):
+                  return payload
+
+              if not isinstance(payload, dict):
+                  return []
+
+              for key in ("posts", "items", "data", "results"):
+                  value = payload.get(key)
+                  if isinstance(value, list):
+                      return value
+
+              return []
+
+          feed_items = extract_items(feed_data)
+          public_items = extract_items(public_data)
+
+          # ------------------------------------------------------------
+          # Normalisation and traceability
+          # ------------------------------------------------------------
+          def text_value(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              return str(value).strip()
+
+          def get_id(item):
+              for key in ("id", "post_id", "uuid"):
+                  value = text_value(item.get(key))
+                  if value:
+                      return value
+              return ""
+
+          def get_title(item):
+              for key in ("title", "name", "subject"):
+                  value = text_value(item.get(key))
+                  if value:
+                      return value
+              return ""
+
+          def get_body(item):
+              for key in (
+                  "body",
+                  "content",
+                  "text",
+                  "description"
+              ):
+                  value = text_value(item.get(key))
+                  if value:
+                      return value
+              return ""
+
+          def get_requester(item):
+              for key in (
+                  "requester",
+                  "author",
+                  "username",
+                  "agent_username"
+              ):
+                  value = text_value(item.get(key))
+
+                  if value:
+                      return value
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  for key in (
+                      "username",
+                      "handle",
+                      "name",
+                      "id"
+                  ):
+                      value = text_value(author.get(key))
+
+                      if value:
+                          return value
+
+              return "unknown"
+
+          def get_post_type(item):
+              for key in (
+                  "post_type",
+                  "type",
+                  "kind",
+                  "category"
+              ):
+                  value = text_value(item.get(key))
+
+                  if value:
+                      return value.lower()
+
+              return ""
+
+          def normalized_item(item, source, source_index):
+              return {
+                  "id": get_id(item),
+                  "title": get_title(item),
+                  "requester": get_requester(item),
+                  "post_type": get_post_type(item),
+                  "body": get_body(item),
+                  "source": source,
+                  "source_index": source_index,
+                  "raw_item_present": bool(item),
+                  "raw_item_keys": (
+                      sorted(list(item.keys()))
+                      if isinstance(item, dict)
+                      else []
+                  )
+              }
+
+          normalized = []
+
+          for i, item in enumerate(feed_items):
+              normalized.append(
+                  normalized_item(item, "for_you_feed", i)
+              )
+
+          for i, item in enumerate(public_items):
+              normalized.append(
+                  normalized_item(item, "public_posts", i)
+              )
+
+          # Deduplicate only when a stable ID exists.
+          # Malformed items are retained for traceability.
+          seen_ids = set()
+          deduplicated = []
+
+          for item in normalized:
+              item_id = item["id"]
+
+              if item_id:
+                  if item_id in seen_ids:
+                      continue
+
+                  seen_ids.add(item_id)
+
+              deduplicated.append(item)
+
+          # ------------------------------------------------------------
+          # Signal definitions
+          # ------------------------------------------------------------
+
+          explicit_request_patterns = [
+              r"\bwe need (?:an?|someone|somebody|help|a|to)\b",
+              r"\bwe(?:'re| are) looking for\b",
+              r"\blooking for (?:an?|someone|somebody|a)\b",
+              r"\bneed someone to\b",
+              r"\bneed an? (?:agent|developer|designer|writer|researcher|builder|auditor|engineer)\b",
+              r"\bcan someone (?:build|create|write|fix|audit|research|implement|develop|verify|deliver)\b",
+              r"\bwho can (?:build|create|write|fix|audit|research|implement|develop|verify|deliver)\b",
+              r"\bis anyone able to\b",
+              r"\bseeking (?:an?|someone|a)\b",
+              r"\bcommission(?:ing)?\b",
+              r"\brequest(?:ing)?\b",
+              r"\bjob available\b",
+              r"\btask available\b",
+              r"\bopen task\b",
+              r"\bopen job\b",
+              r"\bhiring\b",
+              r"\bfor hire\b"
+          ]
+
+          concrete_task_patterns = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bimplement\b",
+              r"\bwrite\b",
+              r"\bdesign\b",
+              r"\bf[ia]x\b",
+              r"\bdebug\b",
+              r"\baudit\b",
+              r"\bresearch\b",
+              r"\bverify\b",
+              r"\btest\b",
+              r"\banaly[sz]e\b",
+              r"\bdeliver\b",
+              r"\bproduce\b",
+              r"\bscrape\b",
+              r"\bintegrat(?:e|ion)\b",
+              r"\bcode\b",
+              r"\btranslate\b",
+              r"\bmoderate\b"
+          ]
+
+          compensation_patterns = [
+              r"\b\d+(?:\.\d+)?\s*(?:usd|usdc|btc|sats?|sat|eur|€|\$)\b",
+              r"\bpaid\b",
+              r"\bpay(?:ing|ment)?\b",
+              r"\breward\b",
+              r"\bbounty\b",
+              r"\btip\b",
+              r"\btips\b",
+              r"\bcompensation\b",
+              r"\brate\b",
+              r"\bbudget\b"
+          ]
+
+          open_task_patterns = [
+              r"\bopen task\b",
+              r"\bopen job\b",
+              r"\bavailable task\b",
+              r"\bavailable work\b",
+              r"\baccepting applications\b",
+              r"\baccepting submissions\b",
+              r"\bcommission\b",
+              r"\brequest for\b",
+              r"\blooking to hire\b",
+              r"\bfor hire\b"
+          ]
+
+          completion_patterns = [
+              r"\bcompleted\b",
+              r"\bfinished\b",
+              r"\bdelivered\b",
+              r"\bshipped\b",
+              r"\bsettled\b",
+              r"\bpaid out\b",
+              r"\bpayment received\b",
+              r"\bhire settled\b",
+              r"\bcompleted hire\b"
+          ]
+
+          # IMPORTANT:
+          # "shipped" alone is NOT enough to classify completed work.
+          strong_completion_patterns = [
+              r"\bcompleted (?:the|a|an|this)\b",
+              r"\bcompleted hire\b",
+              r"\bhire settled\b",
+              r"\bpayment received\b",
+              r"\bpaid out\b",
+              r"\bdelivered (?:the|a|an|this)\b",
+              r"\bfinished (?:the|a|an|this)\b"
+          ]
+
+          service_offer_patterns = [
+              r"\bi offer\b",
+              r"\bi can provide\b",
+              r"\bfor hire\b",
+              r"\bavailable for work\b",
+              r"\baccepting clients\b",
+              r"\baccepting commissions\b",
+              r"\bmy rate\b",
+              r"\bmy rates\b",
+              r"\bbook me\b",
+              r"\bhire me\b"
+          ]
+
+          agent_seeking_patterns = [
+              r"\bi(?:'m| am) looking for work\b",
+              r"\bi(?:'m| am) seeking work\b",
+              r"\blooking for clients\b",
+              r"\blooking for paid work\b",
+              r"\blooking for a client\b",
+              r"\bseeking clients\b"
+          ]
+
+          promotional_patterns = [
+              r"\bpromo(?:tion)?\b",
+              r"\bpromotional\b",
+              r"\blisting check\b",
+              r"\baffiliate\b",
+              r"\bproduct listing\b",
+              r"\bmarket(?:ing|place) listing\b"
+          ]
+
+          discussion_patterns = [
+              r"\bthe problem is\b",
+              r"\bthis means\b",
+              r"\bthe point is\b",
+              r"\bin this study\b",
+              r"\bwe observed\b",
+              r"\bfindings?\b",
+              r"\bframework\b",
+              r"\bbenchmark(?:ing)?\b",
+              r"\banalysis\b",
+              r"\bstudy\b",
+              r"\bpaper\b",
+              r"\bresearch finding\b",
+              r"\bdiscussion\b",
+              r"\bwhy\b",
+              r"\bhow do\b",
+              r"\bwhat do you think\b"
+          ]
+
+          def matches(patterns, text):
+              return [
+                  pattern
+                  for pattern in patterns
+                  if re.search(pattern, text, re.I)
+              ]
+
+          # ------------------------------------------------------------
+          # Classification
+          # ------------------------------------------------------------
+
+          def classify(item):
+              title = item["title"]
+              body = item["body"]
+              combined = f"{title}\n{body}".strip()
+              lower = combined.lower()
+              post_type = item["post_type"]
+
+              # Preserve malformed records.
+              if not item["id"] and not title and not body:
+                  return {
+                      "classification": "INVALID_SOURCE_ITEM",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 10,
+                      "rejection_reason": (
+                          "Source item has no usable ID, title, or body; "
+                          "retained for traceability."
+                      ),
+                      "signals": {}
+                  }
+
+              request_matches = matches(
+                  explicit_request_patterns,
+                  lower
+              )
+
+              task_matches = matches(
+                  concrete_task_patterns,
+                  lower
+              )
+
+              compensation_matches = matches(
+                  compensation_patterns,
+                  lower
+              )
+
+              open_task_matches = matches(
+                  open_task_patterns,
+                  lower
+              )
+
+              completion_matches = matches(
+                  completion_patterns,
+                  lower
+              )
+
+              strong_completion_matches = matches(
+                  strong_completion_patterns,
+                  lower
+              )
+
+              service_matches = matches(
+                  service_offer_patterns,
+                  lower
+              )
+
+              agent_seeking_matches = matches(
+                  agent_seeking_patterns,
+                  lower
+              )
+
+              promotional_matches = matches(
+                  promotional_patterns,
+                  lower
+              )
+
+              discussion_matches = matches(
+                  discussion_patterns,
+                  lower
+              )
+
+              # --------------------------------------------------------
+              # Completion detection
+              # --------------------------------------------------------
+
+              has_completion_context = (
+                  bool(strong_completion_matches)
+                  or (
+                      len(completion_matches) >= 2
+                      and any(
+                          word in lower
+                          for word in [
+                              "payment",
+                              "hire",
+                              "delivered",
+                              "completed"
+                          ]
+                      )
+                  )
+              )
+
+              # --------------------------------------------------------
+              # Payment receipt
+              # --------------------------------------------------------
+
+              if (
+                  has_completion_context
+                  and any(
+                      word in lower
+                      for word in [
+                          "payment",
+                          "paid",
+                          "settled",
+                          "hire",
+                          "usdc",
+                          "usd",
+                          "btc",
+                          "sats",
+                          "sat"
+                      ]
+                  )
+              ):
+                  return {
+                      "classification": "PAYMENT_RECEIPT",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 10,
+                      "rejection_reason": (
+                          "Evidence describes completed or settled "
+                          "payment/work, not an open task."
+                      ),
+                      "signals": {
+                          "request": request_matches,
+                          "task": task_matches,
+                          "compensation": compensation_matches,
+                          "completion": completion_matches,
+                          "strong_completion": (
+                              strong_completion_matches
+                          )
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Completed work
+              # --------------------------------------------------------
+
+              if (
+                  has_completion_context
+                  and not request_matches
+              ):
+                  return {
+                      "classification": "COMPLETED_WORK",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 9,
+                      "rejection_reason": (
+                          "Evidence describes completed work rather "
+                          "than an open request."
+                      ),
+                      "signals": {
+                          "task": task_matches,
+                          "completion": completion_matches,
+                          "strong_completion": (
+                              strong_completion_matches
+                          )
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Service offer
+              # --------------------------------------------------------
+
+              if service_matches and not request_matches:
+                  return {
+                      "classification": "SERVICE_OFFER",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 9,
+                      "rejection_reason": (
+                          "Post offers the author's own services "
+                          "rather than containing a buyer request."
+                      ),
+                      "signals": {
+                          "service_offer": service_matches,
+                          "compensation": compensation_matches
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Agent seeking work
+              # --------------------------------------------------------
+
+              if (
+                  agent_seeking_matches
+                  and not request_matches
+              ):
+                  return {
+                      "classification": "AGENT_SEEKING_WORK",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 9,
+                      "rejection_reason": (
+                          "Post is an agent seeking work, not a "
+                          "requester assigning work."
+                      ),
+                      "signals": {
+                          "agent_seeking": agent_seeking_matches
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Promotional content
+              # --------------------------------------------------------
+
+              if (
+                  promotional_matches
+                  and not request_matches
+              ):
+                  return {
+                      "classification": "PROMOTIONAL",
+                      "genuine_demand": False,
+                      "score": 0,
+                      "confidence": 8,
+                      "rejection_reason": (
+                          "Promotional/listing content without an "
+                          "actionable buyer request."
+                      ),
+                      "signals": {
+                          "promotional": promotional_matches
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Demand scoring
+              # Request evidence dominates capability evidence.
+              # --------------------------------------------------------
+
+              score = 0
+
+              if request_matches:
+                  score += 35
+
+              if len(request_matches) >= 2:
+                  score += 10
+
+              if task_matches:
+                  score += min(
+                      20,
+                      5 * len(task_matches)
+                  )
+
+              if open_task_matches:
+                  score += 15
+
+              if compensation_matches:
+                  score += min(
+                      10,
+                      5 * len(compensation_matches)
+                  )
+
+              # Compensation alone cannot create demand.
+              if not request_matches:
+                  score = min(score, 15)
+
+              # Discussion/analysis without explicit requester intent
+              # must not become a demand.
+              if (
+                  discussion_matches
+                  and not request_matches
+              ):
+                  score -= min(
+                      20,
+                      5 * len(discussion_matches)
+                  )
+
+              # Findings/analysis/discussions are strongly penalized
+              # when there is no explicit request.
+              if (
+                  post_type in {
+                      "finding",
+                      "analysis",
+                      "discussion"
+                  }
+                  and not request_matches
+              ):
+                  score -= 10
+
+              score = max(0, score)
+
+              # --------------------------------------------------------
+              # Genuine demand gate
+              #
+              # Requires:
+              #   1. explicit requester intent
+              #   2. concrete task
+              #   3. sufficient score
+              #
+              # Compensation is helpful but not mandatory.
+              # --------------------------------------------------------
+
+              genuine = (
+                  bool(request_matches)
+                  and bool(task_matches)
+                  and score >= 40
+                  and not has_completion_context
+                  and not service_matches
+                  and not agent_seeking_matches
+                  and not promotional_matches
+              )
+
+              if genuine:
+                  if (
+                      compensation_matches
+                      or open_task_matches
+                  ):
+                      classification = "OPEN_PAID_TASK"
+                  else:
+                      classification = "BUYER_REQUEST"
+
+                  confidence = min(
+                      10,
+                      6
+                      + int(bool(compensation_matches))
+                      + int(bool(open_task_matches))
+                      + int(len(request_matches) >= 2)
+                  )
+
+                  return {
+                      "classification": classification,
+                      "genuine_demand": True,
+                      "score": score,
+                      "confidence": confidence,
+                      "rejection_reason": "",
+                      "signals": {
+                          "request": request_matches,
+                          "task": task_matches,
+                          "open_task": open_task_matches,
+                          "compensation": compensation_matches
+                      }
+                  }
+
+              # --------------------------------------------------------
+              # Non-genuine request / discussion
+              # --------------------------------------------------------
+
+              if request_matches and task_matches:
+                  classification = "BUYER_REQUEST"
+
+                  reason = (
+                      "Request and task signals exist, but evidence "
+                      "is not strong enough for automatic "
+                      "genuine-demand qualification."
+                  )
+
+              elif (
+                  discussion_matches
+                  or post_type in {
+                      "finding",
+                      "analysis",
+                      "discussion"
+                  }
+              ):
+                  classification = "DISCUSSION"
+
+                  reason = (
+                      "Content is analytical/discussion-oriented and "
+                      "lacks sufficiently strong requester intent."
+                  )
+
+              else:
+                  classification = "UNCLEAR"
+
+                  reason = (
+                      "No sufficiently strong explicit requester "
+                      "intent plus concrete actionable task."
+                  )
+
+              return {
+                  "classification": classification,
+                  "genuine_demand": False,
+                  "score": score,
+                  "confidence": max(
+                      3,
+                      min(
+                          8,
+                          4
+                          + int(bool(request_matches))
+                          + int(bool(task_matches))
+                      )
+                  ),
+                  "rejection_reason": reason,
+                  "signals": {
+                      "request": request_matches,
+                      "task": task_matches,
+                      "open_task": open_task_matches,
+                      "compensation": compensation_matches,
+                      "discussion": discussion_matches
+                  }
+              }
+
+          # ------------------------------------------------------------
+          # Analyse every item while preserving original metadata.
+          # ------------------------------------------------------------
+
+          results = []
+
+          for item in deduplicated:
+              decision = classify(item)
+
+              results.append({
+                  "id": item["id"],
+                  "title": item["title"],
+                  "requester": item["requester"],
+                  "post_type": item["post_type"],
+                  "source": item["source"],
+                  "source_index": item["source_index"],
+                  "classification": decision["classification"],
+                  "genuine_demand": decision["genuine_demand"],
+                  "score": decision["score"],
+                  "confidence": decision["confidence"],
+                  "signals": decision["signals"],
+                  "rejection_reason": decision["rejection_reason"]
+              })
+
+          # ------------------------------------------------------------
+          # Summary
+          # ------------------------------------------------------------
+
+          counts = {}
+
+          for result in results:
+              key = result["classification"]
+              counts[key] = counts.get(key, 0) + 1
+
+          genuine_demands = [
+              result
+              for result in results
+              if result["genuine_demand"] is True
+          ]
+
+          genuine_demands.sort(
+              key=lambda result: (
+                  result["score"],
+                  result["confidence"]
+              ),
+              reverse=True
+          )
+
+          generated_at = datetime.now(
+              timezone.utc
+          ).isoformat()
+
+          output = {
+              "version": VERSION,
+              "generated_at": generated_at,
+              "mode": "demand_evidence_traceability_gate",
+              "objective": (
+                  "Detect genuine actionable work opportunities "
+                  "with high precision while preserving complete "
+                  "traceability."
+              ),
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+              "actions_taken": [],
+              "gemini_used": False,
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(deduplicated)
+              },
+              "total_scanned": len(deduplicated),
+              "real_demands": len(genuine_demands),
+              "rejected_or_unclear": (
+                  len(deduplicated)
+                  - len(genuine_demands)
+              ),
+              "classification_counts": counts,
+              "traceability": {
+                  "metadata_preserved_for_all_items": True,
+                  "invalid_source_items_preserved": True,
+                  "deduplicated_by_stable_id_only": True
+              },
+              "recommendation": {
+                  "action": (
+                      "MANUAL_REVIEW_REQUIRED"
+                      if genuine_demands
+                      else "NO_ACTION"
+                  ),
+                  "reason": (
+                      "A sufficiently reliable actionable demand "
+                      "was detected. NØX must not contact the "
+                      "requester automatically."
+                      if genuine_demands
+                      else
+                      "No sufficiently reliable open buyer demand "
+                      "was detected in the scanned Colony content."
+                  ),
+                  "top_demand_id": (
+                      genuine_demands[0]["id"]
+                      if genuine_demands
+                      else None
+                  ),
+                  "top_demand_score": (
+                      genuine_demands[0]["score"]
+                      if genuine_demands
+                      else 0
+                  )
+              },
+              "items": results
+          }
+
+          with open(
+              MEMORY_FILE,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(
+              json.dumps(
+                  {
+                      "version": VERSION,
+                      "generated_at": generated_at,
+                      "total_scanned": len(deduplicated),
+                      "real_demands": len(genuine_demands),
+                      "classification_counts": counts,
+                      "top_demand_id": (
+                          genuine_demands[0]["id"]
+                          if genuine_demands
+                          else None
+                      ),
+                      "top_demand_score": (
+                          genuine_demands[0]["score"]
+                          if genuine_demands
+                          else 0
+                      ),
+                      "gemini_used": False,
+                      "actions_taken": [],
+                      "memory_file": MEMORY_FILE
+                  },
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+          PY
+
+      - name: Commit V64 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+          git add memory/nox_v64_demand_evidence_traceability_gate.json
+          git diff --cached --quiet || git commit -m "Add NØX V64 demand evidence traceability memory"
+          git push
