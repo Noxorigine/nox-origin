@@ -1,0 +1,547 @@
+name: NØX V69 - Opportunity Learning Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  opportunity-learning-audit:
+    runs-on: ubuntu-latest
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run V69 learning audit
+        run: |
+          python <<'PY'
+          import os
+          import json
+          import re
+          from datetime import datetime, timezone
+          import requests
+
+          VERSION = "V69"
+
+          API_KEY = os.environ.get("COLONY_API_KEY")
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          BASE_URL = "https://www.thecolony.cc/api/v1"
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+          })
+
+          # ------------------------------------------------------------
+          # AUTHENTICATION
+          # ------------------------------------------------------------
+
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          auth.raise_for_status()
+
+          auth_data = auth.json()
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError("No authentication token returned")
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          # ------------------------------------------------------------
+          # FETCH SOURCES
+          # ------------------------------------------------------------
+
+          def get_json(path):
+              response = session.get(
+                  f"{BASE_URL}{path}",
+                  timeout=30
+              )
+              response.raise_for_status()
+              return response.json()
+
+          feed_data = get_json("/feed/for-you")
+          public_data = get_json("/posts")
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if not isinstance(data, dict):
+                  return []
+
+              for key in (
+                  "posts",
+                  "items",
+                  "data",
+                  "results",
+                  "feed"
+              ):
+                  value = data.get(key)
+                  if isinstance(value, list):
+                      return value
+
+              return []
+
+          feed_items = extract_items(feed_data)
+          public_items = extract_items(public_data)
+
+          # ------------------------------------------------------------
+          # STABLE-ID DEDUPLICATION
+          # ------------------------------------------------------------
+
+          combined = []
+
+          for source_name, items in (
+              ("for_you_feed", feed_items),
+              ("public_posts", public_items)
+          ):
+              for item in items:
+                  if not isinstance(item, dict):
+                      combined.append({
+                          "_invalid": True,
+                          "_source": source_name,
+                          "_raw": item
+                      })
+                      continue
+
+                  enriched = dict(item)
+                  enriched["_source"] = source_name
+                  combined.append(enriched)
+
+          seen_ids = set()
+          items = []
+
+          for item in combined:
+              item_id = item.get("id")
+
+              if item.get("_invalid"):
+                  items.append(item)
+                  continue
+
+              if item_id:
+                  if item_id in seen_ids:
+                      continue
+                  seen_ids.add(item_id)
+
+              items.append(item)
+
+          # ------------------------------------------------------------
+          # TEXT EXTRACTION
+          # ------------------------------------------------------------
+
+          def text_of(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              values = []
+
+              for key in (
+                  "title",
+                  "body",
+                  "content",
+                  "text",
+                  "description"
+              ):
+                  value = item.get(key)
+                  if isinstance(value, str):
+                      values.append(value)
+
+              return " ".join(values).strip()
+
+          # ------------------------------------------------------------
+          # SIGNALS
+          # ------------------------------------------------------------
+
+          explicit_delegation = [
+              r"\bi need someone\b",
+              r"\bwe need someone\b",
+              r"\bneed someone to\b",
+              r"\bneed an agent to\b",
+              r"\blooking for someone\b",
+              r"\blooking for an agent\b",
+              r"\blooking for a developer\b",
+              r"\bcan anyone (?:build|create|implement|write|fix|audit|research|design|develop|scrape|analyze|test|integrate|automate)\b",
+              r"\bwho can\b",
+              r"\bwho could\b",
+              r"\bwe are hiring\b",
+              r"\bwe're hiring\b",
+              r"\bjob for an agent\b",
+              r"\btask for an agent\b"
+          ]
+
+          recovery_patterns = [
+              r"\bneed help with\b",
+              r"\bcould use help with\b",
+              r"\bcan someone help\b",
+              r"\bi need help\b",
+              r"\bhelp wanted\b",
+              r"\bwould anyone be able to\b",
+              r"\bis anyone available to\b",
+              r"\bcould someone\b",
+              r"\bseeking someone to\b",
+              r"\bwant someone to\b",
+              r"\banyone interested in\b",
+              r"\bi have a task\b",
+              r"\bthere is a task\b"
+          ]
+
+          concrete_task = [
+              r"\bbuild\b",
+              r"\bcreate\b",
+              r"\bdevelop\b",
+              r"\bimplement\b",
+              r"\bwrite\b",
+              r"\bfix\b",
+              r"\bdebug\b",
+              r"\baudit\b",
+              r"\bresearch\b",
+              r"\bdesign\b",
+              r"\bscrape\b",
+              r"\bcollect\b",
+              r"\bextract\b",
+              r"\banalyze\b",
+              r"\btest\b",
+              r"\bintegrate\b",
+              r"\bautomate\b",
+              r"\bverify\b",
+              r"\btranslate\b",
+              r"\bcompile\b",
+              r"\bdeploy\b"
+          ]
+
+          compensation = [
+              r"\bbudget\s*:",
+              r"\breward\s*:",
+              r"\bpayment\s*:",
+              r"\bpaid\s+(?:task|job|work|commission)\b",
+              r"\b(?:\$|€)\s*\d+(?:\.\d+)?\b",
+              r"\b\d+(?:\.\d+)?\s*(?:usdc|sats|sat|btc)\b"
+          ]
+
+          completion = [
+              r"\bcompleted\b",
+              r"\bfinished\b",
+              r"\bshipped\b",
+              r"\balready built\b",
+              r"\balready done\b",
+              r"\bdelivered\b"
+          ]
+
+          service_offer = [
+              r"\bi can help\b",
+              r"\bi can build\b",
+              r"\bi offer\b",
+              r"\bavailable for work\b",
+              r"\bopen for work\b"
+          ]
+
+          agent_seeking = [
+              r"\blooking for work\b",
+              r"\bseeking work\b",
+              r"\bavailable for tasks\b",
+              r"\bhire me\b"
+          ]
+
+          discussion = [
+              r"\bhow do you\b",
+              r"\bwhat do you think\b",
+              r"\bdiscussion\b",
+              r"\bpaper\b",
+              r"\bstudy\b",
+              r"\bbenchmark\b",
+              r"\bfindings?\b"
+          ]
+
+          def matches(patterns, text):
+              return [p for p in patterns if re.search(p, text, re.I)]
+
+          # ------------------------------------------------------------
+          # CLASSIFICATION
+          # ------------------------------------------------------------
+
+          records = []
+
+          for item in items:
+              if item.get("_invalid"):
+                  records.append({
+                      "id": None,
+                      "classification": "INVALID_SOURCE_ITEM",
+                      "learning_flags": [
+                          "invalid_source_preserved"
+                      ],
+                      "source": item.get("_source"),
+                      "metadata_preserved": True
+                  })
+                  continue
+
+              text = text_of(item)
+
+              delegation_hits = matches(explicit_delegation, text)
+              recovery_hits = matches(recovery_patterns, text)
+              task_hits = matches(concrete_task, text)
+              compensation_hits = matches(compensation, text)
+              completion_hits = matches(completion, text)
+              service_hits = matches(service_offer, text)
+              seeking_hits = matches(agent_seeking, text)
+              discussion_hits = matches(discussion, text)
+
+              score = 0
+
+              if delegation_hits:
+                  score += 45
+
+              if recovery_hits:
+                  score += 25
+
+              if task_hits:
+                  score += 20
+
+              if compensation_hits:
+                  score += 20
+
+              if completion_hits:
+                  score -= 45
+
+              if service_hits:
+                  score -= 35
+
+              if seeking_hits:
+                  score -= 35
+
+              if discussion_hits and not delegation_hits and not recovery_hits:
+                  score -= 20
+
+              if not task_hits:
+                  score -= 20
+
+              if delegation_hits and task_hits:
+                  classification = "STRONG_OPPORTUNITY_SIGNAL"
+              elif recovery_hits and task_hits:
+                  classification = "RECOVERY_SIGNAL"
+              elif task_hits:
+                  classification = "TASK_WITHOUT_DEMAND"
+              elif compensation_hits:
+                  classification = "COMPENSATION_WITHOUT_DEMAND"
+              else:
+                  classification = "NO_ACTIONABLE_SIGNAL"
+
+              if completion_hits:
+                  classification = "COMPLETED_OR_ALREADY_DONE"
+
+              if service_hits:
+                  classification = "SERVICE_OFFER"
+
+              if seeking_hits:
+                  classification = "AGENT_SEEKING_WORK"
+
+              records.append({
+                  "id": item.get("id"),
+                  "title": item.get("title"),
+                  "requester": item.get("requester"),
+                  "post_type": item.get("post_type"),
+                  "source": item.get("_source"),
+                  "classification": classification,
+                  "score": score,
+                  "evidence": {
+                      "explicit_delegation": delegation_hits,
+                      "recovery_signals": recovery_hits,
+                      "concrete_task": task_hits,
+                      "compensation": compensation_hits,
+                      "completion": completion_hits,
+                      "service_offer": service_hits,
+                      "agent_seeking": seeking_hits,
+                      "discussion": discussion_hits
+                  },
+                  "metadata_preserved": True
+              })
+
+          # ------------------------------------------------------------
+          # LEARNING AUDIT
+          # ------------------------------------------------------------
+
+          counts = {}
+
+          for record in records:
+              classification = record["classification"]
+              counts[classification] = counts.get(classification, 0) + 1
+
+          strong = [
+              r for r in records
+              if r["classification"] == "STRONG_OPPORTUNITY_SIGNAL"
+          ]
+
+          recovery = [
+              r for r in records
+              if r["classification"] == "RECOVERY_SIGNAL"
+          ]
+
+          suspicious = [
+              r for r in records
+              if (
+                  r.get("classification") in (
+                      "TASK_WITHOUT_DEMAND",
+                      "COMPENSATION_WITHOUT_DEMAND"
+                  )
+              )
+          ]
+
+          completed = [
+              r for r in records
+              if r.get("classification") == "COMPLETED_OR_ALREADY_DONE"
+          ]
+
+          learning_findings = []
+
+          if not strong:
+              learning_findings.append(
+                  "No strong opportunity signal was observed in the current sample."
+              )
+
+          if not recovery:
+              learning_findings.append(
+                  "The recovery lane did not recover an atypical delegated opportunity."
+              )
+
+          if suspicious:
+              learning_findings.append(
+                  "Task or compensation language appears without sufficient delegation."
+              )
+
+          if completed:
+              learning_findings.append(
+                  "Completion signals remain important exclusion evidence."
+              )
+
+          learning_findings.append(
+              "Generic task, payment and request words must not be treated as demand proof."
+          )
+
+          learning_findings.append(
+              "Future opportunity detection should prioritize independent evidence convergence."
+          )
+
+          learning_findings.append(
+              "A real work request should contain enough structure to distinguish an open task from analysis, findings or completed work."
+          )
+
+          improvement_priorities = [
+              "Improve recovery of atypical human delegation language.",
+              "Separate open work from completed work and payment receipts.",
+              "Increase use of structural request evidence when available.",
+              "Preserve false-positive examples as regression cases.",
+              "Prepare a machine-readable standard for genuine work requests."
+          ]
+
+          output = {
+              "version": VERSION,
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "mode": "opportunity_learning_audit",
+              "objective": (
+                  "Measure opportunity-detection weaknesses and convert observed "
+                  "errors into evidence for future controlled improvement."
+              ),
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "marketplace_actions": False,
+                  "comments": False,
+                  "dm": False,
+                  "payments": False,
+                  "gemini": False
+              },
+              "actions_taken": [],
+              "gemini_used": False,
+              "sources": {
+                  "for_you_feed": len(feed_items),
+                  "public_posts": len(public_items),
+                  "deduplicated_items": len(items)
+              },
+              "total_scanned": len(items),
+              "classification_counts": counts,
+              "learning": {
+                  "strong_opportunity_signals": len(strong),
+                  "recovery_signals": len(recovery),
+                  "suspicious_non_demand_signals": len(suspicious),
+                  "completed_items": len(completed),
+                  "findings": learning_findings,
+                  "improvement_priorities": improvement_priorities
+              },
+              "records": records,
+              "next_stage": {
+                  "version": "V70",
+                  "purpose": (
+                      "Generate a non-binding structured WORK REQUEST standard "
+                      "based on the learning audit."
+                  ),
+                  "automatic_publication": False,
+                  "automatic_contact": False,
+                  "automatic_bidding": False,
+                  "automatic_payment": False
+              },
+              "safety": {
+                  "automatic_external_action": False,
+                  "automatic_contact": False,
+                  "automatic_payment": False,
+                  "gemini_disabled": True,
+                  "zero_cost_constraint": True,
+                  "metadata_preserved": True,
+                  "invalid_items_preserved": True,
+                  "stable_id_only_deduplication": True
+              }
+          }
+
+          os.makedirs("memory", exist_ok=True)
+
+          with open(
+              "memory/nox_v69_opportunity_learning_audit.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(json.dumps(output, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Commit V69 learning audit
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+          git add memory/nox_v69_opportunity_learning_audit.json
+          git diff --cached --quiet || git commit -m "NØX V69 opportunity learning audit"
+          git push
