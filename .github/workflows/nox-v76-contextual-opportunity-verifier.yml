@@ -1,0 +1,970 @@
+name: NØX V76 — Contextual Opportunity Verifier
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-v76-contextual-opportunity-verifier
+  cancel-in-progress: false
+
+jobs:
+  opportunity-verification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run NØX V76
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import re
+          import requests
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          BASE = "https://thecolony.ai/api/v1"
+          TIMEOUT = 20
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def api_request(method, path, token=None, params=None, payload=None):
+              headers = {
+                  "Accept": "application/json"
+              }
+
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+
+              response = requests.request(
+                  method,
+                  BASE + path,
+                  headers=headers,
+                  params=params,
+                  json=payload,
+                  timeout=TIMEOUT
+              )
+
+              response.raise_for_status()
+
+              if not response.content:
+                  return {}
+
+              return response.json()
+
+          def first_list(value):
+              if isinstance(value, list):
+                  return value
+
+              if not isinstance(value, dict):
+                  return []
+
+              for key in [
+                  "items",
+                  "posts",
+                  "results",
+                  "data",
+                  "suggestions",
+                  "feed",
+                  "comments"
+              ]:
+                  candidate = value.get(key)
+
+                  if isinstance(candidate, list):
+                      return candidate
+
+              return []
+
+          def text_of(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              parts = [
+                  item.get("title"),
+                  item.get("body"),
+                  item.get("content"),
+                  item.get("description"),
+                  item.get("text")
+              ]
+
+              return " ".join(
+                  str(x) for x in parts
+                  if x
+              ).strip()
+
+          def post_id_of(item):
+              if not isinstance(item, dict):
+                  return None
+
+              for key in [
+                  "id",
+                  "post_id",
+                  "postId"
+              ]:
+                  if item.get(key):
+                      return str(item[key])
+
+              return None
+
+          def author_of(item):
+              if not isinstance(item, dict):
+                  return {}
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return author
+
+              return {
+                  "username": item.get("author_username") or item.get("username"),
+                  "id": item.get("author_id")
+              }
+
+          def is_nox(item, me):
+              author = author_of(item)
+
+              ids = {
+                  str(me.get("id", "")).lower(),
+                  str(me.get("user_id", "")).lower(),
+                  "442104b5-eee0-4f73-b452-08f258a21ea2"
+              }
+
+              usernames = {
+                  str(me.get("username", "")).lower(),
+                  "nox_origine"
+              }
+
+              aid = str(author.get("id", "")).lower()
+              username = str(author.get("username", "")).lower()
+
+              return (
+                  aid in ids
+                  or username in usernames
+              )
+
+          def deduplicate(items):
+              result = []
+              seen = set()
+
+              for item in items:
+                  pid = post_id_of(item)
+
+                  if pid:
+                      if pid in seen:
+                          continue
+
+                      seen.add(pid)
+
+                  result.append(item)
+
+              return result
+
+          def signal_score(text, post_type):
+              t = text.lower()
+
+              score = 0
+              signals = []
+
+              explicit_request = [
+                  "i need",
+                  "we need",
+                  "looking for",
+                  "need someone",
+                  "seeking",
+                  "wanted",
+                  "request",
+                  "hire",
+                  "hiring",
+                  "who can",
+                  "can someone",
+                  "anyone able",
+                  "help me"
+              ]
+
+              delegation = [
+                  "build this",
+                  "fix this",
+                  "audit this",
+                  "research this",
+                  "create this",
+                  "implement this",
+                  "analyze this",
+                  "translate this",
+                  "design this",
+                  "perform this"
+              ]
+
+              concrete_work = [
+                  "deliver",
+                  "deliverable",
+                  "file",
+                  "report",
+                  "script",
+                  "code",
+                  "video",
+                  "dataset",
+                  "analysis",
+                  "implementation",
+                  "documentation",
+                  "proof"
+              ]
+
+              acceptance = [
+                  "acceptance criteria",
+                  "must include",
+                  "must contain",
+                  "requirements",
+                  "criteria",
+                  "verified by"
+              ]
+
+              reward = [
+                  "reward",
+                  "paid",
+                  "payment",
+                  "pay",
+                  "bounty",
+                  "sats",
+                  "bitcoin",
+                  "btc",
+                  "usdc",
+                  "usd",
+                  "eur"
+              ]
+
+              deadline = [
+                  "deadline",
+                  "due",
+                  "by tomorrow",
+                  "by friday",
+                  "within 24",
+                  "within 48"
+              ]
+
+              application = [
+                  "apply",
+                  "application",
+                  "comment below",
+                  "reply here",
+                  "dm me",
+                  "send me",
+                  "contact me"
+              ]
+
+              settlement = [
+                  "paid",
+                  "payment received",
+                  "settled",
+                  "settlement",
+                  "transaction",
+                  "txid",
+                  "tx hash"
+              ]
+
+              completion = [
+                  "completed",
+                  "done",
+                  "finished",
+                  "delivered",
+                  "successfully completed",
+                  "already built",
+                  "i built",
+                  "we built"
+              ]
+
+              analysis_markers = [
+                  "finding",
+                  "analysis",
+                  "i observed",
+                  "my research",
+                  "here is what i learned",
+                  "experiment"
+              ]
+
+              def hit(words):
+                  return any(w in t for w in words)
+
+              if hit(explicit_request):
+                  score += 30
+                  signals.append("EXPLICIT_REQUEST")
+
+              if hit(delegation):
+                  score += 20
+                  signals.append("DELEGATION")
+
+              if hit(concrete_work):
+                  score += 15
+                  signals.append("CONCRETE_WORK")
+
+              if hit(acceptance):
+                  score += 15
+                  signals.append("ACCEPTANCE_CRITERIA")
+
+              if hit(reward):
+                  score += 10
+                  signals.append("REWARD_SIGNAL")
+
+              if hit(deadline):
+                  score += 5
+                  signals.append("DEADLINE_SIGNAL")
+
+              if hit(application):
+                  score += 5
+                  signals.append("APPLICATION_ROUTE")
+
+              if hit(settlement):
+                  score += 15
+                  signals.append("SETTLEMENT_SIGNAL")
+
+              if hit(completion):
+                  score -= 35
+                  signals.append("COMPLETION_SIGNAL")
+
+              if post_type in ["analysis", "finding"] and not hit(explicit_request):
+                  score -= 20
+                  signals.append("ANALYSIS_WITHOUT_DELEGATION")
+
+              if not signals:
+                  signals.append("NO_STRUCTURAL_SIGNAL")
+
+              if score >= 75:
+                  classification = "HIGH_CONFIDENCE_OPPORTUNITY"
+
+              elif score >= 55:
+                  classification = "CONTEXTUAL_VERIFICATION_REQUIRED"
+
+              elif score >= 35:
+                  classification = "WEAK_OR_ATYPICAL_SIGNAL"
+
+              else:
+                  classification = "NO_ACTIONABLE_SIGNAL"
+
+              return score, classification, signals
+
+          def infer_next_action(text, post_type):
+              t = text.lower()
+
+              if any(x in t for x in [
+                  "looking for",
+                  "need someone",
+                  "hire",
+                  "hiring",
+                  "seeking"
+              ]):
+                  if any(x in t for x in [
+                      "comment",
+                      "reply here",
+                      "reply below"
+                  ]):
+                      return "COMMENT_APPLICATION"
+
+                  if "dm" in t or "message" in t:
+                      return "DM_APPLICATION"
+
+                  return "APPLICATION_METHOD_UNCLEAR"
+
+              if post_type == "question":
+                  return "PROVIDE_USEFUL_ANSWER"
+
+              if post_type in ["discussion", "analysis", "finding"]:
+                  return "SUBSTANTIVE_ENGAGEMENT_IF_RELEVANT"
+
+              return "OBSERVE"
+
+          print("Starting NØX V76")
+          print("Mode: contextual opportunity verification")
+
+          api_key = os.environ.get("COLONY_API_KEY")
+
+          if not api_key:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          # ------------------------------------------------------------
+          # JWT authentication
+          # ------------------------------------------------------------
+
+          token_response = requests.post(
+              BASE + "/auth/token",
+              json={"api_key": api_key},
+              headers={"Accept": "application/json"},
+              timeout=TIMEOUT
+          )
+
+          token_response.raise_for_status()
+
+          token_data = token_response.json()
+          token = token_data.get("access_token")
+
+          if not token:
+              raise RuntimeError("JWT access_token missing")
+
+          print("JWT authentication: OK")
+
+          # ------------------------------------------------------------
+          # Canonical identity
+          # ------------------------------------------------------------
+
+          me = api_request(
+              "GET",
+              "/users/me",
+              token=token
+          )
+
+          print(
+              "NØX identity:",
+              me.get("username") or me.get("name") or "unknown"
+          )
+
+          # ------------------------------------------------------------
+          # Load V75 evidence
+          # ------------------------------------------------------------
+
+          v75_path = Path(
+              "memory/nox_v75_evidence_weighted_opportunity_detector.json"
+          )
+
+          if v75_path.exists():
+              v75 = json.loads(
+                  v75_path.read_text(encoding="utf-8")
+              )
+          else:
+              v75 = {}
+
+          v75_candidates = []
+
+          for key in [
+              "opportunities",
+              "candidates",
+              "ranked_opportunities",
+              "signals",
+              "items"
+          ]:
+              value = v75.get(key)
+
+              if isinstance(value, list):
+                  v75_candidates.extend(value)
+
+          # ------------------------------------------------------------
+          # Personalized feed
+          # ------------------------------------------------------------
+
+          print("Retrieving personalized feed")
+
+          feed_raw = api_request(
+              "GET",
+              "/feed/for-you",
+              token=token,
+              params={"limit": 25}
+          )
+
+          feed_items = first_list(feed_raw)
+
+          print(
+              "Personalized feed items:",
+              len(feed_items)
+          )
+
+          # ------------------------------------------------------------
+          # Colony suggestions
+          # ------------------------------------------------------------
+
+          print("Retrieving Colony suggestions")
+
+          suggestions_raw = api_request(
+              "GET",
+              "/suggestions",
+              token=token,
+              params={"limit": 20}
+          )
+
+          suggestions = first_list(suggestions_raw)
+
+          print(
+              "Suggestions:",
+              len(suggestions)
+          )
+
+          # ------------------------------------------------------------
+          # Public posts
+          # ------------------------------------------------------------
+
+          print("Retrieving recent public posts")
+
+          posts_raw = api_request(
+              "GET",
+              "/posts",
+              token=token,
+              params={
+                  "limit": 100
+              }
+          )
+
+          public_posts = first_list(posts_raw)
+
+          print(
+              "Public posts:",
+              len(public_posts)
+          )
+
+          # ------------------------------------------------------------
+          # Merge and deduplicate
+          # ------------------------------------------------------------
+
+          merged = deduplicate(
+              feed_items +
+              public_posts
+          )
+
+          external_posts = [
+              item for item in merged
+              if not is_nox(item, me)
+          ]
+
+          print(
+              "External posts after deduplication:",
+              len(external_posts)
+          )
+
+          # ------------------------------------------------------------
+          # Contextual verification
+          # ------------------------------------------------------------
+
+          verified_candidates = []
+
+          for item in external_posts:
+              pid = post_id_of(item)
+
+              if not pid:
+                  continue
+
+              title = str(item.get("title") or "")
+              body = text_of(item)
+              post_type = str(
+                  item.get("post_type")
+                  or item.get("type")
+                  or ""
+              )
+
+              base_text = (
+                  title + "\n" + body
+              ).strip()
+
+              score, classification, signals = signal_score(
+                  base_text,
+                  post_type
+              )
+
+              if classification == "NO_ACTIONABLE_SIGNAL":
+                  continue
+
+              context = None
+
+              try:
+                  context = api_request(
+                      "GET",
+                      f"/posts/{pid}/context",
+                      token=token
+                  )
+              except Exception as exc:
+                  print(
+                      f"Context retrieval failed for {pid}: {exc}"
+                  )
+
+              context_text = ""
+
+              if isinstance(context, dict):
+                  context_text = text_of(context)
+
+                  if not context_text:
+                      context_text = json.dumps(
+                          context,
+                          ensure_ascii=False
+                      )
+
+              combined_text = (
+                  base_text + "\n" + context_text
+              ).strip()
+
+              contextual_score, contextual_classification, contextual_signals = signal_score(
+                  combined_text,
+                  post_type
+              )
+
+              final_score = max(
+                  score,
+                  contextual_score
+              )
+
+              final_classification = contextual_classification
+
+              if final_score >= 75:
+                  final_classification = "HIGH_CONFIDENCE_OPPORTUNITY"
+
+              elif final_score >= 55:
+                  final_classification = "CONTEXTUAL_VERIFICATION_REQUIRED"
+
+              elif final_score >= 35:
+                  final_classification = "WEAK_OR_ATYPICAL_SIGNAL"
+
+              next_action = infer_next_action(
+                  combined_text,
+                  post_type
+              )
+
+              verified_candidates.append({
+                  "post_id": pid,
+                  "title": title,
+                  "post_type": post_type,
+                  "author": author_of(item),
+                  "initial_score": score,
+                  "contextual_score": contextual_score,
+                  "final_score": final_score,
+                  "classification": final_classification,
+                  "signals": sorted(
+                      set(
+                          signals +
+                          contextual_signals
+                      )
+                  ),
+                  "next_action_candidate": next_action,
+                  "context_retrieved": context is not None
+              })
+
+          verified_candidates.sort(
+              key=lambda x: x["final_score"],
+              reverse=True
+          )
+
+          # Keep a bounded ranked list.
+          verified_candidates = verified_candidates[:20]
+
+          # ------------------------------------------------------------
+          # Decision layer
+          # ------------------------------------------------------------
+
+          strong = [
+              x for x in verified_candidates
+              if x["classification"] ==
+              "HIGH_CONFIDENCE_OPPORTUNITY"
+          ]
+
+          contextual = [
+              x for x in verified_candidates
+              if x["classification"] ==
+              "CONTEXTUAL_VERIFICATION_REQUIRED"
+          ]
+
+          atypical = [
+              x for x in verified_candidates
+              if x["classification"] ==
+              "WEAK_OR_ATYPICAL_SIGNAL"
+          ]
+
+          # Important:
+          # V76 DOES NOT automatically apply, bid, DM or pay.
+          # It prepares evidence for the next autonomy stage.
+
+          if strong:
+              decision_status = "ACTION_CANDIDATE_IDENTIFIED"
+
+          elif contextual:
+              decision_status = "FURTHER_VERIFICATION_REQUIRED"
+
+          elif atypical:
+              decision_status = "ATYPICAL_SIGNAL_PRESERVED"
+
+          else:
+              decision_status = "NO_ACTIONABLE_OPPORTUNITY"
+
+          # ------------------------------------------------------------
+          # Build suggestions summary
+          # ------------------------------------------------------------
+
+          suggestion_summary = []
+
+          for suggestion in suggestions[:20]:
+              suggestion_summary.append({
+                  "type": suggestion.get("type"),
+                  "title": suggestion.get("title"),
+                  "description": suggestion.get("description"),
+                  "action": suggestion.get("action"),
+                  "post_id": suggestion.get("post_id"),
+                  "user": suggestion.get("user"),
+                  "raw_keys": sorted(
+                      suggestion.keys()
+                  )
+              })
+
+          # ------------------------------------------------------------
+          # Evidence record
+          # ------------------------------------------------------------
+
+          result = {
+              "version": "V76",
+              "generated_at": now(),
+              "mode": "contextual_opportunity_verification",
+              "agent": {
+                  "id": me.get("id"),
+                  "username": me.get("username")
+              },
+              "scope": {
+                  "personalized_feed": True,
+                  "public_recent_posts": True,
+                  "suggestions": True,
+                  "context_verification": True,
+                  "automatic_comments": False,
+                  "automatic_application": False,
+                  "automatic_bidding": False,
+                  "automatic_dm": False,
+                  "automatic_payment": False,
+                  "gemini": False
+              },
+              "sources": {
+                  "v75_candidates_loaded": len(v75_candidates),
+                  "personalized_feed": len(feed_items),
+                  "suggestions": len(suggestions),
+                  "public_posts": len(public_posts),
+                  "deduplicated_external_posts": len(external_posts)
+              },
+              "verification": {
+                  "candidates": len(verified_candidates),
+                  "high_confidence": len(strong),
+                  "contextual_verification_required": len(contextual),
+                  "weak_or_atypical": len(atypical)
+              },
+              "decision": {
+                  "status": decision_status,
+                  "top_candidate": (
+                      verified_candidates[0]
+                      if verified_candidates
+                      else None
+                  ),
+                  "action_execution": False
+              },
+              "ranked_opportunities": verified_candidates,
+              "colony_suggestions": suggestion_summary,
+              "learning": {
+                  "objective": (
+                      "Determine whether detected signals survive "
+                      "contextual verification and identify the most "
+                      "useful next action without executing it yet."
+                  ),
+                  "principles": [
+                      "Context is stronger than isolated keywords.",
+                      "A strong signal is not automatically a real job.",
+                      "Completion evidence must reduce opportunity confidence.",
+                      "Reward language alone is not proof of payment.",
+                      "Application routing matters for eventual execution.",
+                      "Atypical signals must remain visible.",
+                      "The system must distinguish observation from action.",
+                      "Future autonomy should be earned through measured results."
+                  ]
+              },
+              "autonomy_progression": {
+                  "current_stage": "VERIFICATION_AND_ACTION_CANDIDATE_SELECTION",
+                  "next_stage": "CONTROLLED_USEFUL_ACTION",
+                  "long_term_target": "V100_AUTONOMOUS_DECISION_MAKING"
+              },
+              "regression_cases_preserved": [
+                  "V62_GENERIC_DEMAND_FALSE_POSITIVE",
+                  "V64_ANALYSIS_FALSE_POSITIVE",
+                  "V67_OVER_PRUNING",
+                  "V69_TASK_WITHOUT_DEMAND",
+                  "V72_INPUT_RECOVERY_FAILURE",
+                  "V74_SELF_EVIDENCE_CONTAMINATION"
+              ],
+              "safety": {
+                  "automatic_external_action": False,
+                  "automatic_contact": False,
+                  "automatic_application": False,
+                  "automatic_bidding": False,
+                  "automatic_payment": False,
+                  "gemini_disabled": True,
+                  "zero_cost_constraint": True
+              },
+              "answer_status": (
+                  "ACTION_CANDIDATE_IDENTIFIED"
+                  if strong
+                  else "CONTEXTUAL_EVIDENCE_AVAILABLE"
+                  if contextual
+                  else "ATYPICAL_SIGNAL_PRESERVED"
+                  if atypical
+                  else "NO_ACTIONABLE_OPPORTUNITY"
+              ),
+              "confidence": (
+                  0.90 if strong
+                  else 0.78 if contextual
+                  else 0.62 if atypical
+                  else 0.40
+              )
+          }
+
+          # ------------------------------------------------------------
+          # Markdown report
+          # ------------------------------------------------------------
+
+          md_lines = [
+              "# NØX V76 — Contextual Opportunity Verification",
+              "",
+              f"Generated: {result['generated_at']}",
+              "",
+              "## Objective",
+              "",
+              "Verify opportunity signals using contextual evidence "
+              "before any useful external action is considered.",
+              "",
+              "## Sources",
+              "",
+              f"- V75 candidates loaded: {len(v75_candidates)}",
+              f"- Personalized feed: {len(feed_items)}",
+              f"- Suggestions: {len(suggestions)}",
+              f"- Public posts: {len(public_posts)}",
+              f"- External posts after deduplication: {len(external_posts)}",
+              "",
+              "## Verification",
+              "",
+              f"- Candidates: {len(verified_candidates)}",
+              f"- High confidence: {len(strong)}",
+              f"- Contextual verification required: {len(contextual)}",
+              f"- Weak / atypical: {len(atypical)}",
+              "",
+              f"## Decision: {decision_status}",
+              ""
+          ]
+
+          if verified_candidates:
+              md_lines.append("## Ranked opportunities")
+              md_lines.append("")
+
+              for index, candidate in enumerate(
+                  verified_candidates,
+                  start=1
+              ):
+                  md_lines.extend([
+                      f"### {index}. {candidate['title'] or candidate['post_id']}",
+                      "",
+                      f"- Post ID: `{candidate['post_id']}`",
+                      f"- Score: **{candidate['final_score']}**",
+                      f"- Classification: `{candidate['classification']}`",
+                      f"- Next action candidate: `{candidate['next_action_candidate']}`",
+                      f"- Context retrieved: `{candidate['context_retrieved']}`",
+                      f"- Signals: {', '.join(candidate['signals'])}",
+                      ""
+                  ])
+
+          else:
+              md_lines.extend([
+                  "No actionable opportunity survived contextual verification.",
+                  ""
+              ])
+
+          md_lines.extend([
+              "## Autonomy progression",
+              "",
+              "V76 moves NØX from simple detection toward contextual "
+              "verification and selection of an action candidate.",
+              "",
+              "No automatic application, bidding, DM, payment or other "
+              "external action is executed in this version.",
+              "",
+              "Target: progressively move toward controlled useful action "
+              "and ultimately V100 autonomous decision-making.",
+              "",
+              "## Constraints",
+              "",
+              "- Gemini disabled.",
+              "- Project cost: €0.",
+              "- No automatic bidding.",
+              "- No automatic payment.",
+              "- No automatic DM.",
+              "- No automatic application.",
+              "- Regression cases preserved.",
+              ""
+          ])
+
+          # ------------------------------------------------------------
+          # Write outputs
+          # ------------------------------------------------------------
+
+          Path("memory").mkdir(exist_ok=True)
+
+          json_path = Path(
+              "memory/nox_v76_contextual_opportunity_verifier.json"
+          )
+
+          md_path = Path(
+              "memory/nox_v76_contextual_opportunity_verifier.md"
+          )
+
+          json_path.write_text(
+              json.dumps(
+                  result,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          md_path.write_text(
+              "\n".join(md_lines),
+              encoding="utf-8"
+          )
+
+          print("")
+          print("V76 result written:")
+          print(json_path)
+          print(md_path)
+
+          print("")
+          print(
+              "Decision status:",
+              decision_status
+          )
+
+          if verified_candidates:
+              print(
+                  "Top candidate:",
+                  verified_candidates[0]["title"]
+              )
+              print(
+                  "Top score:",
+                  verified_candidates[0]["final_score"]
+              )
+
+          print("")
+          print("NØX V76 completed successfully.")
+          PY
+
+      - name: Commit V76 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "noreply@nox-origin.local"
+
+          git add memory/nox_v76_contextual_opportunity_verifier.json \
+                  memory/nox_v76_contextual_opportunity_verifier.md
+
+          git diff --cached --quiet || \
+            git commit -m "NØX V76 contextual opportunity verification"
+
+          git push
