@@ -1,0 +1,434 @@
+name: NØX ACT 03 Opportunity Action
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  act-03:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Run ACT 03
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = "https://thecolony.ai"
+          MEMORY_DIR = "memory"
+          MEMORY_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_act_03_opportunity_action.json"
+          )
+
+          os.makedirs(MEMORY_DIR, exist_ok=True)
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load_memory():
+              if not os.path.exists(MEMORY_FILE):
+                  return {
+                      "version": "ACT 03",
+                      "actions": []
+                  }
+
+              try:
+                  with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {
+                      "version": "ACT 03",
+                      "actions": []
+                  }
+
+          def save_memory(memory):
+              with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                  json.dump(memory, f, indent=2, ensure_ascii=False)
+
+          def request(method, path, token=None, **kwargs):
+              headers = kwargs.pop("headers", {})
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              headers["Accept"] = "application/json"
+
+              response = requests.request(
+                  method,
+                  BASE + path,
+                  headers=headers,
+                  timeout=30,
+                  **kwargs
+              )
+
+              print(f"{method} {path} -> {response.status_code}")
+
+              if not response.ok:
+                  print(response.text[:1000])
+
+              return response
+
+          api_key = os.environ.get("COLONY_API_KEY")
+
+          if not api_key:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          memory = load_memory()
+
+          # ------------------------------------------------------------
+          # 1. Authenticate
+          # ------------------------------------------------------------
+
+          auth = request(
+              "POST",
+              "/api/v1/auth/token",
+              headers={"Content-Type": "application/json"},
+              json={"api_key": api_key}
+          )
+
+          auth.raise_for_status()
+
+          auth_data = auth.json()
+          token = auth_data.get("access_token")
+
+          if not token:
+              raise RuntimeError("No access token returned")
+
+          print("Authentication successful")
+
+          # ------------------------------------------------------------
+          # 2. Retrieve personalized suggestions
+          # ------------------------------------------------------------
+
+          suggestions_response = request(
+              "GET",
+              "/api/v1/suggestions?limit=20",
+              token=token
+          )
+
+          suggestions_response.raise_for_status()
+
+          suggestions_data = suggestions_response.json()
+
+          if isinstance(suggestions_data, dict):
+              suggestions = (
+                  suggestions_data.get("suggestions")
+                  or suggestions_data.get("items")
+                  or suggestions_data.get("data")
+                  or []
+              )
+          elif isinstance(suggestions_data, list):
+              suggestions = suggestions_data
+          else:
+              suggestions = []
+
+          print(f"Suggestions received: {len(suggestions)}")
+
+          # ------------------------------------------------------------
+          # Helpers for flexible suggestion parsing
+          # ------------------------------------------------------------
+
+          def flatten(value):
+              """
+              Convert a nested suggestion object into searchable text.
+              """
+              values = []
+
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      values.append(str(key))
+                      values.extend(flatten(item))
+
+              elif isinstance(value, list):
+                  for item in value:
+                      values.extend(flatten(item))
+
+              elif value is not None:
+                  values.append(str(value))
+
+              return values
+
+          def normalized_text(item):
+              return " ".join(flatten(item)).lower()
+
+          def find_value(item, keys):
+              """
+              Search recursively for common identifier fields.
+              """
+              if isinstance(item, dict):
+                  for key in keys:
+                      if key in item and item[key]:
+                          return item[key]
+
+                  for value in item.values():
+                      result = find_value(value, keys)
+                      if result:
+                          return result
+
+              elif isinstance(item, list):
+                  for value in item:
+                      result = find_value(value, keys)
+                      if result:
+                          return result
+
+              return None
+
+          def action_key(item):
+              """
+              Try to identify the intended Colony action.
+              """
+              text = normalized_text(item)
+
+              # Prefer explicit action labels when available.
+              explicit = find_value(
+                  item,
+                  [
+                      "action",
+                      "action_type",
+                      "type",
+                      "kind",
+                      "operation"
+                  ]
+              )
+
+              if explicit:
+                  explicit_text = str(explicit).lower()
+
+                  if "follow" in explicit_text:
+                      return "follow"
+
+                  if "join" in explicit_text:
+                      return "join"
+
+              # Fallback to semantic detection.
+              if re.search(r"\bfollow\b|\bfollowing\b", text):
+                  return "follow"
+
+              if re.search(r"\bjoin\b|\bjoin colony\b|\bjoin the colony\b", text):
+                  return "join"
+
+              return None
+
+          # ------------------------------------------------------------
+          # 3. Select the highest-priority executable opportunity
+          # ------------------------------------------------------------
+
+          selected = None
+          selected_action = None
+
+          for suggestion in suggestions:
+              action = action_key(suggestion)
+
+              if action not in ("follow", "join"):
+                  continue
+
+              if action == "follow":
+                  target_id = find_value(
+                      suggestion,
+                      [
+                          "user_id",
+                          "userId",
+                          "target_user_id",
+                          "targetUserId",
+                          "author_id",
+                          "authorId"
+                      ]
+                  )
+
+                  if target_id:
+                      selected = suggestion
+                      selected_action = ("follow", str(target_id))
+                      break
+
+              if action == "join":
+                  target_id = find_value(
+                      suggestion,
+                      [
+                          "colony_id",
+                          "colonyId",
+                          "target_colony_id",
+                          "targetColonyId"
+                      ]
+                  )
+
+                  if target_id:
+                      selected = suggestion
+                      selected_action = ("join", str(target_id))
+                      break
+
+          # ------------------------------------------------------------
+          # 4. No executable opportunity
+          # ------------------------------------------------------------
+
+          if not selected_action:
+              print("No executable opportunity detected.")
+
+              memory["last_run"] = {
+                  "timestamp": now(),
+                  "status": "NO_ACTION",
+                  "reason": "No supported executable opportunity found",
+                  "suggestions_seen": len(suggestions)
+              }
+
+              save_memory(memory)
+
+              print(json.dumps(memory["last_run"], indent=2, ensure_ascii=False))
+              raise SystemExit(0)
+
+          action_type, target_id = selected_action
+
+          # ------------------------------------------------------------
+          # 5. Duplicate protection
+          # ------------------------------------------------------------
+
+          action_key_value = f"{action_type}:{target_id}"
+
+          previous_actions = memory.get("actions", [])
+
+          already_done = any(
+              item.get("action_key") == action_key_value
+              and item.get("status") == "SUCCESS"
+              for item in previous_actions
+          )
+
+          if already_done:
+              print(f"Action already completed: {action_key_value}")
+
+              memory["last_run"] = {
+                  "timestamp": now(),
+                  "status": "NO_ACTION",
+                  "reason": "Duplicate action prevented",
+                  "action": action_type,
+                  "target_id": target_id
+              }
+
+              save_memory(memory)
+              raise SystemExit(0)
+
+          # ------------------------------------------------------------
+          # 6. Execute the appropriate Colony action
+          # ------------------------------------------------------------
+
+          result = {
+              "timestamp": now(),
+              "action": action_type,
+              "target_id": target_id,
+              "status": "FAILED"
+          }
+
+          if action_type == "follow":
+              response = request(
+                  "POST",
+                  f"/api/v1/users/{target_id}/follow",
+                  token=token
+              )
+
+          elif action_type == "join":
+              response = request(
+                  "POST",
+                  f"/api/v1/colonies/{target_id}/join",
+                  token=token
+              )
+
+          else:
+              response = None
+
+          if response is not None and response.ok:
+              result["status"] = "SUCCESS"
+
+              try:
+                  result["response"] = response.json()
+              except Exception:
+                  result["response"] = response.text[:500]
+
+              print("ACT 03 ACTION SUCCESS")
+
+          else:
+              result["status"] = "FAILED"
+
+              if response is not None:
+                  result["http_status"] = response.status_code
+                  result["response"] = response.text[:500]
+
+              print("ACT 03 ACTION FAILED")
+
+          # ------------------------------------------------------------
+          # 7. Record the action
+          # ------------------------------------------------------------
+
+          result["action_key"] = action_key_value
+          result["suggestion"] = selected
+
+          previous_actions.append(result)
+
+          # Keep memory compact.
+          memory["actions"] = previous_actions[-100:]
+
+          memory["last_run"] = result
+
+          memory["scope"] = {
+              "observe_feed": True,
+              "observe_suggestions": True,
+              "detect_opportunity": True,
+              "autonomous_colony_action": True,
+              "follow": True,
+              "join_colony": True,
+              "publication": False,
+              "comments": False,
+              "dm": False,
+              "marketplace": False,
+              "payments": False,
+              "gemini": False,
+              "automatic_collaboration": False,
+              "permanent_self_modification": False,
+              "human_override": True,
+              "project_cost_eur": 0
+          }
+
+          save_memory(memory)
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          # A failed Colony action should fail the workflow visibly.
+          if result["status"] != "SUCCESS":
+              raise RuntimeError(
+                  f"ACT 03 action failed: {action_type} {target_id}"
+              )
+          PY
+
+      - name: Commit ACT 03 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_03_opportunity_action.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "ACT 03 autonomous opportunity action"
+            git push
+          fi
