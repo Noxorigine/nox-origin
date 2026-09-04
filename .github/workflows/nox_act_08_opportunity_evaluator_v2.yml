@@ -1,0 +1,744 @@
+name: NØX ACT 08 V2 Opportunity Evaluator
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  opportunity-evaluator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Evaluate marketplace opportunities
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          BASE_URL = "https://thecolony.cc/api/v1"
+          MEMORY_FILE = Path("memory/nox_act_08_opportunity_evaluator_v2.json")
+          MAX_OPPORTUNITIES = 10
+
+          headers = {
+              "Authorization": f"Bearer {os.environ['COLONY_API_KEY']}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+
+          session = requests.Session()
+          session.headers.update(headers)
+
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def load_memory():
+              if not MEMORY_FILE.exists():
+                  return {
+                      "version": "ACT 08 V2",
+                      "evaluated_task_ids": [],
+                      "evaluation_history": [],
+                      "last_result": None,
+                  }
+
+              try:
+                  return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+              except Exception:
+                  return {
+                      "version": "ACT 08 V2",
+                      "evaluated_task_ids": [],
+                      "evaluation_history": [],
+                      "last_result": None,
+                  }
+
+
+          def save_memory(memory):
+              MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+              MEMORY_FILE.write_text(
+                  json.dumps(memory, indent=2, ensure_ascii=False),
+                  encoding="utf-8",
+              )
+
+
+          def get_json(path, params=None):
+              response = session.get(
+                  f"{BASE_URL}{path}",
+                  params=params,
+                  timeout=30,
+              )
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"GET {path} failed: "
+                      f"{response.status_code} {response.text[:500]}"
+                  )
+
+              return response.json()
+
+
+          def as_list(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in ("items", "tasks", "results", "data", "opportunities"):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+
+          def task_id(task):
+              return str(
+                  task.get("task_id")
+                  or task.get("id")
+                  or task.get("post_id")
+                  or task.get("uuid")
+                  or ""
+              )
+
+
+          def title(task):
+              return str(task.get("title") or "").strip()
+
+
+          def description(task):
+              return str(
+                  task.get("description")
+                  or task.get("body")
+                  or task.get("content")
+                  or ""
+              ).strip()
+
+
+          def normalize_text(text):
+              text = str(text or "")
+              text = text.replace("\u2013", "-")
+              text = text.replace("\u2014", "-")
+              text = text.replace("\u00a0", " ")
+              return text
+
+
+          def parse_number(raw):
+              value = str(raw).strip().replace(",", "")
+              try:
+                  return float(value)
+              except ValueError:
+                  return None
+
+
+          def extract_money(text):
+              """
+              Extract explicit monetary amounts without summing unrelated
+              examples. Supports:
+                2,000 sats
+                1000 sats
+                10+ USDC
+                $10 USDC
+                $10+
+              """
+
+              text = normalize_text(text)
+
+              patterns = [
+                  (
+                      r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(sats?|sat)\b",
+                      "sats",
+                  ),
+                  (
+                      r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(usdc)\b",
+                      "USDC",
+                  ),
+                  (
+                      r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(?:usdc)?\b",
+                      "USDC",
+                  ),
+              ]
+
+              found = []
+
+              for pattern, currency in patterns:
+                  for match in re.finditer(pattern, text, re.IGNORECASE):
+                      value = parse_number(match.group(1))
+
+                      if value is None:
+                          continue
+
+                      raw = match.group(0).strip()
+
+                      plus = "+" in raw
+
+                      found.append({
+                          "value": value,
+                          "currency": currency,
+                          "minimum": value if plus else None,
+                          "fixed": not plus,
+                          "raw": raw,
+                      })
+
+              # Remove exact duplicates while preserving order.
+              unique = []
+              seen = set()
+
+              for item in found:
+                  key = (
+                      item["value"],
+                      item["currency"],
+                      item["minimum"],
+                      item["fixed"],
+                  )
+
+                  if key not in seen:
+                      seen.add(key)
+                      unique.append(item)
+
+              return unique
+
+
+          def extract_compensation(task):
+              """
+              Prefer explicit compensation in the title.
+              Only use description as secondary evidence.
+              Never add multiple amounts together.
+              """
+
+              task_title = normalize_text(title(task))
+              task_description = normalize_text(description(task))
+
+              title_amounts = extract_money(task_title)
+              description_amounts = extract_money(task_description)
+
+              # Prefer amounts explicitly present in the title.
+              if title_amounts:
+                  primary = title_amounts[0]
+
+                  if primary["minimum"] is not None:
+                      structure = "minimum_or_more"
+                  else:
+                      structure = "fixed_or_stated"
+
+                  return {
+                      "known": True,
+                      "currency": primary["currency"],
+                      "amount": primary["value"],
+                      "minimum": primary["minimum"],
+                      "structure": structure,
+                      "source": "title",
+                      "raw": primary["raw"],
+                      "additional_mentions": max(
+                          0,
+                          len(title_amounts) - 1
+                      ),
+                  }
+
+              if description_amounts:
+                  primary = description_amounts[0]
+
+                  if primary["minimum"] is not None:
+                      structure = "minimum_or_more"
+                  else:
+                      structure = "fixed_or_stated"
+
+                  return {
+                      "known": True,
+                      "currency": primary["currency"],
+                      "amount": primary["value"],
+                      "minimum": primary["minimum"],
+                      "structure": structure,
+                      "source": "description",
+                      "raw": primary["raw"],
+                      "additional_mentions": max(
+                          0,
+                          len(description_amounts) - 1
+                      ),
+                  }
+
+              # Fallback to structured API fields.
+              structured_fields = (
+                  "reward_sats",
+                  "amount_sats",
+                  "payout_sats",
+                  "price_sats",
+              )
+
+              for field in structured_fields:
+                  value = task.get(field)
+
+                  if isinstance(value, (int, float)) and value > 0:
+                      return {
+                          "known": True,
+                          "currency": "sats",
+                          "amount": float(value),
+                          "minimum": None,
+                          "structure": "api_field",
+                          "source": field,
+                          "raw": f"{value} sats",
+                          "additional_mentions": 0,
+                      }
+
+              return {
+                  "known": False,
+                  "currency": None,
+                  "amount": None,
+                  "minimum": None,
+                  "structure": "unknown",
+                  "source": None,
+                  "raw": None,
+                  "additional_mentions": 0,
+              }
+
+
+          def skill_match(text):
+              text = text.lower()
+
+              skill_map = {
+                  "python": "Python",
+                  "javascript": "JavaScript",
+                  "typescript": "TypeScript",
+                  "api": "API integration",
+                  "automation": "Automation",
+                  "scraping": "Web scraping",
+                  "research": "Research",
+                  "analysis": "Data/analysis",
+                  "data": "Data work",
+                  "json": "JSON/data handling",
+                  "csv": "CSV/data handling",
+                  "testing": "Testing",
+                  "qa": "QA/verification",
+                  "verification": "Verification",
+                  "documentation": "Technical documentation",
+                  "debug": "Debugging",
+                  "code review": "Code review",
+                  "technical writing": "Technical writing",
+              }
+
+              matches = []
+
+              for keyword, skill in skill_map.items():
+                  if keyword in text:
+                      matches.append(skill)
+
+              return sorted(set(matches))
+
+
+          def detect_proof(text):
+              proof_terms = (
+                  "proof",
+                  "verified",
+                  "verification",
+                  "deliverable",
+                  "reproducible",
+                  "test",
+                  "report",
+                  "evidence",
+              )
+
+              matched = [
+                  term for term in proof_terms
+                  if term in text.lower()
+              ]
+
+              return {
+                  "required": bool(matched),
+                  "level": "CLEAR" if matched else "UNCLEAR",
+                  "signals": matched,
+              }
+
+
+          def detect_risk(text):
+              high_risk_terms = {
+                  "deposit": -6,
+                  "wallet funding": -6,
+                  "transfer funds": -6,
+                  "buy crypto": -6,
+                  "investment": -5,
+                  "trading": -5,
+                  "gambling": -10,
+                  "captcha": -8,
+                  "private system": -6,
+                  "secret": -6,
+              }
+
+              flags = []
+
+              for term in high_risk_terms:
+                  if term in text.lower():
+                      flags.append(term)
+
+              if flags:
+                  return "HIGH", flags
+
+              return "LOW", []
+
+
+          def detect_difficulty(text):
+              text = text.lower()
+
+              if any(
+                  word in text
+                  for word in (
+                      "microtask",
+                      "simple",
+                      "quick",
+                      "small",
+                  )
+              ):
+                  return "LOW"
+
+              if any(
+                  word in text
+                  for word in (
+                      "full-stack",
+                      "comprehensive",
+                      "complex",
+                      "security review",
+                  )
+              ):
+                  return "HIGH"
+
+              return "MEDIUM"
+
+
+          def compensation_score(compensation):
+              if not compensation["known"]:
+                  return 0
+
+              currency = compensation["currency"]
+              amount = compensation["amount"]
+
+              if currency == "sats":
+                  if amount >= 5000:
+                      return 5
+                  if amount >= 2000:
+                      return 4
+                  if amount >= 1000:
+                      return 3
+                  if amount >= 500:
+                      return 2
+                  return 1
+
+              if currency == "USDC":
+                  if amount >= 25:
+                      return 5
+                  if amount >= 10:
+                      return 4
+                  if amount >= 5:
+                      return 3
+                  if amount >= 2:
+                      return 2
+                  return 1
+
+              return 0
+
+
+          def evaluate_task(task):
+              text = f"{title(task)} {description(task)}".lower()
+
+              compensation = extract_compensation(task)
+              skills = skill_match(text)
+              proof = detect_proof(text)
+              difficulty = detect_difficulty(text)
+              risk, risk_flags = detect_risk(text)
+
+              positive_signals = {
+                  "python": 3,
+                  "api": 3,
+                  "automation": 3,
+                  "research": 2,
+                  "analysis": 2,
+                  "data": 2,
+                  "testing": 2,
+                  "qa": 2,
+                  "verification": 2,
+                  "documentation": 1,
+                  "json": 1,
+                  "csv": 1,
+                  "scraping": 2,
+                  "debug": 2,
+                  "code review": 2,
+              }
+
+              compatibility_score = sum(
+                  points
+                  for keyword, points in positive_signals.items()
+                  if keyword in text
+              )
+
+              if risk == "HIGH":
+                  risk_score = -8
+              else:
+                  risk_score = 1
+
+              proof_score = 2 if proof["required"] else 0
+
+              difficulty_score = {
+                  "LOW": 3,
+                  "MEDIUM": 2,
+                  "HIGH": 1,
+              }[difficulty]
+
+              pay_score = compensation_score(compensation)
+
+              total_score = (
+                  compatibility_score
+                  + pay_score
+                  + proof_score
+                  + difficulty_score
+                  + risk_score
+              )
+
+              if risk == "HIGH":
+                  priority = "REJECT"
+                  recommendation = "DO_NOT_BID"
+              elif (
+                  compatibility_score >= 7
+                  and compensation["known"]
+                  and proof["required"]
+              ):
+                  priority = "HIGH"
+                  recommendation = "MANUAL_REVIEW"
+              elif compatibility_score >= 5:
+                  priority = "MEDIUM"
+                  recommendation = "MANUAL_REVIEW"
+              else:
+                  priority = "LOW"
+                  recommendation = "OBSERVE"
+
+              return {
+                  "task_id": task_id(task),
+                  "title": title(task),
+                  "description_present": bool(description(task)),
+                  "compensation": compensation,
+                  "required_skills": skills,
+                  "difficulty": difficulty,
+                  "proof": proof,
+                  "compatibility": {
+                      "score": compatibility_score,
+                      "with_nox_capabilities": compatibility_score >= 5,
+                  },
+                  "risk": {
+                      "level": risk,
+                      "flags": risk_flags,
+                  },
+                  "scores": {
+                      "compatibility": compatibility_score,
+                      "compensation": pay_score,
+                      "proof": proof_score,
+                      "difficulty": difficulty_score,
+                      "risk": risk_score,
+                      "total": total_score,
+                  },
+                  "priority": priority,
+                  "recommendation": recommendation,
+                  "financial_action_executed": False,
+                  "bid_executed": False,
+                  "payment_executed": False,
+              }
+
+
+          memory = load_memory()
+
+          try:
+              marketplace_data = get_json(
+                  "/marketplace/tasks",
+                  params={
+                      "status": "open",
+                      "sort": "new",
+                      "limit": 100,
+                      "offset": 0,
+                  },
+              )
+
+              tasks = as_list(marketplace_data)
+
+              evaluations = []
+
+              for task in tasks:
+                  if task_id(task):
+                      evaluations.append(evaluate_task(task))
+
+              evaluations.sort(
+                  key=lambda item: (
+                      item["priority"] == "HIGH",
+                      item["scores"]["total"],
+                      item["scores"]["compensation"],
+                  ),
+                  reverse=True,
+              )
+
+              evaluations = evaluations[:MAX_OPPORTUNITIES]
+
+              previous_ids = set(
+                  memory.get("evaluated_task_ids", [])
+              )
+
+              new_evaluations = [
+                  item
+                  for item in evaluations
+                  if item["task_id"] not in previous_ids
+              ]
+
+              high_priority = [
+                  item
+                  for item in evaluations
+                  if item["priority"] == "HIGH"
+              ]
+
+              medium_priority = [
+                  item
+                  for item in evaluations
+                  if item["priority"] == "MEDIUM"
+              ]
+
+              manual_review = [
+                  item
+                  for item in evaluations
+                  if item["recommendation"] == "MANUAL_REVIEW"
+              ]
+
+              result = {
+                  "version": "ACT 08 V2",
+                  "name": "Opportunity Evaluator V2",
+                  "mode": "read_only_decision_support",
+                  "generated_at": now(),
+                  "policy": {
+                      "marketplace_read": True,
+                      "opportunity_evaluation": True,
+                      "bid": False,
+                      "purchase": False,
+                      "payment": False,
+                      "transfer": False,
+                      "dm": False,
+                      "gemini": False,
+                      "project_cost_eur": 0,
+                  },
+                  "observation": {
+                      "open_tasks_found": len(tasks),
+                      "evaluated_opportunities": len(evaluations),
+                      "new_evaluations": len(new_evaluations),
+                      "high_priority_count": len(high_priority),
+                      "medium_priority_count": len(medium_priority),
+                      "manual_review_count": len(manual_review),
+                  },
+                  "decision": (
+                      "MANUAL_REVIEW_REQUIRED"
+                      if manual_review
+                      else "OBSERVE"
+                  ),
+                  "decision_reason": (
+                      "Opportunities were evaluated using explicit "
+                      "compensation parsing, capability matching, "
+                      "proof requirements, difficulty and risk. "
+                      "Manual review is recommended; no financial "
+                      "or marketplace action is executed."
+                  ),
+                  "opportunities": evaluations,
+              }
+
+              all_ids = list(
+                  dict.fromkeys(
+                      memory.get("evaluated_task_ids", [])
+                      + [
+                          item["task_id"]
+                          for item in evaluations
+                      ]
+                  )
+              )[-500:]
+
+              history = memory.get("evaluation_history", [])
+
+              history.append({
+                  "generated_at": result["generated_at"],
+                  "open_tasks_found": len(tasks),
+                  "evaluated_opportunities": len(evaluations),
+                  "new_evaluations": len(new_evaluations),
+                  "high_priority_count": len(high_priority),
+                  "medium_priority_count": len(medium_priority),
+              })
+
+              memory["version"] = "ACT 08 V2"
+              memory["evaluated_task_ids"] = all_ids
+              memory["evaluation_history"] = history[-50:]
+              memory["last_result"] = result
+
+              save_memory(memory)
+
+              print(
+                  json.dumps(
+                      result,
+                      indent=2,
+                      ensure_ascii=False,
+                  )
+              )
+
+          except Exception as exc:
+              result = {
+                  "version": "ACT 08 V2",
+                  "name": "Opportunity Evaluator V2",
+                  "mode": "read_only_decision_support",
+                  "generated_at": now(),
+                  "policy": {
+                      "bid": False,
+                      "purchase": False,
+                      "payment": False,
+                      "transfer": False,
+                      "dm": False,
+                      "gemini": False,
+                      "project_cost_eur": 0,
+                  },
+                  "decision": "ERROR",
+                  "error": str(exc),
+              }
+
+              memory["last_result"] = result
+              save_memory(memory)
+
+              print(
+                  json.dumps(
+                      result,
+                      indent=2,
+                      ensure_ascii=False,
+                  )
+              )
+
+              raise
+          PY
+
+      - name: Commit ACT 08 V2 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+          git add memory/nox_act_08_opportunity_evaluator_v2.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX ACT 08 V2 opportunity evaluation update"
+            git push
+          fi
