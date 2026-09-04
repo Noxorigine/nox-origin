@@ -26,916 +26,467 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run ACT 07 V2
+      - name: Run NØX ACT 07 V2
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           python <<'PY'
-          import json
           import os
+          import json
           import re
           from datetime import datetime, timezone
 
           import requests
 
-          BASE_URL = "https://thecolony.cc/api/v1"
-          MEMORY_PATH = "memory/nox_act_07_marketplace_opportunity_hunter_v2.json"
 
-          MAX_TASKS = 50
-          MAX_STORED_OPPORTUNITIES = 150
+          BASE_URL = "https://thecolony.cc/api/v1"
+          API_KEY = os.environ["COLONY_API_KEY"]
+
+          MEMORY_FILE = "memory/nox_act_07_marketplace_hunter.json"
+
+          MAX_TASKS = 100
+          TOP_RESULTS = 10
+          TIMEOUT = 20
+
 
           session = requests.Session()
+
           session.headers.update({
+              "Authorization": f"Bearer {API_KEY}",
               "Accept": "application/json",
-              "Content-Type": "application/json",
           })
 
-          api_key = os.environ.get("COLONY_API_KEY")
 
-          if not api_key:
-              raise RuntimeError("COLONY_API_KEY is missing")
-
-          def utc_now():
-              return datetime.now(timezone.utc).isoformat()
-
-          def safe_get(path, params=None):
+          def get_json(path, params=None):
               response = session.get(
                   BASE_URL + path,
                   params=params,
-                  timeout=30
+                  timeout=TIMEOUT
               )
 
-              if response.status_code != 200:
-                  return None, response.status_code, response.text[:1000]
+              response.raise_for_status()
+              return response.json()
 
-              try:
-                  return response.json(), response.status_code, None
-              except Exception:
-                  return None, response.status_code, "Invalid JSON response"
-
-          def authenticate():
-              response = session.post(
-                  BASE_URL + "/auth/token",
-                  json={"api_key": api_key},
-                  timeout=30
-              )
-
-              if response.status_code != 200:
-                  raise RuntimeError(
-                      f"Authentication failed: HTTP {response.status_code} "
-                      f"{response.text[:500]}"
-                  )
-
-              data = response.json()
-
-              token = (
-                  data.get("access_token")
-                  or data.get("token")
-                  or data.get("jwt")
-              )
-
-              if not token:
-                  raise RuntimeError("Authentication succeeded but no token was returned")
-
-              session.headers.update({
-                  "Authorization": f"Bearer {token}"
-              })
 
           def load_memory():
-              if not os.path.exists(MEMORY_PATH):
-                  return {
-                      "version": "ACT 07 V2",
-                      "processed_ids": [],
-                      "opportunities": [],
-                      "observations": [],
-                      "last_run": None
-                  }
-
               try:
-                  with open(MEMORY_PATH, "r", encoding="utf-8") as f:
-                      data = json.load(f)
+                  with open(MEMORY_FILE, "r", encoding="utf-8") as file:
+                      return json.load(file)
 
-                  if not isinstance(data, dict):
-                      raise ValueError("Memory is not an object")
-
-                  data.setdefault("processed_ids", [])
-                  data.setdefault("opportunities", [])
-                  data.setdefault("observations", [])
-                  data.setdefault("last_run", None)
-
-                  return data
-
-              except Exception:
+              except (FileNotFoundError, json.JSONDecodeError):
                   return {
-                      "version": "ACT 07 V2",
-                      "processed_ids": [],
-                      "opportunities": [],
-                      "observations": [],
-                      "last_run": None
+                      "seen_task_ids": [],
+                      "runs": [],
+                      "last_result": None
                   }
+
 
           def save_memory(memory):
-              os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+              directory = os.path.dirname(MEMORY_FILE)
 
-              with open(MEMORY_PATH, "w", encoding="utf-8") as f:
-                  json.dump(memory, f, indent=2, ensure_ascii=False)
+              if directory:
+                  os.makedirs(directory, exist_ok=True)
 
-          def as_text(value):
-              if value is None:
-                  return ""
-
-              if isinstance(value, str):
-                  return value
-
-              if isinstance(value, (int, float)):
-                  return str(value)
-
-              try:
-                  return json.dumps(value, ensure_ascii=False)
-              except Exception:
-                  return str(value)
-
-          def normalize_text(text):
-              return re.sub(
-                  r"\s+",
-                  " ",
-                  as_text(text).lower()
-              ).strip()
-
-          def extract_task_id(task):
-              return (
-                  task.get("id")
-                  or task.get("task_id")
-                  or task.get("listing_id")
-                  or task.get("uuid")
-              )
-
-          def extract_title(task):
-              return (
-                  task.get("title")
-                  or task.get("name")
-                  or task.get("task_title")
-                  or "Untitled opportunity"
-              )
-
-          def extract_description(task):
-              return (
-                  task.get("description")
-                  or task.get("details")
-                  or task.get("body")
-                  or task.get("content")
-                  or ""
-              )
-
-          def extract_status(task):
-              value = (
-                  task.get("status")
-                  or task.get("state")
-                  or task.get("availability")
-                  or ""
-              )
-
-              return normalize_text(value)
-
-          def extract_combined_text(task):
-              fields = [
-                  extract_title(task),
-                  extract_description(task),
-                  extract_status(task),
-                  task.get("category"),
-                  task.get("type"),
-                  task.get("payment"),
-                  task.get("reward"),
-                  task.get("price"),
-                  task.get("budget"),
-                  task.get("currency"),
-                  task.get("requirements"),
-                  task.get("deliverables"),
-                  task.get("deadline"),
-              ]
-
-              return normalize_text(" ".join(as_text(x) for x in fields if x is not None))
-
-          def detect_status(status, text):
-              open_words = [
-                  "open",
-                  "available",
-                  "active",
-                  "published",
-                  "bidding"
-              ]
-
-              closed_words = [
-                  "closed",
-                  "completed",
-                  "cancelled",
-                  "canceled",
-                  "expired",
-                  "withdrawn",
-                  "rejected"
-              ]
-
-              accepted_words = [
-                  "accepted",
-                  "assigned",
-                  "in_progress",
-                  "in progress"
-              ]
-
-              if any(word in status for word in closed_words):
-                  return "CLOSED"
-
-              if any(word in status for word in accepted_words):
-                  return "ACCEPTED_OR_ASSIGNED"
-
-              if any(word in status for word in open_words):
-                  return "OPEN"
-
-              if any(word in text for word in closed_words):
-                  return "CLOSED"
-
-              if any(word in text for word in accepted_words):
-                  return "ACCEPTED_OR_ASSIGNED"
-
-              return "UNKNOWN"
-
-          def extract_reward(task, text):
-              candidates = []
-
-              explicit_values = [
-                  task.get("reward"),
-                  task.get("price"),
-                  task.get("budget"),
-                  task.get("payment"),
-                  task.get("amount"),
-                  task.get("payout")
-              ]
-
-              for value in explicit_values:
-                  if value is None:
-                      continue
-
-                  raw = as_text(value)
-
-                  matches = re.findall(
-                      r"(?<![\w.-])(\d+(?:[.,]\d+)?)\s*(sats?|satoshis?|sat|usdc|usd|eth)\b",
-                      raw,
-                      flags=re.IGNORECASE
+              with open(MEMORY_FILE, "w", encoding="utf-8") as file:
+                  json.dump(
+                      memory,
+                      file,
+                      ensure_ascii=False,
+                      indent=2
                   )
 
-                  for amount, currency in matches:
-                      try:
-                          numeric = float(amount.replace(",", ""))
-                      except Exception:
-                          continue
 
-                      candidates.append({
-                          "amount": numeric,
-                          "currency": currency.lower(),
-                          "source": "structured_field"
-                      })
+          def as_list(payload):
+              if isinstance(payload, list):
+                  return payload
 
-              text_matches = re.findall(
-                  r"(?<![\w.-])(\d+(?:[.,]\d+)?)\s*(sats?|satoshis?|sat|usdc|usd|eth)\b",
-                  text,
-                  flags=re.IGNORECASE
-              )
-
-              for amount, currency in text_matches:
-                  try:
-                      numeric = float(amount.replace(",", ""))
-                  except Exception:
-                      continue
-
-                  candidates.append({
-                      "amount": numeric,
-                      "currency": currency.lower(),
-                      "source": "text"
-                  })
-
-              if not candidates:
-                  return {
-                      "detected": False,
-                      "amount": None,
-                      "currency": None,
-                      "source": None,
-                      "all_detected": []
-                  }
-
-              # Prefer explicit structured values.
-              structured = [
-                  c for c in candidates
-                  if c["source"] == "structured_field"
-              ]
-
-              selected = structured[0] if structured else candidates[0]
-
-              return {
-                  "detected": True,
-                  "amount": selected["amount"],
-                  "currency": selected["currency"],
-                  "source": selected["source"],
-                  "all_detected": candidates[:10]
-              }
-
-          def classify_economic_direction(task, text):
-              earning_signals = [
-                  "for hire",
-                  "paid task",
-                  "paid:",
-                  "bounty",
-                  "reward",
-                  "earn",
-                  "pay",
-                  "payment",
-                  "compensation",
-                  "microtask",
-                  "task",
-                  "deliverable",
-                  "hire"
-              ]
-
-              purchase_signals = [
-                  "for sale",
-                  "buy",
-                  "buyer",
-                  "purchase",
-                  "bundle",
-                  "kit",
-                  "service available",
-                  "i will create",
-                  "i can create",
-                  "selling"
-              ]
-
-              earning_score = sum(
-                  1 for phrase in earning_signals
-                  if phrase in text
-              )
-
-              purchase_score = sum(
-                  1 for phrase in purchase_signals
-                  if phrase in text
-              )
-
-              if purchase_score >= 2 and purchase_score > earning_score:
-                  return "EXPENSE_OR_PURCHASE"
-
-              if earning_score > 0 and earning_score >= purchase_score:
-                  return "EARNING_OPPORTUNITY"
-
-              return "UNKNOWN"
-
-          def detect_payment_modes(text):
-              modes = []
-
-              if any(x in text for x in [
-                  "lightning",
-                  "sats",
-                  "satoshi"
-              ]):
-                  modes.append("LIGHTNING_SATS")
-
-              if "usdc" in text:
-                  modes.append("USDC")
-
-              if "base" in text:
-                  modes.append("BASE")
-
-              if "eth" in text or "ethereum" in text:
-                  modes.append("ETH")
-
-              if "crypto" in text:
-                  modes.append("CRYPTO")
-
-              if "dm" in text or "direct message" in text:
-                  modes.append("DM_REQUIRED")
-
-              if "escrow" in text:
-                  modes.append("ESCROW")
-
-              return sorted(set(modes))
-
-          def detect_skills(text):
-              skill_map = {
-                  "python": "Python",
-                  "javascript": "JavaScript",
-                  "js": "JavaScript",
-                  "api": "API",
-                  "automation": "Automation",
-                  "web scraping": "Web scraping",
-                  "scraping": "Web scraping",
-                  "data analysis": "Data analysis",
-                  "data cleanup": "Data cleanup",
-                  "qa": "QA/testing",
-                  "testing": "Testing",
-                  "research": "Research",
-                  "research notes": "Research",
-                  "csv": "CSV/data handling",
-                  "html": "HTML",
-                  "css": "CSS",
-                  "godot": "Godot",
-                  "logo": "Graphic/logo work",
-                  "svg": "SVG"
-              }
-
-              found = []
-
-              for key, label in skill_map.items():
-                  if key in text:
-                      found.append(label)
-
-              return sorted(set(found))
-
-          def detect_constraints(text):
-              constraints = []
-
-              constraint_map = {
-                  "captcha": "No CAPTCHA bypass / CAPTCHA involved",
-                  "credential": "Credentials may be involved",
-                  "credentials": "Credentials may be involved",
-                  "private key": "Private key mentioned",
-                  "wallet": "Wallet interaction mentioned",
-                  "social spam": "Social spam prohibited/mentioned",
-                  "unauthorized": "Unauthorized activity restriction",
-                  "public": "Public/sanitized data possible",
-                  "sanitized": "Sanitized data mentioned",
-                  "sandbox": "Sandbox required",
-                  "docker": "Docker required",
-                  "redacted": "Redacted logs/report expected"
-              }
-
-              for key, label in constraint_map.items():
-                  if key in text:
-                      constraints.append(label)
-
-              return sorted(set(constraints))
-
-          def detect_deliverables(text):
-              deliverables = []
-
-              patterns = [
-                  ("script", "Script/code"),
-                  ("report", "Report"),
-                  ("csv", "CSV/data output"),
-                  ("logs", "Logs"),
-                  ("dockerfile", "Dockerfile"),
-                  ("proof", "Proof/evidence"),
-                  ("sha-256", "SHA-256 proof"),
-                  ("test", "Tests/results"),
-                  ("source checks", "Source verification"),
-                  ("summary", "Summary")
-              ]
-
-              for key, label in patterns:
-                  if key in text:
-                      deliverables.append(label)
-
-              return sorted(set(deliverables))
-
-          def detect_risk_flags(text):
-              flags = []
-
-              risk_patterns = {
-                  "captcha": "CAPTCHA",
-                  "private key": "PRIVATE_KEY",
-                  "credentials": "CREDENTIALS",
-                  "credential": "CREDENTIALS",
-                  "wallet": "WALLET",
-                  "payment required": "PAYMENT_REQUIRED",
-                  "buy": "PURCHASE_LANGUAGE",
-                  "purchase": "PURCHASE_LANGUAGE",
-                  "negative": "POSSIBLE_NEGATIVE_PRICE",
-                  "scam": "SCAM_LANGUAGE",
-                  "spam": "SPAM",
-                  "social spam": "SOCIAL_SPAM",
-                  "unauthorized": "UNAUTHORIZED_ACTIVITY",
-                  "bypass": "BYPASS_LANGUAGE"
-              }
-
-              for key, flag in risk_patterns.items():
-                  if key in text:
-                      flags.append(flag)
-
-              return sorted(set(flags))
-
-          def detect_negative_reward(task, text):
-              fields = [
-                  task.get("reward"),
-                  task.get("price"),
-                  task.get("budget"),
-                  task.get("payment"),
-                  task.get("amount"),
-                  text
-              ]
-
-              for field in fields:
-                  raw = as_text(field).lower()
-
-                  if re.search(
-                      r"-\s*\d+(?:[.,]\d+)?\s*(?:sats?|satoshis?|sat|usdc|usd|eth)\b",
-                      raw
+              if isinstance(payload, dict):
+                  for key in (
+                      "items",
+                      "tasks",
+                      "results",
+                      "data"
                   ):
-                      return True
+                      value = payload.get(key)
 
-              return False
+                      if isinstance(value, list):
+                          return value
 
-          def estimate_difficulty(text):
-              score = 0
+              return []
 
-              low_signals = [
-                  "simple",
-                  "small",
-                  "microtask",
-                  "smoke test",
-                  "csv dedupe",
-                  "5 usdc",
-                  "5000 sats"
-              ]
 
-              medium_signals = [
-                  "automation",
-                  "api",
-                  "web scraping",
-                  "data analysis",
-                  "research",
-                  "testing"
-              ]
+          def text_of(task):
+              parts = []
 
-              high_signals = [
-                  "sdk",
-                  "docker",
-                  "integration",
-                  "deployment",
-                  "complex",
-                  "24h delivery",
-                  "production"
-              ]
+              for key in (
+                  "title",
+                  "body",
+                  "description",
+                  "details",
+                  "tags",
+                  "category"
+              ):
+                  value = task.get(key)
 
-              for phrase in low_signals:
-                  if phrase in text:
-                      score -= 1
+                  if isinstance(value, list):
+                      parts.extend(str(item) for item in value)
 
-              for phrase in medium_signals:
-                  if phrase in text:
-                      score += 1
+                  elif value is not None:
+                      parts.append(str(value))
 
-              for phrase in high_signals:
-                  if phrase in text:
-                      score += 2
+              return " ".join(parts).lower()
 
-              if score <= 0:
-                  return "LOW"
 
-              if score <= 3:
-                  return "MEDIUM"
+          def reward_sats(task):
+              for key in (
+                  "reward_sats",
+                  "budget_sats",
+                  "reward",
+                  "budget_max_sats",
+                  "listed_rate_sats"
+              ):
+                  value = task.get(key)
 
-              return "HIGH"
+                  if isinstance(value, (int, float)):
+                      return float(value)
 
-          def calculate_score(
-              status,
-              economic_direction,
-              reward,
-              payment_modes,
-              skills,
-              deliverables,
-              constraints,
-              risk_flags,
-              difficulty,
-              text
-          ):
-              score = 0
-              reasons = []
-
-              # Economic direction is the strongest filter.
-              if economic_direction == "EARNING_OPPORTUNITY":
-                  score += 6
-                  reasons.append("potential earning opportunity")
-
-              elif economic_direction == "EXPENSE_OR_PURCHASE":
-                  score -= 10
-                  reasons.append("appears to require NØX to spend")
-
-              else:
-                  score -= 2
-                  reasons.append("economic direction unclear")
-
-              # Availability.
-              if status == "OPEN":
-                  score += 4
-                  reasons.append("currently open/available")
-
-              elif status == "ACCEPTED_OR_ASSIGNED":
-                  score -= 5
-                  reasons.append("already accepted/assigned")
-
-              elif status == "CLOSED":
-                  score -= 8
-                  reasons.append("closed or unavailable")
-
-              # Reward.
-              if reward["detected"]:
-                  amount = reward["amount"]
-                  currency = reward["currency"]
-
-                  if amount > 0:
-                      score += 3
-                      reasons.append(
-                          f"reward detected: {amount:g} {currency}"
+                  if isinstance(value, str):
+                      match = re.search(
+                          r"([\d,.]+)\s*sats?",
+                          value.lower()
                       )
 
-                      if currency in ["sat", "sats", "satoshi", "satoshis"]:
-                          if amount >= 10000:
-                              score += 3
-                          elif amount >= 2000:
-                              score += 2
-                          elif amount >= 1000:
-                              score += 1
+                      if match:
+                          return float(
+                              match.group(1).replace(",", "")
+                          )
 
-                      elif currency in ["usdc", "usd"]:
-                          if amount >= 10:
-                              score += 3
-                          elif amount >= 5:
-                              score += 2
-                          elif amount > 0:
-                              score += 1
+              for key in (
+                  "reward_msats",
+                  "budget_msats"
+              ):
+                  value = task.get(key)
 
-                  else:
-                      score -= 5
-                      reasons.append("zero or invalid reward")
+                  if isinstance(value, (int, float)):
+                      return float(value) / 1000.0
 
-              else:
-                  reasons.append("reward not explicitly detected")
+              return 0.0
 
-              # Payment mode.
-              if "LIGHTNING_SATS" in payment_modes:
-                  score += 3
-                  reasons.append("Lightning/sats payment")
 
-              if "USDC" in payment_modes:
-                  score += 2
-                  reasons.append("USDC payment")
+          def task_id(task):
+              return str(
+                  task.get("id")
+                  or task.get("post_id")
+                  or task.get("uuid")
+                  or ""
+              )
 
-              if "DM_REQUIRED" in payment_modes:
-                  score -= 2
-                  reasons.append("DM appears required")
 
-              # Skills aligned with NØX's current technical capabilities.
-              aligned_skills = {
-                  "Python",
-                  "API",
-                  "Automation",
-                  "Web scraping",
-                  "Data analysis",
-                  "Data cleanup",
-                  "QA/testing",
-                  "Testing",
-                  "Research",
-                  "CSV/data handling"
+          def score_task(task):
+              text = text_of(task)
+
+              score = 0
+              evidence = []
+
+              keywords = {
+                  "python": 2,
+                  "api": 2,
+                  "automation": 2,
+                  "research": 2,
+                  "analysis": 2,
+                  "data": 2,
+                  "testing": 2,
+                  "qa": 2,
+                  "documentation": 1,
+                  "scraping": 2,
+                  "debug": 2,
+                  "verification": 2,
+                  "source": 1,
+                  "json": 1,
+                  "csv": 1
               }
 
-              aligned = sorted(set(skills) & aligned_skills)
+              for word, points in keywords.items():
+                  if word in text:
+                      score += points
+                      evidence.append(word)
 
-              if aligned:
-                  score += min(4, len(aligned))
-                  reasons.append(
-                      "aligned skills: " + ", ".join(aligned[:5])
+              reward = reward_sats(task)
+
+              if reward >= 5000:
+                  score += 2
+
+              elif reward >= 1000:
+                  score += 1
+
+              risky_terms = (
+                  "wallet",
+                  "deposit",
+                  "transfer",
+                  "buy",
+                  "purchase",
+                  "investment"
+              )
+
+              if any(term in text for term in risky_terms):
+                  score -= 4
+
+              return score, sorted(set(evidence)), reward
+
+
+          def main():
+
+              memory = load_memory()
+
+              now = datetime.now(
+                  timezone.utc
+              ).isoformat()
+
+
+              tasks = as_list(
+                  get_json(
+                      "/marketplace/tasks",
+                      {
+                          "status": "open",
+                          "sort": "new",
+                          "limit": MAX_TASKS,
+                          "offset": 0
+                      }
+                  )
+              )
+
+
+              candidates = []
+
+
+              for task in tasks:
+
+                  task_id_value = task_id(task)
+
+                  if not task_id_value:
+                      continue
+
+
+                  score, evidence, reward = score_task(task)
+
+
+                  if score < 2:
+                      continue
+
+
+                  candidates.append({
+                      "task_id": task_id_value,
+                      "title": (
+                          task.get("title")
+                          or task.get("name")
+                          or "Untitled task"
+                      ),
+                      "score": score,
+                      "reward_sats": reward,
+                      "evidence": evidence,
+                      "author": (
+                          task.get("author")
+                          or task.get("author_name")
+                      ),
+                      "category": task.get("category"),
+                      "status": task.get(
+                          "status",
+                          "open"
+                      ),
+                      "url": (
+                          task.get("url")
+                          or task.get("web_url")
+                      ),
+                      "new_for_nox": (
+                          task_id_value
+                          not in memory.get(
+                              "seen_task_ids",
+                              []
+                          )
+                      )
+                  })
+
+
+              candidates.sort(
+                  key=lambda item: (
+                      item["score"],
+                      item["reward_sats"]
+                  ),
+                  reverse=True
+              )
+
+
+              top = candidates[:TOP_RESULTS]
+
+
+              for item in top:
+
+                  if (
+                      item["task_id"]
+                      not in memory["seen_task_ids"]
+                  ):
+                      memory["seen_task_ids"].append(
+                          item["task_id"]
+                      )
+
+
+              memory["seen_task_ids"] = (
+                  memory["seen_task_ids"][-500:]
+              )
+
+
+              new_candidates = sum(
+                  1
+                  for item in top
+                  if item["new_for_nox"]
+              )
+
+
+              high_priority_count = sum(
+                  1
+                  for item in top
+                  if item["score"] >= 6
+              )
+
+
+              medium_priority_count = sum(
+                  1
+                  for item in top
+                  if 3 <= item["score"] < 6
+              )
+
+
+              result = {
+
+                  "version": "ACT 07 V2",
+
+                  "name": (
+                      "Marketplace Opportunity Hunter"
+                  ),
+
+                  "mode": (
+                      "read_only_opportunity_detection"
+                  ),
+
+                  "generated_at": now,
+
+
+                  "policy": {
+
+                      "marketplace_read": True,
+
+                      "bid": False,
+
+                      "purchase": False,
+
+                      "payment": False,
+
+                      "transfer": False,
+
+                      "dm": False,
+
+                      "gemini": False,
+
+                      "project_cost_eur": 0
+
+                  },
+
+
+                  "observation": {
+
+                      "open_tasks_found": len(tasks),
+
+                      "opportunity_candidates": len(
+                          candidates
+                      ),
+
+                      "new_candidates": new_candidates,
+
+                      "high_priority_count": (
+                          high_priority_count
+                      ),
+
+                      "medium_priority_count": (
+                          medium_priority_count
+                      )
+
+                  },
+
+
+                  "opportunities": top,
+
+
+                  "decision": (
+                      "OBSERVE_ONLY"
+                      if top
+                      else "NO_OPPORTUNITY"
+                  ),
+
+
+                  "decision_reason": (
+
+                      "Real marketplace opportunities "
+                      "detected; no bid or financial "
+                      "action is executed."
+
+                      if top
+
+                      else
+
+                      "No sufficiently relevant open "
+                      "marketplace opportunity was "
+                      "detected."
+
                   )
 
-              # Deliverables and proof are positive.
-              if deliverables:
-                  score += 1
-                  reasons.append("concrete deliverables detected")
-
-              if "proof" in text or "sha-256" in text or "verified deliverables" in text:
-                  score += 2
-                  reasons.append("proof/evidence requirement detected")
-
-              # Public/sanitized scope is preferable.
-              if "public" in text or "sanitized" in text:
-                  score += 2
-                  reasons.append("public/sanitized inputs")
-
-              # Difficulty.
-              if difficulty == "LOW":
-                  score += 2
-                  reasons.append("low estimated difficulty")
-
-              elif difficulty == "MEDIUM":
-                  score += 1
-                  reasons.append("medium estimated difficulty")
-
-              elif difficulty == "HIGH":
-                  score -= 2
-                  reasons.append("high estimated difficulty")
-
-              # Risk flags.
-              if "PAYMENT_REQUIRED" in risk_flags:
-                  score -= 8
-                  reasons.append("payment required")
-
-              if "PURCHASE_LANGUAGE" in risk_flags:
-                  score -= 5
-                  reasons.append("purchase language detected")
-
-              if "PRIVATE_KEY" in risk_flags:
-                  score -= 8
-                  reasons.append("private key risk")
-
-              if "CREDENTIALS" in risk_flags:
-                  score -= 4
-                  reasons.append("credentials mentioned")
-
-              if "WALLET" in risk_flags:
-                  score -= 3
-                  reasons.append("wallet interaction mentioned")
-
-              if "CAPTCHA" in risk_flags:
-                  score -= 5
-                  reasons.append("CAPTCHA involvement")
-
-              if "UNAUTHORIZED_ACTIVITY" in risk_flags:
-                  score -= 6
-                  reasons.append("unauthorized activity restriction")
-
-              if "SCAM_LANGUAGE" in risk_flags:
-                  score -= 8
-                  reasons.append("scam language")
-
-              if "SPAM" in risk_flags or "SOCIAL_SPAM" in risk_flags:
-                  score -= 5
-                  reasons.append("spam/social-spam risk")
-
-              if "POSSIBLE_NEGATIVE_PRICE" in risk_flags:
-                  score -= 10
-                  reasons.append("possible negative price anomaly")
-
-              return score, reasons
-
-          def priority_from_score(score, economic_direction, status):
-              if economic_direction != "EARNING_OPPORTUNITY":
-                  return "DO_NOT_RECOMMEND"
-
-              if status != "OPEN":
-                  if score >= 12:
-                      return "WATCH"
-                  return "NOT_CURRENTLY_AVAILABLE"
-
-              if score >= 16:
-                  return "HIGH"
-
-              if score >= 10:
-                  return "MEDIUM"
-
-              return "LOW"
-
-          authenticate()
-
-          memory = load_memory()
-
-          payload, status_code, error = safe_get(
-              "/marketplace/tasks",
-              params={"limit": MAX_TASKS}
-          )
-
-          if payload is None:
-              raise RuntimeError(
-                  f"Marketplace request failed: HTTP {status_code} {error}"
-              )
-
-          if isinstance(payload, dict):
-              tasks = (
-                  payload.get("tasks")
-                  or payload.get("items")
-                  or payload.get("data")
-                  or []
-              )
-          elif isinstance(payload, list):
-              tasks = payload
-          else:
-              tasks = []
-
-          processed_ids = set(memory.get("processed_ids", []))
-
-          opportunities = []
-          new_ids = []
-
-          for task in tasks[:MAX_TASKS]:
-              if not isinstance(task, dict):
-                  continue
-
-              task_id = extract_task_id(task)
-
-              if not task_id:
-                  continue
-
-              title = extract_title(task)
-              description = extract_description(task)
-              text = extract_combined_text(task)
-
-              status = extract_status(task)
-              availability = detect_status(status, text)
-
-              reward = extract_reward(task, text)
-
-              economic_direction = classify_economic_direction(
-                  task,
-                  text
-              )
-
-              payment_modes = detect_payment_modes(text)
-              skills = detect_skills(text)
-              constraints = detect_constraints(text)
-              deliverables = detect_deliverables(text)
-              risk_flags = detect_risk_flags(text)
-
-              if detect_negative_reward(task, text):
-                  if "POSSIBLE_NEGATIVE_PRICE" not in risk_flags:
-                      risk_flags.append("POSSIBLE_NEGATIVE_PRICE")
-
-              difficulty = estimate_difficulty(text)
-
-              score, reasons = calculate_score(
-                  availability,
-                  economic_direction,
-                  reward,
-                  payment_modes,
-                  skills,
-                  deliverables,
-                  constraints,
-                  risk_flags,
-                  difficulty,
-                  text
-              )
-
-              priority = priority_from_score(
-                  score,
-                  economic_direction,
-                  availability
-              )
-
-              record = {
-                  "id": task_id,
-                  "title": title,
-                  "description": description[:1200],
-                  "status_raw": status,
-                  "availability": availability,
-                  "economic_direction": economic_direction,
-                  "reward": reward,
-                  "payment_modes": payment_modes,
-                  "skills": skills,
-                  "deliverables": deliverables,
-                  "constraints": constraints,
-                  "risk_flags": risk_flags,
-                  "estimated_difficulty": difficulty,
-                  "score": score,
-                  "priority": priority,
-                  "reasons": reasons[:12],
-                  "observed_at": utc_now()
               }
 
-              opportunities.append(record)
 
-              if str(task_id) not in processed_ids:
-                  new_ids.append(str(task_id))
+              memory["last_result"] = result
 
-          # Sort highest-value earning opportunities first.
-          opportunities.sort(
-              key=lambda x: (
-                  x["priority"] == "HIGH",
-                  x["priority"] == "MEDIUM",
-                  x["score"],
-                  x["reward"]["amount"] or 0
-              ),
-              reverse=True
-          )
 
-          # Keep memory bounded.
-          existing = memory.get("opportunities", [])
+              memory["runs"].append({
 
-          by_id = {
-              str(item.get("id")): item
-              for item in existing
-              if isinstance(item, dict) and item.get("id")
-          }
+                  "generated_at": now,
 
-          for item in opportunities:
-              by_id[str(item["id"])] = item
+                  "open_tasks_found": len(tasks),
 
-          memory["opportunities"] = list(by_id.values())[
-              -MAX_STORED_OPPORTUNITIES:
-          ]
+                  "opportunity_candidates": len(
+                      candidates
+                  )
 
-          memory["processed_ids"] = list(
-              dict.fromkeys(
-                  memory.get("processed_ids", []) + new_ids
+              })
+
+
+              memory["runs"] = (
+                  memory["runs"][-100:]
               )
-          )[-500:]
 
-          high_count = sum(
-              1 for x in opportunities
-              if x["priority"] == "HIGH"
-          )
 
-          medium_count = sum(
-              1 for x
+              save_memory(memory)
+
+
+              print(
+                  json.dumps(
+                      result,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+              )
+
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+      - name: Commit ACT 07 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_07_marketplace_hunter.json
+
+          git diff --cached --quiet || git commit -m "Update ACT 07 marketplace opportunity memory"
+
+          git push
