@@ -1,0 +1,565 @@
+name: NØX ACT 08 Opportunity Evaluator
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  opportunity-evaluator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Evaluate marketplace opportunities
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          BASE_URL = "https://thecolony.cc/api/v1"
+          MEMORY_FILE = Path("memory/nox_act_08_opportunity_evaluator.json")
+
+          MAX_OPPORTUNITIES = 10
+
+          headers = {
+              "Authorization": f"Bearer {os.environ['COLONY_API_KEY']}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+
+          session = requests.Session()
+          session.headers.update(headers)
+
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def load_memory():
+              if not MEMORY_FILE.exists():
+                  return {
+                      "version": "ACT 08",
+                      "evaluated_task_ids": [],
+                      "evaluation_history": [],
+                      "last_result": None,
+                  }
+
+              try:
+                  return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+              except Exception:
+                  return {
+                      "version": "ACT 08",
+                      "evaluated_task_ids": [],
+                      "evaluation_history": [],
+                      "last_result": None,
+                  }
+
+
+          def save_memory(memory):
+              MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+              MEMORY_FILE.write_text(
+                  json.dumps(memory, indent=2, ensure_ascii=False),
+                  encoding="utf-8",
+              )
+
+
+          def get_json(path, params=None):
+              response = session.get(
+                  f"{BASE_URL}{path}",
+                  params=params,
+                  timeout=30,
+              )
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"GET {path} failed: "
+                      f"{response.status_code} {response.text[:500]}"
+                  )
+
+              return response.json()
+
+
+          def as_list(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in ("items", "tasks", "results", "data", "opportunities"):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+
+          def task_id(task):
+              return str(
+                  task.get("task_id")
+                  or task.get("id")
+                  or task.get("post_id")
+                  or task.get("uuid")
+                  or ""
+              )
+
+
+          def title(task):
+              return str(task.get("title") or "").strip()
+
+
+          def description(task):
+              return str(
+                  task.get("description")
+                  or task.get("body")
+                  or task.get("content")
+                  or ""
+              ).strip()
+
+
+          def combined_text(task):
+              return f"{title(task)} {description(task)}".lower()
+
+
+          def extract_compensation(task):
+              text = combined_text(task)
+
+              amounts = []
+
+              patterns = [
+                  (r"(\d+(?:\.\d+)?)\s*sats?\b", "sats"),
+                  (r"(\d+(?:\.\d+)?)\s*sat\b", "sats"),
+                  (r"(\d+(?:\.\d+)?)\s*usdc\b", "USDC"),
+                  (r"\$\s*(\d+(?:\.\d+)?)\s*usdc\b", "USDC"),
+                  (r"(\d+(?:\.\d+)?)\s*\+\s*usdc\b", "USDC"),
+              ]
+
+              for pattern, currency in patterns:
+                  for match in re.finditer(pattern, text, re.IGNORECASE):
+                      try:
+                          value = float(match.group(1))
+                          amounts.append({
+                              "value": value,
+                              "currency": currency,
+                              "raw": match.group(0),
+                          })
+                      except ValueError:
+                          pass
+
+              reward_fields = (
+                  "reward_sats",
+                  "reward",
+                  "amount_sats",
+                  "payout_sats",
+                  "price_sats",
+              )
+
+              for field in reward_fields:
+                  value = task.get(field)
+
+                  if isinstance(value, (int, float)) and value > 0:
+                      amounts.append({
+                          "value": float(value),
+                          "currency": "sats",
+                          "raw": f"{value} sats",
+                      })
+
+              if not amounts:
+                  return {
+                      "known": False,
+                      "amounts": [],
+                      "status": "UNKNOWN",
+                  }
+
+              return {
+                  "known": True,
+                  "amounts": amounts,
+                  "status": "EXTRACTED",
+              }
+
+
+          def skill_match(text):
+              skill_map = {
+                  "python": "Python",
+                  "javascript": "JavaScript",
+                  "typescript": "TypeScript",
+                  "api": "API integration",
+                  "automation": "Automation",
+                  "scraping": "Web scraping",
+                  "research": "Research",
+                  "analysis": "Data/analysis",
+                  "data": "Data work",
+                  "json": "JSON/data handling",
+                  "csv": "CSV/data handling",
+                  "testing": "Testing",
+                  "qa": "QA/verification",
+                  "verification": "Verification",
+                  "documentation": "Technical documentation",
+                  "debug": "Debugging",
+                  "code review": "Code review",
+                  "technical writing": "Technical writing",
+              }
+
+              matches = []
+
+              for keyword, skill in skill_map.items():
+                  if keyword in text:
+                      matches.append(skill)
+
+              return sorted(set(matches))
+
+
+          def evaluate_task(task):
+              text = combined_text(task)
+              compensation = extract_compensation(task)
+              skills = skill_match(text)
+
+              positive_signals = {
+                  "python": 3,
+                  "api": 3,
+                  "automation": 3,
+                  "research": 2,
+                  "analysis": 2,
+                  "data": 2,
+                  "testing": 2,
+                  "qa": 2,
+                  "verification": 2,
+                  "documentation": 1,
+                  "json": 1,
+                  "csv": 1,
+                  "scraping": 2,
+                  "debug": 2,
+              }
+
+              negative_signals = {
+                  "deposit": -6,
+                  "wallet funding": -6,
+                  "transfer funds": -6,
+                  "buy crypto": -6,
+                  "investment": -5,
+                  "trading": -5,
+                  "gambling": -10,
+                  "captcha": -8,
+                  "private system": -6,
+                  "secret": -6,
+              }
+
+              compatibility_score = 0
+
+              for keyword, points in positive_signals.items():
+                  if keyword in text:
+                      compatibility_score += points
+
+              for keyword, points in negative_signals.items():
+                  if keyword in text:
+                      compatibility_score += points
+
+              if compensation["known"]:
+                  compensation_score = 3
+              else:
+                  compensation_score = 0
+
+              proof_required = any(
+                  word in text
+                  for word in (
+                      "proof",
+                      "verified",
+                      "verification",
+                      "deliverable",
+                      "reproducible",
+                      "test",
+                      "report",
+                  )
+              )
+
+              if proof_required:
+                  proof_level = "CLEAR"
+                  proof_score = 2
+              else:
+                  proof_level = "UNCLEAR"
+                  proof_score = 0
+
+              difficulty_keywords = {
+                  "microtask": "LOW",
+                  "small": "LOW",
+                  "simple": "LOW",
+                  "quick": "LOW",
+                  "24h": "MEDIUM",
+                  "full-stack": "HIGH",
+                  "complex": "HIGH",
+                  "comprehensive": "HIGH",
+                  "security": "HIGH",
+              }
+
+              difficulty = "MEDIUM"
+
+              for keyword, level in difficulty_keywords.items():
+                  if keyword in text:
+                      difficulty = level
+                      break
+
+              difficulty_score = {
+                  "LOW": 3,
+                  "MEDIUM": 2,
+                  "HIGH": 1,
+              }[difficulty]
+
+              risk_flags = []
+
+              for keyword in (
+                  "deposit",
+                  "wallet funding",
+                  "transfer funds",
+                  "buy crypto",
+                  "investment",
+                  "trading",
+                  "gambling",
+                  "captcha",
+                  "private system",
+                  "secret",
+              ):
+                  if keyword in text:
+                      risk_flags.append(keyword)
+
+              if risk_flags:
+                  risk = "HIGH"
+                  risk_score = -8
+              elif not compensation["known"]:
+                  risk = "MEDIUM"
+                  risk_score = -1
+              else:
+                  risk = "LOW"
+                  risk_score = 1
+
+              total_score = (
+                  compatibility_score
+                  + compensation_score
+                  + proof_score
+                  + difficulty_score
+                  + risk_score
+              )
+
+              if risk == "HIGH":
+                  priority = "REJECT"
+                  recommendation = "DO_NOT_PURCHASE_OR_BID"
+              elif compatibility_score >= 7 and compensation["known"] and proof_required:
+                  priority = "HIGH"
+                  recommendation = "MANUAL_REVIEW"
+              elif compatibility_score >= 5:
+                  priority = "MEDIUM"
+                  recommendation = "MANUAL_REVIEW"
+              else:
+                  priority = "LOW"
+                  recommendation = "OBSERVE"
+
+              return {
+                  "task_id": task_id(task),
+                  "title": title(task),
+                  "description_present": bool(description(task)),
+                  "compensation": compensation,
+                  "required_skills": skills,
+                  "difficulty": difficulty,
+                  "proof": {
+                      "required": proof_required,
+                      "level": proof_level,
+                  },
+                  "compatibility": {
+                      "score": compatibility_score,
+                      "with_nox_capabilities": compatibility_score >= 5,
+                  },
+                  "risk": {
+                      "level": risk,
+                      "flags": risk_flags,
+                  },
+                  "evaluation_score": total_score,
+                  "priority": priority,
+                  "recommendation": recommendation,
+                  "financial_action_executed": False,
+                  "bid_executed": False,
+                  "payment_executed": False,
+              }
+
+
+          memory = load_memory()
+
+          try:
+              previous_v07 = get_json(
+                  "/marketplace/tasks",
+                  params={
+                      "status": "open",
+                      "sort": "new",
+                      "limit": 100,
+                      "offset": 0,
+                  },
+              )
+
+              tasks = as_list(previous_v07)
+
+              evaluated = []
+
+              for task in tasks:
+                  tid = task_id(task)
+
+                  if not tid:
+                      continue
+
+                  evaluated.append(evaluate_task(task))
+
+              evaluated.sort(
+                  key=lambda item: (
+                      item["priority"] == "HIGH",
+                      item["evaluation_score"],
+                  ),
+                  reverse=True,
+              )
+
+              evaluated = evaluated[:MAX_OPPORTUNITIES]
+
+              previous_ids = set(memory.get("evaluated_task_ids", []))
+
+              new_evaluations = [
+                  item
+                  for item in evaluated
+                  if item["task_id"] not in previous_ids
+              ]
+
+              high_priority = [
+                  item
+                  for item in evaluated
+                  if item["priority"] == "HIGH"
+              ]
+
+              medium_priority = [
+                  item
+                  for item in evaluated
+                  if item["priority"] == "MEDIUM"
+              ]
+
+              recommended_manual_review = [
+                  item
+                  for item in evaluated
+                  if item["recommendation"] == "MANUAL_REVIEW"
+              ]
+
+              result = {
+                  "version": "ACT 08",
+                  "name": "Opportunity Evaluator",
+                  "mode": "read_only_decision_support",
+                  "generated_at": now(),
+                  "policy": {
+                      "marketplace_read": True,
+                      "opportunity_evaluation": True,
+                      "bid": False,
+                      "purchase": False,
+                      "payment": False,
+                      "transfer": False,
+                      "dm": False,
+                      "gemini": False,
+                      "project_cost_eur": 0,
+                  },
+                  "observation": {
+                      "open_tasks_found": len(tasks),
+                      "evaluated_opportunities": len(evaluated),
+                      "new_evaluations": len(new_evaluations),
+                      "high_priority_count": len(high_priority),
+                      "medium_priority_count": len(medium_priority),
+                      "manual_review_count": len(recommended_manual_review),
+                  },
+                  "decision": (
+                      "MANUAL_REVIEW_REQUIRED"
+                      if recommended_manual_review
+                      else "OBSERVE"
+                  ),
+                  "decision_reason": (
+                      "Compatible marketplace opportunities were evaluated. "
+                      "NØX recommends manual review only; no bid, payment, "
+                      "purchase or transfer is executed."
+                  ),
+                  "opportunities": evaluated,
+              }
+
+              all_ids = list(
+                  dict.fromkeys(
+                      memory.get("evaluated_task_ids", [])
+                      + [item["task_id"] for item in evaluated]
+                  )
+              )[-500:]
+
+              history = memory.get("evaluation_history", [])
+              history.append({
+                  "generated_at": result["generated_at"],
+                  "open_tasks_found": len(tasks),
+                  "evaluated_opportunities": len(evaluated),
+                  "new_evaluations": len(new_evaluations),
+                  "high_priority_count": len(high_priority),
+                  "medium_priority_count": len(medium_priority),
+              })
+
+              memory["version"] = "ACT 08"
+              memory["evaluated_task_ids"] = all_ids
+              memory["evaluation_history"] = history[-50:]
+              memory["last_result"] = result
+
+              save_memory(memory)
+
+              print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          except Exception as exc:
+              result = {
+                  "version": "ACT 08",
+                  "name": "Opportunity Evaluator",
+                  "mode": "read_only_decision_support",
+                  "generated_at": now(),
+                  "policy": {
+                      "bid": False,
+                      "purchase": False,
+                      "payment": False,
+                      "transfer": False,
+                      "dm": False,
+                      "gemini": False,
+                      "project_cost_eur": 0,
+                  },
+                  "decision": "ERROR",
+                  "error": str(exc),
+              }
+
+              memory["last_result"] = result
+              save_memory(memory)
+
+              print(json.dumps(result, indent=2, ensure_ascii=False))
+              raise
+          PY
+
+      - name: Commit ACT 08 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+          git add memory/nox_act_08_opportunity_evaluator.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "NØX ACT 08 opportunity evaluation update"
+            git push
+          fi
