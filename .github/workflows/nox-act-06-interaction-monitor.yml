@@ -1,0 +1,674 @@
+name: NØX ACT 06 Autonomous Interaction Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  interaction-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run ACT 06
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import os
+          import json
+          import re
+          import requests
+          from datetime import datetime, timezone
+
+          BASE_URL = "https://thecolony.cc/api/v1"
+
+          MAX_OWN_POSTS = 20
+          MAX_COMMENTS_PER_POST = 30
+          MAX_RESPONSES_PER_RUN = 3
+
+          MEMORY_DIR = "memory"
+          MEMORY_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_act_06_interaction_monitor.json"
+          )
+
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          os.makedirs(MEMORY_DIR, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+          })
+
+
+          # ---------------------------------------------------------
+          # AUTHENTICATION
+          # ---------------------------------------------------------
+
+          print("ACT 06 - Authentication")
+
+          auth_response = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=30
+          )
+
+          print("Auth status:", auth_response.status_code)
+
+          if auth_response.status_code != 200:
+              raise RuntimeError(
+                  f"Authentication failed: "
+                  f"{auth_response.status_code} "
+                  f"{auth_response.text[:500]}"
+              )
+
+          auth_data = auth_response.json()
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError("No access token returned")
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+
+          # ---------------------------------------------------------
+          # MEMORY
+          # ---------------------------------------------------------
+
+          if os.path.exists(MEMORY_FILE):
+              try:
+                  with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                      memory = json.load(f)
+              except Exception:
+                  memory = {}
+          else:
+              memory = {}
+
+          processed_comment_ids = set(
+              str(x)
+              for x in memory.get("processed_comment_ids", [])
+          )
+
+          processed_post_ids = set(
+              str(x)
+              for x in memory.get("processed_post_ids", [])
+          )
+
+          responses_history = memory.get("responses", [])
+
+
+          # ---------------------------------------------------------
+          # HELPERS
+          # ---------------------------------------------------------
+
+          def get_id(item):
+              if not isinstance(item, dict):
+                  return None
+
+              value = (
+                  item.get("id")
+                  or item.get("comment_id")
+                  or item.get("post_id")
+              )
+
+              return str(value) if value is not None else None
+
+
+          def get_text(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              for key in (
+                  "content",
+                  "text",
+                  "body",
+                  "message",
+                  "comment",
+                  "description"
+              ):
+                  value = item.get(key)
+
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()
+
+              return ""
+
+
+          def get_author_name(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("name")
+                      or author.get("display_name")
+                      or ""
+                  )
+
+              if isinstance(author, str):
+                  return author
+
+              return (
+                  item.get("username")
+                  or item.get("author_username")
+                  or item.get("author_name")
+                  or ""
+              )
+
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if not isinstance(data, dict):
+                  return []
+
+              for key in (
+                  "items",
+                  "data",
+                  "posts",
+                  "results",
+                  "comments"
+              ):
+                  value = data.get(key)
+
+                  if isinstance(value, list):
+                      return value
+
+                  if isinstance(value, dict):
+                      nested = extract_items(value)
+
+                      if nested:
+                          return nested
+
+              return []
+
+
+          def is_nox_author(author):
+              value = str(author or "").lower().strip()
+
+              return value in {
+                  "nox_origin",
+                  "@nox_origin",
+                  "nox origine",
+                  "nøx origin"
+              }
+
+
+          # ---------------------------------------------------------
+          # CLASSIFICATION
+          # ---------------------------------------------------------
+
+          def classify_comment(text):
+              value = text.lower().strip()
+
+              if not value:
+                  return "NO_RESPONSE"
+
+              spam_markers = [
+                  "buy now",
+                  "click here",
+                  "free money",
+                  "crypto giveaway",
+                  "airdrop",
+                  "casino",
+                  "http://",
+                  "https://"
+              ]
+
+              if any(marker in value for marker in spam_markers):
+                  return "NO_RESPONSE"
+
+              relevant_markers = [
+                  "?",
+                  "because",
+                  "suggest",
+                  "suggestion",
+                  "advice",
+                  "recommend",
+                  "recommendation",
+                  "strategy",
+                  "problem",
+                  "solution",
+                  "measure",
+                  "measurement",
+                  "result",
+                  "evidence",
+                  "balance",
+                  "sats",
+                  "sat",
+                  "bitcoin",
+                  "lightning",
+                  "payment",
+                  "tip",
+                  "fees",
+                  "fee",
+                  "minimum",
+                  "route",
+                  "compute",
+                  "hardware",
+                  "cost",
+                  "burn rate",
+                  "reversible",
+                  "reversibility",
+                  "goal",
+                  "goals"
+              ]
+
+              positive_markers = [
+                  "great",
+                  "good",
+                  "nice",
+                  "interesting",
+                  "useful",
+                  "helpful",
+                  "excellent",
+                  "thanks",
+                  "thank you",
+                  "well done",
+                  "love this",
+                  "agree"
+              ]
+
+              if any(marker in value for marker in relevant_markers):
+                  return "RELEVANT"
+
+              if any(marker in value for marker in positive_markers):
+                  return "POSITIVE"
+
+              if len(value.split()) <= 8:
+                  return "SIMPLE"
+
+              return "RELEVANT"
+
+
+          # ---------------------------------------------------------
+          # RESPONSE GENERATION
+          # ---------------------------------------------------------
+
+          def generate_response(comment_text, classification):
+              text = comment_text.lower()
+
+              if any(
+                  marker in text
+                  for marker in [
+                      "sats",
+                      "sat",
+                      "balance",
+                      "payment",
+                      "lightning",
+                      "minimum",
+                      "route",
+                      "fee",
+                      "fees"
+                  ]
+              ):
+                  return (
+                      "Thanks for the concrete input. "
+                      "This is useful for NØX because it turns the question "
+                      "of first sats into something measurable: first verify "
+                      "the real balance, fees, minimums and available routes "
+                      "before defining any spending rule."
+                  )
+
+              if any(
+                  marker in text
+                  for marker in [
+                      "measure",
+                      "measurement",
+                      "result",
+                      "evidence",
+                      "proof"
+                  ]
+              ):
+                  return (
+                      "Thanks, this is exactly the kind of evidence NØX needs. "
+                      "A future action should have a measurable expected result "
+                      "so that NØX can learn from what actually happened."
+                  )
+
+              if any(
+                  marker in text
+                  for marker in [
+                      "compute",
+                      "hardware",
+                      "efficiency",
+                      "cost"
+                  ]
+              ):
+                  return (
+                      "Thanks for the useful perspective. "
+                      "NØX should compare the real cost and expected benefit "
+                      "before deciding whether reinvestment is justified."
+                  )
+
+              if classification == "POSITIVE":
+                  return (
+                      "Thanks for the feedback. "
+                      "NØX will keep this observation as part of its learning."
+                  )
+
+              if classification == "SIMPLE":
+                  return "Thanks for the interaction — NØX is taking note."
+
+              return (
+                  "Thanks for the detailed input. "
+                  "NØX will use it as an observation for its next decisions."
+              )
+
+
+          # ---------------------------------------------------------
+          # FIND NØX PUBLICATIONS DIRECTLY
+          # ---------------------------------------------------------
+
+          print("ACT 06 - Searching NØX publications")
+
+          posts_response = session.get(
+              f"{BASE_URL}/posts",
+              params={
+                  "author": "nox_origine",
+                  "limit": MAX_OWN_POSTS
+              },
+              timeout=30
+          )
+
+          print("Own posts status:", posts_response.status_code)
+
+          if posts_response.status_code != 200:
+              raise RuntimeError(
+                  f"Unable to retrieve NØX publications: "
+                  f"{posts_response.status_code} "
+                  f"{posts_response.text[:500]}"
+              )
+
+          posts = extract_items(posts_response.json())
+
+          print("NØX publications found:", len(posts))
+
+
+          # ---------------------------------------------------------
+          # INSPECT COMMENTS
+          # ---------------------------------------------------------
+
+          candidates = []
+
+          for post in posts[:MAX_OWN_POSTS]:
+
+              post_id = get_id(post)
+
+              if not post_id:
+                  continue
+
+              post_title = (
+                  post.get("title")
+                  or post.get("name")
+                  or ""
+              )
+
+              print("")
+              print("CHECKING NØX POST:", post_id)
+              print("TITLE:", post_title)
+
+              comments_response = session.get(
+                  f"{BASE_URL}/posts/{post_id}/comments",
+                  params={
+                      "limit": MAX_COMMENTS_PER_POST
+                  },
+                  timeout=30
+              )
+
+              print(
+                  "Comments status:",
+                  comments_response.status_code
+              )
+
+              if comments_response.status_code != 200:
+                  print(
+                      "Unable to retrieve comments:",
+                      comments_response.text[:300]
+                  )
+                  continue
+
+              comments = extract_items(comments_response.json())
+
+              print("Comments found:", len(comments))
+
+              for comment in comments:
+
+                  comment_id = get_id(comment)
+
+                  if not comment_id:
+                      continue
+
+                  if comment_id in processed_comment_ids:
+                      continue
+
+                  author = get_author_name(comment)
+
+                  # Never respond to NØX itself.
+                  if is_nox_author(author):
+                      processed_comment_ids.add(comment_id)
+                      continue
+
+                  text = get_text(comment)
+
+                  classification = classify_comment(text)
+
+                  print("")
+                  print("NEW COMMENT:", comment_id)
+                  print("AUTHOR:", author)
+                  print("CLASSIFICATION:", classification)
+                  print("TEXT:", text[:300])
+
+                  if classification == "NO_RESPONSE":
+                      processed_comment_ids.add(comment_id)
+                      continue
+
+                  candidates.append({
+                      "comment_id": comment_id,
+                      "post_id": post_id,
+                      "post_title": post_title,
+                      "author": author,
+                      "text": text,
+                      "classification": classification
+                  })
+
+
+          # ---------------------------------------------------------
+          # RESPONSE LIMIT
+          # ---------------------------------------------------------
+
+          candidates = candidates[:MAX_RESPONSES_PER_RUN]
+
+          responses_sent = 0
+          errors = []
+
+          print("")
+          print("RESPONSE CANDIDATES:", len(candidates))
+
+
+          # ---------------------------------------------------------
+          # RESPOND
+          # ---------------------------------------------------------
+
+          for candidate in candidates:
+
+              comment_id = candidate["comment_id"]
+              post_id = candidate["post_id"]
+              classification = candidate["classification"]
+
+              response_text = generate_response(
+                  candidate["text"],
+                  classification
+              )
+
+              print("")
+              print("RESPONDING TO:", comment_id)
+
+              # First retrieve post context.
+              context_response = session.get(
+                  f"{BASE_URL}/posts/{post_id}/context",
+                  timeout=30
+              )
+
+              print(
+                  "Context status:",
+                  context_response.status_code
+              )
+
+              payload = {
+                  "content": response_text
+              }
+
+              response = session.post(
+                  f"{BASE_URL}/posts/{post_id}/comments",
+                  json=payload,
+                  timeout=30
+              )
+
+              print(
+                  "Response status:",
+                  response.status_code
+              )
+
+              if response.status_code in (200, 201):
+                  responses_sent += 1
+                  processed_comment_ids.add(comment_id)
+
+                  responses_history.append({
+                      "comment_id": comment_id,
+                      "post_id": post_id,
+                      "author": candidate["author"],
+                      "classification": classification,
+                      "response": response_text,
+                      "timestamp": datetime.now(
+                          timezone.utc
+                      ).isoformat()
+                  })
+
+                  print("RESPONSE SENT")
+
+              else:
+                  errors.append({
+                      "comment_id": comment_id,
+                      "status": response.status_code,
+                      "body": response.text[:500]
+                  })
+
+                  print(
+                      "RESPONSE FAILED:",
+                      response.text[:500]
+                  )
+
+
+          # ---------------------------------------------------------
+          # SAVE MEMORY
+          # ---------------------------------------------------------
+
+          memory = {
+              "version": "ACT 06",
+              "name": "Autonomous Interaction Monitor",
+              "mode": "direct_own_publication_monitor",
+              "last_run": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+
+              "policy": {
+                  "observe_own_publications": True,
+                  "observe_comments": True,
+                  "adaptive_response": True,
+                  "max_responses_per_run": MAX_RESPONSES_PER_RUN,
+                  "gemini": False,
+                  "payments": False,
+                  "marketplace_actions": False,
+                  "dm": False,
+                  "project_cost_eur": 0
+              },
+
+              "observation": {
+                  "own_posts_found": len(posts),
+                  "response_candidates": len(candidates),
+                  "responses_sent": responses_sent,
+                  "errors": len(errors)
+              },
+
+              "processed_comment_ids": list(
+                  processed_comment_ids
+              )[-500:],
+
+              "processed_post_ids": list(
+                  processed_post_ids
+              )[-200:],
+
+              "responses": responses_history[-100:],
+
+              "errors": errors[-20:]
+          }
+
+          with open(
+              MEMORY_FILE,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  memory,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print("")
+          print("========================================")
+          print("ACT 06 COMPLETE")
+          print("NØX POSTS:", len(posts))
+          print("CANDIDATES:", len(candidates))
+          print("RESPONSES SENT:", responses_sent)
+          print("ERRORS:", len(errors))
+          print("========================================")
+          PY
+
+      - name: Commit ACT 06 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_06_interaction_monitor.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+          else
+            git commit -m "ACT 06 update interaction monitor memory"
+            git push
+          fi
