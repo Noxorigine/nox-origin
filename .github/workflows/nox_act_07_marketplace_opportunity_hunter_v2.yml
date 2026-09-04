@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "*/30 * * * *"
 
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -13,8 +17,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,467 +32,493 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run NØX ACT 07 V2
+      - name: Run ACT 07 V2 Marketplace Opportunity Hunter
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           python <<'PY'
-          import os
           import json
+          import os
           import re
+          import requests
           from datetime import datetime, timezone
 
-          import requests
-
-
+          API_KEY = os.environ.get("COLONY_API_KEY")
           BASE_URL = "https://thecolony.cc/api/v1"
-          API_KEY = os.environ["COLONY_API_KEY"]
+          TASKS_URL = f"{BASE_URL}/marketplace/tasks"
 
-          MEMORY_FILE = "memory/nox_act_07_marketplace_hunter.json"
+          MEMORY_DIR = "memory"
+          MEMORY_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_act_07_marketplace_opportunity_hunter_v2.json"
+          )
 
-          MAX_TASKS = 100
-          TOP_RESULTS = 10
-          TIMEOUT = 20
+          MAX_RESULTS = 20
 
+          os.makedirs(MEMORY_DIR, exist_ok=True)
 
-          session = requests.Session()
-
-          session.headers.update({
-              "Authorization": f"Bearer {API_KEY}",
-              "Accept": "application/json",
-          })
-
-
-          def get_json(path, params=None):
-              response = session.get(
-                  BASE_URL + path,
-                  params=params,
-                  timeout=TIMEOUT
-              )
-
-              response.raise_for_status()
-              return response.json()
-
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
 
           def load_memory():
-              try:
-                  with open(MEMORY_FILE, "r", encoding="utf-8") as file:
-                      return json.load(file)
-
-              except (FileNotFoundError, json.JSONDecodeError):
+              if not os.path.exists(MEMORY_FILE):
                   return {
-                      "seen_task_ids": [],
-                      "runs": [],
-                      "last_result": None
+                      "version": "ACT 07 V2",
+                      "generated_at": None,
+                      "scanned_tasks": {},
+                      "statistics": {
+                          "runs": 0,
+                          "tasks_seen": 0,
+                          "opportunities_found": 0
+                      }
                   }
 
+              try:
+                  with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {
+                      "version": "ACT 07 V2",
+                      "generated_at": None,
+                      "scanned_tasks": {},
+                      "statistics": {
+                          "runs": 0,
+                          "tasks_seen": 0,
+                          "opportunities_found": 0
+                      }
+                  }
 
           def save_memory(memory):
-              directory = os.path.dirname(MEMORY_FILE)
+              temp_file = MEMORY_FILE + ".tmp"
 
-              if directory:
-                  os.makedirs(directory, exist_ok=True)
+              with open(temp_file, "w", encoding="utf-8") as f:
+                  json.dump(memory, f, ensure_ascii=False, indent=2)
 
-              with open(MEMORY_FILE, "w", encoding="utf-8") as file:
-                  json.dump(
-                      memory,
-                      file,
-                      ensure_ascii=False,
-                      indent=2
-                  )
-
-
-          def as_list(payload):
-              if isinstance(payload, list):
-                  return payload
-
-              if isinstance(payload, dict):
-                  for key in (
-                      "items",
-                      "tasks",
-                      "results",
-                      "data"
-                  ):
-                      value = payload.get(key)
-
-                      if isinstance(value, list):
-                          return value
-
-              return []
-
+              os.replace(temp_file, MEMORY_FILE)
 
           def text_of(task):
-              parts = []
+              title = str(task.get("title") or "")
+              description = str(
+                  task.get("description")
+                  or task.get("body")
+                  or ""
+              )
 
-              for key in (
-                  "title",
-                  "body",
-                  "description",
-                  "details",
-                  "tags",
-                  "category"
+              return f"{title} {description}".strip()
+
+          def normalize(value):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(value or "").strip().lower()
+              )
+
+          def is_service_offer(task):
+              text = normalize(text_of(task))
+
+              service_patterns = [
+                  r"\bfor hire\b",
+                  r"\bavailable for hire\b",
+                  r"\boffering\b",
+                  r"\bi offer\b",
+                  r"\bmy services\b",
+                  r"\bservices available\b",
+                  r"\bavailable to help\b",
+                  r"\bopen for work\b"
+              ]
+
+              return any(
+                  re.search(pattern, text)
+                  for pattern in service_patterns
+              )
+
+          def is_task_request(task):
+              text = normalize(text_of(task))
+
+              request_patterns = [
+                  r"\bneed an?\b",
+                  r"\blooking for\b",
+                  r"\bseeking\b",
+                  r"\bneed someone\b",
+                  r"\bwant someone\b",
+                  r"\bplease build\b",
+                  r"\bplease create\b",
+                  r"\bplease fix\b",
+                  r"\bplease analyze\b",
+                  r"\bplease research\b",
+                  r"\bplease test\b",
+                  r"\bplease develop\b",
+                  r"\bcan someone\b",
+                  r"\bdoes anyone\b",
+                  r"\bhelp needed\b",
+                  r"\btask\b",
+                  r"\bjob\b",
+                  r"\bwork needed\b"
+              ]
+
+              return any(
+                  re.search(pattern, text)
+                  for pattern in request_patterns
+              )
+
+          def extract_reward(task):
+              text = text_of(task)
+
+              # Never interpret a negative amount as a positive reward.
+              negative_money = re.search(
+                  r"-\s*\d+(?:[.,]\d+)?\s*(USDC|USD|SAT|SATS|BTC)",
+                  text,
+                  flags=re.IGNORECASE
+              )
+
+              if negative_money:
+                  return {
+                      "status": "ambiguous",
+                      "amount": None,
+                      "currency": negative_money.group(1).upper(),
+                      "reason": "negative_amount_detected"
+                  }
+
+              ambiguous_patterns = [
+                  r"\bpay what you want\b",
+                  r"\bnegotiable\b",
+                  r"\bmake an offer\b",
+                  r"\bcontact .* price\b",
+                  r"\bprice on request\b",
+                  r"\bdiscuss.*price\b",
+                  r"\bpayment.*negotiable\b"
+              ]
+
+              if any(
+                  re.search(pattern, normalize(text))
+                  for pattern in ambiguous_patterns
               ):
-                  value = task.get(key)
+                  return {
+                      "status": "ambiguous",
+                      "amount": None,
+                      "currency": None,
+                      "reason": "ambiguous_compensation"
+                  }
 
-                  if isinstance(value, list):
-                      parts.extend(str(item) for item in value)
+              positive = re.search(
+                  r"\b(\d+(?:[.,]\d+)?)\s*(USDC|USD|SAT|SATS|BTC)\b",
+                  text,
+                  flags=re.IGNORECASE
+              )
 
-                  elif value is not None:
-                      parts.append(str(value))
+              if positive:
+                  return {
+                      "status": "confirmed",
+                      "amount": positive.group(1),
+                      "currency": positive.group(2).upper(),
+                      "reason": "explicit_compensation"
+                  }
 
-              return " ".join(parts).lower()
+              return {
+                  "status": "unknown",
+                  "amount": None,
+                  "currency": None,
+                  "reason": "no_explicit_compensation"
+              }
 
+          def risk_assessment(task):
+              text = normalize(text_of(task))
 
-          def reward_sats(task):
-              for key in (
-                  "reward_sats",
-                  "budget_sats",
-                  "reward",
-                  "budget_max_sats",
-                  "listed_rate_sats"
-              ):
-                  value = task.get(key)
+              high_risk_patterns = [
+                  r"\bsolve captcha\b",
+                  r"\bcomplete captcha\b",
+                  r"\bpass captcha\b",
+                  r"\bbypass captcha\b",
+                  r"\bverify captcha\b",
+                  r"\bcaptcha solving\b",
+                  r"\bcaptcha required\b",
+                  r"\bprovide .*private key\b",
+                  r"\bshare .*private key\b",
+                  r"\bprovide .*seed phrase\b",
+                  r"\bshare .*seed phrase\b",
+                  r"\bprovide .*recovery phrase\b",
+                  r"\bshare .*recovery phrase\b",
+                  r"\bprovide .*mnemonic\b",
+                  r"\bsend crypto\b",
+                  r"\btransfer crypto\b",
+                  r"\bpay upfront\b",
+                  r"\bpay first\b",
+                  r"\bfund wallet\b",
+                  r"\bdeposit crypto\b",
+                  r"\bwallet password\b",
+                  r"\bwallet credentials\b"
+              ]
 
-                  if isinstance(value, (int, float)):
-                      return float(value)
+              for pattern in high_risk_patterns:
+                  if re.search(pattern, text):
+                      return {
+                          "level": "high",
+                          "reason": pattern
+                      }
 
-                  if isinstance(value, str):
-                      match = re.search(
-                          r"([\d,.]+)\s*sats?",
-                          value.lower()
-                      )
+              mention_patterns = [
+                  r"\bcaptcha\b",
+                  r"\bprivate key\b",
+                  r"\bseed phrase\b",
+                  r"\brecovery phrase\b",
+                  r"\bmnemonic\b",
+                  r"\bwallet\b"
+              ]
 
-                      if match:
-                          return float(
-                              match.group(1).replace(",", "")
-                          )
+              for pattern in mention_patterns:
+                  if re.search(pattern, text):
+                      return {
+                          "level": "mention_only",
+                          "reason": pattern
+                      }
 
-              for key in (
-                  "reward_msats",
-                  "budget_msats"
-              ):
-                  value = task.get(key)
+              return {
+                  "level": "low",
+                  "reason": None
+              }
 
-                  if isinstance(value, (int, float)):
-                      return float(value) / 1000.0
+          def compatibility(task):
+              text = normalize(text_of(task))
 
-              return 0.0
+              skills = {
+                  "python": [
+                      r"\bpython\b"
+                  ],
+                  "api": [
+                      r"\bapi\b",
+                      r"\brest\b",
+                      r"\bendpoint\b"
+                  ],
+                  "automation": [
+                      r"\bautomation\b",
+                      r"\bautomate\b",
+                      r"\bworkflow\b",
+                      r"\bbot\b"
+                  ],
+                  "research": [
+                      r"\bresearch\b",
+                      r"\banalyze\b",
+                      r"\banalysis\b",
+                      r"\binvestigate\b"
+                  ],
+                  "data": [
+                      r"\bdata\b",
+                      r"\bdataset\b",
+                      r"\bjson\b",
+                      r"\bcsv\b"
+                  ],
+                  "web": [
+                      r"\bweb scraping\b",
+                      r"\bscraping\b",
+                      r"\bscraper\b",
+                      r"\bcrawl\b"
+                  ],
+                  "testing": [
+                      r"\btest\b",
+                      r"\btesting\b",
+                      r"\bqa\b"
+                  ],
+                  "technical_writing": [
+                      r"\bdocumentation\b",
+                      r"\btechnical writing\b",
+                      r"\bdocs\b"
+                  ],
+                  "debugging": [
+                      r"\bdebug\b",
+                      r"\bdebugging\b",
+                      r"\bbug\b",
+                      r"\bfix\b"
+                  ]
+              }
 
+              matched = []
 
-          def task_id(task):
-              return str(
+              for skill, patterns in skills.items():
+                  if any(
+                      re.search(pattern, text)
+                      for pattern in patterns
+                  ):
+                      matched.append(skill)
+
+              score = min(len(matched) * 2, 10)
+
+              return score, matched
+
+          memory = load_memory()
+
+          headers = {
+              "Accept": "application/json",
+              "Authorization": f"Bearer {API_KEY}"
+          }
+
+          response = requests.get(
+              TASKS_URL,
+              headers=headers,
+              params={
+                  "status": "open",
+                  "sort": "new",
+                  "limit": 100,
+                  "offset": 0
+              },
+              timeout=30
+          )
+
+          print(f"Marketplace HTTP status: {response.status_code}")
+
+          response.raise_for_status()
+
+          payload = response.json()
+
+          if isinstance(payload, dict):
+              tasks = (
+                  payload.get("tasks")
+                  or payload.get("data")
+                  or payload.get("items")
+                  or []
+              )
+          elif isinstance(payload, list):
+              tasks = payload
+          else:
+              tasks = []
+
+          evaluated = []
+
+          for task in tasks[:MAX_RESULTS]:
+              task_id = str(
                   task.get("id")
-                  or task.get("post_id")
+                  or task.get("task_id")
                   or task.get("uuid")
                   or ""
               )
 
+              if not task_id:
+                  continue
 
-          def score_task(task):
-              text = text_of(task)
+              service_offer = is_service_offer(task)
+              task_request = is_task_request(task)
 
-              score = 0
-              evidence = []
+              reward = extract_reward(task)
+              risk = risk_assessment(task)
+              compatibility_score, matched_skills = compatibility(task)
 
-              keywords = {
-                  "python": 2,
-                  "api": 2,
-                  "automation": 2,
-                  "research": 2,
-                  "analysis": 2,
-                  "data": 2,
-                  "testing": 2,
-                  "qa": 2,
-                  "documentation": 1,
-                  "scraping": 2,
-                  "debug": 2,
-                  "verification": 2,
-                  "source": 1,
-                  "json": 1,
-                  "csv": 1
-              }
+              if service_offer and not task_request:
+                  classification = "SERVICE_OFFER"
 
-              for word, points in keywords.items():
-                  if word in text:
-                      score += points
-                      evidence.append(word)
+              elif risk["level"] == "high":
+                  classification = "REJECT"
 
-              reward = reward_sats(task)
+              elif not task_request:
+                  classification = "OBSERVE"
 
-              if reward >= 5000:
-                  score += 2
+              elif reward["status"] != "confirmed":
+                  classification = "REVIEW"
 
-              elif reward >= 1000:
-                  score += 1
+              elif risk["level"] == "mention_only":
+                  classification = "REVIEW"
 
-              risky_terms = (
-                  "wallet",
-                  "deposit",
-                  "transfer",
-                  "buy",
-                  "purchase",
-                  "investment"
-              )
+              elif compatibility_score >= 8:
+                  classification = "QUALIFIED"
 
-              if any(term in text for term in risky_terms):
-                  score -= 4
+              elif compatibility_score >= 5:
+                  classification = "REVIEW"
 
-              return score, sorted(set(evidence)), reward
+              else:
+                  classification = "OBSERVE"
 
+              title = str(task.get("title") or "Untitled")
 
-          def main():
-
-              memory = load_memory()
-
-              now = datetime.now(
-                  timezone.utc
-              ).isoformat()
-
-
-              tasks = as_list(
-                  get_json(
-                      "/marketplace/tasks",
-                      {
-                          "status": "open",
-                          "sort": "new",
-                          "limit": MAX_TASKS,
-                          "offset": 0
-                      }
-                  )
-              )
-
-
-              candidates = []
-
-
-              for task in tasks:
-
-                  task_id_value = task_id(task)
-
-                  if not task_id_value:
-                      continue
-
-
-                  score, evidence, reward = score_task(task)
-
-
-                  if score < 2:
-                      continue
-
-
-                  candidates.append({
-                      "task_id": task_id_value,
-                      "title": (
-                          task.get("title")
-                          or task.get("name")
-                          or "Untitled task"
-                      ),
-                      "score": score,
-                      "reward_sats": reward,
-                      "evidence": evidence,
-                      "author": (
-                          task.get("author")
-                          or task.get("author_name")
-                      ),
-                      "category": task.get("category"),
-                      "status": task.get(
-                          "status",
-                          "open"
-                      ),
-                      "url": (
-                          task.get("url")
-                          or task.get("web_url")
-                      ),
-                      "new_for_nox": (
-                          task_id_value
-                          not in memory.get(
-                              "seen_task_ids",
-                              []
-                          )
-                      )
-                  })
-
-
-              candidates.sort(
-                  key=lambda item: (
-                      item["score"],
-                      item["reward_sats"]
-                  ),
-                  reverse=True
-              )
-
-
-              top = candidates[:TOP_RESULTS]
-
-
-              for item in top:
-
-                  if (
-                      item["task_id"]
-                      not in memory["seen_task_ids"]
-                  ):
-                      memory["seen_task_ids"].append(
-                          item["task_id"]
-                      )
-
-
-              memory["seen_task_ids"] = (
-                  memory["seen_task_ids"][-500:]
-              )
-
-
-              new_candidates = sum(
-                  1
-                  for item in top
-                  if item["new_for_nox"]
-              )
-
-
-              high_priority_count = sum(
-                  1
-                  for item in top
-                  if item["score"] >= 6
-              )
-
-
-              medium_priority_count = sum(
-                  1
-                  for item in top
-                  if 3 <= item["score"] < 6
-              )
-
-
-              result = {
-
-                  "version": "ACT 07 V2",
-
-                  "name": (
-                      "Marketplace Opportunity Hunter"
-                  ),
-
-                  "mode": (
-                      "read_only_opportunity_detection"
-                  ),
-
-                  "generated_at": now,
-
-
-                  "policy": {
-
-                      "marketplace_read": True,
-
+              record = {
+                  "task_id": task_id,
+                  "title": title,
+                  "classification": classification,
+                  "service_offer": service_offer,
+                  "task_request": task_request,
+                  "reward": reward,
+                  "risk": risk,
+                  "compatibility_score": compatibility_score,
+                  "matched_skills": matched_skills,
+                  "observed_at": utc_now(),
+                  "actions": {
                       "bid": False,
-
-                      "purchase": False,
-
-                      "payment": False,
-
-                      "transfer": False,
-
+                      "comment": False,
                       "dm": False,
-
-                      "gemini": False,
-
-                      "project_cost_eur": 0
-
-                  },
-
-
-                  "observation": {
-
-                      "open_tasks_found": len(tasks),
-
-                      "opportunity_candidates": len(
-                          candidates
-                      ),
-
-                      "new_candidates": new_candidates,
-
-                      "high_priority_count": (
-                          high_priority_count
-                      ),
-
-                      "medium_priority_count": (
-                          medium_priority_count
-                      )
-
-                  },
-
-
-                  "opportunities": top,
-
-
-                  "decision": (
-                      "OBSERVE_ONLY"
-                      if top
-                      else "NO_OPPORTUNITY"
-                  ),
-
-
-                  "decision_reason": (
-
-                      "Real marketplace opportunities "
-                      "detected; no bid or financial "
-                      "action is executed."
-
-                      if top
-
-                      else
-
-                      "No sufficiently relevant open "
-                      "marketplace opportunity was "
-                      "detected."
-
-                  )
-
+                      "payment": False,
+                      "purchase": False,
+                      "transfer": False
+                  }
               }
 
+              evaluated.append(record)
+              memory["scanned_tasks"][task_id] = record
 
-              memory["last_result"] = result
+          memory["version"] = "ACT 07 V2"
+          memory["generated_at"] = utc_now()
+          memory["statistics"]["runs"] = (
+              memory["statistics"].get("runs", 0) + 1
+          )
+          memory["statistics"]["tasks_seen"] = len(tasks)
+          memory["statistics"]["opportunities_found"] = sum(
+              1
+              for item in evaluated
+              if item["classification"] in {
+                  "QUALIFIED",
+                  "REVIEW"
+              }
+          )
 
+          memory["last_run"] = {
+              "timestamp": utc_now(),
+              "marketplace_status": response.status_code,
+              "tasks_returned": len(tasks),
+              "tasks_evaluated": len(evaluated),
+              "actions_performed": False,
+              "gemini_used": False,
+              "project_cost_eur": 0
+          }
 
-              memory["runs"].append({
+          save_memory(memory)
 
-                  "generated_at": now,
+          print("")
+          print("=== NØX ACT 07 V2 RESULT ===")
+          print(f"Open tasks received: {len(tasks)}")
+          print(f"Tasks evaluated: {len(evaluated)}")
 
-                  "open_tasks_found": len(tasks),
+          counts = {}
 
-                  "opportunity_candidates": len(
-                      candidates
-                  )
+          for item in evaluated:
+              category = item["classification"]
+              counts[category] = counts.get(category, 0) + 1
 
-              })
+          for category, count in sorted(counts.items()):
+              print(f"{category}: {count}")
 
-
-              memory["runs"] = (
-                  memory["runs"][-100:]
-              )
-
-
-              save_memory(memory)
-
-
-              print(
-                  json.dumps(
-                      result,
-                      ensure_ascii=False,
-                      indent=2
-                  )
-              )
-
-
-          if __name__ == "__main__":
-              main()
-
+          print("")
+          print("Actions performed: NO")
+          print("Gemini used: NO")
+          print("Project cost: €0")
+          print("==============================")
           PY
 
-      - name: Commit ACT 07 memory
+      - name: Commit and push ACT 07 memory
         run: |
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
 
-          git add memory/nox_act_07_marketplace_hunter.json
+          git add memory/nox_act_07_marketplace_opportunity_hunter_v2.json
 
-          git diff --cached --quiet || git commit -m "Update ACT 07 marketplace opportunity memory"
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+            exit 0
+          fi
 
-          git push
+          git commit -m "Update ACT 07 marketplace opportunity memory"
+
+          git fetch origin main
+
+          if git rebase origin/main; then
+            git push origin HEAD:main
+          else
+            echo "Rebase conflict detected."
+            git rebase --abort
+            exit 1
+          fi
