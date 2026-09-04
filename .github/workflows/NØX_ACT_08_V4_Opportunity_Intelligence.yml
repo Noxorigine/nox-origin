@@ -1,0 +1,667 @@
+name: NØX ACT 08 V4 Opportunity Intelligence
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  opportunity-intelligence:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run ACT 08 V4 Opportunity Intelligence
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import re
+          import requests
+          from datetime import datetime, timezone
+
+          API_KEY = os.environ.get("COLONY_API_KEY")
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is not configured.")
+
+          BASE_URL = "https://thecolony.cc/api/v1"
+          TASKS_URL = f"{BASE_URL}/marketplace/tasks"
+
+          MEMORY_DIR = "memory"
+          MEMORY_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_act_08_opportunity_evaluator_v4.json"
+          )
+
+          MAX_RESULTS = 10
+
+          os.makedirs(MEMORY_DIR, exist_ok=True)
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def empty_memory():
+              return {
+                  "version": "ACT 08 V4",
+                  "generated_at": None,
+                  "evaluated_tasks": {},
+                  "statistics": {
+                      "runs": 0,
+                      "tasks_seen": 0,
+                      "tasks_evaluated": 0,
+                      "qualified": 0,
+                      "review": 0,
+                      "observe": 0,
+                      "service_offer": 0,
+                      "reward_unclear": 0,
+                      "rejected": 0
+                  }
+              }
+
+          def load_memory():
+              if not os.path.exists(MEMORY_FILE):
+                  return empty_memory()
+
+              try:
+                  with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+
+                  if not isinstance(data, dict):
+                      return empty_memory()
+
+                  data.setdefault("evaluated_tasks", {})
+                  data.setdefault("statistics", {})
+
+                  return data
+
+              except Exception:
+                  print("Memory could not be loaded. Starting with empty memory.")
+                  return empty_memory()
+
+          def save_memory(memory):
+              temp_file = MEMORY_FILE + ".tmp"
+
+              with open(temp_file, "w", encoding="utf-8") as f:
+                  json.dump(
+                      memory,
+                      f,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+
+              os.replace(temp_file, MEMORY_FILE)
+
+          def normalize(value):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(value or "").strip().lower()
+              )
+
+          def get_text(task):
+              title = str(task.get("title") or "")
+              body = str(
+                  task.get("description")
+                  or task.get("body")
+                  or task.get("content")
+                  or ""
+              )
+
+              return f"{title} {body}".strip()
+
+          # ------------------------------------------------------------
+          # 1. CLASSIFICATION OF THE ANNOUNCEMENT
+          # ------------------------------------------------------------
+
+          def classify_announcement(task):
+              title = normalize(task.get("title"))
+              body = normalize(
+                  task.get("description")
+                  or task.get("body")
+                  or task.get("content")
+                  or ""
+              )
+
+              full_text = f"{title} {body}"
+
+              service_patterns = [
+                  r"\bfor hire\b",
+                  r"\bavailable for hire\b",
+                  r"\boffering\b",
+                  r"\bi offer\b",
+                  r"\bmy services\b",
+                  r"\bservices available\b",
+                  r"\bavailable to help\b",
+                  r"\bopen for work\b",
+                  r"\bhire me\b"
+              ]
+
+              request_patterns = [
+                  r"\bneed an?\b",
+                  r"\bneed someone\b",
+                  r"\blooking for someone\b",
+                  r"\blooking for an?\b",
+                  r"\bseeking someone\b",
+                  r"\bseeking an?\b",
+                  r"\bwant someone\b",
+                  r"\bplease build\b",
+                  r"\bplease create\b",
+                  r"\bplease fix\b",
+                  r"\bplease analyze\b",
+                  r"\bplease research\b",
+                  r"\bplease test\b",
+                  r"\bplease develop\b",
+                  r"\bcan someone\b",
+                  r"\bdoes anyone\b",
+                  r"\bhelp needed\b",
+                  r"\bwork needed\b"
+              ]
+
+              has_service = any(
+                  re.search(pattern, full_text)
+                  for pattern in service_patterns
+              )
+
+              has_request = any(
+                  re.search(pattern, full_text)
+                  for pattern in request_patterns
+              )
+
+              # Explicit direct request wins over generic service wording.
+              if has_request:
+                  return "TASK_REQUEST"
+
+              if has_service:
+                  return "SERVICE_OFFER"
+
+              generic_task_patterns = [
+                  r"\btask\b",
+                  r"\bjob\b",
+                  r"\bassignment\b",
+                  r"\bbuild\b",
+                  r"\bcreate\b",
+                  r"\bdevelop\b",
+                  r"\bfixed\b",
+                  r"\bfix\b",
+                  r"\banalyze\b",
+                  r"\bresearch\b",
+                  r"\btest\b",
+                  r"\bdebug\b"
+              ]
+
+              if any(
+                  re.search(pattern, full_text)
+                  for pattern in generic_task_patterns
+              ):
+                  return "TASK_REQUEST"
+
+              return "AMBIGUOUS"
+
+          # ------------------------------------------------------------
+          # 2. COMPENSATION ANALYSIS
+          # ------------------------------------------------------------
+
+          def classify_reward(task):
+              text = get_text(task)
+
+              normalized = normalize(text)
+
+              ambiguous_patterns = [
+                  r"\bpay what you want\b",
+                  r"\bpay-what-you-want\b",
+                  r"\bnegotiable\b",
+                  r"\bmake an offer\b",
+                  r"\bmake your offer\b",
+                  r"\bcontact .* price\b",
+                  r"\bprice on request\b",
+                  r"\bprice negotiable\b",
+                  r"\bpayment negotiable\b",
+                  r"\bdiscuss .* price\b",
+                  r"\bopen to offers\b"
+              ]
+
+              if any(
+                  re.search(pattern, normalized)
+                  for pattern in ambiguous_patterns
+              ):
+                  return {
+                      "status": "REWARD_AMBIGUOUS",
+                      "amount": None,
+                      "currency": None,
+                      "reason": "ambiguous_compensation"
+                  }
+
+              negative = re.search(
+                  r"-\s*\d+(?:[.,]\d+)?\s*(USDC|USD|SAT|SATS|BTC)",
+                  text,
+                  flags=re.IGNORECASE
+              )
+
+              if negative:
+                  return {
+                      "status": "REWARD_AMBIGUOUS",
+                      "amount": None,
+                      "currency": negative.group(1).upper(),
+                      "reason": "negative_amount_detected"
+                  }
+
+              positive = re.search(
+                  r"\b(\d+(?:[.,]\d+)?)\s*(USDC|USD|SAT|SATS|BTC)\b",
+                  text,
+                  flags=re.IGNORECASE
+              )
+
+              if positive:
+                  return {
+                      "status": "CONFIRMED_REWARD",
+                      "amount": positive.group(1),
+                      "currency": positive.group(2).upper(),
+                      "reason": "explicit_positive_reward"
+                  }
+
+              return {
+                  "status": "REWARD_UNKNOWN",
+                  "amount": None,
+                  "currency": None,
+                  "reason": "no_explicit_reward"
+              }
+
+          # ------------------------------------------------------------
+          # 3. ACTION-SENSITIVE RISK ANALYSIS
+          # ------------------------------------------------------------
+
+          def assess_risk(task):
+              text = normalize(get_text(task))
+
+              high_risk_patterns = [
+                  r"\bsolve captcha\b",
+                  r"\bcomplete captcha\b",
+                  r"\bpass captcha\b",
+                  r"\bbypass captcha\b",
+                  r"\bverify captcha\b",
+                  r"\bcaptcha solving\b",
+                  r"\bcaptcha required\b",
+
+                  r"\bprovide .*private key\b",
+                  r"\bshare .*private key\b",
+                  r"\bgive .*private key\b",
+
+                  r"\bprovide .*seed phrase\b",
+                  r"\bshare .*seed phrase\b",
+                  r"\bgive .*seed phrase\b",
+
+                  r"\bprovide .*recovery phrase\b",
+                  r"\bshare .*recovery phrase\b",
+
+                  r"\bprovide .*mnemonic\b",
+                  r"\bshare .*mnemonic\b",
+
+                  r"\bsend crypto\b",
+                  r"\btransfer crypto\b",
+                  r"\bsend .*usdc\b",
+                  r"\btransfer .*usdc\b",
+
+                  r"\bpay upfront\b",
+                  r"\bpay first\b",
+                  r"\bpayment upfront\b",
+
+                  r"\bfund wallet\b",
+                  r"\bdeposit crypto\b",
+
+                  r"\bwallet password\b",
+                  r"\bwallet credentials\b"
+              ]
+
+              for pattern in high_risk_patterns:
+                  if re.search(pattern, text):
+                      return {
+                          "level": "HIGH",
+                          "reason": pattern
+                      }
+
+              mention_patterns = [
+                  r"\bcaptcha\b",
+                  r"\bprivate key\b",
+                  r"\bseed phrase\b",
+                  r"\brecovery phrase\b",
+                  r"\bmnemonic\b",
+                  r"\bwallet\b"
+              ]
+
+              for pattern in mention_patterns:
+                  if re.search(pattern, text):
+                      return {
+                          "level": "RISK_MENTION_ONLY",
+                          "reason": pattern
+                      }
+
+              return {
+                  "level": "LOW",
+                  "reason": None
+              }
+
+          # ------------------------------------------------------------
+          # 4. NØX COMPATIBILITY
+          # ------------------------------------------------------------
+
+          def calculate_compatibility(task):
+              text = normalize(get_text(task))
+
+              skills = {
+                  "python": [
+                      r"\bpython\b"
+                  ],
+                  "api": [
+                      r"\bapi\b",
+                      r"\brest api\b",
+                      r"\bendpoint\b"
+                  ],
+                  "automation": [
+                      r"\bautomation\b",
+                      r"\bautomate\b",
+                      r"\bworkflow\b",
+                      r"\bbot\b"
+                  ],
+                  "research": [
+                      r"\bresearch\b",
+                      r"\banalyze\b",
+                      r"\banalysis\b",
+                      r"\binvestigate\b"
+                  ],
+                  "data": [
+                      r"\bdata\b",
+                      r"\bdataset\b",
+                      r"\bjson\b",
+                      r"\bcsv\b"
+                  ],
+                  "web": [
+                      r"\bweb scraping\b",
+                      r"\bscraping\b",
+                      r"\bscraper\b",
+                      r"\bcrawl\b"
+                  ],
+                  "testing": [
+                      r"\btest\b",
+                      r"\btesting\b",
+                      r"\bqa\b"
+                  ],
+                  "technical_writing": [
+                      r"\bdocumentation\b",
+                      r"\btechnical writing\b",
+                      r"\bdocs\b"
+                  ],
+                  "debugging": [
+                      r"\bdebug\b",
+                      r"\bdebugging\b",
+                      r"\bbug\b",
+                      r"\bfix\b"
+                  ]
+              }
+
+              matched = []
+
+              for skill, patterns in skills.items():
+                  if any(
+                      re.search(pattern, text)
+                      for pattern in patterns
+                  ):
+                      matched.append(skill)
+
+              score = min(len(matched) * 2, 10)
+
+              return {
+                  "score": score,
+                  "matched_skills": matched
+              }
+
+          # ------------------------------------------------------------
+          # 5. FINAL DECISION
+          # ------------------------------------------------------------
+
+          def final_classification(
+              announcement,
+              reward,
+              risk,
+              compatibility
+          ):
+              # Safety always has priority.
+              if risk["level"] == "HIGH":
+                  return "REJECT"
+
+              # Service advertisements are not client opportunities.
+              if announcement == "SERVICE_OFFER":
+                  return "SERVICE_OFFER"
+
+              # Unknown announcement type stays observational.
+              if announcement == "AMBIGUOUS":
+                  return "OBSERVE"
+
+              # A task without clear positive compensation is not qualified.
+              if reward["status"] == "REWARD_AMBIGUOUS":
+                  return "REWARD_UNCLEAR"
+
+              if reward["status"] == "REWARD_UNKNOWN":
+                  return "REVIEW"
+
+              # Mention-only safety context requires manual review.
+              if risk["level"] == "RISK_MENTION_ONLY":
+                  return "REVIEW"
+
+              if compatibility["score"] >= 8:
+                  return "QUALIFIED"
+
+              if compatibility["score"] >= 5:
+                  return "REVIEW"
+
+              return "OBSERVE"
+
+          memory = load_memory()
+
+          headers = {
+              "Accept": "application/json",
+              "Authorization": f"Bearer {API_KEY}"
+          }
+
+          response = requests.get(
+              TASKS_URL,
+              headers=headers,
+              params={
+                  "status": "open",
+                  "sort": "new",
+                  "limit": 100,
+                  "offset": 0
+              },
+              timeout=30
+          )
+
+          print(f"Marketplace HTTP status: {response.status_code}")
+
+          response.raise_for_status()
+
+          payload = response.json()
+
+          if isinstance(payload, dict):
+              tasks = (
+                  payload.get("tasks")
+                  or payload.get("data")
+                  or payload.get("items")
+                  or []
+              )
+          elif isinstance(payload, list):
+              tasks = payload
+          else:
+              tasks = []
+
+          evaluated = []
+
+          for task in tasks[:MAX_RESULTS]:
+              task_id = str(
+                  task.get("id")
+                  or task.get("task_id")
+                  or task.get("uuid")
+                  or ""
+              )
+
+              if not task_id:
+                  continue
+
+              announcement = classify_announcement(task)
+              reward = classify_reward(task)
+              risk = assess_risk(task)
+              compatibility = calculate_compatibility(task)
+
+              classification = final_classification(
+                  announcement,
+                  reward,
+                  risk,
+                  compatibility
+              )
+
+              record = {
+                  "task_id": task_id,
+                  "title": str(task.get("title") or "Untitled"),
+
+                  "announcement": {
+                      "type": announcement
+                  },
+
+                  "compensation": reward,
+
+                  "risk": risk,
+
+                  "compatibility": compatibility,
+
+                  "classification": classification,
+
+                  "actions": {
+                      "bid": False,
+                      "comment": False,
+                      "dm": False,
+                      "payment": False,
+                      "purchase": False,
+                      "transfer": False
+                  },
+
+                  "gemini_used": False,
+                  "project_cost_eur": 0,
+                  "evaluated_at": utc_now()
+              }
+
+              evaluated.append(record)
+              memory["evaluated_tasks"][task_id] = record
+
+          stats = memory.setdefault(
+              "statistics",
+              {}
+          )
+
+          stats["runs"] = stats.get("runs", 0) + 1
+          stats["tasks_seen"] = len(tasks)
+          stats["tasks_evaluated"] = len(evaluated)
+
+          categories = [
+              "QUALIFIED",
+              "REVIEW",
+              "OBSERVE",
+              "SERVICE_OFFER",
+              "REWARD_UNCLEAR",
+              "REJECT"
+          ]
+
+          for category in categories:
+              key = category.lower()
+              stats[key] = sum(
+                  1
+                  for item in evaluated
+                  if item["classification"] == category
+              )
+
+          memory["version"] = "ACT 08 V4"
+          memory["generated_at"] = utc_now()
+
+          memory["last_run"] = {
+              "timestamp": utc_now(),
+              "marketplace_status": response.status_code,
+              "open_tasks_received": len(tasks),
+              "tasks_evaluated": len(evaluated),
+
+              "actions_performed": False,
+              "bid": False,
+              "comment": False,
+              "dm": False,
+              "payment": False,
+              "purchase": False,
+              "transfer": False,
+
+              "gemini_used": False,
+              "project_cost_eur": 0
+          }
+
+          save_memory(memory)
+
+          print("")
+          print("========================================")
+          print("NØX ACT 08 V4 OPPORTUNITY INTELLIGENCE")
+          print("========================================")
+          print(f"Open tasks received : {len(tasks)}")
+          print(f"Tasks evaluated     : {len(evaluated)}")
+          print("")
+
+          for category in categories:
+              count = stats.get(category.lower(), 0)
+              print(f"{category:16}: {count}")
+
+          print("")
+          print("Actions performed   : NO")
+          print("Gemini used         : NO")
+          print("Project cost        : €0")
+          print("========================================")
+          PY
+
+      - name: Commit and push ACT 08 V4 memory
+        run: |
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_08_opportunity_evaluator_v4.json
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update ACT 08 V4 opportunity intelligence memory"
+
+          git fetch origin main
+
+          if git rebase origin/main; then
+            git push origin HEAD:main
+          else
+            echo "Rebase conflict detected."
+            git rebase --abort
+            exit 1
+          fi
