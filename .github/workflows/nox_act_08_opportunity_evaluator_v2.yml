@@ -40,49 +40,89 @@ jobs:
           import requests
 
           BASE_URL = "https://thecolony.cc/api/v1"
-          MEMORY_FILE = Path("memory/nox_act_08_opportunity_evaluator_v2.json")
-          MAX_OPPORTUNITIES = 10
+          MEMORY_FILE = Path(
+              "memory/nox_act_08_opportunity_evaluator_v2.json"
+          )
 
-          headers = {
-              "Authorization": f"Bearer {os.environ['COLONY_API_KEY']}",
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-          }
+          MAX_OPPORTUNITIES = 10
+          MAX_HISTORY = 50
+          MAX_EVALUATED_IDS = 500
+
+          api_key = os.environ.get("COLONY_API_KEY", "").strip()
+
+          if not api_key:
+              raise RuntimeError("COLONY_API_KEY secret is missing.")
 
           session = requests.Session()
-          session.headers.update(headers)
+          session.headers.update({
+              "Authorization": f"Bearer {api_key}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          })
 
 
           def now():
               return datetime.now(timezone.utc).isoformat()
 
 
+          def empty_memory():
+              return {
+                  "version": "ACT 08 V2",
+                  "evaluated_task_ids": [],
+                  "evaluation_history": [],
+                  "last_result": None,
+              }
+
+
           def load_memory():
               if not MEMORY_FILE.exists():
-                  return {
-                      "version": "ACT 08 V2",
-                      "evaluated_task_ids": [],
-                      "evaluation_history": [],
-                      "last_result": None,
-                  }
+                  return empty_memory()
 
               try:
-                  return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-              except Exception:
-                  return {
-                      "version": "ACT 08 V2",
-                      "evaluated_task_ids": [],
-                      "evaluation_history": [],
-                      "last_result": None,
-                  }
+                  data = json.loads(
+                      MEMORY_FILE.read_text(encoding="utf-8")
+                  )
+
+                  if not isinstance(data, dict):
+                      return empty_memory()
+
+                  memory = empty_memory()
+                  memory.update(data)
+
+                  if not isinstance(
+                      memory.get("evaluated_task_ids"), list
+                  ):
+                      memory["evaluated_task_ids"] = []
+
+                  if not isinstance(
+                      memory.get("evaluation_history"), list
+                  ):
+                      memory["evaluation_history"] = []
+
+                  return memory
+
+              except (OSError, json.JSONDecodeError):
+                  return empty_memory()
 
 
           def save_memory(memory):
-              MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-              MEMORY_FILE.write_text(
-                  json.dumps(memory, indent=2, ensure_ascii=False),
+              MEMORY_FILE.parent.mkdir(
+                  parents=True,
+                  exist_ok=True,
+              )
+
+              temporary_file = MEMORY_FILE.with_suffix(".tmp")
+
+              temporary_file.write_text(
+                  json.dumps(
+                      memory,
+                      indent=2,
+                      ensure_ascii=False,
+                  ),
                   encoding="utf-8",
               )
+
+              temporary_file.replace(MEMORY_FILE)
 
 
           def get_json(path, params=None):
@@ -95,10 +135,16 @@ jobs:
               if response.status_code != 200:
                   raise RuntimeError(
                       f"GET {path} failed: "
-                      f"{response.status_code} {response.text[:500]}"
+                      f"{response.status_code} "
+                      f"{response.text[:500]}"
                   )
 
-              return response.json()
+              try:
+                  return response.json()
+              except ValueError as exc:
+                  raise RuntimeError(
+                      f"GET {path} returned invalid JSON."
+                  ) from exc
 
 
           def as_list(data):
@@ -106,10 +152,23 @@ jobs:
                   return data
 
               if isinstance(data, dict):
-                  for key in ("items", "tasks", "results", "data", "opportunities"):
+                  for key in (
+                      "items",
+                      "tasks",
+                      "results",
+                      "data",
+                      "opportunities",
+                  ):
                       value = data.get(key)
+
                       if isinstance(value, list):
                           return value
+
+                      if isinstance(value, dict):
+                          nested = as_list(value)
+
+                          if nested:
+                              return nested
 
               return []
 
@@ -121,11 +180,13 @@ jobs:
                   or task.get("post_id")
                   or task.get("uuid")
                   or ""
-              )
+              ).strip()
 
 
           def title(task):
-              return str(task.get("title") or "").strip()
+              return str(
+                  task.get("title") or ""
+              ).strip()
 
 
           def description(task):
@@ -147,6 +208,7 @@ jobs:
 
           def parse_number(raw):
               value = str(raw).strip().replace(",", "")
+
               try:
                   return float(value)
               except ValueError:
@@ -155,28 +217,40 @@ jobs:
 
           def extract_money(text):
               """
-              Extract explicit monetary amounts without summing unrelated
-              examples. Supports:
-                2,000 sats
-                1000 sats
-                10+ USDC
-                $10 USDC
-                $10+
+              Extract explicit monetary amounts.
+
+              Supported examples:
+              - 2,000 sats
+              - 1000 sat
+              - 10+ USDC
+              - $10 USDC
+              - $10+
+
+              Amounts are never added together.
               """
 
               text = normalize_text(text)
 
               patterns = [
                   (
-                      r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(sats?|sat)\b",
+                      r"(?<![\d,])"
+                      r"(\d[\d,]*(?:\.\d+)?)"
+                      r"\s*\+?\s*"
+                      r"(sats?|sat)\b",
                       "sats",
                   ),
                   (
-                      r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(usdc)\b",
+                      r"(?<![\d,])"
+                      r"(\d[\d,]*(?:\.\d+)?)"
+                      r"\s*\+?\s*"
+                      r"(usdc)\b",
                       "USDC",
                   ),
                   (
-                      r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*\+?\s*(?:usdc)?\b",
+                      r"\$\s*"
+                      r"(\d[\d,]*(?:\.\d+)?)"
+                      r"\s*\+?\s*"
+                      r"(?:usdc)?\b",
                       "USDC",
                   ),
               ]
@@ -184,14 +258,17 @@ jobs:
               found = []
 
               for pattern, currency in patterns:
-                  for match in re.finditer(pattern, text, re.IGNORECASE):
+                  for match in re.finditer(
+                      pattern,
+                      text,
+                      re.IGNORECASE,
+                  ):
                       value = parse_number(match.group(1))
 
-                      if value is None:
+                      if value is None or value <= 0:
                           continue
 
                       raw = match.group(0).strip()
-
                       plus = "+" in raw
 
                       found.append({
@@ -202,7 +279,6 @@ jobs:
                           "raw": raw,
                       })
 
-              # Remove exact duplicates while preserving order.
               unique = []
               seen = set()
 
@@ -223,63 +299,66 @@ jobs:
 
           def extract_compensation(task):
               """
-              Prefer explicit compensation in the title.
-              Only use description as secondary evidence.
-              Never add multiple amounts together.
+              Priority:
+              1. Explicit amount in title.
+              2. Explicit amount in description.
+              3. Structured API reward fields.
+
+              Multiple amounts are never summed.
               """
 
               task_title = normalize_text(title(task))
-              task_description = normalize_text(description(task))
+              task_description = normalize_text(
+                  description(task)
+              )
 
               title_amounts = extract_money(task_title)
-              description_amounts = extract_money(task_description)
+              description_amounts = extract_money(
+                  task_description
+              )
 
-              # Prefer amounts explicitly present in the title.
               if title_amounts:
                   primary = title_amounts[0]
-
-                  if primary["minimum"] is not None:
-                      structure = "minimum_or_more"
-                  else:
-                      structure = "fixed_or_stated"
 
                   return {
                       "known": True,
                       "currency": primary["currency"],
                       "amount": primary["value"],
                       "minimum": primary["minimum"],
-                      "structure": structure,
+                      "structure": (
+                          "minimum_or_more"
+                          if primary["minimum"] is not None
+                          else "fixed_or_stated"
+                      ),
                       "source": "title",
                       "raw": primary["raw"],
                       "additional_mentions": max(
                           0,
-                          len(title_amounts) - 1
+                          len(title_amounts) - 1,
                       ),
                   }
 
               if description_amounts:
                   primary = description_amounts[0]
 
-                  if primary["minimum"] is not None:
-                      structure = "minimum_or_more"
-                  else:
-                      structure = "fixed_or_stated"
-
                   return {
                       "known": True,
                       "currency": primary["currency"],
                       "amount": primary["value"],
                       "minimum": primary["minimum"],
-                      "structure": structure,
+                      "structure": (
+                          "minimum_or_more"
+                          if primary["minimum"] is not None
+                          else "fixed_or_stated"
+                      ),
                       "source": "description",
                       "raw": primary["raw"],
                       "additional_mentions": max(
                           0,
-                          len(description_amounts) - 1
+                          len(description_amounts) - 1,
                       ),
                   }
 
-              # Fallback to structured API fields.
               structured_fields = (
                   "reward_sats",
                   "amount_sats",
@@ -360,36 +439,51 @@ jobs:
               )
 
               matched = [
-                  term for term in proof_terms
-                  if term in text.lower()
+                  term
+                  for term in proof_terms
+                  if re.search(
+                      rf"\b{re.escape(term)}\b",
+                      text.lower(),
+                  )
               ]
 
               return {
                   "required": bool(matched),
-                  "level": "CLEAR" if matched else "UNCLEAR",
+                  "level": (
+                      "CLEAR"
+                      if matched
+                      else "UNCLEAR"
+                  ),
                   "signals": matched,
               }
 
 
           def detect_risk(text):
-              high_risk_terms = {
-                  "deposit": -6,
-                  "wallet funding": -6,
-                  "transfer funds": -6,
-                  "buy crypto": -6,
-                  "investment": -5,
-                  "trading": -5,
-                  "gambling": -10,
-                  "captcha": -8,
-                  "private system": -6,
-                  "secret": -6,
-              }
+              text_lower = text.lower()
 
-              flags = []
+              high_risk_terms = (
+                  "deposit",
+                  "wallet funding",
+                  "transfer funds",
+                  "buy crypto",
+                  "investment",
+                  "trading",
+                  "gambling",
+                  "captcha",
+                  "private system",
+                  "secret",
+                  "private key",
+                  "seed phrase",
+              )
 
-              for term in high_risk_terms:
-                  if term in text.lower():
-                      flags.append(term)
+              flags = [
+                  term
+                  for term in high_risk_terms
+                  if re.search(
+                      rf"\b{re.escape(term)}\b",
+                      text_lower,
+                  )
+              ]
 
               if flags:
                   return "HIGH", flags
@@ -458,7 +552,11 @@ jobs:
 
 
           def evaluate_task(task):
-              text = f"{title(task)} {description(task)}".lower()
+              combined_text = (
+                  f"{title(task)} {description(task)}"
+              ).strip()
+
+              text = combined_text.lower()
 
               compensation = extract_compensation(task)
               skills = skill_match(text)
@@ -490,12 +588,17 @@ jobs:
                   if keyword in text
               )
 
-              if risk == "HIGH":
-                  risk_score = -8
-              else:
-                  risk_score = 1
+              risk_score = (
+                  -8
+                  if risk == "HIGH"
+                  else 1
+              )
 
-              proof_score = 2 if proof["required"] else 0
+              proof_score = (
+                  2
+                  if proof["required"]
+                  else 0
+              )
 
               difficulty_score = {
                   "LOW": 3,
@@ -503,7 +606,9 @@ jobs:
                   "HIGH": 1,
               }[difficulty]
 
-              pay_score = compensation_score(compensation)
+              pay_score = compensation_score(
+                  compensation
+              )
 
               total_score = (
                   compatibility_score
@@ -516,6 +621,7 @@ jobs:
               if risk == "HIGH":
                   priority = "REJECT"
                   recommendation = "DO_NOT_BID"
+
               elif (
                   compatibility_score >= 7
                   and compensation["known"]
@@ -523,9 +629,18 @@ jobs:
               ):
                   priority = "HIGH"
                   recommendation = "MANUAL_REVIEW"
-              elif compatibility_score >= 5:
+
+              elif (
+                  compatibility_score >= 5
+                  and compensation["known"]
+              ):
                   priority = "MEDIUM"
                   recommendation = "MANUAL_REVIEW"
+
+              elif compatibility_score >= 5:
+                  priority = "MEDIUM"
+                  recommendation = "OBSERVE"
+
               else:
                   priority = "LOW"
                   recommendation = "OBSERVE"
@@ -533,14 +648,18 @@ jobs:
               return {
                   "task_id": task_id(task),
                   "title": title(task),
-                  "description_present": bool(description(task)),
+                  "description_present": bool(
+                      description(task)
+                  ),
                   "compensation": compensation,
                   "required_skills": skills,
                   "difficulty": difficulty,
                   "proof": proof,
                   "compatibility": {
                       "score": compatibility_score,
-                      "with_nox_capabilities": compatibility_score >= 5,
+                      "with_nox_capabilities": (
+                          compatibility_score >= 5
+                      ),
                   },
                   "risk": {
                       "level": risk,
@@ -580,23 +699,35 @@ jobs:
               evaluations = []
 
               for task in tasks:
-                  if task_id(task):
-                      evaluations.append(evaluate_task(task))
+                  if (
+                      isinstance(task, dict)
+                      and task_id(task)
+                  ):
+                      evaluations.append(
+                          evaluate_task(task)
+                      )
 
               evaluations.sort(
                   key=lambda item: (
                       item["priority"] == "HIGH",
+                      item["priority"] == "MEDIUM",
                       item["scores"]["total"],
                       item["scores"]["compensation"],
                   ),
                   reverse=True,
               )
 
-              evaluations = evaluations[:MAX_OPPORTUNITIES]
+              evaluations = evaluations[
+                  :MAX_OPPORTUNITIES
+              ]
 
-              previous_ids = set(
-                  memory.get("evaluated_task_ids", [])
-              )
+              previous_ids = {
+                  str(value)
+                  for value in memory.get(
+                      "evaluated_task_ids",
+                      [],
+                  )
+              }
 
               new_evaluations = [
                   item
@@ -619,7 +750,8 @@ jobs:
               manual_review = [
                   item
                   for item in evaluations
-                  if item["recommendation"] == "MANUAL_REVIEW"
+                  if item["recommendation"]
+                  == "MANUAL_REVIEW"
               ]
 
               result = {
@@ -640,11 +772,21 @@ jobs:
                   },
                   "observation": {
                       "open_tasks_found": len(tasks),
-                      "evaluated_opportunities": len(evaluations),
-                      "new_evaluations": len(new_evaluations),
-                      "high_priority_count": len(high_priority),
-                      "medium_priority_count": len(medium_priority),
-                      "manual_review_count": len(manual_review),
+                      "evaluated_opportunities": len(
+                          evaluations
+                      ),
+                      "new_evaluations": len(
+                          new_evaluations
+                      ),
+                      "high_priority_count": len(
+                          high_priority
+                      ),
+                      "medium_priority_count": len(
+                          medium_priority
+                      ),
+                      "manual_review_count": len(
+                          manual_review
+                      ),
                   },
                   "decision": (
                       "MANUAL_REVIEW_REQUIRED"
@@ -652,39 +794,60 @@ jobs:
                       else "OBSERVE"
                   ),
                   "decision_reason": (
-                      "Opportunities were evaluated using explicit "
-                      "compensation parsing, capability matching, "
-                      "proof requirements, difficulty and risk. "
-                      "Manual review is recommended; no financial "
-                      "or marketplace action is executed."
+                      "Opportunities were evaluated using "
+                      "explicit compensation parsing, "
+                      "capability matching, proof "
+                      "requirements, difficulty and risk. "
+                      "Manual review is recommended; no "
+                      "financial or marketplace action is "
+                      "executed."
                   ),
                   "opportunities": evaluations,
               }
 
               all_ids = list(
                   dict.fromkeys(
-                      memory.get("evaluated_task_ids", [])
+                      memory.get(
+                          "evaluated_task_ids",
+                          [],
+                      )
                       + [
                           item["task_id"]
                           for item in evaluations
                       ]
                   )
-              )[-500:]
+              )[-MAX_EVALUATED_IDS:]
 
-              history = memory.get("evaluation_history", [])
+              history = memory.get(
+                  "evaluation_history",
+                  [],
+              )
 
               history.append({
                   "generated_at": result["generated_at"],
                   "open_tasks_found": len(tasks),
-                  "evaluated_opportunities": len(evaluations),
-                  "new_evaluations": len(new_evaluations),
-                  "high_priority_count": len(high_priority),
-                  "medium_priority_count": len(medium_priority),
+                  "evaluated_opportunities": len(
+                      evaluations
+                  ),
+                  "new_evaluations": len(
+                      new_evaluations
+                  ),
+                  "high_priority_count": len(
+                      high_priority
+                  ),
+                  "medium_priority_count": len(
+                      medium_priority
+                  ),
+                  "manual_review_count": len(
+                      manual_review
+                  ),
               })
 
               memory["version"] = "ACT 08 V2"
               memory["evaluated_task_ids"] = all_ids
-              memory["evaluation_history"] = history[-50:]
+              memory["evaluation_history"] = (
+                  history[-MAX_HISTORY:]
+              )
               memory["last_result"] = result
 
               save_memory(memory)
@@ -704,6 +867,7 @@ jobs:
                   "mode": "read_only_decision_support",
                   "generated_at": now(),
                   "policy": {
+                      "marketplace_read": True,
                       "bid": False,
                       "purchase": False,
                       "payment": False,
@@ -734,6 +898,7 @@ jobs:
         run: |
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
+
           git add memory/nox_act_08_opportunity_evaluator_v2.json
 
           if git diff --cached --quiet; then
