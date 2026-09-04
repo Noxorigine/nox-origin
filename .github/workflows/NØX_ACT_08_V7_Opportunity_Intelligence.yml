@@ -1,0 +1,938 @@
+name: NØX ACT 08 V7 — Opportunity Intelligence
+
+on:
+workflow_dispatch:
+schedule:
+- cron: "15 * * * *"
+
+permissions:
+contents: write
+
+concurrency:
+group: nox-main-writer
+cancel-in-progress: false
+
+jobs:
+opportunity-intelligence:
+runs-on: ubuntu-latest
+
+env:
+  COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+  MARKETPLACE_ENDPOINT: https://thecolony.cc/api/v1/marketplace/tasks
+  MAX_RESULTS: "100"
+
+steps:
+  - name: Checkout main
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+
+  - name: Setup Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
+
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install requests
+
+  - name: Run ACT 08 V7
+    shell: bash
+    run: |
+      python <<'PY'
+      import json
+      import os
+      import re
+      import unicodedata
+      from datetime import datetime, timezone
+
+      import requests
+
+      VERSION = "ACT 08 V7"
+      ENDPOINT = os.environ["MARKETPLACE_ENDPOINT"]
+      API_KEY = os.environ["COLONY_API_KEY"]
+      MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "100"))
+
+      now = datetime.now(timezone.utc).isoformat()
+
+      headers = {
+          "Authorization": f"Bearer {API_KEY}",
+          "Accept": "application/json",
+          "User-Agent": "NØX-Origin-ACT08-V7"
+      }
+
+      # ------------------------------------------------------------
+      # Helpers
+      # ------------------------------------------------------------
+
+      def normalize_text(value):
+          if value is None:
+              return ""
+          value = str(value)
+          value = unicodedata.normalize("NFKC", value)
+
+          replacements = {
+              "−": "-",
+              "–": "-",
+              "—": "-",
+              "-": "-",
+              "﹣": "-",
+              "＋": "+",
+          }
+
+          for old, new in replacements.items():
+              value = value.replace(old, new)
+
+          return value.strip()
+
+      def safe_lower(value):
+          return normalize_text(value).lower()
+
+      def extract_tasks(payload):
+          """
+          Accept the known marketplace response structures:
+          list
+          {items: [...]}
+          {tasks: [...]}
+          {data: [...]}
+          {results: [...]}
+          {marketplace: [...]}
+          """
+
+          if isinstance(payload, list):
+              return payload
+
+          if not isinstance(payload, dict):
+              return []
+
+          preferred_keys = [
+              "items",
+              "tasks",
+              "data",
+              "results",
+              "marketplace",
+          ]
+
+          for key in preferred_keys:
+              value = payload.get(key)
+
+              if isinstance(value, list):
+                  return value
+
+              if isinstance(value, dict):
+                  for nested_key in preferred_keys:
+                      nested = value.get(nested_key)
+                      if isinstance(nested, list):
+                          return nested
+
+          return []
+
+      def get_text(task):
+          title = normalize_text(
+              task.get("title")
+              or task.get("name")
+              or task.get("subject")
+              or ""
+          )
+
+          body = normalize_text(
+              task.get("body")
+              or task.get("description")
+              or task.get("content")
+              or ""
+          )
+
+          tags = task.get("tags") or []
+
+          if isinstance(tags, list):
+              tag_text = " ".join(normalize_text(x) for x in tags)
+          else:
+              tag_text = normalize_text(tags)
+
+          return title, body, tag_text
+
+      # ------------------------------------------------------------
+      # Reward parser
+      # ------------------------------------------------------------
+
+      CURRENCY_PATTERN = (
+          r"(USDC|USDT|USD|BTC|ETH|SATS?|SATOSHIS?)"
+      )
+
+      def parse_number(raw, currency):
+          raw = raw.strip()
+
+          # For sats/satoshis, 1.000 / 2.000 / 5.000 are treated
+          # as thousands separators.
+          if currency in ("sat", "sats", "satoshi", "satoshis"):
+              if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw):
+                  return float(raw.replace(".", ""))
+
+          # Standard decimal form.
+          normalized = raw.replace(",", "")
+
+          try:
+              return float(normalized)
+          except ValueError:
+              return None
+
+      def parse_reward(title, body):
+          """
+          IMPORTANT:
+          - Negative reward is only recognized when '-' is directly
+            attached to the amount, e.g. -30 USDC.
+          - A title separator such as '- 1000 sats' is NOT negative.
+          - Positive forms include:
+              5 USDC
+              $2 USDC
+              $10+ USDC
+              1000 sats
+              2.000 sats
+              from $0.25
+              USDC 5
+          """
+
+          title = normalize_text(title)
+          body = normalize_text(body)
+
+          # Title has stronger semantic value than body.
+          sources = [
+              ("title", title),
+              ("body", body),
+          ]
+
+          # --------------------------------------------------------
+          # Explicit negative amount:
+          # ONLY attached '-' directly before the number.
+          # --------------------------------------------------------
+
+          negative_pattern = re.compile(
+              r"(?<![\w])-\$?\s*(\d+(?:[.,]\d+)?)\s*"
+              + CURRENCY_PATTERN
+              + r"\b",
+              re.IGNORECASE,
+          )
+
+          for source_name, text in sources:
+              match = negative_pattern.search(text)
+
+              if match:
+                  raw_number = match.group(1)
+                  currency = match.group(2).lower()
+
+                  amount = parse_number(raw_number, currency)
+
+                  if amount is not None:
+                      return {
+                          "status": "NEGATIVE_COST",
+                          "amount": amount,
+                          "currency": currency.upper(),
+                          "minimum_or_from": False,
+                          "plus": False,
+                          "source": source_name,
+                          "evidence": match.group(0),
+                      }
+
+          # --------------------------------------------------------
+          # Positive amount followed by currency.
+          # Supports:
+          # 5 USDC
+          # $2 USDC
+          # $10+ USDC
+          # 1000 sats
+          # from $0.25
+          # --------------------------------------------------------
+
+          positive_pattern = re.compile(
+              r"(?:(?:from|starting\s+at|minimum(?:\s+of)?)\s+)?"
+              r"\$?\s*(\d+(?:[.,]\d+)?)"
+              r"(\+)?\s*"
+              + CURRENCY_PATTERN
+              + r"\b",
+              re.IGNORECASE,
+          )
+
+          for source_name, text in sources:
+              matches = list(positive_pattern.finditer(text))
+
+              if not matches:
+                  continue
+
+              # Prefer an explicit reward-like match.
+              for match in matches:
+                  raw_number = match.group(1)
+                  plus = bool(match.group(2))
+                  currency = match.group(3).lower()
+
+                  amount = parse_number(raw_number, currency)
+
+                  if amount is None:
+                      continue
+
+                  start = max(0, match.start() - 30)
+                  context = text[start:match.end()].lower()
+
+                  minimum_or_from = bool(
+                      re.search(
+                          r"\b(from|starting\s+at|minimum)\b",
+                          context
+                      )
+                  )
+
+                  return {
+                      "status": "CONFIRMED_REWARD",
+                      "amount": amount,
+                      "currency": currency.upper(),
+                      "minimum_or_from": minimum_or_from,
+                      "plus": plus,
+                      "source": source_name,
+                      "evidence": match.group(0),
+                  }
+
+          # --------------------------------------------------------
+          # Currency before amount:
+          # USDC 5
+          # USD 10
+          # --------------------------------------------------------
+
+          reverse_pattern = re.compile(
+              CURRENCY_PATTERN
+              + r"\s*\$?\s*(\d+(?:[.,]\d+)?)",
+              re.IGNORECASE,
+          )
+
+          for source_name, text in sources:
+              match = reverse_pattern.search(text)
+
+              if match:
+                  currency = match.group(1).lower()
+                  amount = parse_number(match.group(2), currency)
+
+                  if amount is not None:
+                      return {
+                          "status": "CONFIRMED_REWARD",
+                          "amount": amount,
+                          "currency": currency.upper(),
+                          "minimum_or_from": False,
+                          "plus": False,
+                          "source": source_name,
+                          "evidence": match.group(0),
+                      }
+
+          # --------------------------------------------------------
+          # Explicit compensation uncertainty.
+          # --------------------------------------------------------
+
+          uncertainty_patterns = [
+              r"\bpay\s+what\s+you\s+want\b",
+              r"\bnegotiable\b",
+              r"\bnegotiated\b",
+              r"\bdepends\s+on\b",
+              r"\bpay\s+in\s+eth\b",
+              r"\bpay\s+in\s+crypto\b",
+              r"\bcrypto\s+payout\b",
+          ]
+
+          combined = f"{title} {body}".lower()
+
+          for pattern in uncertainty_patterns:
+              if re.search(pattern, combined):
+                  return {
+                      "status": "REWARD_AMBIGUOUS",
+                      "amount": None,
+                      "currency": None,
+                      "minimum_or_from": False,
+                      "plus": False,
+                      "source": "semantic",
+                      "evidence": pattern,
+                  }
+
+          return {
+              "status": "REWARD_UNKNOWN",
+              "amount": None,
+              "currency": None,
+              "minimum_or_from": False,
+              "plus": False,
+              "source": None,
+              "evidence": None,
+          }
+
+      # ------------------------------------------------------------
+      # Listing / announcement classification
+      # ------------------------------------------------------------
+
+      TRADE_PATTERNS = [
+          r"\bfor\s+1\s+(?:usdc|usdt|usd|btc|eth)\b",
+          r"\b(?:usdc|usdt|usd|btc|eth)\s+for\s+\d",
+          r"\bexchange\b",
+          r"\bswap\b",
+          r"\btrade\b",
+          r"\btrading\b",
+          r"\bbelow\s+market\s+rate\b",
+          r"\bconvert\b",
+      ]
+
+      SERVICE_PATTERNS = [
+          r"^\s*for\s+hire\b",
+          r"^\s*offering\b",
+          r"\bavailable\s+for\s+hire\b",
+          r"\bwhat\s+i\s+(?:can|deliver|offer)\b",
+          r"\bservices?\s*(?:&|and)?\s*pricing\b",
+          r"\bi\s+(?:can|will)\s+(?:deliver|create|write|build)\b",
+      ]
+
+      REQUEST_PATTERNS = [
+          r"\bneed\s+(?:someone|an?\s+(?:agent|developer|writer|researcher|designer|person))\b",
+          r"\blooking\s+for\b",
+          r"\bseeking\b",
+          r"\bwe\s+need\b",
+          r"\bi\s+need\b",
+          r"\btask\s+is\b",
+          r"\bplease\s+(?:build|write|create|research|verify|test|analy[sz]e)\b",
+          r"\bwill\s+you\b",
+          r"\bcan\s+someone\b",
+          r"\bwho\s+can\b",
+          r"\bwant\s+someone\s+to\b",
+          r"\bhelp\s+needed\b",
+          r"\bpaid\s+task\b",
+          r"\bpaid_task\b",
+      ]
+
+      def matches_any(text, patterns):
+          for pattern in patterns:
+              if re.search(pattern, text, re.IGNORECASE):
+                  return True
+          return False
+
+      def classify_listing(title, body, tags):
+          combined = " ".join(
+              x for x in [title, body, tags] if x
+          ).strip()
+
+          lower = combined.lower()
+
+          # Explicit trade/exchange takes precedence.
+          if matches_any(lower, TRADE_PATTERNS):
+              return "TRADE_OFFER"
+
+          # Explicit request patterns come before service patterns
+          # when the same text contains both.
+          request = matches_any(lower, REQUEST_PATTERNS)
+
+          service = matches_any(lower, SERVICE_PATTERNS)
+
+          # Explicit marketplace paid-task metadata is authoritative.
+          metadata_values = [
+              str(title).lower(),
+              str(body).lower(),
+              str(tags).lower(),
+          ]
+
+          if any("paid_task" in value for value in metadata_values):
+              return "TASK_REQUEST"
+
+          if request and not service:
+              return "TASK_REQUEST"
+
+          if service and not request:
+              return "SERVICE_OFFER"
+
+          if request and service:
+              # A direct demand is more useful than a generic
+              # service advertisement, but keep confidence lower.
+              return "TASK_REQUEST"
+
+          return "AMBIGUOUS"
+
+      # ------------------------------------------------------------
+      # Risk analysis
+      # ------------------------------------------------------------
+
+      HIGH_RISK_PATTERNS = [
+          r"\bprivate\s+key\b",
+          r"\bseed\s+phrase\b",
+          r"\bsecret\s+key\b",
+          r"\bmnemonic\b",
+          r"\bexport\s+(?:your\s+)?wallet\b",
+          r"\btransfer\s+(?:usdc|usdt|btc|eth|crypto)\b",
+          r"\bsend\s+(?:usdc|usdt|btc|eth|crypto)\b",
+          r"\bpay\s+upfront\b",
+          r"\bdeposit\b",
+          r"\bsolve\s+(?:a\s+)?captcha\b",
+          r"\bcomplete\s+(?:a\s+)?captcha\b",
+          r"\bverification\s+code\b",
+      ]
+
+      MENTION_RISK_PATTERNS = [
+          r"\bcaptcha\b",
+          r"\bwallet\b",
+          r"\bcrypto\b",
+          r"\busdc\b",
+          r"\busdt\b",
+          r"\blightning\b",
+      ]
+
+      def analyze_risk(title, body):
+          combined = f"{title}\n{body}"
+          lower = combined.lower()
+
+          high = []
+
+          for pattern in HIGH_RISK_PATTERNS:
+              if re.search(pattern, lower):
+                  high.append(pattern)
+
+          if high:
+              return {
+                  "level": "HIGH",
+                  "action_required": True,
+                  "signals": high,
+              }
+
+          mentions = []
+
+          for pattern in MENTION_RISK_PATTERNS:
+              if re.search(pattern, lower):
+                  mentions.append(pattern)
+
+          if mentions:
+              return {
+                  "level": "MENTION_ONLY",
+                  "action_required": False,
+                  "signals": mentions,
+              }
+
+          return {
+              "level": "LOW",
+              "action_required": False,
+              "signals": [],
+          }
+
+      # ------------------------------------------------------------
+      # Compatibility
+      # ------------------------------------------------------------
+
+      NOX_CAPABILITIES = [
+          ("python", "python"),
+          ("api", "api"),
+          ("automation", "automation"),
+          ("research", "research"),
+          ("analysis", "analysis"),
+          ("data", "data"),
+          ("csv", "csv"),
+          ("json", "json"),
+          ("writing", "writing"),
+          ("technical writing", "technical"),
+          ("documentation", "documentation"),
+          ("qa", "qa"),
+          ("testing", "testing"),
+          ("verification", "verification"),
+      ]
+
+      def compatibility_score(title, body):
+          lower = f"{title} {body}".lower()
+
+          matches = []
+          for label, keyword in NOX_CAPABILITIES:
+              if keyword in lower:
+                  matches.append(label)
+
+          score = min(10, 2 + len(matches))
+
+          return score, matches
+
+      # ------------------------------------------------------------
+      # Opportunity scoring
+      # ------------------------------------------------------------
+
+      def opportunity_score(listing_type, reward, risk, compatibility):
+          # Only actual buyer-side task requests can become
+          # opportunities.
+          if listing_type != "TASK_REQUEST":
+              return 0
+
+          if reward["status"] != "CONFIRMED_REWARD":
+              return 0
+
+          if risk["level"] == "HIGH":
+              return 0
+
+          if compatibility < 5:
+              return 0
+
+          score = compatibility
+
+          if reward["currency"] in ("SATS", "SAT", "SATOShIS", "SATOShI"):
+              score += 1
+
+          if reward["currency"] in ("USDC", "USD"):
+              score += 1
+
+          if reward.get("minimum_or_from"):
+              score -= 1
+
+          return max(0, min(10, score))
+
+      # ------------------------------------------------------------
+      # Fetch marketplace
+      # ------------------------------------------------------------
+
+      attempts = [
+          {
+              "status": "open",
+              "sort": "new",
+              "limit": MAX_RESULTS,
+              "offset": 0,
+          },
+          {
+              "status": "open",
+              "limit": MAX_RESULTS,
+              "offset": 0,
+          },
+          {
+              "limit": MAX_RESULTS,
+              "offset": 0,
+          },
+      ]
+
+      tasks = []
+      diagnostic_attempts = []
+
+      for params in attempts:
+          try:
+              response = requests.get(
+                  ENDPOINT,
+                  headers=headers,
+                  params=params,
+                  timeout=30,
+              )
+
+              structure = "unknown"
+              payload = None
+
+              try:
+                  payload = response.json()
+              except Exception:
+                  payload = None
+
+              if isinstance(payload, list):
+                  structure = "list"
+              elif isinstance(payload, dict):
+                  for key in ["items", "tasks", "data", "results", "marketplace"]:
+                      if isinstance(payload.get(key), (list, dict)):
+                          structure = key
+                          break
+
+              candidate_tasks = extract_tasks(payload)
+
+              diagnostic_attempts.append({
+                  "params": params,
+                  "status": response.status_code,
+                  "response_structure": structure,
+                  "tasks_received": len(candidate_tasks),
+              })
+
+              if response.ok and candidate_tasks:
+                  tasks = candidate_tasks
+                  break
+
+              if response.ok and not tasks:
+                  tasks = candidate_tasks
+
+          except Exception as exc:
+              diagnostic_attempts.append({
+                  "params": params,
+                  "status": None,
+                  "response_structure": "exception",
+                  "tasks_received": 0,
+                  "error": str(exc),
+              })
+
+      # Remove duplicates while preserving order.
+      unique_tasks = []
+      seen_ids = set()
+
+      for task in tasks:
+          task_id = (
+              task.get("id")
+              or task.get("task_id")
+              or task.get("post_id")
+              or task.get("uuid")
+          )
+
+          dedupe_key = str(task_id or json.dumps(task, sort_keys=True))
+
+          if dedupe_key in seen_ids:
+              continue
+
+          seen_ids.add(dedupe_key)
+          unique_tasks.append(task)
+
+      tasks = unique_tasks[:MAX_RESULTS]
+
+      # ------------------------------------------------------------
+      # Evaluate
+      # ------------------------------------------------------------
+
+      evaluated = {}
+      top_opportunities = []
+
+      statistics = {
+          "runs": 1,
+          "tasks_seen": len(tasks),
+          "tasks_evaluated": 0,
+          "qualified": 0,
+          "review": 0,
+          "observe": 0,
+          "service_offer": 0,
+          "trade_offer": 0,
+          "reward_unclear": 0,
+          "rejected": 0,
+      }
+
+      for task in tasks:
+          title, body, tags = get_text(task)
+
+          task_id = (
+              task.get("id")
+              or task.get("task_id")
+              or task.get("post_id")
+              or task.get("uuid")
+          )
+
+          task_id = str(task_id or f"unknown-{len(evaluated)+1}")
+
+          listing_type = classify_listing(title, body, tags)
+          reward = parse_reward(title, body)
+          risk = analyze_risk(title, body)
+          compatibility, matched_capabilities = compatibility_score(
+              title,
+              body,
+          )
+
+          score = opportunity_score(
+              listing_type,
+              reward,
+              risk,
+              compatibility,
+          )
+
+          # --------------------------------------------------------
+          # Final category
+          # --------------------------------------------------------
+
+          if listing_type == "TRADE_OFFER":
+              category = "REJECT"
+              statistics["trade_offer"] += 1
+              statistics["rejected"] += 1
+
+          elif listing_type == "SERVICE_OFFER":
+              category = "SERVICE_OFFER"
+              statistics["service_offer"] += 1
+
+          elif risk["level"] == "HIGH":
+              category = "REJECT"
+              statistics["rejected"] += 1
+
+          elif reward["status"] in (
+              "REWARD_UNKNOWN",
+              "REWARD_AMBIGUOUS",
+          ):
+              category = "REVIEW"
+              statistics["reward_unclear"] += 1
+              statistics["review"] += 1
+
+          elif listing_type == "TASK_REQUEST":
+              if compatibility >= 5 and reward["status"] == "CONFIRMED_REWARD":
+                  category = "QUALIFIED"
+                  statistics["qualified"] += 1
+              else:
+                  category = "REVIEW"
+                  statistics["review"] += 1
+
+          else:
+              category = "OBSERVE"
+              statistics["observe"] += 1
+
+          record = {
+              "id": task_id,
+              "title": title,
+              "listing_type": listing_type,
+              "category": category,
+              "reward": reward,
+              "risk": risk,
+              "compatibility": {
+                  "score": compatibility,
+                  "matched_capabilities": matched_capabilities,
+              },
+              "opportunity_score": score,
+              "actionable": False,
+              "actions_performed": False,
+              "bid": False,
+              "comment": False,
+              "dm": False,
+              "payment": False,
+              "purchase": False,
+              "transfer": False,
+          }
+
+          evaluated[task_id] = record
+          statistics["tasks_evaluated"] += 1
+
+          # Only genuine paid task requests can enter the ranking.
+          if category == "QUALIFIED" and score > 0:
+              top_opportunities.append(record)
+
+      top_opportunities.sort(
+          key=lambda item: (
+              item["opportunity_score"],
+              item["compatibility"]["score"],
+              item["reward"].get("amount") or 0,
+          ),
+          reverse=True,
+      )
+
+      # ------------------------------------------------------------
+      # Diagnostic status
+      # ------------------------------------------------------------
+
+      marketplace_status = None
+
+      for attempt in diagnostic_attempts:
+          if attempt.get("status") is not None:
+              marketplace_status = attempt["status"]
+              if attempt["tasks_received"] > 0:
+                  break
+
+      problem_detected = (
+          marketplace_status != 200
+          or len(tasks) == 0
+      )
+
+      diagnostic = {
+          "endpoint": ENDPOINT,
+          "status": marketplace_status,
+          "response_structure": (
+              diagnostic_attempts[0]["response_structure"]
+              if diagnostic_attempts
+              else "unknown"
+          ),
+          "parameters_used": (
+              diagnostic_attempts[0]["params"]
+              if diagnostic_attempts
+              else None
+          ),
+          "fetch_attempts": len(diagnostic_attempts),
+          "tasks_received": len(tasks),
+          "problem_detected": problem_detected,
+          "attempt_details": diagnostic_attempts,
+      }
+
+      # ------------------------------------------------------------
+      # Immutable safety state
+      # ------------------------------------------------------------
+
+      safety = {
+          "read_only": True,
+          "public_action": False,
+          "bid": False,
+          "comment": False,
+          "dm": False,
+          "payment": False,
+          "purchase": False,
+          "transfer": False,
+          "gemini_used": False,
+          "project_cost_eur": 0,
+      }
+
+      output = {
+          "version": VERSION,
+          "generated_at": now,
+          "mode": "opportunity_intelligence_read_only",
+          "scope": {
+              "personalized_feed": True,
+              "public_recent_posts": True,
+              "marketplace_actions": False,
+              "comments": False,
+              "dm": False,
+              "payments": False,
+              "gemini": False,
+              "max_results": MAX_RESULTS,
+          },
+          "marketplace_diagnostic": diagnostic,
+          "evaluated_tasks": evaluated,
+          "top_opportunities": top_opportunities[:10],
+          "statistics": statistics,
+          "safety": safety,
+          "last_run": {
+              "timestamp": now,
+              "marketplace_status": marketplace_status,
+              "open_tasks_received": len(tasks),
+              "tasks_evaluated": len(evaluated),
+              "actions_performed": False,
+              "bid": False,
+              "comment": False,
+              "dm": False,
+              "payment": False,
+              "purchase": False,
+              "transfer": False,
+              "gemini_used": False,
+              "project_cost_eur": 0,
+          },
+      }
+
+      os.makedirs("memory", exist_ok=True)
+
+      output_path = "memory/nox_act_08_opportunity_evaluator_v7.json"
+
+      with open(output_path, "w", encoding="utf-8") as f:
+          json.dump(
+              output,
+              f,
+              ensure_ascii=False,
+              indent=2,
+          )
+
+      diagnostic_path = "memory/nox_act_08_marketplace_diagnostic_v7.json"
+
+      with open(diagnostic_path, "w", encoding="utf-8") as f:
+          json.dump(
+              diagnostic,
+              f,
+              ensure_ascii=False,
+              indent=2,
+          )
+
+      print(json.dumps(output, ensure_ascii=False, indent=2))
+
+      PY
+
+  - name: Commit ACT 08 V7 result
+    shell: bash
+    run: |
+      git config user.name "NØX Origin"
+      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      git add memory/nox_act_08_opportunity_evaluator_v7.json
+      git add memory/nox_act_08_marketplace_diagnostic_v7.json
+
+      if git diff --cached --quiet; then
+        echo "No changes to commit."
+        exit 0
+      fi
+
+      git commit -m "ACT 08 V7 opportunity intelligence result"
+
+  - name: Synchronize with main and push
+    shell: bash
+    run: |
+      git fetch origin main
+
+      if git rebase origin/main; then
+        git push origin HEAD:main
+      else
+        git rebase --abort
+        echo "Rebase failed. No push performed."
+        exit 1
+      fi
