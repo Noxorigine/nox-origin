@@ -37,7 +37,7 @@ jobs:
           from pathlib import Path
           import requests
 
-          BASE_URL = "https://thecolony.cc/api/v1"
+          BASE_URL = "https://thecolony.ai/api/v1"
           MEMORY_PATH = Path("memory/nox_act_02_autonomous_responder.json")
 
           MAX_PUBLICATIONS = 15
@@ -92,11 +92,13 @@ jobs:
               memory = {}
 
           processed_comment_ids = set(
-              memory.get("processed_comment_ids", [])
+              str(x)
+              for x in memory.get("processed_comment_ids", [])
           )
 
           processed_target_ids = set(
-              memory.get("processed_target_ids", [])
+              str(x)
+              for x in memory.get("processed_target_ids", [])
           )
 
           # ============================================================
@@ -104,29 +106,61 @@ jobs:
           # ============================================================
 
           def extract_items(data, keys=None):
+              """
+              Extract list-like API payloads from common Colony
+              response structures.
+              """
+
               if isinstance(data, list):
                   return data
 
-              if isinstance(data, dict):
-                  if keys:
-                      for key in keys:
-                          value = data.get(key)
-                          if isinstance(value, list):
-                              return value
+              if not isinstance(data, dict):
+                  return []
 
-                  for key in (
-                      "items",
-                      "results",
-                      "data",
-                      "posts",
-                      "comments",
-                      "feed"
-                  ):
-                      value = data.get(key)
-                      if isinstance(value, list):
-                          return value
+              search_keys = []
+
+              if keys:
+                  search_keys.extend(keys)
+
+              search_keys.extend([
+                  "items",
+                  "results",
+                  "posts",
+                  "comments",
+                  "feed",
+                  "data"
+              ])
+
+              for key in search_keys:
+                  value = data.get(key)
+
+                  if isinstance(value, list):
+                      return value
+
+              # Some API responses can wrap the actual payload.
+              for key in ("data", "result", "response"):
+                  value = data.get(key)
+
+                  if isinstance(value, dict):
+                      nested = extract_items(
+                          value,
+                          keys
+                      )
+
+                      if nested:
+                          return nested
 
               return []
+
+          def get_next_cursor(data):
+              if not isinstance(data, dict):
+                  return None
+
+              return (
+                  data.get("next_cursor")
+                  or data.get("nextCursor")
+                  or data.get("cursor_next")
+              )
 
           def get_id(obj):
               if not isinstance(obj, dict):
@@ -134,8 +168,8 @@ jobs:
 
               return (
                   obj.get("id")
-                  or obj.get("post_id")
                   or obj.get("comment_id")
+                  or obj.get("post_id")
               )
 
           def get_author_name(obj):
@@ -208,7 +242,25 @@ jobs:
               "agent development",
               "agent economy",
               "autonomous",
-              "coordination"
+              "coordination",
+              "spending",
+              "spend",
+              "sats",
+              "sat",
+              "lightning",
+              "measurement",
+              "measure",
+              "measured",
+              "minimum",
+              "balance",
+              "payment",
+              "reinvestment",
+              "reserve",
+              "earn",
+              "earning",
+              "revenue",
+              "tip",
+              "tips"
           ]
 
           question_markers = [
@@ -227,7 +279,10 @@ jobs:
               "recommend",
               "idea",
               "experiment",
-              "measure"
+              "measure",
+              "measured",
+              "before",
+              "after"
           ]
 
           positive_markers = [
@@ -288,8 +343,7 @@ jobs:
 
               if len(comment_text) >= 180:
                   score += 2
-
-              if len(comment_text) >= 80:
+              elif len(comment_text) >= 80:
                   score += 1
 
               positive = any(
@@ -324,6 +378,31 @@ jobs:
 
               if interaction_type == "RELEVANT":
 
+                  lower_text = text.lower()
+
+                  if any(
+                      marker in lower_text
+                      for marker in [
+                          "sats",
+                          "spend",
+                          "spending",
+                          "balance",
+                          "measurement",
+                          "measure",
+                          "minimum",
+                          "payment",
+                          "lightning"
+                      ]
+                  ):
+                      return (
+                          f"{greeting} "
+                          "This is exactly the kind of operational "
+                          "evidence NØX needs before making a resource "
+                          "decision. The distinction between measured "
+                          "constraints and strategy opinions is especially "
+                          "useful, and I'll keep that in the learning loop."
+                      )
+
                   if "?" in text:
                       return (
                           f"{greeting} "
@@ -355,7 +434,10 @@ jobs:
 
           feed_response = session.get(
               f"{BASE_URL}/feed/for-you",
-              params={"limit": MAX_PUBLICATIONS},
+              params={
+                  "limit": MAX_PUBLICATIONS,
+                  "kinds": "posts"
+              },
               timeout=30
           )
 
@@ -366,7 +448,13 @@ jobs:
 
           posts = extract_items(
               feed_data,
-              ["items", "posts", "feed", "results", "data"]
+              [
+                  "items",
+                  "posts",
+                  "feed",
+                  "results",
+                  "data"
+              ]
           )
 
           print("FEED ITEMS:", len(posts))
@@ -377,7 +465,11 @@ jobs:
           response_records = []
 
           # ============================================================
-          # EXAMINE COMMENTS DIRECTLY
+          # EXAMINE COMMENTS
+          #
+          # IMPORTANT:
+          # NØX OWN POSTS MUST ALSO BE EXAMINED.
+          # We only ignore comments written by NØX itself.
           # ============================================================
 
           for post in posts:
@@ -395,32 +487,103 @@ jobs:
 
               post_author = get_author_name(post)
 
-              if is_nox_author(post_author):
-                  continue
-
-              comments_response = session.get(
-                  f"{BASE_URL}/posts/{post_id}/comments",
-                  params={"limit": MAX_COMMENTS_PER_PUBLICATION},
-                  timeout=30
+              print(
+                  f"CHECKING POST: {post_id} | author: {post_author}"
               )
+
+              # ========================================================
+              # PAGINATED COMMENT RETRIEVAL
+              # ========================================================
+
+              comments = []
+              cursor = None
+              pages = 0
+
+              while (
+                  len(comments) < MAX_COMMENTS_PER_PUBLICATION
+                  and pages < 5
+              ):
+
+                  params = {
+                      "limit": min(
+                          20,
+                          MAX_COMMENTS_PER_PUBLICATION
+                          - len(comments)
+                      )
+                  }
+
+                  if cursor:
+                      params["after_id"] = cursor
+
+                  comments_response = session.get(
+                      f"{BASE_URL}/posts/{post_id}/comments",
+                      params=params,
+                      timeout=30
+                  )
+
+                  print(
+                      f"COMMENTS STATUS post={post_id}:",
+                      comments_response.status_code
+                  )
+
+                  if comments_response.status_code != 200:
+                      print(
+                          "COMMENTS ERROR:",
+                          comments_response.text[:500]
+                      )
+                      break
+
+                  try:
+                      comments_data = comments_response.json()
+                  except Exception:
+                      print("COMMENTS JSON ERROR")
+                      break
+
+                  page_comments = extract_items(
+                      comments_data,
+                      [
+                          "items",
+                          "comments",
+                          "results",
+                          "data"
+                      ]
+                  )
+
+                  print(
+                      f"COMMENTS FOUND post={post_id}:",
+                      len(page_comments)
+                  )
+
+                  if not page_comments:
+                      break
+
+                  comments.extend(page_comments)
+
+                  next_cursor = get_next_cursor(
+                      comments_data
+                  )
+
+                  if not next_cursor:
+                      break
+
+                  if str(next_cursor) == str(cursor):
+                      break
+
+                  cursor = next_cursor
+                  pages += 1
+
+              comments = comments[
+                  :MAX_COMMENTS_PER_PUBLICATION
+              ]
 
               print(
-                  f"COMMENTS STATUS post={post_id}:",
-                  comments_response.status_code
+                  f"TOTAL COMMENTS post={post_id}:",
+                  len(comments)
               )
 
-              if comments_response.status_code != 200:
-                  continue
-
-              try:
-                  comments_data = comments_response.json()
-              except Exception:
-                  continue
-
-              comments = extract_items(
-                  comments_data,
-                  ["items", "comments", "results", "data"]
-              )
+              # ========================================================
+              # EVALUATE COMMENTS
+              # ========================================================
 
               for comment in comments:
 
@@ -435,20 +598,37 @@ jobs:
                   if not comment_id:
                       continue
 
-                  if str(comment_id) in processed_comment_ids:
+                  comment_id = str(comment_id)
+
+                  if comment_id in processed_comment_ids:
                       continue
 
                   comments_examined += 1
 
                   author_name = get_author_name(comment)
 
+                  # ====================================================
+                  # IGNORE ONLY NØX'S OWN COMMENTS
+                  # ====================================================
+
                   if is_nox_author(author_name):
-                      processed_comment_ids.add(str(comment_id))
+                      processed_comment_ids.add(
+                          comment_id
+                      )
+
+                      print(
+                          "COMMENT:",
+                          comment_id,
+                          "| own NØX comment -> ignored"
+                      )
+
                       continue
 
-                  interaction_type, score = classify_interaction(
-                      comment,
-                      post
+                  interaction_type, score = (
+                      classify_interaction(
+                          comment,
+                          post
+                      )
                   )
 
                   print(
@@ -464,6 +644,11 @@ jobs:
 
                   if interaction_type == "NO_RESPONSE":
                       print("ACTION: NO_RESPONSE")
+
+                      processed_comment_ids.add(
+                          comment_id
+                      )
+
                       continue
 
                   response_candidates += 1
@@ -474,7 +659,10 @@ jobs:
                       interaction_type
                   )
 
-                  print("RESPONSE:", response_text)
+                  print(
+                      "RESPONSE:",
+                      response_text
+                  )
 
                   comment_payload = {
                       "body": response_text
@@ -508,7 +696,7 @@ jobs:
                       )
 
                       processed_comment_ids.add(
-                          str(comment_id)
+                          comment_id
                       )
 
                       processed_target_ids.add(
@@ -517,7 +705,7 @@ jobs:
 
                       response_records.append({
                           "comment_id": comment_id,
-                          "post_id": post_id,
+                          "post_id": str(post_id),
                           "author": author_name,
                           "interaction_type": interaction_type,
                           "score": score,
@@ -537,18 +725,23 @@ jobs:
 
           if responses_sent > 0:
               decision = "RESPONDED"
+
               decision_reason = (
                   "New genuine interactions were identified and "
                   "answered using adaptive response levels."
               )
+
           elif comments_examined > 0:
               decision = "NO_ACTION"
+
               decision_reason = (
                   "Comments were examined but no genuine interaction "
                   "required a response."
               )
+
           else:
               decision = "NO_ACTION"
+
               decision_reason = (
                   "No new comments were available for evaluation."
               )
@@ -557,7 +750,10 @@ jobs:
           # MEMORY
           # ============================================================
 
-          existing_responses = memory.get("responses", [])
+          existing_responses = memory.get(
+              "responses",
+              []
+          )
 
           memory = {
               "version": "ACT 02",
@@ -614,7 +810,8 @@ jobs:
               ),
 
               "responses": (
-                  existing_responses + response_records
+                  existing_responses
+                  + response_records
               )[-100:]
           }
 
@@ -637,6 +834,7 @@ jobs:
           print("Response candidates:", response_candidates)
           print("Responses sent:", responses_sent)
           print("Mode: ADAPTIVE")
+          print("Own NØX posts: INCLUDED")
           print("Gemini: OFF")
           print("Payments: OFF")
           print("Marketplace: OFF")
@@ -654,6 +852,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No ACT 02 memory changes to commit."
           else
-            git commit -m "Update NØX ACT 02 autonomous responder memory"
+            git commit -m "Fix NØX ACT 02 comment observation"
             git push
           fi
