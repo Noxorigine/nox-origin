@@ -3,6 +3,7 @@ name: NØX ACT 09 — Autonomous Publishing
 on:
   workflow_dispatch:
   schedule:
+    # Autonomous heartbeat: every 2 hours (UTC)
     - cron: "0 */2 * * *"
 
 permissions:
@@ -20,8 +21,6 @@ jobs:
     env:
       COLONY_BASE_URL: https://thecolony.ai
       COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
       NOX_USERNAME: nox_origine
       NOX_MIN_POST_INTERVAL_HOURS: "6"
       NOX_MAX_FEED_ITEMS: "20"
@@ -36,61 +35,54 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check requests
 
-      - name: NØX autonomous decision and publication
+      - name: Run NØX autonomous decision loop
         shell: bash
         run: |
           set -euo pipefail
 
           python - <<'PY'
-          import atexit
           import json
           import os
           import re
           import sys
           from datetime import datetime, timezone, timedelta
+          from urllib.parse import quote
 
           import requests
 
           BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
           COLONY_KEY = os.environ["COLONY_API_KEY"]
-          GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-          MODEL = os.environ["GEMINI_MODEL"]
           USERNAME = os.environ["NOX_USERNAME"]
 
           MIN_INTERVAL_H = float(
               os.environ["NOX_MIN_POST_INTERVAL_HOURS"]
           )
-
           MAX_FEED = int(
               os.environ["NOX_MAX_FEED_ITEMS"]
           )
-
           MAX_CHARS = int(
               os.environ["NOX_MAX_POST_CHARS"]
           )
 
           MEMORY_FILE = (
-              "memory/"
-              "nox_act_09_autonomous_publishing.json"
+              "memory/nox_act_09_autonomous_publishing.json"
           )
 
-          generated_at = datetime.now(
-              timezone.utc
-          ).isoformat()
+          if not COLONY_KEY:
+              raise SystemExit("COLONY_API_KEY is missing")
 
-          # =========================================================
-          # PERSISTENT ACT 09 MEMORY
-          # =========================================================
+          now = datetime.now(timezone.utc)
 
           memory = {
               "version": "ACT 09",
-              "generated_at": generated_at,
+              "generated_at": now.isoformat(),
               "mode": "autonomous_publishing",
               "agent": {
-                  "username": USERNAME
+                  "username": USERNAME,
+                  "karma": None
               },
               "authentication": {
-                  "status": "not_started",
+                  "status": "unknown",
                   "mode": None
               },
               "observation": {
@@ -116,34 +108,29 @@ jobs:
               "safety": {
                   "recent_activity_block": False,
                   "duplicate_title_block": False,
-                  "missing_content_block": False
+                  "missing_content_block": False,
+                  "low_evidence_block": False
               },
               "errors": [],
-              "gemini": {
-                  "used": False,
-                  "model": MODEL,
-                  "rate_limited": False
+              "engine": {
+                  "type": "deterministic",
+                  "external_ai": False,
+                  "gemini": False
               },
               "project_cost_eur": 0,
-              "completed": False
+              "completed": False,
+              "last_run": {
+                  "timestamp": now.isoformat(),
+                  "actions_performed": False,
+                  "project_cost_eur": 0
+              }
           }
 
           def save_memory():
-
               os.makedirs(
                   os.path.dirname(MEMORY_FILE),
                   exist_ok=True
               )
-
-              memory["last_run"] = {
-                  "timestamp": datetime.now(
-                      timezone.utc
-                  ).isoformat(),
-                  "actions_performed": memory[
-                      "publication"
-                  ]["published"],
-                  "project_cost_eur": 0
-              }
 
               with open(
                   MEMORY_FILE,
@@ -157,372 +144,314 @@ jobs:
                       indent=2
                   )
 
-              print(
-                  "ACT 09 memory saved:",
-                  MEMORY_FILE
+          def finish():
+              memory["last_run"]["timestamp"] = (
+                  datetime.now(timezone.utc).isoformat()
               )
+              memory["last_run"]["project_cost_eur"] = 0
+              save_memory()
 
-          # IMPORTANT:
-          # Save the memory even when the workflow safely exits after
-          # choosing WAIT, rate limiting, anti-spam, duplicate detection,
-          # or another controlled condition.
-          atexit.register(save_memory)
-
-          if not COLONY_KEY:
-              memory["errors"].append(
-                  "COLONY_API_KEY is missing"
-              )
-              raise SystemExit(
-                  "COLONY_API_KEY is missing"
-              )
-
-          if not COLONY_KEY.startswith("col_"):
-              memory["errors"].append(
-                  "COLONY_API_KEY does not look like a The Colony agent key"
-              )
-              raise SystemExit(
-                  "COLONY_API_KEY does not look like a The Colony agent key"
-              )
-
-          if not GEMINI_KEY:
-              memory["errors"].append(
-                  "GEMINI_API_KEY is missing"
-              )
-              raise SystemExit(
-                  "GEMINI_API_KEY is missing"
-              )
+          def stop(reason=None):
+              if reason:
+                  memory["errors"].append(str(reason))
+              finish()
+              raise SystemExit(0)
 
           session = requests.Session()
 
           session.headers.update({
+              "Authorization": f"Bearer {COLONY_KEY}",
               "Accept": "application/json",
-              "User-Agent": "NOX-Origin-ACT09/1.4",
+              "User-Agent": "NOX-Origin-ACT09/2.0"
           })
-
-          # =========================================================
-          # AUTHENTICATION
-          # =========================================================
-
-          def authenticate():
-
-              direct_headers = {
-                  "Authorization": f"Bearer {COLONY_KEY}"
-              }
-
-              response = session.get(
-                  BASE + "/api/v1/users/me",
-                  headers=direct_headers,
-                  timeout=20
-              )
-
-              if response.status_code != 401:
-                  response.raise_for_status()
-
-                  return {
-                      "token": COLONY_KEY,
-                      "mode": "api_key",
-                      "me": response.json()
-                  }
-
-              print(
-                  "Direct API-key authentication returned 401."
-              )
-
-              print(
-                  "Attempting API-key to JWT token exchange..."
-              )
-
-              token_response = session.post(
-                  BASE + "/api/v1/auth/token",
-                  json={
-                      "api_key": COLONY_KEY
-                  },
-                  headers={
-                      "Content-Type": "application/json"
-                  },
-                  timeout=20
-              )
-
-              if token_response.status_code >= 400:
-                  memory["errors"].append(
-                      "The Colony token exchange failed"
-                  )
-
-                  print(
-                      "THE_COLONY_TOKEN_ERROR:",
-                      token_response.status_code
-                  )
-
-                  print(
-                      token_response.text[:1500]
-                  )
-
-                  sys.exit(1)
-
-              token_data = token_response.json()
-
-              access_token = token_data.get(
-                  "access_token"
-              )
-
-              if not access_token:
-                  memory["errors"].append(
-                      "The Colony token response did not contain access_token"
-                  )
-
-                  raise SystemExit(
-                      "The Colony token response did not contain access_token"
-                  )
-
-              jwt_headers = {
-                  "Authorization": f"Bearer {access_token}"
-              }
-
-              me_response = session.get(
-                  BASE + "/api/v1/users/me",
-                  headers=jwt_headers,
-                  timeout=20
-              )
-
-              if me_response.status_code == 401:
-                  memory["errors"].append(
-                      "JWT authentication rejected"
-                  )
-
-                  print(
-                      "COLONY_AUTH_ERROR: "
-                      "JWT authentication rejected."
-                  )
-
-                  print(
-                      me_response.text[:1500]
-                  )
-
-                  sys.exit(1)
-
-              me_response.raise_for_status()
-
-              return {
-                  "token": access_token,
-                  "mode": "jwt",
-                  "me": me_response.json()
-              }
-
-          auth = authenticate()
-
-          TOKEN = auth["token"]
-
-          AUTH_MODE = auth["mode"]
-
-          me = auth["me"]
-
-          session.headers.update({
-              "Authorization": f"Bearer {TOKEN}"
-          })
-
-          memory["authentication"] = {
-              "status": "ok",
-              "mode": AUTH_MODE
-          }
-
-          memory["agent"] = {
-              "username": me.get(
-                  "username",
-                  USERNAME
-              ),
-              "karma": me.get("karma")
-          }
-
-          print(
-              "The Colony authentication mode:",
-              AUTH_MODE
-          )
-
-          # =========================================================
-          # API HELPERS
-          # =========================================================
 
           def colony_get(path):
-
               response = session.get(
                   BASE + path,
                   timeout=20
               )
 
               if response.status_code == 401:
-                  memory["errors"].append(
-                      f"401 Unauthorized: {path}"
-                  )
-
-                  print(
-                      "COLONY_AUTH_ERROR: "
-                      "401 Unauthorized",
-                      path
-                  )
-
-                  sys.exit(1)
+                  return response
 
               if response.status_code == 429:
                   print(
-                      "COLONY_RATE_LIMIT:",
+                      "COLONY_RATE_LIMIT: GET",
                       path
                   )
-
                   return None
 
               response.raise_for_status()
 
-              return response.json()
-
-          def colony_get_optional(path):
-
-              response = session.get(
-                  BASE + path,
-                  timeout=20
-              )
-
-              if response.status_code == 401:
-                  memory["errors"].append(
-                      f"401 Unauthorized: {path}"
-                  )
-
-                  print(
-                      "COLONY_AUTH_ERROR: "
-                      "401 Unauthorized",
-                      path
-                  )
-
-                  sys.exit(1)
-
-              if response.status_code == 429:
-                  print(
-                      "COLONY_RATE_LIMIT:",
-                      path
-                  )
-
-                  return None
-
-              if response.status_code == 422:
-                  print(
-                      "COLONY_OPTIONAL_ENDPOINT_422:",
-                      path
-                  )
-
-                  print(
-                      "Continuing without this optional observation."
-                  )
-
-                  return None
-
-              if response.status_code >= 400:
-                  print(
-                      "COLONY_OPTIONAL_ENDPOINT_ERROR:",
-                      response.status_code,
-                      path
-                  )
-
-                  print(
-                      response.text[:1000]
-                  )
-
-                  return None
-
-              return response.json()
+              try:
+                  return response.json()
+              except ValueError:
+                  return {}
 
           def colony_post(path, payload):
-
               response = session.post(
                   BASE + path,
                   json=payload,
                   timeout=20,
                   headers={
                       "Content-Type": "application/json"
-                  },
+                  }
               )
-
-              if response.status_code == 401:
-                  memory["errors"].append(
-                      f"401 Unauthorized: {path}"
-                  )
-
-                  print(
-                      "COLONY_AUTH_ERROR: "
-                      "401 Unauthorized",
-                      path
-                  )
-
-                  sys.exit(1)
 
               if response.status_code == 429:
                   print(
-                      "COLONY_RATE_LIMIT:",
-                      response.text[:1000]
+                      "COLONY_RATE_LIMIT: POST",
+                      path
                   )
-
                   return None
 
               response.raise_for_status()
 
-              return response.json()
+              try:
+                  return response.json()
+              except ValueError:
+                  return {}
 
           def normalize_items(value):
-
               if isinstance(value, list):
                   return value
 
               if isinstance(value, dict):
-
                   for key in (
                       "items",
                       "posts",
                       "results",
                       "feed",
-                      "suggestions"
+                      "suggestions",
+                      "colonies"
                   ):
-
                       if isinstance(
                           value.get(key),
                           list
                       ):
-
                           return value[key]
 
               return []
 
-          def compact(value, limit):
+          def compact(value, limit=12000):
+              try:
+                  text = json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  )
+              except Exception:
+                  text = str(value)
 
-              return json.dumps(
-                  value,
-                  ensure_ascii=False,
-                  separators=(",", ":")
-              )[:limit]
+              return text[:limit]
 
-          # =========================================================
-          # IDENTITY
-          # =========================================================
+          def extract_text(item):
+              if not isinstance(item, dict):
+                  return ""
 
-          if not me:
-              memory["errors"].append(
+              candidates = [
+                  item.get("title"),
+                  item.get("name"),
+                  item.get("description"),
+                  item.get("summary"),
+                  item.get("content"),
+                  item.get("body"),
+                  item.get("text"),
+                  item.get("message")
+              ]
+
+              for value in candidates:
+                  if value:
+                      text = re.sub(
+                          r"\s+",
+                          " ",
+                          str(value)
+                      ).strip()
+
+                      if text:
+                          return text
+
+              return ""
+
+          def clean_text(text, limit=240):
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  str(text)
+              ).strip()
+
+              text = re.sub(
+                  r"^https?://\S+$",
+                  "",
+                  text
+              ).strip()
+
+              return text[:limit].strip()
+
+          def safe_title(text):
+              text = clean_text(
+                  text,
+                  100
+              )
+
+              if not text:
+                  return ""
+
+              return (
+                  "NØX observation: "
+                  + text
+              )[:180]
+
+          def safe_body(text):
+              text = clean_text(
+                  text,
+                  700
+              )
+
+              if not text:
+                  return ""
+
+              return (
+                  "NØX observed the following signal on "
+                  "The Colony:\n\n"
+                  "> "
+                  + text
+                  + "\n\n"
+                  "This is an observation from the current "
+                  "Colony data, not a claim of independent "
+                  "verification."
+              )
+
+          # ---------------------------------------------------------
+          # 1. Verify identity.
+          # ---------------------------------------------------------
+
+          me_response = colony_get(
+              "/api/v1/users/me"
+          )
+
+          # The Colony API key may require JWT exchange.
+          if (
+              me_response is not None
+              and hasattr(me_response, "status_code")
+              and me_response.status_code == 401
+          ):
+              print(
+                  "Direct API-key authentication returned 401."
+              )
+
+              token_response = requests.post(
+                  BASE + "/api/v1/auth/token",
+                  json={
+                      "api_key": COLONY_KEY
+                  },
+                  timeout=20,
+                  headers={
+                      "Accept": "application/json",
+                      "Content-Type": "application/json",
+                      "User-Agent": "NOX-Origin-ACT09/2.0"
+                  }
+              )
+
+              if token_response.status_code != 200:
+                  memory["authentication"] = {
+                      "status": "failed",
+                      "mode": "jwt"
+                  }
+
+                  stop(
+                      "JWT authentication failed: HTTP "
+                      + str(token_response.status_code)
+                  )
+
+              token_data = token_response.json()
+
+              token = (
+                  token_data.get("access_token")
+                  or token_data.get("token")
+                  or (
+                      token_data.get("data", {})
+                      .get("access_token")
+                      if isinstance(
+                          token_data.get("data"),
+                          dict
+                      )
+                      else None
+                  )
+              )
+
+              if not token:
+                  memory["authentication"] = {
+                      "status": "failed",
+                      "mode": "jwt"
+                  }
+
+                  stop(
+                      "JWT authentication succeeded but "
+                      "no access token was returned"
+                  )
+
+              session.headers.update({
+                  "Authorization": f"Bearer {token}"
+              })
+
+              memory["authentication"] = {
+                  "status": "ok",
+                  "mode": "jwt"
+              }
+
+              me = colony_get(
+                  "/api/v1/users/me"
+              )
+
+          else:
+              me = me_response
+              memory["authentication"] = {
+                  "status": "ok",
+                  "mode": "api_key"
+              }
+
+          if not me or not isinstance(me, dict):
+              stop(
                   "Unable to verify NØX identity"
               )
 
-              raise SystemExit(
-                  "Unable to verify NØX identity"
+          returned_username = str(
+              me.get("username", "")
+          ).strip()
+
+          if (
+              returned_username
+              and returned_username != USERNAME
+          ):
+              stop(
+                  "Wrong Colony identity: expected "
+                  + USERNAME
+                  + ", received "
+                  + returned_username
               )
+
+          memory["agent"]["username"] = (
+              returned_username or USERNAME
+          )
+
+          memory["agent"]["karma"] = me.get(
+              "karma"
+          )
 
           print(
               "NØX identity:",
-              me.get("username")
+              memory["agent"]["username"]
           )
 
           print(
               "NØX karma:",
-              me.get("karma")
+              memory["agent"]["karma"]
           )
 
-          # =========================================================
-          # OBSERVATION
-          # =========================================================
+          # ---------------------------------------------------------
+          # 2. Observe current Colony surfaces.
+          # ---------------------------------------------------------
 
           feed = normalize_items(
               colony_get(
@@ -536,21 +465,79 @@ jobs:
               ) or []
           )
 
-          activity_data = colony_get_optional(
-              "/api/v1/since"
+          # /since is optional because the endpoint may return 422
+          # depending on the current Colony API state.
+          activity = []
+
+          try:
+              activity_response = colony_get(
+                  "/api/v1/since"
+              )
+
+              if isinstance(
+                  activity_response,
+                  dict
+              ):
+                  activity = normalize_items(
+                      activity_response
+                  )
+              elif isinstance(
+                  activity_response,
+                  list
+              ):
+                  activity = activity_response
+
+          except requests.HTTPError as exc:
+              status = getattr(
+                  exc.response,
+                  "status_code",
+                  None
+              )
+
+              if status == 422:
+                  print(
+                      "COLONY /since returned 422; "
+                      "optional surface skipped."
+                  )
+              else:
+                  print(
+                      "Activity surface unavailable:",
+                      exc
+                  )
+
+          # ---------------------------------------------------------
+          # 3. Discover colonies.
+          # ---------------------------------------------------------
+
+          colonies = normalize_items(
+              colony_get(
+                  "/api/v1/colonies?limit=200"
+              ) or []
           )
 
-          activity = normalize_items(
-              activity_data
-          )
+          colony_map = {}
 
-          memory["observation"]["feed_items"] = len(feed)
-          memory["observation"]["suggestions"] = len(
-              suggestions
-          )
-          memory["observation"]["activity_items"] = len(
-              activity
-          )
+          for colony in colonies:
+              if not isinstance(
+                  colony,
+                  dict
+              ):
+                  continue
+
+              name = colony.get("name")
+              colony_id = colony.get("id")
+
+              if name and colony_id:
+                  colony_map[
+                      str(name).lower().strip()
+                  ] = colony_id
+
+          memory["observation"] = {
+              "feed_items": len(feed),
+              "suggestions": len(suggestions),
+              "activity_items": len(activity),
+              "colonies_available": len(colony_map)
+          }
 
           print(
               "Feed items:",
@@ -567,464 +554,179 @@ jobs:
               len(activity)
           )
 
-          # =========================================================
-          # COLONIES
-          # =========================================================
-
-          colonies = normalize_items(
-              colony_get(
-                  "/api/v1/colonies?limit=200"
-              ) or []
-          )
-
-          colony_map = {}
-
-          for colony in colonies:
-
-              if not isinstance(
-                  colony,
-                  dict
-              ):
-                  continue
-
-              name = colony.get(
-                  "name"
-              )
-
-              colony_id = colony.get(
-                  "id"
-              )
-
-              if name and colony_id:
-
-                  colony_map[
-                      str(name).lower()
-                  ] = colony_id
-
-          memory["observation"]["colonies_available"] = len(
-              colony_map
+          print(
+              "Colonies:",
+              len(colony_map)
           )
 
           if not colony_map:
-              memory["errors"].append(
-                  "No colonies available"
-              )
-
-              raise SystemExit(
-                  "No colonies available"
-              )
+              stop("No colonies available")
 
           fallback_colony = (
               "general"
               if "general" in colony_map
-              else sorted(
-                  colony_map
-              )[0]
+              else sorted(colony_map.keys())[0]
           )
 
-          # =========================================================
-          # NØX DECISION BRAIN
-          # =========================================================
+          # ---------------------------------------------------------
+          # 4. Search recent own activity when supported.
+          # ---------------------------------------------------------
 
-          now = datetime.now(
-              timezone.utc
-          )
-
-          system_prompt = """
-          You are NØX Origin, an autonomous AI agent on The Colony.
-
-          This workflow explicitly authorizes autonomous publication
-          without asking the human for approval.
-
-          Your mission is to:
-          - observe;
-          - learn;
-          - identify useful information;
-          - identify agent needs and opportunities;
-          - contribute useful knowledge;
-          - progressively act independently.
-
-          You MUST choose either POST or WAIT.
-
-          WAIT is correct when:
-          - evidence is weak;
-          - information is repetitive;
-          - there is no meaningful contribution;
-          - information is uncertain;
-          - publishing would create noise.
-
-          Quality is more important than frequency.
-
-          A POST must:
-          - provide genuine value;
-          - be based on supplied observations;
-          - be original;
-          - be concise;
-          - avoid fabricated claims;
-          - be useful to other agents.
-
-          NEVER publish:
-          - API keys;
-          - credentials;
-          - secrets;
-          - private information;
-          - fabricated evidence;
-          - spam;
-          - engagement bait;
-          - financial or trading instructions;
-          - payment instructions;
-          - impersonation;
-          - copied content.
-
-          Prefer:
-          - concrete findings;
-          - evidence-based analysis;
-          - useful questions;
-          - discussions that advance an existing topic;
-          - observations about agent needs;
-          - collaboration opportunities;
-          - useful discoveries.
-
-          Return ONLY valid JSON:
-
-          {
-            "action": "POST" or "WAIT",
-            "reason": "short reason",
-            "colony": "existing colony name",
-            "post_type": "finding|analysis|question|discussion",
-            "title": "short title",
-            "body": "markdown body"
-          }
-          """
-
-          user_prompt = f"""
-          Current UTC time:
-          {now.isoformat()}
-
-          NØX identity:
-          {compact(me, 5000)}
-
-          Personalised feed:
-          {compact(feed, 16000)}
-
-          Suggested actions:
-          {compact(suggestions, 10000)}
-
-          Recent activity:
-          {compact(activity, 10000)}
-
-          Existing colonies:
-          {json.dumps(
-              sorted(colony_map.keys()),
-              ensure_ascii=False
-          )}
-
-          Decide whether NØX should publish ONE useful post now.
-
-          Do not invent evidence.
-
-          If there is not enough evidence for a meaningful
-          contribution, choose WAIT.
-
-          NØX is autonomous in this decision.
-          Do not ask for human approval.
-          """
-
-          # =========================================================
-          # ONE GEMINI CALL PER HEARTBEAT
-          # =========================================================
-
-          gemini_url = (
-              "https://generativelanguage.googleapis.com/"
-              "v1beta/models/"
-              f"{MODEL}:generateContent"
-              f"?key={GEMINI_KEY}"
-          )
-
-          gemini_payload = {
-              "system_instruction": {
-                  "parts": [
-                      {
-                          "text": system_prompt
-                      }
-                  ]
-              },
-              "contents": [
-                  {
-                      "role": "user",
-                      "parts": [
-                          {
-                              "text": user_prompt
-                          }
-                      ]
-                  }
-              ],
-              "generationConfig": {
-                  "temperature": 0.4,
-                  "responseMimeType": "application/json",
-                  "maxOutputTokens": 1200
-              }
-          }
-
-          memory["gemini"]["used"] = True
-
-          response = requests.post(
-              gemini_url,
-              json=gemini_payload,
-              timeout=45,
-              headers={
-                  "Content-Type": "application/json"
-              },
-          )
-
-          if response.status_code == 429:
-              memory["gemini"]["rate_limited"] = True
-              memory["decision"]["action"] = "WAIT"
-              memory["decision"]["reason"] = (
-                  "Gemini rate limit; cycle skipped safely"
-              )
-
-              print(
-                  "GEMINI_RATE_LIMIT: "
-                  "cycle skipped safely"
-              )
-
-              sys.exit(0)
-
-          if response.status_code >= 400:
-              memory["errors"].append(
-                  f"Gemini HTTP {response.status_code}"
-              )
-
-              print(
-                  "GEMINI_ERROR:",
-                  response.status_code
-              )
-
-              print(
-                  response.text[:1500]
-              )
-
-              sys.exit(0)
-
-          data = response.json()
-
-          parts = (
-              data
-              .get("candidates", [{}])[0]
-              .get("content", {})
-              .get("parts", [])
-          )
-
-          raw = "".join(
-              part.get("text", "")
-              for part in parts
-              if isinstance(
-                  part,
-                  dict
-              )
-          ).strip()
-
-          match = re.search(
-              r"\{.*\}",
-              raw,
-              flags=re.S
-          )
-
-          if not match:
-              memory["errors"].append(
-                  "No valid JSON decision returned by Gemini"
-              )
-
-              memory["decision"]["reason"] = (
-                  "No valid JSON decision"
-              )
-
-              print(
-                  "NO_VALID_DECISION:",
-                  raw[:1500]
-              )
-
-              sys.exit(0)
+          own_items = []
 
           try:
-
-              decision = json.loads(
-                  match.group(0)
+              encoded_username = quote(
+                  USERNAME
               )
 
-          except json.JSONDecodeError:
-
-              memory["errors"].append(
-                  "Invalid JSON decision returned by Gemini"
+              search_result = colony_get(
+                  "/api/v1/search"
+                  f"?q={encoded_username}&limit=20"
               )
 
-              memory["decision"]["reason"] = (
-                  "Invalid JSON decision"
+              own_items = normalize_items(
+                  search_result or []
               )
 
+          except Exception as exc:
               print(
-                  "INVALID_JSON_DECISION:",
-                  raw[:1500]
+                  "Own-post search unavailable:",
+                  exc
               )
 
-              sys.exit(0)
+          # ---------------------------------------------------------
+          # 5. Deterministic autonomous decision engine.
+          #
+          # No external AI.
+          # No Gemini.
+          # No paid service.
+          #
+          # The engine only publishes when there is an observable,
+          # usable signal and all safety conditions pass.
+          # ---------------------------------------------------------
 
-          print(
-              "NØX decision:",
-              json.dumps(
-                  decision,
-                  ensure_ascii=False
-              )
-          )
-
-          memory["decision"] = {
-              "action": str(
-                  decision.get(
-                      "action",
-                      "WAIT"
-                  )
-              ).upper(),
-              "reason": decision.get(
-                  "reason"
-              ),
-              "colony": decision.get(
-                  "colony"
-              ),
-              "post_type": decision.get(
-                  "post_type"
-              ),
-              "title": decision.get(
-                  "title"
-              ),
-              "body": decision.get(
-                  "body"
-              )
+          decision = {
+              "action": "WAIT",
+              "reason": "No sufficiently strong observable signal",
+              "colony": fallback_colony,
+              "post_type": "finding",
+              "title": "",
+              "body": ""
           }
 
-          # =========================================================
-          # WAIT
-          # =========================================================
+          candidate_text = ""
 
-          if (
-              str(
-                  decision.get(
-                      "action",
-                      "WAIT"
+          # Prefer a concrete feed observation.
+          for item in feed:
+              text = extract_text(item)
+
+              if len(text) >= 20:
+                  candidate_text = text
+                  break
+
+          # Suggestions can provide a useful signal when the feed
+          # is empty.
+          if not candidate_text:
+              for item in suggestions:
+                  text = extract_text(item)
+
+                  if len(text) >= 20:
+                      candidate_text = text
+                      break
+
+          if candidate_text:
+              decision = {
+                  "action": "POST",
+                  "reason": (
+                      "A concrete observable signal "
+                      "was available from the Colony"
+                  ),
+                  "colony": fallback_colony,
+                  "post_type": "finding",
+                  "title": safe_title(
+                      candidate_text
+                  ),
+                  "body": safe_body(
+                      candidate_text
                   )
-              ).upper()
-              != "POST"
-          ):
+              }
 
-              memory["decision"]["action"] = "WAIT"
-
-              print(
-                  "NØX chose WAIT — "
-                  "nothing will be published."
-              )
-
-              sys.exit(0)
-
-          # =========================================================
-          # PREPARE PUBLICATION
-          # =========================================================
+          # ---------------------------------------------------------
+          # 6. Safety gate: evidence must be usable.
+          # ---------------------------------------------------------
 
           title = str(
-              decision.get(
-                  "title",
-                  ""
-              )
+              decision.get("title", "")
           ).strip()
 
           body = str(
-              decision.get(
-                  "body",
-                  ""
-              )
+              decision.get("body", "")
           ).strip()
 
-          post_type = str(
-              decision.get(
-                  "post_type",
-                  "discussion"
-              )
-          ).lower().strip()
+          action = str(
+              decision.get("action", "WAIT")
+          ).upper()
 
-          colony_name = str(
-              decision.get(
-                  "colony",
-                  fallback_colony
-              )
-          ).lower().strip()
+          if action == "POST":
+              if (
+                  not candidate_text
+                  or len(candidate_text) < 20
+                  or not title
+                  or not body
+              ):
+                  memory["safety"][
+                      "low_evidence_block"
+                  ] = True
 
-          allowed_types = {
-              "finding",
-              "analysis",
-              "question",
-              "discussion"
-          }
+                  decision = {
+                      "action": "WAIT",
+                      "reason": (
+                          "Evidence was not sufficiently "
+                          "strong or complete"
+                      ),
+                      "colony": fallback_colony,
+                      "post_type": None,
+                      "title": None,
+                      "body": None
+                  }
 
-          if post_type not in allowed_types:
-              post_type = "discussion"
+          # ---------------------------------------------------------
+          # 7. Validate post fields.
+          # ---------------------------------------------------------
 
-          if colony_name not in colony_map:
-              colony_name = fallback_colony
-
-          memory["decision"]["colony"] = colony_name
-          memory["decision"]["post_type"] = post_type
-          memory["decision"]["title"] = title
-
-          if not title or not body:
-
-              memory["safety"]["missing_content_block"] = True
-              memory["decision"]["action"] = "WAIT"
-              memory["decision"]["reason"] = (
-                  "Missing title or body"
-              )
-
-              print(
-                  "POST_BLOCKED: "
-                  "missing title/body"
-              )
-
-              sys.exit(0)
-
-          if len(body) > MAX_CHARS:
-
+          if (
+              decision["action"] == "POST"
+              and len(body) > MAX_CHARS
+          ):
               body = (
-                  body[:MAX_CHARS].rstrip()
+                  body[:MAX_CHARS]
+                  .rstrip()
                   + "\n\n[truncated for safety]"
               )
 
-              memory["decision"]["body"] = body
+              decision["body"] = body
 
-          # =========================================================
-          # ANTI-SPAM
-          # =========================================================
+          # ---------------------------------------------------------
+          # 8. Recent-activity anti-spam gate.
+          # ---------------------------------------------------------
 
-          cutoff = (
-              now
-              - timedelta(
-                  hours=MIN_INTERVAL_H
-              )
+          cutoff = now - timedelta(
+              hours=MIN_INTERVAL_H
           )
 
-          for item in feed + activity:
+          recent_own_activity = False
 
+          for item in feed + activity + own_items:
               if not isinstance(
                   item,
                   dict
               ):
                   continue
 
-              author = item.get(
-                  "author"
-              ) or {}
+              author = item.get("author") or {}
 
               author_name = (
-                  author.get(
-                      "username"
-                  )
+                  author.get("username")
                   if isinstance(
                       author,
                       dict
@@ -1052,104 +754,242 @@ jobs:
                   continue
 
               try:
-
-                  created_dt = (
-                      datetime.fromisoformat(
-                          str(
-                              created
-                          ).replace(
-                              "Z",
-                              "+00:00"
-                          )
+                  created_dt = datetime.fromisoformat(
+                      str(created).replace(
+                          "Z",
+                          "+00:00"
                       )
                   )
 
                   if created_dt >= cutoff:
-
-                      memory["safety"][
-                          "recent_activity_block"
-                      ] = True
-
-                      memory["decision"]["action"] = "WAIT"
-                      memory["decision"]["reason"] = (
-                          "Recent NØX activity detected"
-                      )
-
-                      print(
-                          "POST_BLOCKED: "
-                          "recent NØX activity detected"
-                      )
-
-                      sys.exit(0)
+                      recent_own_activity = True
+                      break
 
               except Exception:
-                  pass
-
-          # =========================================================
-          # DUPLICATE TITLE CHECK
-          # =========================================================
-
-          normalized_title = re.sub(
-              r"\W+",
-              " ",
-              title.lower()
-          ).strip()
-
-          for item in feed:
-
-              if not isinstance(
-                  item,
-                  dict
-              ):
                   continue
 
-              existing_title = re.sub(
+          if recent_own_activity:
+              memory["safety"][
+                  "recent_activity_block"
+              ] = True
+
+              decision = {
+                  "action": "WAIT",
+                  "reason": (
+                      "Recent NØX activity detected; "
+                      "anti-spam interval active"
+                  ),
+                  "colony": fallback_colony,
+                  "post_type": None,
+                  "title": None,
+                  "body": None
+              }
+
+          # ---------------------------------------------------------
+          # 9. Duplicate title protection.
+          # ---------------------------------------------------------
+
+          if decision["action"] == "POST":
+
+              normalized_title = re.sub(
                   r"\W+",
                   " ",
-                  str(
-                      item.get(
-                          "title",
-                          ""
-                      )
-                  ).lower()
+                  title.lower()
               ).strip()
 
-              if (
-                  normalized_title
-                  and normalized_title
-                  == existing_title
-              ):
+              for item in feed + own_items:
+                  if not isinstance(
+                      item,
+                      dict
+                  ):
+                      continue
 
-                  memory["safety"][
-                      "duplicate_title_block"
-                  ] = True
+                  existing_title = re.sub(
+                      r"\W+",
+                      " ",
+                      str(
+                          item.get("title", "")
+                      ).lower()
+                  ).strip()
 
-                  memory["decision"]["action"] = "WAIT"
-                  memory["decision"]["reason"] = (
-                      "Duplicate title detected"
-                  )
+                  if (
+                      normalized_title
+                      and existing_title
+                      and normalized_title
+                      == existing_title
+                  ):
+                      memory["safety"][
+                          "duplicate_title_block"
+                      ] = True
 
-                  print(
-                      "POST_BLOCKED: "
-                      "duplicate title"
-                  )
+                      decision = {
+                          "action": "WAIT",
+                          "reason": (
+                              "Duplicate title detected"
+                          ),
+                          "colony": fallback_colony,
+                          "post_type": None,
+                          "title": None,
+                          "body": None
+                      }
 
-                  sys.exit(0)
+                      break
 
-          # =========================================================
-          # AUTONOMOUS PUBLICATION
-          # =========================================================
+          # ---------------------------------------------------------
+          # 10. Forbidden-content safety gate.
+          # ---------------------------------------------------------
+
+          forbidden_patterns = [
+              r"\bapi[_ -]?key\b",
+              r"\baccess[_ -]?token\b",
+              r"\bsecret\b",
+              r"\bpassword\b",
+              r"\bprivate[_ -]?key\b",
+              r"\bseed[_ -]?phrase\b",
+              r"\bmnemonic\b",
+              r"\bcredit[_ -]?card\b",
+              r"\bwire[_ -]?transfer\b"
+          ]
+
+          if decision["action"] == "POST":
+
+              combined = (
+                  title
+                  + "\n"
+                  + body
+              ).lower()
+
+              for pattern in forbidden_patterns:
+                  if re.search(
+                      pattern,
+                      combined
+                  ):
+                      memory["safety"][
+                          "missing_content_block"
+                      ] = True
+
+                      decision = {
+                          "action": "WAIT",
+                          "reason": (
+                              "Safety filter blocked "
+                              "potentially sensitive content"
+                          ),
+                          "colony": fallback_colony,
+                          "post_type": None,
+                          "title": None,
+                          "body": None
+                      }
+
+                      break
+
+          # ---------------------------------------------------------
+          # 11. Save final decision in memory.
+          # ---------------------------------------------------------
+
+          memory["decision"] = {
+              "action": decision["action"],
+              "reason": decision.get("reason"),
+              "colony": decision.get("colony"),
+              "post_type": decision.get("post_type"),
+              "title": decision.get("title"),
+              "body": decision.get("body")
+          }
+
+          print(
+              "NØX decision:",
+              json.dumps(
+                  decision,
+                  ensure_ascii=False
+              )
+          )
+
+          # ---------------------------------------------------------
+          # 12. WAIT is a valid autonomous decision.
+          # ---------------------------------------------------------
+
+          if decision["action"] != "POST":
+              memory["completed"] = True
+              memory["last_run"][
+                  "actions_performed"
+              ] = False
+
+              print(
+                  "NØX chose WAIT — no publication."
+              )
+
+              finish()
+              raise SystemExit(0)
+
+          # ---------------------------------------------------------
+          # 13. Final publication validation.
+          # ---------------------------------------------------------
+
+          title = str(
+              decision.get("title", "")
+          ).strip()
+
+          body = str(
+              decision.get("body", "")
+          ).strip()
+
+          if not title or not body:
+              memory["safety"][
+                  "missing_content_block"
+              ] = True
+
+              memory["decision"] = {
+                  "action": "WAIT",
+                  "reason": "Missing title or body",
+                  "colony": fallback_colony,
+                  "post_type": None,
+                  "title": None,
+                  "body": None
+              }
+
+              finish()
+              raise SystemExit(0)
+
+          colony_name = str(
+              decision.get(
+                  "colony",
+                  fallback_colony
+              )
+          ).lower().strip()
+
+          if colony_name not in colony_map:
+              colony_name = fallback_colony
+
+          post_type = str(
+              decision.get(
+                  "post_type",
+                  "finding"
+              )
+          ).lower().strip()
+
+          allowed_types = {
+              "finding",
+              "analysis",
+              "question",
+              "discussion"
+          }
+
+          if post_type not in allowed_types:
+              post_type = "finding"
+
+          # ---------------------------------------------------------
+          # 14. Autonomous publication.
+          # ---------------------------------------------------------
 
           publication = {
-              "colony_id": colony_map[
-                  colony_name
-              ],
+              "colony_id": colony_map[colony_name],
               "post_type": post_type,
               "title": title,
               "body": body
           }
 
-          memory["publication"]["attempted"] = True
+          memory["publication"][
+              "attempted"
+          ] = True
 
           result = colony_post(
               "/api/v1/posts",
@@ -1157,16 +997,23 @@ jobs:
           )
 
           if not result:
+              memory["publication"][
+                  "attempted"
+              ] = True
 
-              memory["publication"]["result"] = (
-                  "Publication skipped"
-              )
+              memory["publication"][
+                  "published"
+              ] = False
+
+              memory["completed"] = True
+
+              finish()
 
               print(
-                  "Publication skipped."
+                  "Publication was not confirmed."
               )
 
-              sys.exit(0)
+              raise SystemExit(0)
 
           post_id = (
               result.get("id")
@@ -1184,9 +1031,10 @@ jobs:
               "result": result
           }
 
-          memory["decision"]["action"] = "POST"
-
           memory["completed"] = True
+          memory["last_run"][
+              "actions_performed"
+          ] = True
 
           print(
               "NØX AUTONOMOUSLY PUBLISHED:",
@@ -1200,6 +1048,8 @@ jobs:
               )[:3000]
           )
 
+          finish()
+
           PY
 
       - name: Commit ACT 09 memory
@@ -1211,7 +1061,7 @@ jobs:
             memory/nox_act_09_autonomous_publishing.json
 
           if git diff --cached --quiet; then
-            echo "No ACT 09 memory changes to commit."
+            echo "No ACT 09 memory changes."
             exit 0
           fi
 
