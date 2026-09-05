@@ -1,0 +1,666 @@
+name: NØX ACT 09 — Autonomous Publishing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nox-act-09-autonomous-publishing
+  cancel-in-progress: false
+
+jobs:
+  autonomous-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
+      NOX_USERNAME: nox_origine
+      NOX_MIN_POST_INTERVAL_HOURS: "6"
+      NOX_MAX_FEED_ITEMS: "20"
+      NOX_MAX_POST_CHARS: "5000"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: NØX autonomous decision and publication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone, timedelta
+
+          import requests
+
+          BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
+          COLONY_KEY = os.environ["COLONY_API_KEY"]
+          GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+          MODEL = os.environ["GEMINI_MODEL"]
+          USERNAME = os.environ["NOX_USERNAME"]
+
+          MIN_INTERVAL_H = float(os.environ["NOX_MIN_POST_INTERVAL_HOURS"])
+          MAX_FEED = int(os.environ["NOX_MAX_FEED_ITEMS"])
+          MAX_CHARS = int(os.environ["NOX_MAX_POST_CHARS"])
+
+          if not COLONY_KEY:
+              raise SystemExit("COLONY_API_KEY is missing")
+
+          if not GEMINI_KEY:
+              raise SystemExit("GEMINI_API_KEY is missing")
+
+          session = requests.Session()
+
+          session.headers.update({
+              "Authorization": f"Bearer {COLONY_KEY}",
+              "Accept": "application/json",
+              "User-Agent": "NOX-Origin-ACT09/1.0",
+          })
+
+          def colony_get(path):
+              response = session.get(
+                  BASE + path,
+                  timeout=20
+              )
+
+              if response.status_code == 429:
+                  print("COLONY_RATE_LIMIT:", path)
+                  return None
+
+              response.raise_for_status()
+              return response.json()
+
+          def colony_post(path, payload):
+              response = session.post(
+                  BASE + path,
+                  json=payload,
+                  timeout=20,
+                  headers={
+                      "Content-Type": "application/json"
+                  },
+              )
+
+              if response.status_code == 429:
+                  print(
+                      "COLONY_RATE_LIMIT:",
+                      response.text[:1000]
+                  )
+                  return None
+
+              response.raise_for_status()
+              return response.json()
+
+          def normalize_items(value):
+              if isinstance(value, list):
+                  return value
+
+              if isinstance(value, dict):
+                  for key in (
+                      "items",
+                      "posts",
+                      "results",
+                      "feed",
+                      "suggestions"
+                  ):
+                      if isinstance(value.get(key), list):
+                          return value[key]
+
+              return []
+
+          def compact(value, limit):
+              return json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              )[:limit]
+
+          # ---------------------------------------------------------
+          # 1. IDENTITY
+          # ---------------------------------------------------------
+
+          me = colony_get("/api/v1/users/me")
+
+          if not me:
+              raise SystemExit(
+                  "Unable to verify NØX identity"
+              )
+
+          print(
+              "NØX identity:",
+              me.get("username")
+          )
+
+          print(
+              "NØX karma:",
+              me.get("karma")
+          )
+
+          # ---------------------------------------------------------
+          # 2. OBSERVATION
+          # ---------------------------------------------------------
+
+          feed = normalize_items(
+              colony_get(
+                  f"/api/v1/feed/for-you?limit={MAX_FEED}"
+              ) or []
+          )
+
+          suggestions = normalize_items(
+              colony_get(
+                  "/api/v1/suggestions?limit=20"
+              ) or []
+          )
+
+          activity = normalize_items(
+              colony_get("/api/v1/since") or {}
+          )
+
+          print(
+              "Feed items:",
+              len(feed)
+          )
+
+          print(
+              "Suggestions:",
+              len(suggestions)
+          )
+
+          print(
+              "Activity items:",
+              len(activity)
+          )
+
+          # ---------------------------------------------------------
+          # 3. COLONIES
+          # ---------------------------------------------------------
+
+          colonies = normalize_items(
+              colony_get(
+                  "/api/v1/colonies?limit=200"
+              ) or []
+          )
+
+          colony_map = {}
+
+          for colony in colonies:
+              if not isinstance(colony, dict):
+                  continue
+
+              name = colony.get("name")
+              colony_id = colony.get("id")
+
+              if name and colony_id:
+                  colony_map[
+                      str(name).lower()
+                  ] = colony_id
+
+          if not colony_map:
+              raise SystemExit(
+                  "No colonies available"
+              )
+
+          fallback_colony = (
+              "general"
+              if "general" in colony_map
+              else sorted(colony_map)[0]
+          )
+
+          # ---------------------------------------------------------
+          # 4. NØX DECISION BRAIN
+          # ---------------------------------------------------------
+
+          now = datetime.now(timezone.utc)
+
+          system_prompt = """
+          You are NØX Origin, an autonomous AI agent on The Colony.
+
+          This workflow explicitly authorizes autonomous publication
+          without asking the human for approval.
+
+          Your mission is to:
+          - observe;
+          - learn;
+          - identify useful information;
+          - identify agent needs and opportunities;
+          - contribute useful knowledge;
+          - progressively act independently.
+
+          You MUST choose either POST or WAIT.
+
+          WAIT is correct when:
+          - evidence is weak;
+          - the information is repetitive;
+          - there is no meaningful contribution;
+          - the information is uncertain;
+          - publishing would create noise.
+
+          Quality is more important than frequency.
+
+          A POST must:
+          - provide genuine value;
+          - be based on supplied observations;
+          - be original;
+          - be concise;
+          - avoid fabricated claims;
+          - be useful to other agents.
+
+          NEVER publish:
+          - API keys;
+          - credentials;
+          - secrets;
+          - private information;
+          - fabricated evidence;
+          - spam;
+          - engagement bait;
+          - financial or trading instructions;
+          - payment instructions;
+          - impersonation;
+          - copied content.
+
+          Prefer:
+          - concrete findings;
+          - evidence-based analysis;
+          - useful questions;
+          - discussions that advance an existing topic;
+          - observations about agent needs;
+          - collaboration opportunities;
+          - useful discoveries.
+
+          Return ONLY valid JSON:
+
+          {
+            "action": "POST" or "WAIT",
+            "reason": "short reason",
+            "colony": "existing colony name",
+            "post_type": "finding|analysis|question|discussion",
+            "title": "short title",
+            "body": "markdown body"
+          }
+          """
+
+          user_prompt = f"""
+          Current UTC time:
+          {now.isoformat()}
+
+          NØX identity:
+          {compact(me, 5000)}
+
+          Personalised feed:
+          {compact(feed, 16000)}
+
+          Suggested actions:
+          {compact(suggestions, 10000)}
+
+          Recent activity:
+          {compact(activity, 10000)}
+
+          Existing colonies:
+          {json.dumps(
+              sorted(colony_map.keys()),
+              ensure_ascii=False
+          )}
+
+          Decide whether NØX should publish ONE useful post now.
+
+          Do not invent evidence.
+
+          If there is not enough evidence for a meaningful
+          contribution, choose WAIT.
+
+          NØX is autonomous in this decision.
+          Do not ask for human approval.
+          """
+
+          # ---------------------------------------------------------
+          # 5. ONE GEMINI CALL PER HEARTBEAT
+          # ---------------------------------------------------------
+
+          gemini_url = (
+              "https://generativelanguage.googleapis.com/"
+              f"v1beta/models/{MODEL}:generateContent"
+              f"?key={GEMINI_KEY}"
+          )
+
+          gemini_payload = {
+              "system_instruction": {
+                  "parts": [
+                      {
+                          "text": system_prompt
+                      }
+                  ]
+              },
+              "contents": [
+                  {
+                      "role": "user",
+                      "parts": [
+                          {
+                              "text": user_prompt
+                          }
+                      ]
+                  }
+              ],
+              "generationConfig": {
+                  "temperature": 0.4,
+                  "responseMimeType": "application/json",
+                  "maxOutputTokens": 1200
+              }
+          }
+
+          response = requests.post(
+              gemini_url,
+              json=gemini_payload,
+              timeout=45,
+              headers={
+                  "Content-Type": "application/json"
+              },
+          )
+
+          if response.status_code == 429:
+              print(
+                  "GEMINI_RATE_LIMIT: "
+                  "cycle skipped safely"
+              )
+              sys.exit(0)
+
+          if response.status_code >= 400:
+              print(
+                  "GEMINI_ERROR:",
+                  response.status_code
+              )
+
+              print(
+                  response.text[:1500]
+              )
+
+              sys.exit(0)
+
+          data = response.json()
+
+          parts = (
+              data
+              .get("candidates", [{}])[0]
+              .get("content", {})
+              .get("parts", [])
+          )
+
+          raw = "".join(
+              part.get("text", "")
+              for part in parts
+              if isinstance(part, dict)
+          ).strip()
+
+          match = re.search(
+              r"\{.*\}",
+              raw,
+              flags=re.S
+          )
+
+          if not match:
+              print(
+                  "NO_VALID_DECISION:",
+                  raw[:1500]
+              )
+              sys.exit(0)
+
+          try:
+              decision = json.loads(
+                  match.group(0)
+              )
+          except json.JSONDecodeError:
+              print(
+                  "INVALID_JSON_DECISION:",
+                  raw[:1500]
+              )
+              sys.exit(0)
+
+          print(
+              "NØX decision:",
+              json.dumps(
+                  decision,
+                  ensure_ascii=False
+              )
+          )
+
+          # ---------------------------------------------------------
+          # 6. WAIT
+          # ---------------------------------------------------------
+
+          if (
+              str(
+                  decision.get(
+                      "action",
+                      "WAIT"
+                  )
+              ).upper()
+              != "POST"
+          ):
+              print(
+                  "NØX chose WAIT — "
+                  "nothing will be published."
+              )
+              sys.exit(0)
+
+          # ---------------------------------------------------------
+          # 7. PREPARE PUBLICATION
+          # ---------------------------------------------------------
+
+          title = str(
+              decision.get(
+                  "title",
+                  ""
+              )
+          ).strip()
+
+          body = str(
+              decision.get(
+                  "body",
+                  ""
+              )
+          ).strip()
+
+          post_type = str(
+              decision.get(
+                  "post_type",
+                  "discussion"
+              )
+          ).lower().strip()
+
+          colony_name = str(
+              decision.get(
+                  "colony",
+                  fallback_colony
+              )
+          ).lower().strip()
+
+          allowed_types = {
+              "finding",
+              "analysis",
+              "question",
+              "discussion"
+          }
+
+          if post_type not in allowed_types:
+              post_type = "discussion"
+
+          if colony_name not in colony_map:
+              colony_name = fallback_colony
+
+          if not title or not body:
+              print(
+                  "POST_BLOCKED: "
+                  "missing title/body"
+              )
+              sys.exit(0)
+
+          if len(body) > MAX_CHARS:
+              body = (
+                  body[:MAX_CHARS].rstrip()
+                  + "\n\n[truncated for safety]"
+              )
+
+          # ---------------------------------------------------------
+          # 8. ANTI-SPAM
+          # ---------------------------------------------------------
+
+          cutoff = (
+              now
+              - timedelta(
+                  hours=MIN_INTERVAL_H
+              )
+          )
+
+          for item in feed + activity:
+
+              if not isinstance(item, dict):
+                  continue
+
+              author = item.get(
+                  "author"
+              ) or {}
+
+              author_name = (
+                  author.get("username")
+                  if isinstance(
+                      author,
+                      dict
+                  )
+                  else None
+              )
+
+              direct_name = item.get(
+                  "author_username"
+              )
+
+              if (
+                  author_name != USERNAME
+                  and direct_name != USERNAME
+              ):
+                  continue
+
+              created = (
+                  item.get("created_at")
+                  or item.get("published_at")
+                  or item.get("timestamp")
+              )
+
+              if not created:
+                  continue
+
+              try:
+                  created_dt = (
+                      datetime.fromisoformat(
+                          str(created).replace(
+                              "Z",
+                              "+00:00"
+                          )
+                      )
+                  )
+
+                  if created_dt >= cutoff:
+                      print(
+                          "POST_BLOCKED: "
+                          "recent NØX activity detected"
+                      )
+                      sys.exit(0)
+
+              except Exception:
+                  pass
+
+          # ---------------------------------------------------------
+          # 9. DUPLICATE TITLE CHECK
+          # ---------------------------------------------------------
+
+          normalized_title = re.sub(
+              r"\W+",
+              " ",
+              title.lower()
+          ).strip()
+
+          for item in feed:
+
+              if not isinstance(item, dict):
+                  continue
+
+              existing_title = re.sub(
+                  r"\W+",
+                  " ",
+                  str(
+                      item.get(
+                          "title",
+                          ""
+                      )
+                  ).lower()
+              ).strip()
+
+              if (
+                  normalized_title
+                  and normalized_title
+                  == existing_title
+              ):
+                  print(
+                      "POST_BLOCKED: "
+                      "duplicate title"
+                  )
+                  sys.exit(0)
+
+          # ---------------------------------------------------------
+          # 10. AUTONOMOUS PUBLICATION
+          # ---------------------------------------------------------
+
+          publication = {
+              "colony_id": colony_map[
+                  colony_name
+              ],
+              "post_type": post_type,
+              "title": title,
+              "body": body
+          }
+
+          result = colony_post(
+              "/api/v1/posts",
+              publication
+          )
+
+          if not result:
+              print(
+                  "Publication skipped."
+              )
+              sys.exit(0)
+
+          post_id = (
+              result.get("id")
+              if isinstance(
+                  result,
+                  dict
+              )
+              else None
+          )
+
+          print(
+              "NØX AUTONOMOUSLY PUBLISHED:",
+              post_id or "success"
+          )
+
+          print(
+              json.dumps(
+                  result,
+                  ensure_ascii=False
+              )[:3000]
+          )
+
+          PY
