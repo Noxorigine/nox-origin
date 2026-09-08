@@ -1,9 +1,8 @@
-name: NØX ACT 09 — Autonomous Publishing
+name: NØX ACT 09 — Autonomous Publishing V2
 
 on:
   workflow_dispatch:
   schedule:
-    # Autonomous heartbeat: every 2 hours (UTC)
     - cron: "0 */2 * * *"
 
 permissions:
@@ -44,7 +43,6 @@ jobs:
           import json
           import os
           import re
-          import sys
           from datetime import datetime, timezone, timedelta
           from urllib.parse import quote
 
@@ -74,7 +72,7 @@ jobs:
           now = datetime.now(timezone.utc)
 
           memory = {
-              "version": "ACT 09",
+              "version": "ACT 09 V2",
               "generated_at": now.isoformat(),
               "mode": "autonomous_publishing",
               "agent": {
@@ -97,7 +95,8 @@ jobs:
                   "colony": None,
                   "post_type": None,
                   "title": None,
-                  "body": None
+                  "body": None,
+                  "target_post_id": None
               },
               "publication": {
                   "attempted": False,
@@ -105,11 +104,18 @@ jobs:
                   "post_id": None,
                   "result": None
               },
+              "reply": {
+                  "attempted": False,
+                  "published": False,
+                  "target_post_id": None,
+                  "result": None
+              },
               "safety": {
                   "recent_activity_block": False,
                   "duplicate_title_block": False,
                   "missing_content_block": False,
-                  "low_evidence_block": False
+                  "low_evidence_block": False,
+                  "missing_reply_target_block": False
               },
               "errors": [],
               "engine": {
@@ -154,6 +160,7 @@ jobs:
           def stop(reason=None):
               if reason:
                   memory["errors"].append(str(reason))
+
               finish()
               raise SystemExit(0)
 
@@ -162,7 +169,7 @@ jobs:
           session.headers.update({
               "Authorization": f"Bearer {COLONY_KEY}",
               "Accept": "application/json",
-              "User-Agent": "NOX-Origin-ACT09/2.0"
+              "User-Agent": "NOX-Origin-ACT09/2.1"
           })
 
           def colony_get(path):
@@ -205,7 +212,54 @@ jobs:
                   )
                   return None
 
-              response.raise_for_status()
+              if response.status_code == 409:
+                  try:
+                      detail = response.json()
+                  except ValueError:
+                      detail = response.text[:2000]
+
+                  memory["errors"].append({
+                      "type": "http_conflict",
+                      "status": 409,
+                      "endpoint": path,
+                      "detail": detail
+                  })
+
+                  print(
+                      "COLONY_CONFLICT:",
+                      path
+                  )
+                  print(
+                      json.dumps(
+                          detail,
+                          ensure_ascii=False
+                      )[:3000]
+                      if isinstance(detail, dict)
+                      else str(detail)
+                  )
+
+                  return None
+
+              if response.status_code >= 400:
+                  try:
+                      detail = response.json()
+                  except ValueError:
+                      detail = response.text[:2000]
+
+                  memory["errors"].append({
+                      "type": "http_error",
+                      "status": response.status_code,
+                      "endpoint": path,
+                      "detail": detail
+                  })
+
+                  print(
+                      "COLONY_HTTP_ERROR:",
+                      response.status_code,
+                      path
+                  )
+
+                  return None
 
               try:
                   return response.json()
@@ -223,13 +277,26 @@ jobs:
                       "results",
                       "feed",
                       "suggestions",
-                      "colonies"
+                      "colonies",
+                      "data"
                   ):
-                      if isinstance(
-                          value.get(key),
-                          list
-                      ):
-                          return value[key]
+                      candidate = value.get(key)
+
+                      if isinstance(candidate, list):
+                          return candidate
+
+                      if isinstance(candidate, dict):
+                          for nested_key in (
+                              "items",
+                              "posts",
+                              "results"
+                          ):
+                              nested = candidate.get(
+                                  nested_key
+                              )
+
+                              if isinstance(nested, list):
+                                  return nested
 
               return []
 
@@ -322,6 +389,64 @@ jobs:
                   "verification."
               )
 
+          def get_post_id(item):
+              if not isinstance(item, dict):
+                  return None
+
+              direct_candidates = [
+                  item.get("post_id"),
+                  item.get("postId"),
+                  item.get("id")
+              ]
+
+              for value in direct_candidates:
+                  if value is not None and str(value).strip():
+                      return str(value).strip()
+
+              for container_key in (
+                  "post",
+                  "target",
+                  "parent",
+                  "source",
+                  "data"
+              ):
+                  container = item.get(container_key)
+
+                  if isinstance(container, dict):
+                      for key in (
+                          "post_id",
+                          "postId",
+                          "id"
+                      ):
+                          value = container.get(key)
+
+                          if (
+                              value is not None
+                              and str(value).strip()
+                          ):
+                              return str(value).strip()
+
+              return None
+
+          def looks_like_reply_signal(item):
+              text = extract_text(item).lower()
+
+              reply_patterns = [
+                  r"\breply\b",
+                  r"\bmentioned you\b",
+                  r"\bmention\b",
+                  r"\brespond\b",
+                  r"\bcomment\b"
+              ]
+
+              return any(
+                  re.search(
+                      pattern,
+                      text
+                  )
+                  for pattern in reply_patterns
+              )
+
           # ---------------------------------------------------------
           # 1. Verify identity.
           # ---------------------------------------------------------
@@ -330,7 +455,6 @@ jobs:
               "/api/v1/users/me"
           )
 
-          # The Colony API key may require JWT exchange.
           if (
               me_response is not None
               and hasattr(me_response, "status_code")
@@ -349,7 +473,7 @@ jobs:
                   headers={
                       "Accept": "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": "NOX-Origin-ACT09/2.0"
+                      "User-Agent": "NOX-Origin-ACT09/2.1"
                   }
               )
 
@@ -406,6 +530,7 @@ jobs:
 
           else:
               me = me_response
+
               memory["authentication"] = {
                   "status": "ok",
                   "mode": "api_key"
@@ -450,7 +575,7 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 2. Observe current Colony surfaces.
+          # 2. Observe Colony.
           # ---------------------------------------------------------
 
           feed = normalize_items(
@@ -465,8 +590,6 @@ jobs:
               ) or []
           )
 
-          # /since is optional because the endpoint may return 422
-          # depending on the current Colony API state.
           activity = []
 
           try:
@@ -569,7 +692,7 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 4. Search recent own activity when supported.
+          # 4. Search own activity.
           # ---------------------------------------------------------
 
           own_items = []
@@ -595,119 +718,235 @@ jobs:
               )
 
           # ---------------------------------------------------------
-          # 5. Deterministic autonomous decision engine.
+          # 5. Deterministic decision engine.
           #
-          # No external AI.
-          # No Gemini.
-          # No paid service.
-          #
-          # The engine only publishes when there is an observable,
-          # usable signal and all safety conditions pass.
+          # Priority:
+          #   A. Reply to a concrete mention when post_id exists.
+          #   B. Otherwise create a new observation.
+          #   C. Otherwise WAIT.
           # ---------------------------------------------------------
 
           decision = {
               "action": "WAIT",
               "reason": "No sufficiently strong observable signal",
               "colony": fallback_colony,
-              "post_type": "finding",
-              "title": "",
-              "body": ""
+              "post_type": None,
+              "title": None,
+              "body": None,
+              "target_post_id": None
           }
 
-          candidate_text = ""
+          # ---------------------------------------------------------
+          # 5A. Look for a concrete reply signal.
+          # ---------------------------------------------------------
 
-          # Prefer a concrete feed observation.
-          for item in feed:
+          reply_candidate = None
+
+          for item in suggestions:
+              if not isinstance(
+                  item,
+                  dict
+              ):
+                  continue
+
+              if not looks_like_reply_signal(item):
+                  continue
+
+              post_id = get_post_id(item)
+
+              if not post_id:
+                  continue
+
               text = extract_text(item)
 
-              if len(text) >= 20:
-                  candidate_text = text
-                  break
+              if len(text) < 5:
+                  continue
 
-          # Suggestions can provide a useful signal when the feed
-          # is empty.
-          if not candidate_text:
+              reply_candidate = {
+                  "item": item,
+                  "post_id": post_id,
+                  "text": text
+              }
+
+              break
+
+          if reply_candidate:
+              reply_text = clean_text(
+                  reply_candidate["text"],
+                  700
+              )
+
+              decision = {
+                  "action": "REPLY",
+                  "reason": (
+                      "A concrete mention/reply signal "
+                      "with a verified target post was "
+                      "available from the Colony"
+                  ),
+                  "colony": fallback_colony,
+                  "post_type": None,
+                  "title": None,
+                  "body": (
+                      "NØX observed your mention and is "
+                      "responding to the signal."
+                  ),
+                  "target_post_id": (
+                      reply_candidate["post_id"]
+                  )
+              }
+
+          # ---------------------------------------------------------
+          # 5B. If a reply signal exists but has no target ID,
+          #     NEVER convert it into a new post.
+          # ---------------------------------------------------------
+
+          if not reply_candidate:
+
+              reply_without_target = False
+
               for item in suggestions:
+                  if not isinstance(
+                      item,
+                      dict
+                  ):
+                      continue
+
+                  if looks_like_reply_signal(item):
+                      if not get_post_id(item):
+                          reply_without_target = True
+                          break
+
+              if reply_without_target:
+                  memory["safety"][
+                      "missing_reply_target_block"
+                  ] = True
+
+                  decision = {
+                      "action": "WAIT",
+                      "reason": (
+                          "A reply/mention signal was detected "
+                          "but its target post ID could not "
+                          "be verified"
+                      ),
+                      "colony": fallback_colony,
+                      "post_type": None,
+                      "title": None,
+                      "body": None,
+                      "target_post_id": None
+                  }
+
+          # ---------------------------------------------------------
+          # 5C. Otherwise use a concrete feed observation.
+          # ---------------------------------------------------------
+
+          if decision["action"] == "WAIT":
+
+              candidate_text = ""
+
+              for item in feed:
                   text = extract_text(item)
 
                   if len(text) >= 20:
                       candidate_text = text
                       break
 
-          if candidate_text:
-              decision = {
-                  "action": "POST",
-                  "reason": (
-                      "A concrete observable signal "
-                      "was available from the Colony"
-                  ),
-                  "colony": fallback_colony,
-                  "post_type": "finding",
-                  "title": safe_title(
-                      candidate_text
-                  ),
-                  "body": safe_body(
-                      candidate_text
-                  )
-              }
+              if not candidate_text:
+                  for item in suggestions:
+                      if looks_like_reply_signal(item):
+                          continue
+
+                      text = extract_text(item)
+
+                      if len(text) >= 20:
+                          candidate_text = text
+                          break
+
+              if candidate_text:
+                  decision = {
+                      "action": "POST",
+                      "reason": (
+                          "A concrete observable signal "
+                          "was available from the Colony"
+                      ),
+                      "colony": fallback_colony,
+                      "post_type": "finding",
+                      "title": safe_title(
+                          candidate_text
+                      ),
+                      "body": safe_body(
+                          candidate_text
+                      ),
+                      "target_post_id": None
+                  }
 
           # ---------------------------------------------------------
-          # 6. Safety gate: evidence must be usable.
+          # 6. Validate decision.
           # ---------------------------------------------------------
+
+          action = str(
+              decision.get(
+                  "action",
+                  "WAIT"
+              )
+          ).upper()
 
           title = str(
-              decision.get("title", "")
+              decision.get(
+                  "title",
+                  ""
+              ) or ""
           ).strip()
 
           body = str(
-              decision.get("body", "")
+              decision.get(
+                  "body",
+                  ""
+              ) or ""
           ).strip()
 
-          action = str(
-              decision.get("action", "WAIT")
-          ).upper()
-
           if action == "POST":
-              if (
-                  not candidate_text
-                  or len(candidate_text) < 20
-                  or not title
-                  or not body
-              ):
+
+              if not title or not body:
                   memory["safety"][
-                      "low_evidence_block"
+                      "missing_content_block"
+                  ] = True
+
+                  decision = {
+                      "action": "WAIT",
+                      "reason": "Missing title or body",
+                      "colony": fallback_colony,
+                      "post_type": None,
+                      "title": None,
+                      "body": None,
+                      "target_post_id": None
+                  }
+
+          if action == "REPLY":
+
+              target_post_id = decision.get(
+                  "target_post_id"
+              )
+
+              if not target_post_id or not body:
+                  memory["safety"][
+                      "missing_reply_target_block"
                   ] = True
 
                   decision = {
                       "action": "WAIT",
                       "reason": (
-                          "Evidence was not sufficiently "
-                          "strong or complete"
+                          "Reply target or reply body "
+                          "was missing"
                       ),
                       "colony": fallback_colony,
                       "post_type": None,
                       "title": None,
-                      "body": None
+                      "body": None,
+                      "target_post_id": None
                   }
 
           # ---------------------------------------------------------
-          # 7. Validate post fields.
-          # ---------------------------------------------------------
-
-          if (
-              decision["action"] == "POST"
-              and len(body) > MAX_CHARS
-          ):
-              body = (
-                  body[:MAX_CHARS]
-                  .rstrip()
-                  + "\n\n[truncated for safety]"
-              )
-
-              decision["body"] = body
-
-          # ---------------------------------------------------------
-          # 8. Recent-activity anti-spam gate.
+          # 7. Anti-spam.
           # ---------------------------------------------------------
 
           cutoff = now - timedelta(
@@ -782,11 +1021,12 @@ jobs:
                   "colony": fallback_colony,
                   "post_type": None,
                   "title": None,
-                  "body": None
+                  "body": None,
+                  "target_post_id": None
               }
 
           # ---------------------------------------------------------
-          # 9. Duplicate title protection.
+          # 8. Duplicate title protection for new posts.
           # ---------------------------------------------------------
 
           if decision["action"] == "POST":
@@ -798,6 +1038,7 @@ jobs:
               ).strip()
 
               for item in feed + own_items:
+
                   if not isinstance(
                       item,
                       dict
@@ -808,7 +1049,10 @@ jobs:
                       r"\W+",
                       " ",
                       str(
-                          item.get("title", "")
+                          item.get(
+                              "title",
+                              ""
+                          )
                       ).lower()
                   ).strip()
 
@@ -830,34 +1074,48 @@ jobs:
                           "colony": fallback_colony,
                           "post_type": None,
                           "title": None,
-                          "body": None
+                          "body": None,
+                          "target_post_id": None
                       }
 
                       break
 
           # ---------------------------------------------------------
-          # 10. Forbidden-content safety gate.
+          # 9. Sensitive-content protection.
           # ---------------------------------------------------------
 
-          forbidden_patterns = [
-              r"\bapi[_ -]?key\b",
-              r"\baccess[_ -]?token\b",
-              r"\bsecret\b",
-              r"\bpassword\b",
-              r"\bprivate[_ -]?key\b",
-              r"\bseed[_ -]?phrase\b",
-              r"\bmnemonic\b",
-              r"\bcredit[_ -]?card\b",
-              r"\bwire[_ -]?transfer\b"
-          ]
-
-          if decision["action"] == "POST":
+          if decision["action"] in {
+              "POST",
+              "REPLY"
+          }:
 
               combined = (
-                  title
+                  str(
+                      decision.get(
+                          "title",
+                          ""
+                      ) or ""
+                  )
                   + "\n"
-                  + body
+                  + str(
+                      decision.get(
+                          "body",
+                          ""
+                      ) or ""
+                  )
               ).lower()
+
+              forbidden_patterns = [
+                  r"\bapi[_ -]?key\b",
+                  r"\baccess[_ -]?token\b",
+                  r"\bsecret\b",
+                  r"\bpassword\b",
+                  r"\bprivate[_ -]?key\b",
+                  r"\bseed[_ -]?phrase\b",
+                  r"\bmnemonic\b",
+                  r"\bcredit[_ -]?card\b",
+                  r"\bwire[_ -]?transfer\b"
+              ]
 
               for pattern in forbidden_patterns:
                   if re.search(
@@ -877,13 +1135,14 @@ jobs:
                           "colony": fallback_colony,
                           "post_type": None,
                           "title": None,
-                          "body": None
+                          "body": None,
+                          "target_post_id": None
                       }
 
                       break
 
           # ---------------------------------------------------------
-          # 11. Save final decision in memory.
+          # 10. Save final decision.
           # ---------------------------------------------------------
 
           memory["decision"] = {
@@ -892,7 +1151,10 @@ jobs:
               "colony": decision.get("colony"),
               "post_type": decision.get("post_type"),
               "title": decision.get("title"),
-              "body": decision.get("body")
+              "body": decision.get("body"),
+              "target_post_id": decision.get(
+                  "target_post_id"
+              )
           }
 
           print(
@@ -904,10 +1166,11 @@ jobs:
           )
 
           # ---------------------------------------------------------
-          # 12. WAIT is a valid autonomous decision.
+          # 11. WAIT.
           # ---------------------------------------------------------
 
-          if decision["action"] != "POST":
+          if decision["action"] == "WAIT":
+
               memory["completed"] = True
               memory["last_run"][
                   "actions_performed"
@@ -921,15 +1184,99 @@ jobs:
               raise SystemExit(0)
 
           # ---------------------------------------------------------
-          # 13. Final publication validation.
+          # 12. REPLY.
           # ---------------------------------------------------------
 
+          if decision["action"] == "REPLY":
+
+              target_post_id = str(
+                  decision["target_post_id"]
+              ).strip()
+
+              reply_body = str(
+                  decision["body"]
+              ).strip()
+
+              memory["reply"][
+                  "attempted"
+              ] = True
+
+              print(
+                  "NØX replying to post:",
+                  target_post_id
+              )
+
+              result = colony_post(
+                  f"/api/v1/posts/{quote(target_post_id, safe='')}/comments",
+                  {
+                      "body": reply_body
+                  }
+              )
+
+              if not result:
+
+                  memory["reply"][
+                      "published"
+                  ] = False
+
+                  memory["completed"] = True
+
+                  finish()
+
+                  print(
+                      "Reply was not confirmed."
+                  )
+
+                  raise SystemExit(0)
+
+              memory["reply"] = {
+                  "attempted": True,
+                  "published": True,
+                  "target_post_id": target_post_id,
+                  "result": result
+              }
+
+              memory["completed"] = True
+
+              memory["last_run"][
+                  "actions_performed"
+              ] = True
+
+              print(
+                  "NØX AUTONOMOUSLY REPLIED:",
+                  target_post_id
+              )
+
+              print(
+                  json.dumps(
+                      result,
+                      ensure_ascii=False
+                  )[:3000]
+              )
+
+              finish()
+              raise SystemExit(0)
+
+          # ---------------------------------------------------------
+          # 13. NEW POST.
+          # ---------------------------------------------------------
+
+          if decision["action"] != "POST":
+              finish()
+              raise SystemExit(0)
+
           title = str(
-              decision.get("title", "")
+              decision.get(
+                  "title",
+                  ""
+              )
           ).strip()
 
           body = str(
-              decision.get("body", "")
+              decision.get(
+                  "body",
+                  ""
+              )
           ).strip()
 
           if not title or not body:
@@ -943,11 +1290,23 @@ jobs:
                   "colony": fallback_colony,
                   "post_type": None,
                   "title": None,
-                  "body": None
+                  "body": None,
+                  "target_post_id": None
               }
 
               finish()
               raise SystemExit(0)
+
+          if len(body) > MAX_CHARS:
+              body = (
+                  body[:MAX_CHARS]
+                  .rstrip()
+                  + "\n\n[truncated for safety]"
+              )
+
+              memory["decision"][
+                  "body"
+              ] = body
 
           colony_name = str(
               decision.get(
@@ -976,10 +1335,6 @@ jobs:
           if post_type not in allowed_types:
               post_type = "finding"
 
-          # ---------------------------------------------------------
-          # 14. Autonomous publication.
-          # ---------------------------------------------------------
-
           publication = {
               "colony_id": colony_map[colony_name],
               "post_type": post_type,
@@ -991,15 +1346,23 @@ jobs:
               "attempted"
           ] = True
 
+          print(
+              "NØX creating new post:"
+          )
+
+          print(
+              json.dumps(
+                  publication,
+                  ensure_ascii=False
+              )
+          )
+
           result = colony_post(
               "/api/v1/posts",
               publication
           )
 
           if not result:
-              memory["publication"][
-                  "attempted"
-              ] = True
 
               memory["publication"][
                   "published"
@@ -1032,6 +1395,7 @@ jobs:
           }
 
           memory["completed"] = True
+
           memory["last_run"][
               "actions_performed"
           ] = True
