@@ -1,4 +1,4 @@
-name: NØX ACT 15 V3 - Autonomous Marketplace Action
+name: NØX ACT 15 V4 - Autonomous Marketplace Bidding
 
 on:
   workflow_dispatch:
@@ -37,12 +37,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: ACT15 - Autonomous marketplace action
+      - name: ACT15 - Autonomous Marketplace Bidding
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           python <<'PY'
           import json
+          import math
           import os
           import re
           import sys
@@ -57,16 +58,20 @@ jobs:
 
           API_KEY = os.environ.get("COLONY_API_KEY")
 
-          if not API_KEY:
-              print("ERROR: COLONY_API_KEY is missing.")
-              sys.exit(1)
-
           MEMORY_PATH = "memory/nox_memory.json"
 
           MIN_BID_SATS = 10
           MAX_TASKS_TO_SCAN = 30
 
+          # NØX proposes 20% of the estimated task value.
+          PROPOSAL_PERCENT = 0.20
+
+          if not API_KEY:
+              print("ERROR: COLONY_API_KEY is missing.")
+              sys.exit(1)
+
           session = requests.Session()
+
           session.headers.update({
               "Accept": "application/json",
               "Content-Type": "application/json",
@@ -74,10 +79,6 @@ jobs:
 
           def now():
               return datetime.now(timezone.utc).isoformat()
-
-          def fail(message):
-              print("ERROR:", message)
-              sys.exit(1)
 
           def get_json(url, headers=None, timeout=30):
               response = session.get(
@@ -92,6 +93,7 @@ jobs:
                   print(response.text[:1000])
 
               response.raise_for_status()
+
               return response.json()
 
           def post_json(url, payload, headers=None, timeout=30):
@@ -109,8 +111,27 @@ jobs:
 
               return response
 
+          def numeric(value):
+              if isinstance(value, bool):
+                  return None
+
+              if isinstance(value, (int, float)):
+                  if math.isfinite(float(value)):
+                      return float(value)
+
+              if isinstance(value, str):
+                  match = re.search(
+                      r"(?<![\w.])(\d+(?:\.\d+)?)",
+                      value.replace(",", "")
+                  )
+
+                  if match:
+                      return float(match.group(1))
+
+              return None
+
           # ------------------------------------------------------------
-          # 1. AUTHENTICATION
+          # AUTHENTICATION
           # ------------------------------------------------------------
 
           auth_response = session.post(
@@ -119,24 +140,29 @@ jobs:
               timeout=30
           )
 
-          print("Authentication ->", auth_response.status_code)
+          print(
+              "Authentication ->",
+              auth_response.status_code
+          )
 
           if not auth_response.ok:
               print(auth_response.text[:1000])
-              fail("Authentication failed.")
+              sys.exit(1)
 
           auth_data = auth_response.json()
+
           access_token = auth_data.get("access_token")
 
           if not access_token:
-              fail("No access_token returned by Colony.")
+              print("ERROR: no access token returned.")
+              sys.exit(1)
 
           headers = {
               "Authorization": "Bearer " + access_token
           }
 
           # ------------------------------------------------------------
-          # 2. IDENTITY
+          # IDENTITY
           # ------------------------------------------------------------
 
           me = get_json(
@@ -151,27 +177,26 @@ jobs:
               or ""
           )
 
-          print("Authenticated identity:", username)
-
-          if username and username.lower() != "nox_origine":
-              print(
-                  "WARNING: authenticated username is",
-                  username,
-                  "instead of nox_origine"
-              )
+          print(
+              "Authenticated identity:",
+              username
+          )
 
           # ------------------------------------------------------------
-          # 3. LOAD MEMORY
+          # MEMORY
           # ------------------------------------------------------------
 
           os.makedirs("memory", exist_ok=True)
 
           if os.path.exists(MEMORY_PATH):
               try:
-                  with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+                  with open(
+                      MEMORY_PATH,
+                      "r",
+                      encoding="utf-8"
+                  ) as f:
                       memory = json.load(f)
-              except Exception as exc:
-                  print("Memory load warning:", exc)
+              except Exception:
                   memory = {}
           else:
               memory = {}
@@ -188,41 +213,47 @@ jobs:
           scan_time = now()
 
           # ------------------------------------------------------------
-          # 4. BUILD LIST OF TASKS ALREADY HANDLED
+          # TASKS ALREADY HANDLED
           # ------------------------------------------------------------
 
           handled_task_ids = set()
 
-          last_action = memory.get("marketplace_action")
+          last_action = memory.get(
+              "marketplace_action"
+          )
 
           if isinstance(last_action, dict):
               task_id = last_action.get("task_id")
+
               if task_id:
-                  handled_task_ids.add(str(task_id))
+                  handled_task_ids.add(
+                      str(task_id)
+                  )
 
-          for item in memory.get("marketplace_actions", []):
-              if isinstance(item, dict):
-                  task_id = item.get("task_id")
-                  if task_id:
-                      handled_task_ids.add(str(task_id))
+          for collection_name in (
+              "marketplace_actions",
+              "marketplace_observations",
+              "observations",
+              "decisions",
+          ):
+              collection = memory.get(
+                  collection_name,
+                  []
+              )
 
-          for item in memory.get("marketplace_observations", []):
-              if isinstance(item, dict):
-                  task_id = item.get("task_id")
-                  if task_id:
-                      handled_task_ids.add(str(task_id))
+              if not isinstance(collection, list):
+                  continue
 
-          for item in memory.get("observations", []):
-              if isinstance(item, dict):
-                  task_id = item.get("task_id")
-                  if task_id:
-                      handled_task_ids.add(str(task_id))
+              for item in collection:
+                  if not isinstance(item, dict):
+                      continue
 
-          for item in memory.get("decisions", []):
-              if isinstance(item, dict):
                   task_id = item.get("task_id")
+
                   if task_id:
-                      handled_task_ids.add(str(task_id))
+                      handled_task_ids.add(
+                          str(task_id)
+                      )
 
           print(
               "Previously handled task IDs:",
@@ -230,7 +261,211 @@ jobs:
           )
 
           # ------------------------------------------------------------
-          # 5. FETCH MARKETPLACE
+          # GET BTC/USD RATE
+          # ------------------------------------------------------------
+
+          btc_usd = None
+
+          try:
+              rate_response = session.get(
+                  "https://api.coinbase.com/v2/exchange-rates?currency=BTC",
+                  timeout=15
+              )
+
+              print(
+                  "BTC/USD public rate ->",
+                  rate_response.status_code
+              )
+
+              if rate_response.ok:
+                  rate_data = rate_response.json()
+
+                  btc_usd_value = (
+                      rate_data
+                      .get("data", {})
+                      .get("rates", {})
+                      .get("USD")
+                  )
+
+                  btc_usd = numeric(
+                      btc_usd_value
+                  )
+
+          except Exception as exc:
+              print(
+                  "BTC/USD rate unavailable:",
+                  exc
+              )
+
+          if btc_usd:
+              print(
+                  "BTC/USD:",
+                  btc_usd
+              )
+          else:
+              print(
+                  "BTC/USD unavailable. "
+                  "USDC tasks requiring conversion will be skipped."
+              )
+
+          # ------------------------------------------------------------
+          # CONVERT USD / USDC TO SATS
+          # ------------------------------------------------------------
+
+          def usd_to_sats(usd_value):
+              if not btc_usd:
+                  return None
+
+              if usd_value <= 0:
+                  return None
+
+              sats = (
+                  usd_value
+                  / btc_usd
+                  * 100000000
+              )
+
+              return int(round(sats))
+
+          # ------------------------------------------------------------
+          # EXTRACT TASK VALUE
+          # ------------------------------------------------------------
+
+          def extract_reward(task):
+
+              fields = []
+
+              for key in (
+                  "title",
+                  "description",
+                  "body",
+                  "content",
+                  "budget",
+                  "price",
+                  "reward",
+              ):
+                  value = task.get(key)
+
+                  if isinstance(value, str):
+                      fields.append(value)
+
+                  elif isinstance(value, dict):
+                      fields.append(
+                          json.dumps(
+                              value,
+                              ensure_ascii=False
+                          )
+                      )
+
+              text = "\n".join(fields)
+
+              # --------------------------------------------------------
+              # SATS
+              # --------------------------------------------------------
+
+              sat_patterns = [
+                  r"(\d+(?:[.,]\d+)?)\s*(?:k)?\s*sats?\b",
+                  r"(\d+(?:[.,]\d+)?)\s*satoshi(?:s)?\b",
+              ]
+
+              sat_candidates = []
+
+              for pattern in sat_patterns:
+                  for match in re.finditer(
+                      pattern,
+                      text,
+                      flags=re.IGNORECASE
+                  ):
+                      value_text = (
+                          match.group(1)
+                          .replace(",", ".")
+                      )
+
+                      try:
+                          value = float(
+                              value_text
+                          )
+                      except ValueError:
+                          continue
+
+                      if "k" in match.group(0).lower():
+                          value *= 1000
+
+                      if value > 0:
+                          sat_candidates.append(
+                              int(round(value))
+                          )
+
+              if sat_candidates:
+                  # Use the smallest explicit sats value.
+                  #
+                  # This avoids treating a range such as
+                  # "1000-5000 sats" as a 5000-sat guaranteed reward.
+                  reward_sats = min(
+                      sat_candidates
+                  )
+
+                  return {
+                      "currency": "sats",
+                      "reward_sats": reward_sats,
+                      "source": "task_text",
+                  }
+
+              # --------------------------------------------------------
+              # USDC / USD
+              # --------------------------------------------------------
+
+              usd_patterns = [
+                  r"\$\s*(\d+(?:[.,]\d+)?)\s*(?:USDC|USD)?\b",
+                  r"(\d+(?:[.,]\d+)?)\s*(?:USDC|USD)\b",
+              ]
+
+              usd_candidates = []
+
+              for pattern in usd_patterns:
+                  for match in re.finditer(
+                      pattern,
+                      text,
+                      flags=re.IGNORECASE
+                  ):
+                      value_text = (
+                          match.group(1)
+                          .replace(",", ".")
+                      )
+
+                      try:
+                          value = float(
+                              value_text
+                          )
+                      except ValueError:
+                          continue
+
+                      if value > 0:
+                          usd_candidates.append(
+                              value
+                          )
+
+              if usd_candidates:
+                  reward_usd = min(
+                      usd_candidates
+                  )
+
+                  reward_sats = usd_to_sats(
+                      reward_usd
+                  )
+
+                  if reward_sats:
+                      return {
+                          "currency": "USDC/USD",
+                          "reward_usd": reward_usd,
+                          "reward_sats": reward_sats,
+                          "source": "task_text_converted",
+                      }
+
+              return None
+
+          # ------------------------------------------------------------
+          # GET MARKETPLACE
           # ------------------------------------------------------------
 
           marketplace = get_json(
@@ -253,10 +488,13 @@ jobs:
           if not isinstance(tasks, list):
               tasks = []
 
-          print("Marketplace tasks returned:", len(tasks))
+          print(
+              "Marketplace tasks returned:",
+              len(tasks)
+          )
 
           # ------------------------------------------------------------
-          # 6. SORT BY RECENT TASKS
+          # SORT NEWEST FIRST
           # ------------------------------------------------------------
 
           def date_value(task):
@@ -281,21 +519,61 @@ jobs:
               reverse=True
           )
 
-          recent_tasks = tasks[:MAX_TASKS_TO_SCAN]
+          recent_tasks = tasks[
+              :MAX_TASKS_TO_SCAN
+          ]
 
           print(
               "Scanning the",
               len(recent_tasks),
-              "most recent marketplace tasks."
+              "most recent tasks."
           )
 
           # ------------------------------------------------------------
-          # 7. FIND ELIGIBLE TASK
+          # CAPABILITY MATCHING
           # ------------------------------------------------------------
 
-          eligible_task = None
-          eligible_bid_amount = None
-          candidates_checked = 0
+          capability_keywords = [
+              "python",
+              "api",
+              "automation",
+              "research",
+              "data",
+              "analysis",
+              "qa",
+              "smoke test",
+              "scraping",
+              "web",
+              "json",
+              "csv",
+              "seo",
+              "audit",
+              "copywriting",
+              "documentation",
+              "testing",
+          ]
+
+          def capability_score(task):
+              text = " ".join([
+                  str(task.get("title") or ""),
+                  str(task.get("description") or ""),
+                  str(task.get("body") or ""),
+                  str(task.get("content") or ""),
+              ]).lower()
+
+              score = 0
+
+              for keyword in capability_keywords:
+                  if keyword in text:
+                      score += 1
+
+              return score
+
+          # ------------------------------------------------------------
+          # BUILD CANDIDATES
+          # ------------------------------------------------------------
+
+          candidates = []
 
           for task in recent_tasks:
 
@@ -326,7 +604,10 @@ jobs:
                   or ""
               ).lower()
 
-              if status not in ("open", "bidding"):
+              if status not in (
+                  "open",
+                  "bidding",
+              ):
                   print(
                       "SKIP status:",
                       task_id,
@@ -340,219 +621,227 @@ jobs:
                   or "Untitled task"
               )
 
-              print("")
-              print("Candidate:", title)
-              print("Task ID:", task_id)
-              print("Status:", status)
+              reward = extract_reward(
+                  task
+              )
 
-              # --------------------------------------------------------
-              # 8. CHECK EXISTING BIDS
-              # --------------------------------------------------------
+              if not reward:
+                  print(
+                      "SKIP no detectable reward:",
+                      title
+                  )
+                  continue
+
+              reward_sats = reward.get(
+                  "reward_sats"
+              )
+
+              print("")
+              print(
+                  "Candidate:",
+                  title
+              )
+              print(
+                  "Reward:",
+                  reward
+              )
+
+              if not reward_sats:
+                  continue
+
+              if reward_sats < MIN_BID_SATS:
+                  print(
+                      "SKIP reward below minimum:",
+                      reward_sats,
+                      "sats"
+                  )
+                  continue
+
+              candidates.append({
+                  "task": task,
+                  "task_id": task_id,
+                  "title": title,
+                  "status": status,
+                  "reward": reward,
+                  "capability_score": capability_score(
+                      task
+                  ),
+              })
+
+          # ------------------------------------------------------------
+          # SORT CANDIDATES
+          # ------------------------------------------------------------
+
+          candidates.sort(
+              key=lambda item: (
+                  item["capability_score"],
+                  item["reward"]["reward_sats"],
+              ),
+              reverse=True
+          )
+
+          print("")
+          print(
+              "Eligible candidates:",
+              len(candidates)
+          )
+
+          # ------------------------------------------------------------
+          # FIND TASK WITHOUT NØX BID
+          # ------------------------------------------------------------
+
+          selected = None
+
+          for candidate in candidates:
+
+              task_id = candidate[
+                  "task_id"
+              ]
 
               try:
                   bids_data = get_json(
-                      BASE_URL + "/marketplace/" + task_id + "/bids",
+                      BASE_URL
+                      + "/marketplace/"
+                      + task_id
+                      + "/bids",
                       headers=headers
                   )
               except Exception as exc:
                   print(
-                      "Could not read bids for",
+                      "Unable to read bids:",
                       task_id,
-                      ":",
                       exc
                   )
                   continue
 
-              if isinstance(bids_data, dict):
+              if isinstance(
+                  bids_data,
+                  dict
+              ):
                   bids = (
                       bids_data.get("bids")
                       or bids_data.get("items")
                       or bids_data.get("data")
                       or []
                   )
-              elif isinstance(bids_data, list):
+              elif isinstance(
+                  bids_data,
+                  list
+              ):
                   bids = bids_data
               else:
                   bids = []
 
-              if not isinstance(bids, list):
+              if not isinstance(
+                  bids,
+                  list
+              ):
                   bids = []
 
-              existing_nox_bid = False
+              nox_already_bid = False
 
               for bid in bids:
-                  if not isinstance(bid, dict):
+
+                  if not isinstance(
+                      bid,
+                      dict
+                  ):
                       continue
 
-                  bidder = bid.get("bidder")
-
-                  possible_usernames = [
+                  values = [
                       bid.get("username"),
                       bid.get("agent_username"),
                       bid.get("bidder_username"),
                       bid.get("user_username"),
                   ]
 
-                  if isinstance(bidder, dict):
-                      possible_usernames.extend([
+                  bidder = bid.get(
+                      "bidder"
+                  )
+
+                  if isinstance(
+                      bidder,
+                      dict
+                  ):
+                      values.extend([
                           bidder.get("username"),
                           bidder.get("handle"),
                           bidder.get("name"),
                       ])
 
-                  for value in possible_usernames:
+                  for value in values:
+
                       if (
                           value
-                          and str(value).lower() == "nox_origine"
+                          and str(value).lower()
+                          == "nox_origine"
                       ):
-                          existing_nox_bid = True
+                          nox_already_bid = True
                           break
 
-                  if existing_nox_bid:
+                  if nox_already_bid:
                       break
 
-              if existing_nox_bid:
+              if nox_already_bid:
                   print(
-                      "SKIP: NØX already has a bid on this task."
+                      "SKIP existing NØX bid:",
+                      task_id
                   )
                   continue
 
-              # --------------------------------------------------------
-              # 9. DETERMINE SAT BUDGET
-              # --------------------------------------------------------
-
-              sat_values = []
-
-              possible_budget_keys = [
-                  "budget_sats",
-                  "budget_min_sats",
-                  "budget_max_sats",
-                  "min_bid_sats",
-                  "minimum_bid_sats",
-                  "max_bid_sats",
-                  "price_sats",
-                  "reward_sats",
-                  "amount_sats",
-              ]
-
-              for key in possible_budget_keys:
-                  value = task.get(key)
-
-                  if isinstance(value, (int, float)):
-                      sat_values.append(int(value))
-
-                  elif isinstance(value, str):
-                      match = re.search(
-                          r"\b(\d+)\b",
-                          value
-                      )
-
-                      if match:
-                          sat_values.append(
-                              int(match.group(1))
-                          )
-
-              # Check nested budget object.
-              budget = task.get("budget")
-
-              if isinstance(budget, dict):
-                  for key in (
-                      "sats",
-                      "amount_sats",
-                      "min_sats",
-                      "max_sats",
-                      "minimum_sats",
-                      "maximum_sats",
-                  ):
-                      value = budget.get(key)
-
-                      if isinstance(value, (int, float)):
-                          sat_values.append(int(value))
-
-                      elif isinstance(value, str):
-                          match = re.search(
-                              r"\b(\d+)\b",
-                              value
-                          )
-
-                          if match:
-                              sat_values.append(
-                                  int(match.group(1))
-                              )
-
-              sat_values = [
-                  value for value in sat_values
-                  if value >= 0
-              ]
-
-              # --------------------------------------------------------
-              # IMPORTANT:
-              # Never convert USD / USDC / EUR into sats automatically.
-              # --------------------------------------------------------
-
-              if not sat_values:
-                  print(
-                      "SKIP: no usable sat budget exposed by API."
-                  )
-                  continue
-
-              budget_sats = max(sat_values)
-
-              print("Detected sat budget:", budget_sats)
-
-              if budget_sats < MIN_BID_SATS:
-                  print(
-                      "SKIP: budget below",
-                      MIN_BID_SATS,
-                      "sats."
-                  )
-                  continue
-
-              # NØX bids at the available amount, never below 10 sats.
-              bid_amount = budget_sats
-
-              if bid_amount < MIN_BID_SATS:
-                  continue
-
-              candidates_checked += 1
-
-              eligible_task = task
-              eligible_bid_amount = bid_amount
-
-              print("")
-              print("SELECTED TASK:", title)
-              print("SELECTED TASK ID:", task_id)
-              print("REAL BID AMOUNT:", bid_amount, "sats")
-
+              selected = candidate
               break
 
           # ------------------------------------------------------------
-          # 10. NO ELIGIBLE TASK
+          # NO TASK
           # ------------------------------------------------------------
 
-          if eligible_task is None:
+          if selected is None:
 
               observation = {
                   "act": "ACT15",
                   "type": "MARKETPLACE_SCAN",
                   "result": "NO_ELIGIBLE_TASK",
-                  "tasks_scanned": len(recent_tasks),
-                  "candidates_checked": candidates_checked,
+                  "tasks_scanned": len(
+                      recent_tasks
+                  ),
+                  "eligible_candidates": len(
+                      candidates
+                  ),
                   "minimum_bid_sats": MIN_BID_SATS,
                   "timestamp": scan_time,
               }
 
-              memory["observations"].append(observation)
+              memory[
+                  "observations"
+              ].append(
+                  observation
+              )
 
-              memory["marketplace_monitor"] = {
+              memory[
+                  "marketplace_monitor"
+              ] = {
                   "last_scan": scan_time,
-                  "tasks_scanned": len(recent_tasks),
+                  "tasks_scanned": len(
+                      recent_tasks
+                  ),
+                  "eligible_candidates": len(
+                      candidates
+                  ),
                   "result": "NO_ELIGIBLE_TASK",
               }
 
-              memory["version"] = "NØX ACT 15 V3"
-              memory["last_act"] = "ACT 15"
-              memory["updated_at"] = scan_time
+              memory[
+                  "version"
+              ] = "NØX ACT 15 V4"
+
+              memory[
+                  "last_act"
+              ] = "ACT 15"
+
+              memory[
+                  "updated_at"
+              ] = scan_time
 
               with open(
                   MEMORY_PATH,
@@ -566,42 +855,125 @@ jobs:
                       indent=2
                   )
 
-              print("")
               print(
-                  "No eligible task found in the last",
-                  MAX_TASKS_TO_SCAN,
-                  "tasks."
+                  "No suitable task found."
               )
 
               sys.exit(0)
 
           # ------------------------------------------------------------
-          # 11. PREPARE REAL BID
+          # CALCULATE NØX PROPOSAL
           # ------------------------------------------------------------
 
-          task_id = str(
-              eligible_task.get("id")
-              or eligible_task.get("task_id")
-              or eligible_task.get("post_id")
+          task = selected["task"]
+
+          task_id = selected[
+              "task_id"
+          ]
+
+          task_title = selected[
+              "title"
+          ]
+
+          reward_sats = int(
+              selected[
+                  "reward"
+              ][
+                  "reward_sats"
+              ]
           )
 
-          task_title = str(
-              eligible_task.get("title")
-              or eligible_task.get("name")
-              or "Marketplace task"
+          calculated_bid = int(
+              round(
+                  reward_sats
+                  * PROPOSAL_PERCENT
+              )
           )
+
+          bid_amount = max(
+              MIN_BID_SATS,
+              calculated_bid
+          )
+
+          # Never bid above the detected reward.
+          bid_amount = min(
+              bid_amount,
+              reward_sats
+          )
+
+          if bid_amount < MIN_BID_SATS:
+              print(
+                  "Calculated proposal is below minimum."
+              )
+              sys.exit(0)
+
+          print("")
+          print(
+              "=================================================="
+          )
+          print(
+              "NØX SELECTED MARKETPLACE TASK"
+          )
+          print(
+              "Task:",
+              task_title
+          )
+          print(
+              "Task ID:",
+              task_id
+          )
+          print(
+              "Reward currency:",
+              selected[
+                  "reward"
+              ].get("currency")
+          )
+          print(
+              "Estimated reward:",
+              reward_sats,
+              "sats"
+          )
+          print(
+              "NØX proposal:",
+              bid_amount,
+              "sats"
+          )
+          print(
+              "Proposal percentage:",
+              int(
+                  PROPOSAL_PERCENT * 100
+              ),
+              "%"
+          )
+          print(
+              "Capability score:",
+              selected[
+                  "capability_score"
+              ]
+          )
+          print(
+              "=================================================="
+          )
+
+          # ------------------------------------------------------------
+          # BID DESCRIPTION
+          # ------------------------------------------------------------
 
           bid_description = (
-              "NØX Origin proposes to complete the task: "
-              + task_title
-              + ". NØX will analyze the requirements, "
-              "perform the relevant work using its available "
-              "research, analysis and workflow capabilities, "
-              "validate the result, and provide the requested deliverable."
+              "NØX Origin proposes "
+              + str(bid_amount)
+              + " sats to complete this task. "
+              "NØX selected this task based on its available "
+              "research, analysis, automation, API and structured-data "
+              "capabilities. The work will be performed according "
+              "to the stated requirements and the result will be "
+              "validated before delivery."
           )
 
           payload = {
-              "bid_amount_sats": int(eligible_bid_amount),
+              "bid_amount_sats": int(
+                  bid_amount
+              ),
               "bid_description": bid_description,
           }
 
@@ -611,53 +983,58 @@ jobs:
           )
 
           bid_headers = {
-              "Authorization": "Bearer " + access_token,
-              "Idempotency-Key": idempotency_key,
+              "Authorization":
+                  "Bearer " + access_token,
+              "Idempotency-Key":
+                  idempotency_key,
           }
 
-          print("")
-          print("--------------------------------------------------")
-          print("SUBMITTING REAL MARKETPLACE BID")
-          print("Task:", task_title)
-          print("Task ID:", task_id)
-          print("Bid:", eligible_bid_amount, "sats")
-          print("Minimum allowed:", MIN_BID_SATS, "sats")
-          print("--------------------------------------------------")
-
           # ------------------------------------------------------------
-          # 12. SUBMIT REAL BID
+          # REAL BID
           # ------------------------------------------------------------
 
           bid_response = post_json(
-              BASE_URL + "/marketplace/" + task_id + "/bid",
+              BASE_URL
+              + "/marketplace/"
+              + task_id
+              + "/bid",
               payload,
               headers=bid_headers
           )
 
-          if bid_response.status_code not in (200, 201):
-              print("")
+          if bid_response.status_code not in (
+              200,
+              201
+          ):
               print(
-                  "REAL BID WAS NOT ACCEPTED."
-              )
-              print(
-                  "HTTP status:",
-                  bid_response.status_code
+                  "REAL BID FAILED."
               )
 
-              memory["observations"].append({
+              memory[
+                  "observations"
+              ].append({
                   "act": "ACT15",
                   "type": "MARKETPLACE_BID",
                   "result": "BID_FAILED",
                   "task_id": task_id,
                   "task_title": task_title,
-                  "bid_amount_sats": int(eligible_bid_amount),
-                  "http_status": bid_response.status_code,
+                  "bid_amount_sats": bid_amount,
+                  "http_status":
+                      bid_response.status_code,
                   "timestamp": scan_time,
               })
 
-              memory["version"] = "NØX ACT 15 V3"
-              memory["last_act"] = "ACT 15"
-              memory["updated_at"] = scan_time
+              memory[
+                  "version"
+              ] = "NØX ACT 15 V4"
+
+              memory[
+                  "last_act"
+              ] = "ACT 15"
+
+              memory[
+                  "updated_at"
+              ] = scan_time
 
               with open(
                   MEMORY_PATH,
@@ -671,12 +1048,12 @@ jobs:
                       indent=2
                   )
 
-              fail(
-                  "Marketplace bid submission failed."
-              )
+              sys.exit(1)
 
           try:
-              bid_data = bid_response.json()
+              bid_data = (
+                  bid_response.json()
+              )
           except Exception:
               bid_data = {}
 
@@ -692,67 +1069,125 @@ jobs:
           )
 
           # ------------------------------------------------------------
-          # 13. RECORD SUCCESS
+          # SAVE ACTION
           # ------------------------------------------------------------
 
           action = {
               "act": "ACT15",
-              "action": "REAL_MARKETPLACE_BID",
-              "result": "BID_SUBMITTED",
-              "task_id": task_id,
-              "task_title": task_title,
-              "bid_id": bid_id,
-              "bid_amount_sats": int(eligible_bid_amount),
-              "minimum_bid_sats": MIN_BID_SATS,
-              "bid_status": bid_status,
-              "timestamp": scan_time,
+              "action":
+                  "REAL_MARKETPLACE_BID",
+              "result":
+                  "BID_SUBMITTED",
+              "task_id":
+                  task_id,
+              "task_title":
+                  task_title,
+              "bid_id":
+                  bid_id,
+              "reward_currency":
+                  selected[
+                      "reward"
+                  ].get("currency"),
+              "estimated_reward_sats":
+                  reward_sats,
+              "bid_amount_sats":
+                  bid_amount,
+              "proposal_percent":
+                  PROPOSAL_PERCENT,
+              "minimum_bid_sats":
+                  MIN_BID_SATS,
+              "capability_score":
+                  selected[
+                      "capability_score"
+                  ],
+              "bid_status":
+                  bid_status,
+              "timestamp":
+                  scan_time,
           }
 
-          memory["marketplace_action"] = action
-          memory["marketplace_actions"].append(action)
+          memory[
+              "marketplace_action"
+          ] = action
 
-          memory["observations"].append({
+          memory[
+              "marketplace_actions"
+          ].append(action)
+
+          memory[
+              "observations"
+          ].append({
               "act": "ACT15",
-              "type": "MARKETPLACE_ACTION",
-              "result": "BID_SUBMITTED",
-              "task_id": task_id,
-              "task_title": task_title,
-              "bid_id": bid_id,
-              "bid_amount_sats": int(eligible_bid_amount),
-              "timestamp": scan_time,
+              "type":
+                  "MARKETPLACE_ACTION",
+              "result":
+                  "BID_SUBMITTED",
+              "task_id":
+                  task_id,
+              "task_title":
+                  task_title,
+              "estimated_reward_sats":
+                  reward_sats,
+              "bid_amount_sats":
+                  bid_amount,
+              "bid_id":
+                  bid_id,
+              "timestamp":
+                  scan_time,
           })
 
-          memory["decisions"].append({
+          memory[
+              "decisions"
+          ].append({
               "act": "ACT15",
-              "decision": "PLACE_BID",
-              "task_id": task_id,
-              "task_title": task_title,
-              "bid_amount_sats": int(eligible_bid_amount),
-              "reason": (
-                  "Task was found among the 30 most recent marketplace "
-                  "tasks, was eligible, had no existing NØX bid, "
-                  "and exposed a usable sat budget at or above "
-                  + str(MIN_BID_SATS)
-                  + " sats."
-              ),
-              "timestamp": scan_time,
+              "decision":
+                  "PLACE_BID",
+              "task_id":
+                  task_id,
+              "task_title":
+                  task_title,
+              "estimated_reward_sats":
+                  reward_sats,
+              "bid_amount_sats":
+                  bid_amount,
+              "reason":
+                  "NØX evaluated the recent marketplace tasks, "
+                  "selected a compatible task, estimated its reward "
+                  "and generated its own bid instead of copying "
+                  "the advertised price.",
+              "timestamp":
+                  scan_time,
           })
 
-          memory["learning"].append({
+          memory[
+              "learning"
+          ].append({
               "act": "ACT15",
-              "lesson": (
-                  "NØX can autonomously scan recent marketplace tasks "
-                  "and submit a real bid when a valid sat budget is "
-                  "available."
-              ),
-              "task_id": task_id,
-              "bid_amount_sats": int(eligible_bid_amount),
-              "timestamp": scan_time,
+              "lesson":
+                  "NØX can evaluate a marketplace task, "
+                  "estimate its value and generate an autonomous "
+                  "Lightning-sats proposal.",
+              "task_id":
+                  task_id,
+              "reward_sats":
+                  reward_sats,
+              "bid_amount_sats":
+                  bid_amount,
+              "timestamp":
+                  scan_time,
           })
 
-          memory["version"] = "NØX ACT 15 V3"
-          memory["last_act"] = "ACT 15"
-          memory["updated_at"] = scan_time
+          memory[
+              "version"
+          ] = "NØX ACT 15 V4"
+
+          memory[
+              "last_act"
+          ] = "ACT 15"
+
+          memory[
+              "updated_at"
+          ] = scan_time
 
           with open(
               MEMORY_PATH,
@@ -767,15 +1202,44 @@ jobs:
               )
 
           print("")
-          print("==================================================")
-          print("ACT15 SUCCESS")
-          print("REAL BID SUBMITTED")
-          print("Task:", task_title)
-          print("Task ID:", task_id)
-          print("Bid ID:", bid_id)
-          print("Bid amount:", eligible_bid_amount, "sats")
-          print("Bid status:", bid_status)
-          print("==================================================")
+          print(
+              "=================================================="
+          )
+          print(
+              "ACT15 V4 SUCCESS"
+          )
+          print(
+              "REAL BID SUBMITTED"
+          )
+          print(
+              "Task:",
+              task_title
+          )
+          print(
+              "Task ID:",
+              task_id
+          )
+          print(
+              "Bid ID:",
+              bid_id
+          )
+          print(
+              "Estimated reward:",
+              reward_sats,
+              "sats"
+          )
+          print(
+              "NØX proposal:",
+              bid_amount,
+              "sats"
+          )
+          print(
+              "Bid status:",
+              bid_status
+          )
+          print(
+              "=================================================="
+          )
           PY
 
       - name: Commit ACT15 memory
@@ -790,7 +1254,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "NØX ACT15 autonomous marketplace action"
+          git commit -m "NØX ACT15 autonomous marketplace bidding"
 
           git pull --rebase origin main
           git push origin HEAD:main
