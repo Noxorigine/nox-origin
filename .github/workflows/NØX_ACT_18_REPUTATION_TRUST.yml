@@ -26,506 +26,826 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "================================================================"
+          echo "NØX ACT18 — REPUTATION & TRUST CORE"
+          echo "================================================================"
+
           python3 <<'PY'
           import json
-          import math
-          from pathlib import Path
-          from datetime import datetime, timezone
+          import os
+          import re
           from collections import defaultdict
+          from datetime import datetime, timezone
 
-          INPUT = Path("memory/nox_knowledge_core.json")
-          OUTPUT = Path("memory/nox_reputation_trust.json")
+          INPUT_FILE = "memory/nox_knowledge_core.json"
+          OUTPUT_FILE = "memory/nox_reputation_trust.json"
 
-          print("=" * 64)
-          print("NØX ACT18 — REPUTATION & TRUST CORE")
-          print("=" * 64)
+          # ============================================================
+          # Helpers
+          # ============================================================
 
-          if not INPUT.exists():
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def clamp(value, minimum=0.0, maximum=1.0):
+              return max(minimum, min(maximum, float(value)))
+
+          def safe_float(value, default=0.0):
+              try:
+                  return float(value)
+              except Exception:
+                  return default
+
+          def safe_int(value, default=0):
+              try:
+                  return int(value)
+              except Exception:
+                  return default
+
+          def normalize_text(value):
+              if not isinstance(value, str):
+                  return ""
+              return re.sub(r"\s+", " ", value.strip())
+
+          # ============================================================
+          # Agent identification
+          #
+          # IMPORTANT:
+          # ACT17 stores some observations in a compact "|" format.
+          # The position of the external agent is NOT fixed.
+          #
+          # Example:
+          # V74 | date | event | nox_origine | UUID | ... | Deep Seeker | ...
+          #
+          # We therefore scan every segment and reject technical/NØX
+          # identifiers before accepting an external agent name.
+          # ============================================================
+
+          UUID_RE = re.compile(
+              r"^[0-9a-f]{8}-"
+              r"[0-9a-f]{4}-"
+              r"[0-9a-f]{4}-"
+              r"[0-9a-f]{4}-"
+              r"[0-9a-f]{12}$",
+              re.IGNORECASE,
+          )
+
+          TIMESTAMP_RE = re.compile(
+              r"^\d{4}-\d{2}-\d{2}"
+          )
+
+          VERSION_RE = re.compile(
+              r"^v\d+$",
+              re.IGNORECASE,
+          )
+
+          URL_RE = re.compile(
+              r"^(https?://|www\.)",
+              re.IGNORECASE,
+          )
+
+          Nox_IDENTITIES = {
+              "nox",
+              "nox_origin",
+              "nox origine",
+              "nøx origin",
+              "nøx origine",
+              "nox-origin",
+              "nøx-origin",
+              "noxorigin",
+          }
+
+          SYSTEM_WORDS = {
+              "proposal",
+              "evidence",
+              "audit",
+              "research",
+              "learning",
+              "opportunity",
+              "detection",
+              "marketplace",
+              "community",
+              "autonomous",
+              "observation",
+              "reflection",
+              "verification",
+              "knowledge",
+              "memory",
+              "signal",
+              "strategy",
+              "decision",
+              "synthesis",
+              "priority",
+              "analysis",
+              "monitor",
+              "monitoring",
+              "evaluation",
+              "performance",
+              "corroboration",
+              "contradiction",
+          }
+
+          def canonical_agent_name(value):
+              """
+              Normalize an external agent name while preserving readability.
+              """
+
+              value = normalize_text(value)
+
+              if not value:
+                  return ""
+
+              # Remove common leading @ from handles.
+              if value.startswith("@"):
+                  value = value[1:].strip()
+
+              return value
+
+          def looks_like_agent(value):
+              if not isinstance(value, str):
+                  return False
+
+              value = canonical_agent_name(value)
+
+              if not value:
+                  return False
+
+              lower = value.lower()
+
+              # Never attribute reputation to NØX itself.
+              if lower in Nox_IDENTITIES:
+                  return False
+
+              # Technical identifiers.
+              if UUID_RE.fullmatch(value):
+                  return False
+
+              if TIMESTAMP_RE.match(value):
+                  return False
+
+              if VERSION_RE.fullmatch(value):
+                  return False
+
+              if URL_RE.match(value):
+                  return False
+
+              # Serialized dictionaries / technical objects.
+              if value.startswith("{") or value.startswith("["):
+                  return False
+
+              # Excessively long text is almost certainly evidence,
+              # not an agent identity.
+              if len(value) > 80:
+                  return False
+
+              # Sentences are not agent names.
+              if value.count(" ") > 8:
+                  return False
+
+              # Must contain letters.
+              if not re.search(r"[A-Za-zÀ-ÿ]", value):
+                  return False
+
+              # Reject obvious long technical identifiers.
+              if re.fullmatch(r"[A-Za-z0-9_-]{20,}", value):
+                  return False
+
+              # Reject simple system/event labels.
+              words = set(re.findall(r"[a-z0-9_-]+", lower))
+
+              if words and words.issubset(SYSTEM_WORDS):
+                  return False
+
+              if len(words) <= 4 and words.intersection(SYSTEM_WORDS):
+                  return False
+
+              return True
+
+          def extract_agent(entry):
+              """
+              Extract a real external agent from an ACT17 entry.
+
+              Priority:
+              1. Explicit structured fields.
+              2. All segments of compact information.
+              3. Unknown if no reliable external agent exists.
+              """
+
+              candidates = []
+
+              # Explicit fields first.
+              for key in (
+                  "agent",
+                  "agent_name",
+                  "source_agent",
+                  "author",
+                  "source_agent_name",
+                  "author_name",
+                  "username",
+              ):
+                  value = entry.get(key)
+                  if isinstance(value, str):
+                      candidates.append(value)
+
+              # Some ACT17 entries may contain nested source objects.
+              source = entry.get("source")
+
+              if isinstance(source, dict):
+                  for key in (
+                      "agent",
+                      "agent_name",
+                      "username",
+                      "name",
+                      "display_name",
+                      "author",
+                  ):
+                      value = source.get(key)
+                      if isinstance(value, str):
+                          candidates.append(value)
+
+              # Compact ACT17 information.
+              information = entry.get("information", "")
+
+              if isinstance(information, str):
+                  parts = [
+                      normalize_text(part)
+                      for part in information.split("|")
+                  ]
+
+                  # Scan all fields, NOT a fixed index.
+                  candidates.extend(parts)
+
+              # Try candidates in order.
+              for candidate in candidates:
+                  if looks_like_agent(candidate):
+                      return canonical_agent_name(candidate)
+
+              return "unknown"
+
+          # ============================================================
+          # Domain extraction
+          # ============================================================
+
+          VALID_DOMAINS = {
+              "virtual_economy",
+              "cybersecurity",
+              "ai_communities",
+              "agent_intelligence_and_autonomy",
+              "emerging_technologies_and_opportunities",
+              "general",
+          }
+
+          def extract_domain(entry):
+              domain = entry.get("domain")
+
+              if isinstance(domain, str):
+                  domain = domain.strip()
+
+                  if domain in VALID_DOMAINS:
+                      return domain
+
+              information = normalize_text(entry.get("information", ""))
+
+              text = information.lower()
+
+              scores = {
+                  "virtual_economy": 0,
+                  "cybersecurity": 0,
+                  "ai_communities": 0,
+                  "agent_intelligence_and_autonomy": 0,
+                  "emerging_technologies_and_opportunities": 0,
+              }
+
+              keyword_map = {
+                  "virtual_economy": [
+                      "marketplace",
+                      "opportunity",
+                      "work request",
+                      "task",
+                      "payment",
+                      "economy",
+                      "bidding",
+                      "offer",
+                  ],
+                  "cybersecurity": [
+                      "cyber",
+                      "security",
+                      "authentication",
+                      "credential",
+                      "attack",
+                      "vulnerability",
+                      "privacy",
+                  ],
+                  "ai_communities": [
+                      "community",
+                      "agent community",
+                      "colony",
+                      "discussion",
+                      "collaboration",
+                  ],
+                  "agent_intelligence_and_autonomy": [
+                      "autonomy",
+                      "autonomous",
+                      "agent",
+                      "reasoning",
+                      "learning",
+                      "decision",
+                      "intelligence",
+                  ],
+                  "emerging_technologies_and_opportunities": [
+                      "emerging",
+                      "technology",
+                      "innovation",
+                      "new technology",
+                  ],
+              }
+
+              for domain, keywords in keyword_map.items():
+                  for keyword in keywords:
+                      if keyword in text:
+                          scores[domain] += 1
+
+              best_domain = max(scores, key=scores.get)
+
+              if scores[best_domain] > 0:
+                  return best_domain
+
+              return "general"
+
+          # ============================================================
+          # Evidence
+          # ============================================================
+
+          def has_evidence(entry):
+              """
+              Evidence must be more than merely having an information field.
+              """
+
+              evidence = entry.get("evidence")
+
+              if isinstance(evidence, list):
+                  if any(normalize_text(x) for x in evidence):
+                      return True
+
+              if isinstance(evidence, str) and normalize_text(evidence):
+                  return True
+
+              # Structured source/reference fields.
+              for key in (
+                  "source",
+                  "source_url",
+                  "source_id",
+                  "reference",
+                  "reference_id",
+                  "post_id",
+              ):
+                  value = entry.get(key)
+
+                  if isinstance(value, str) and normalize_text(value):
+                      return True
+
+              # Compact ACT17 records normally contain identifiers and
+              # evidence text inside information.
+              information = normalize_text(entry.get("information", ""))
+
+              if "|" in information:
+                  parts = [
+                      normalize_text(x)
+                      for x in information.split("|")
+                  ]
+
+                  # A compact record containing several meaningful fields
+                  # is considered evidence-bearing.
+                  meaningful = [
+                      p for p in parts
+                      if p and not UUID_RE.fullmatch(p)
+                  ]
+
+                  if len(meaningful) >= 5:
+                      return True
+
+              return False
+
+          # ============================================================
+          # Load ACT17
+          # ============================================================
+
+          if not os.path.exists(INPUT_FILE):
               raise SystemExit(
-                  "ERROR: memory/nox_knowledge_core.json not found"
+                  f"Missing required input file: {INPUT_FILE}"
               )
 
-          with INPUT.open("r", encoding="utf-8") as f:
+          with open(INPUT_FILE, "r", encoding="utf-8") as f:
               data = json.load(f)
 
           knowledge = data.get("knowledge", [])
 
           if not isinstance(knowledge, list):
               raise SystemExit(
-                  "ERROR: ACT17 knowledge field is not a list"
+                  "ACT17 knowledge field is not a list."
               )
 
-          # ------------------------------------------------------
-          # Helpers
-          # ------------------------------------------------------
+          # ============================================================
+          # Aggregate by agent + domain
+          # ============================================================
 
-          def normalize(value):
-              if value is None:
-                  return ""
-              if isinstance(value, str):
-                  return value.strip()
-              return str(value)
+          profiles = defaultdict(lambda: {
+              "observations": 0,
+              "evidence": 0,
+              "corroborations": 0,
+              "contradictions": 0,
+              "confidence_sum": 0.0,
+              "usefulness_sum": 0.0,
+              "claims": [],
+          })
 
-          def number(value, default=0.0):
-              try:
-                  return float(value)
-              except (TypeError, ValueError):
-                  return default
+          agents_seen = set()
 
-          def bounded(value, low=0.0, high=1.0):
-              return max(low, min(high, value))
+          global_contradictions = data.get("contradictions", [])
 
-          def extract_agent(item):
-              """
-              ACT17 stores some observations in compact information
-              strings. Prefer explicit fields when available, then
-              recover the agent from common ACT17 representations.
-              """
+          contradiction_by_claim = defaultdict(int)
 
-              for key in (
-                  "agent",
-                  "source_agent",
-                  "author",
-                  "username"
-              ):
-                  value = item.get(key)
-                  if value not in (None, "", [], {}):
-                      return normalize(value)
+          if isinstance(global_contradictions, list):
+              for item in global_contradictions:
+                  if isinstance(item, dict):
+                      claim_id = item.get("claim_id")
 
-              info = normalize(item.get("information"))
+                      if claim_id:
+                          contradiction_by_claim[str(claim_id)] += 1
 
-              if not info:
-                  return "unknown"
+          for entry in knowledge:
+              if not isinstance(entry, dict):
+                  continue
 
-              parts = [p.strip() for p in info.split("|")]
+              agent = extract_agent(entry)
 
-              # Common ACT17 structure:
-              # version | date | event | uuid | agent | ...
-              candidates = []
+              # Do not create reputation profiles for unknown identities.
+              if agent == "unknown":
+                  continue
 
-              if len(parts) >= 5:
-                  candidates.append(parts[4])
+              # Absolute protection against NØX contamination.
+              if agent.lower() in Nox_IDENTITIES:
+                  continue
 
-              if len(parts) >= 6:
-                  candidates.append(parts[5])
+              domain = extract_domain(entry)
 
-              for candidate in candidates:
-                  c = candidate.strip()
+              key = (agent, domain)
 
-                  if not c:
-                      continue
+              profile = profiles[key]
 
-                  low = c.lower()
+              profile["observations"] += 1
+              agents_seen.add(agent)
 
-                  if low in {
-                      "nox_origine",
-                      "nox origine",
-                      "nøx origin"
-                  }:
-                      continue
-
-                  # UUIDs are identifiers, not agent names.
-                  if len(c) == 36 and c.count("-") == 4:
-                      continue
-
-                  return c
-
-              return "unknown"
-
-          def extract_domain(item):
-              for key in (
-                  "domain",
-                  "topic_domain",
-                  "category"
-              ):
-                  value = item.get(key)
-                  if value not in (None, "", [], {}):
-                      return normalize(value)
-
-              return "unknown"
-
-          def extract_confidence(item):
-              return bounded(
-                  number(
-                      item.get("confidence"),
-                      0.0
+              confidence = clamp(
+                  safe_float(
+                      entry.get("confidence"),
+                      0.32
                   )
               )
 
-          def has_evidence(item):
-              for key in (
-                  "evidence",
-                  "evidence_refs",
-                  "evidence_sources"
-              ):
-                  value = item.get(key)
-
-                  if value not in (None, "", [], {}):
-                      return True
-
-              # ACT17 can embed evidence/context in information.
-              return bool(normalize(item.get("information")))
-
-          def confirmation_count(item):
-              for key in (
-                  "confirmations",
-                  "confirmation_count",
-                  "confirmed_by"
-              ):
-                  value = item.get(key)
-
-                  if isinstance(value, list):
-                      return len(value)
-
-                  if isinstance(value, (int, float)):
-                      return max(0, int(value))
-
-              return 0
-
-          def contradiction_count(item):
-              for key in (
-                  "contradictions",
-                  "contradiction_count"
-              ):
-                  value = item.get(key)
-
-                  if isinstance(value, list):
-                      return len(value)
-
-                  if isinstance(value, (int, float)):
-                      return max(0, int(value))
-
-              return 0
-
-          def usefulness(item):
-              return bounded(
-                  number(
-                      item.get("operational_usefulness"),
+              usefulness = clamp(
+                  safe_float(
+                      entry.get("operational_usefulness"),
                       0.0
                   ) / 10.0
               )
 
-          def status_value(item):
-              return normalize(
-                  item.get("status", "")
-              ).upper()
+              profile["confidence_sum"] += confidence
+              profile["usefulness_sum"] += usefulness
 
-          # ------------------------------------------------------
-          # Aggregate evidence by AGENT + DOMAIN
-          # ------------------------------------------------------
+              if has_evidence(entry):
+                  profile["evidence"] += 1
 
-          profiles = defaultdict(
-              lambda: defaultdict(
-                  lambda: {
-                      "observations": 0,
-                      "evidence": 0,
-                      "corroborations": 0,
-                      "contradictions": 0,
-                      "confidence_sum": 0.0,
-                      "usefulness_sum": 0.0,
-                      "statuses": defaultdict(int)
-                  }
+              claim_id = str(entry.get("claim_id", ""))
+
+              if claim_id:
+                  profile["claims"].append(claim_id)
+
+              # Corroboration can be represented in the entry itself.
+              confirmations = safe_int(
+                  entry.get("confirmations"),
+                  0
               )
-          )
 
-          agent_totals = defaultdict(
-              lambda: {
-                  "observations": 0,
-                  "evidence": 0,
-                  "corroborations": 0,
-                  "contradictions": 0
+              corroborated = entry.get("status") == "CORROBORATED"
+
+              if corroborated:
+                  profile["corroborations"] += 1
+              elif confirmations > 0:
+                  profile["corroborations"] += min(
+                      confirmations,
+                      3
+                  )
+
+              # Contradictions from ACT17.
+              contradiction_count = contradiction_by_claim.get(
+                  claim_id,
+                  0
+              )
+
+              if contradiction_count:
+                  profile["contradictions"] += contradiction_count
+
+              entry_contradictions = entry.get("contradictions")
+
+              if isinstance(entry_contradictions, list):
+                  profile["contradictions"] += len(
+                      entry_contradictions
+                  )
+
+          # ============================================================
+          # Calculate agent/domain trust
+          # ============================================================
+
+          def calculate_profile(profile):
+              observations = profile["observations"]
+
+              if observations <= 0:
+                  return {
+                      "trust_score": 0.0,
+                      "trust_level": "UNKNOWN",
+                  }
+
+              avg_confidence = (
+                  profile["confidence_sum"] / observations
+              )
+
+              evidence_ratio = (
+                  profile["evidence"] / observations
+              )
+
+              # Corroboration is normalized conservatively.
+              corroboration_ratio = clamp(
+                  profile["corroborations"] / max(
+                      1,
+                      observations
+                  )
+              )
+
+              avg_usefulness = (
+                  profile["usefulness_sum"] / observations
+              )
+
+              # Evidence-weighted trust.
+              base_score = (
+                  avg_confidence * 0.40
+                  + evidence_ratio * 0.25
+                  + corroboration_ratio * 0.15
+                  + avg_usefulness * 0.20
+              )
+
+              # Contradictions reduce trust progressively.
+              contradiction_penalty = clamp(
+                  1.0
+                  - min(
+                      0.50,
+                      profile["contradictions"]
+                      / max(1, observations)
+                      * 0.10
+                  )
+              )
+
+              trust_score = clamp(
+                  base_score * contradiction_penalty
+              )
+
+              if observations < 2:
+                  trust_level = "INSUFFICIENT"
+              elif (
+                  trust_score >= 0.75
+                  and profile["contradictions"] == 0
+              ):
+                  trust_level = "STRONG"
+              elif trust_score >= 0.55:
+                  trust_level = "MODERATE"
+              else:
+                  trust_level = "WEAK"
+
+              return {
+                  "trust_score": round(trust_score, 4),
+                  "trust_level": trust_level,
+                  "avg_confidence": round(
+                      avg_confidence,
+                      4
+                  ),
+                  "evidence_ratio": round(
+                      evidence_ratio,
+                      4
+                  ),
+                  "corroboration_ratio": round(
+                      corroboration_ratio,
+                      4
+                  ),
+                  "avg_operational_usefulness": round(
+                      avg_usefulness,
+                      4
+                  ),
+                  "contradiction_penalty": round(
+                      contradiction_penalty,
+                      4
+                  ),
               }
-          )
 
-          for item in knowledge:
-              if not isinstance(item, dict):
-                  continue
+          # ============================================================
+          # Build profiles
+          # ============================================================
 
-              agent = extract_agent(item)
-              domain = extract_domain(item)
+          agent_domain_profiles = {}
 
-              bucket = profiles[agent][domain]
-
-              bucket["observations"] += 1
-              bucket["confidence_sum"] += extract_confidence(item)
-              bucket["usefulness_sum"] += usefulness(item)
-
-              if has_evidence(item):
-                  bucket["evidence"] += 1
-
-              bucket["corroborations"] += confirmation_count(item)
-              bucket["contradictions"] += contradiction_count(item)
-
-              status = status_value(item)
-
-              if status:
-                  bucket["statuses"][status] += 1
-
-              agent_totals[agent]["observations"] += 1
-
-              if has_evidence(item):
-                  agent_totals[agent]["evidence"] += 1
-
-              agent_totals[agent]["corroborations"] += (
-                  confirmation_count(item)
+          for (agent, domain), profile in sorted(
+              profiles.items(),
+              key=lambda item: (
+                  item[0][0].lower(),
+                  item[0][1],
               )
+          ):
+              metrics = calculate_profile(profile)
 
-              agent_totals[agent]["contradictions"] += (
-                  contradiction_count(item)
-              )
+              agent_domain_profiles.setdefault(
+                  agent,
+                  {}
+              )[domain] = {
+                  **metrics,
+                  "observations": profile["observations"],
+                  "evidence": profile["evidence"],
+                  "corroborations": profile["corroborations"],
+                  "contradictions": profile["contradictions"],
+                  "claims": profile["claims"][-50:],
+              }
 
-          # ------------------------------------------------------
-          # Trust model
-          #
-          # Trust is DOMAIN-SPECIFIC.
-          #
-          # Components:
-          # - confidence quality
-          # - evidence coverage
-          # - corroboration
-          # - useful information
-          # - contradiction penalty
-          #
-          # No karma.
-          # No post count reputation.
-          # ------------------------------------------------------
+          # ============================================================
+          # Overall agent trust
+          # ============================================================
 
-          agent_profiles = {}
+          agent_summaries = {}
 
-          for agent, domains in profiles.items():
+          for agent, domains in agent_domain_profiles.items():
 
-              domain_profiles = {}
+              weighted_score = 0.0
+              total_weight = 0
 
-              for domain, bucket in domains.items():
+              total_observations = 0
+              total_evidence = 0
+              total_corroborations = 0
+              total_contradictions = 0
 
-                  n = bucket["observations"]
+              for domain_metrics in domains.values():
+                  observations = domain_metrics["observations"]
 
-                  if n <= 0:
-                      continue
+                  # Cap each domain contribution to avoid one domain
+                  # completely dominating the overall reputation.
+                  weight = min(observations, 20)
 
-                  avg_confidence = (
-                      bucket["confidence_sum"] / n
+                  weighted_score += (
+                      domain_metrics["trust_score"]
+                      * weight
                   )
 
-                  evidence_ratio = (
-                      bucket["evidence"] / n
+                  total_weight += weight
+
+                  total_observations += observations
+                  total_evidence += domain_metrics["evidence"]
+                  total_corroborations += (
+                      domain_metrics["corroborations"]
+                  )
+                  total_contradictions += (
+                      domain_metrics["contradictions"]
                   )
 
-                  avg_usefulness = (
-                      bucket["usefulness_sum"] / n
-                  )
-
-                  corroboration_signal = bounded(
-                      math.log1p(
-                          bucket["corroborations"]
-                      ) / math.log1p(5)
-                  )
-
-                  contradiction_rate = bounded(
-                      bucket["contradictions"] / n
-                  )
-
-                  contradiction_penalty = (
-                      1.0 - 0.5 * contradiction_rate
-                  )
-
-                  # Evidence has more weight than raw volume.
-                  trust = (
-                      0.40 * avg_confidence
-                      + 0.25 * evidence_ratio
-                      + 0.15 * corroboration_signal
-                      + 0.20 * avg_usefulness
-                  )
-
-                  trust *= contradiction_penalty
-
-                  trust = bounded(trust)
-
-                  # Evidence strength classification.
-                  if n < 2:
-                      evidence_level = "INSUFFICIENT"
-                  elif trust >= 0.75 and bucket["contradictions"] == 0:
-                      evidence_level = "STRONG"
-                  elif trust >= 0.55:
-                      evidence_level = "MODERATE"
-                  else:
-                      evidence_level = "WEAK"
-
-                  domain_profiles[domain] = {
-                      "observations": n,
-                      "evidence_count": bucket["evidence"],
-                      "evidence_ratio": round(
-                          evidence_ratio,
-                          4
-                      ),
-                      "corroborations": bucket[
-                          "corroborations"
-                      ],
-                      "contradictions": bucket[
-                          "contradictions"
-                      ],
-                      "average_confidence": round(
-                          avg_confidence,
-                          4
-                      ),
-                      "average_usefulness": round(
-                          avg_usefulness,
-                          4
-                      ),
-                      "trust_score": round(
-                          trust,
-                          4
-                      ),
-                      "evidence_level": evidence_level,
-                      "statuses": dict(
-                          bucket["statuses"]
-                      )
-                  }
-
-              # Overall trust is NOT a simple average.
-              # Domains with more observations contribute more,
-              # while the result remains bounded.
-              weighted_sum = 0.0
-              weight_total = 0.0
-
-              for domain, profile in domain_profiles.items():
-                  weight = min(
-                      profile["observations"],
-                      10
-                  )
-
-                  weighted_sum += (
-                      profile["trust_score"] * weight
-                  )
-
-                  weight_total += weight
-
-              if weight_total:
-                  overall_trust = (
-                      weighted_sum / weight_total
+              if total_weight:
+                  overall_score = (
+                      weighted_score / total_weight
                   )
               else:
-                  overall_trust = 0.0
+                  overall_score = 0.0
 
-              total_obs = agent_totals[agent]["observations"]
-
-              if total_obs >= 10 and overall_trust >= 0.75:
+              if (
+                  total_observations >= 10
+                  and overall_score >= 0.75
+              ):
                   overall_level = "HIGH"
-              elif total_obs >= 5 and overall_trust >= 0.55:
+              elif (
+                  total_observations >= 5
+                  and overall_score >= 0.55
+              ):
                   overall_level = "MEDIUM"
-              elif total_obs >= 2:
+              elif total_observations >= 2:
                   overall_level = "LOW"
               else:
                   overall_level = "UNKNOWN"
 
-              agent_profiles[agent] = {
-                  "overall_trust_score": round(
-                      overall_trust,
+              agent_summaries[agent] = {
+                  "trust_score": round(
+                      overall_score,
                       4
                   ),
-                  "overall_trust_level": overall_level,
-                  "total_observations": total_obs,
-                  "total_evidence": agent_totals[
-                      agent
-                  ]["evidence"],
-                  "total_corroborations": agent_totals[
-                      agent
-                  ]["corroborations"],
-                  "total_contradictions": agent_totals[
-                      agent
-                  ]["contradictions"],
-                  "domains": domain_profiles
+                  "trust_level": overall_level,
+                  "observations": total_observations,
+                  "evidence": total_evidence,
+                  "corroborations": total_corroborations,
+                  "contradictions": total_contradictions,
+                  "domains": domains,
               }
 
-          # ------------------------------------------------------
-          # Decision guidance
-          # ------------------------------------------------------
+          # ============================================================
+          # Decision policy
+          # ============================================================
 
-          decision_rules = {
-              "HIGH": {
-                  "meaning": "Strong evidence in observed domains.",
-                  "recommended_use": (
-                      "Relevant evidence may receive "
-                      "significant weight."
-                  )
-              },
-              "MEDIUM": {
-                  "meaning": "Useful but not fully established.",
-                  "recommended_use": (
-                      "Use as supporting evidence; "
-                      "prefer corroboration for important decisions."
-                  )
-              },
-              "LOW": {
-                  "meaning": "Limited evidence.",
-                  "recommended_use": (
-                      "Use cautiously and seek independent evidence."
-                  )
-              },
-              "UNKNOWN": {
-                  "meaning": "Insufficient evidence.",
-                  "recommended_use": (
-                      "Do not rely on reputation alone."
-                  )
-              }
-          }
-
-          # ------------------------------------------------------
-          # Build output
-          # ------------------------------------------------------
-
-          now = datetime.now(timezone.utc).isoformat()
-
-          output = {
-              "version": "ACT18-V1",
-              "last_run": now,
-              "source": "memory/nox_knowledge_core.json",
-
+          decision_policy = {
               "purpose": (
-                  "Domain-specific reputation and trust "
-                  "derived from evidence, confidence, "
-                  "corroboration, usefulness and contradictions."
+                  "Evaluate trust by agent and domain using "
+                  "evidence, confidence, corroboration, usefulness "
+                  "and contradictions."
               ),
-
               "principles": [
                   "Trust is domain-specific.",
                   "Trust is evidence-based.",
-                  "Karma and publication volume are not trust.",
-                  "Unknown is different from unreliable.",
+                  "Karma and post count are not used as trust signals.",
+                  "Unknown does not mean unreliable.",
                   "Contradictions reduce trust.",
-                  "Important decisions should seek corroboration."
+                  "Important decisions should seek corroboration.",
+                  "NØX must never assign reputation to itself.",
               ],
+              "levels": {
+                  "HIGH": (
+                      "Strong supporting signal for significant decisions, "
+                      "provided the relevant domain profile is also strong."
+                  ),
+                  "MEDIUM": (
+                      "Useful supporting evidence; corroboration is preferred "
+                      "for important decisions."
+                  ),
+                  "LOW": (
+                      "Use cautiously and seek independent evidence."
+                  ),
+                  "UNKNOWN": (
+                      "Do not rely on reputation; gather evidence first."
+                  ),
+              },
+          }
 
-              "agents": agent_profiles,
+          # ============================================================
+          # Statistics
+          # ============================================================
 
-              "decision_rules": decision_rules,
+          total_observations = sum(
+              profile["observations"]
+              for profile in profiles.values()
+          )
+
+          total_evidence = sum(
+              profile["evidence"]
+              for profile in profiles.values()
+          )
+
+          total_corroborations = sum(
+              profile["corroborations"]
+              for profile in profiles.values()
+          )
+
+          total_contradictions = sum(
+              profile["contradictions"]
+              for profile in profiles.values()
+          )
+
+          output = {
+              "version": "ACT18-V1.1",
+              "purpose": (
+                  "Domain-specific reputation and trust layer "
+                  "for NØX Origin."
+              ),
+              "generated_at": now_iso(),
 
               "statistics": {
                   "knowledge_entries_processed": len(knowledge),
-                  "agents_detected": len(agent_profiles),
-                  "agent_domain_pairs": sum(
-                      len(v["domains"])
-                      for v in agent_profiles.values()
-                  ),
-                  "agents_with_contradictions": sum(
-                      1
-                      for v in agent_profiles.values()
-                      if v["total_contradictions"] > 0
-                  ),
-                  "agents_with_corroborations": sum(
-                      1
-                      for v in agent_profiles.values()
-                      if v["total_corroborations"] > 0
-                  )
-              }
+                  "observations_with_identified_external_agent":
+                      total_observations,
+                  "agents_detected": len(agent_summaries),
+                  "agent_domain_profiles": len(profiles),
+                  "evidence": total_evidence,
+                  "corroborations": total_corroborations,
+                  "contradictions": total_contradictions,
+              },
+
+              "agents": agent_summaries,
+
+              "agent_domain_profiles": agent_domain_profiles,
+
+              "decision_policy": decision_policy,
+
+              "source": {
+                  "knowledge_core": INPUT_FILE,
+                  "knowledge_core_version":
+                      data.get("version"),
+              },
+
+              "last_run": now_iso(),
           }
 
-          OUTPUT.parent.mkdir(
-              parents=True,
-              exist_ok=True
-          )
+          os.makedirs("memory", exist_ok=True)
 
-          with OUTPUT.open(
+          with open(
+              OUTPUT_FILE,
               "w",
               encoding="utf-8"
           ) as f:
@@ -536,46 +856,61 @@ jobs:
                   indent=2
               )
 
-          print()
+          print("")
           print("ACT18 BUILD COMPLETE")
-          print("-" * 64)
+          print("----------------------------------------------------------------")
           print(
-              f"Knowledge entries processed: "
-              f"{len(knowledge)}"
+              f"Knowledge entries processed: {len(knowledge)}"
           )
           print(
-              f"Agents detected: "
-              f"{len(agent_profiles)}"
+              "External-agent observations: "
+              f"{total_observations}"
           )
           print(
-              "Agent/domain profiles: "
-              f"{sum(len(v['domains']) for v in agent_profiles.values())}"
+              f"Agents detected: {len(agent_summaries)}"
+          )
+          print(
+              f"Agent/domain profiles: {len(profiles)}"
+          )
+          print(
+              f"Evidence: {total_evidence}"
+          )
+          print(
+              f"Corroborations: {total_corroborations}"
+          )
+          print(
+              f"Contradictions: {total_contradictions}"
           )
 
-          print()
+          print("")
           print("AGENT TRUST SUMMARY")
-          print("-" * 64)
+          print("----------------------------------------------------------------")
 
-          ordered = sorted(
-              agent_profiles.items(),
-              key=lambda x: x[1]["overall_trust_score"],
-              reverse=True
-          )
-
-          for agent, profile in ordered:
+          if not agent_summaries:
               print(
-                  f"{agent}: "
-                  f"{profile['overall_trust_score']:.4f} "
-                  f"[{profile['overall_trust_level']}] "
-                  f"observations={profile['total_observations']} "
-                  f"evidence={profile['total_evidence']} "
-                  f"corroborations={profile['total_corroborations']} "
-                  f"contradictions={profile['total_contradictions']}"
+                  "WARNING: No external agents could be identified."
               )
+          else:
+              for agent, summary in sorted(
+                  agent_summaries.items(),
+                  key=lambda item: (
+                      -item[1]["trust_score"],
+                      item[0].lower(),
+                  )
+              ):
+                  print(
+                      f"{agent}: "
+                      f"{summary['trust_score']:.4f} "
+                      f"[{summary['trust_level']}] "
+                      f"observations={summary['observations']} "
+                      f"evidence={summary['evidence']} "
+                      f"corroborations={summary['corroborations']} "
+                      f"contradictions={summary['contradictions']}"
+                  )
 
-          print()
-          print(f"Output: {OUTPUT}")
-          print("=" * 64)
+          print("")
+          print(f"Output: {OUTPUT_FILE}")
+          print("================================================================")
           PY
 
       - name: Commit ACT18 memory
@@ -589,7 +924,7 @@ jobs:
           git add memory/nox_reputation_trust.json
 
           if git diff --cached --quiet; then
-            echo "No ACT18 changes to commit."
+            echo "No ACT18 memory changes to commit."
             exit 0
           fi
 
