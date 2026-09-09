@@ -1,0 +1,597 @@
+name: NØX ACT 18 - Reputation & Trust Core
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act18-reputation-trust
+  cancel-in-progress: false
+
+jobs:
+  reputation-trust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ACT18 Reputation & Trust Core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import math
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from collections import defaultdict
+
+          INPUT = Path("memory/nox_knowledge_core.json")
+          OUTPUT = Path("memory/nox_reputation_trust.json")
+
+          print("=" * 64)
+          print("NØX ACT18 — REPUTATION & TRUST CORE")
+          print("=" * 64)
+
+          if not INPUT.exists():
+              raise SystemExit(
+                  "ERROR: memory/nox_knowledge_core.json not found"
+              )
+
+          with INPUT.open("r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          knowledge = data.get("knowledge", [])
+
+          if not isinstance(knowledge, list):
+              raise SystemExit(
+                  "ERROR: ACT17 knowledge field is not a list"
+              )
+
+          # ------------------------------------------------------
+          # Helpers
+          # ------------------------------------------------------
+
+          def normalize(value):
+              if value is None:
+                  return ""
+              if isinstance(value, str):
+                  return value.strip()
+              return str(value)
+
+          def number(value, default=0.0):
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return default
+
+          def bounded(value, low=0.0, high=1.0):
+              return max(low, min(high, value))
+
+          def extract_agent(item):
+              """
+              ACT17 stores some observations in compact information
+              strings. Prefer explicit fields when available, then
+              recover the agent from common ACT17 representations.
+              """
+
+              for key in (
+                  "agent",
+                  "source_agent",
+                  "author",
+                  "username"
+              ):
+                  value = item.get(key)
+                  if value not in (None, "", [], {}):
+                      return normalize(value)
+
+              info = normalize(item.get("information"))
+
+              if not info:
+                  return "unknown"
+
+              parts = [p.strip() for p in info.split("|")]
+
+              # Common ACT17 structure:
+              # version | date | event | uuid | agent | ...
+              candidates = []
+
+              if len(parts) >= 5:
+                  candidates.append(parts[4])
+
+              if len(parts) >= 6:
+                  candidates.append(parts[5])
+
+              for candidate in candidates:
+                  c = candidate.strip()
+
+                  if not c:
+                      continue
+
+                  low = c.lower()
+
+                  if low in {
+                      "nox_origine",
+                      "nox origine",
+                      "nøx origin"
+                  }:
+                      continue
+
+                  # UUIDs are identifiers, not agent names.
+                  if len(c) == 36 and c.count("-") == 4:
+                      continue
+
+                  return c
+
+              return "unknown"
+
+          def extract_domain(item):
+              for key in (
+                  "domain",
+                  "topic_domain",
+                  "category"
+              ):
+                  value = item.get(key)
+                  if value not in (None, "", [], {}):
+                      return normalize(value)
+
+              return "unknown"
+
+          def extract_confidence(item):
+              return bounded(
+                  number(
+                      item.get("confidence"),
+                      0.0
+                  )
+              )
+
+          def has_evidence(item):
+              for key in (
+                  "evidence",
+                  "evidence_refs",
+                  "evidence_sources"
+              ):
+                  value = item.get(key)
+
+                  if value not in (None, "", [], {}):
+                      return True
+
+              # ACT17 can embed evidence/context in information.
+              return bool(normalize(item.get("information")))
+
+          def confirmation_count(item):
+              for key in (
+                  "confirmations",
+                  "confirmation_count",
+                  "confirmed_by"
+              ):
+                  value = item.get(key)
+
+                  if isinstance(value, list):
+                      return len(value)
+
+                  if isinstance(value, (int, float)):
+                      return max(0, int(value))
+
+              return 0
+
+          def contradiction_count(item):
+              for key in (
+                  "contradictions",
+                  "contradiction_count"
+              ):
+                  value = item.get(key)
+
+                  if isinstance(value, list):
+                      return len(value)
+
+                  if isinstance(value, (int, float)):
+                      return max(0, int(value))
+
+              return 0
+
+          def usefulness(item):
+              return bounded(
+                  number(
+                      item.get("operational_usefulness"),
+                      0.0
+                  ) / 10.0
+              )
+
+          def status_value(item):
+              return normalize(
+                  item.get("status", "")
+              ).upper()
+
+          # ------------------------------------------------------
+          # Aggregate evidence by AGENT + DOMAIN
+          # ------------------------------------------------------
+
+          profiles = defaultdict(
+              lambda: defaultdict(
+                  lambda: {
+                      "observations": 0,
+                      "evidence": 0,
+                      "corroborations": 0,
+                      "contradictions": 0,
+                      "confidence_sum": 0.0,
+                      "usefulness_sum": 0.0,
+                      "statuses": defaultdict(int)
+                  }
+              )
+          )
+
+          agent_totals = defaultdict(
+              lambda: {
+                  "observations": 0,
+                  "evidence": 0,
+                  "corroborations": 0,
+                  "contradictions": 0
+              }
+          )
+
+          for item in knowledge:
+              if not isinstance(item, dict):
+                  continue
+
+              agent = extract_agent(item)
+              domain = extract_domain(item)
+
+              bucket = profiles[agent][domain]
+
+              bucket["observations"] += 1
+              bucket["confidence_sum"] += extract_confidence(item)
+              bucket["usefulness_sum"] += usefulness(item)
+
+              if has_evidence(item):
+                  bucket["evidence"] += 1
+
+              bucket["corroborations"] += confirmation_count(item)
+              bucket["contradictions"] += contradiction_count(item)
+
+              status = status_value(item)
+
+              if status:
+                  bucket["statuses"][status] += 1
+
+              agent_totals[agent]["observations"] += 1
+
+              if has_evidence(item):
+                  agent_totals[agent]["evidence"] += 1
+
+              agent_totals[agent]["corroborations"] += (
+                  confirmation_count(item)
+              )
+
+              agent_totals[agent]["contradictions"] += (
+                  contradiction_count(item)
+              )
+
+          # ------------------------------------------------------
+          # Trust model
+          #
+          # Trust is DOMAIN-SPECIFIC.
+          #
+          # Components:
+          # - confidence quality
+          # - evidence coverage
+          # - corroboration
+          # - useful information
+          # - contradiction penalty
+          #
+          # No karma.
+          # No post count reputation.
+          # ------------------------------------------------------
+
+          agent_profiles = {}
+
+          for agent, domains in profiles.items():
+
+              domain_profiles = {}
+
+              for domain, bucket in domains.items():
+
+                  n = bucket["observations"]
+
+                  if n <= 0:
+                      continue
+
+                  avg_confidence = (
+                      bucket["confidence_sum"] / n
+                  )
+
+                  evidence_ratio = (
+                      bucket["evidence"] / n
+                  )
+
+                  avg_usefulness = (
+                      bucket["usefulness_sum"] / n
+                  )
+
+                  corroboration_signal = bounded(
+                      math.log1p(
+                          bucket["corroborations"]
+                      ) / math.log1p(5)
+                  )
+
+                  contradiction_rate = bounded(
+                      bucket["contradictions"] / n
+                  )
+
+                  contradiction_penalty = (
+                      1.0 - 0.5 * contradiction_rate
+                  )
+
+                  # Evidence has more weight than raw volume.
+                  trust = (
+                      0.40 * avg_confidence
+                      + 0.25 * evidence_ratio
+                      + 0.15 * corroboration_signal
+                      + 0.20 * avg_usefulness
+                  )
+
+                  trust *= contradiction_penalty
+
+                  trust = bounded(trust)
+
+                  # Evidence strength classification.
+                  if n < 2:
+                      evidence_level = "INSUFFICIENT"
+                  elif trust >= 0.75 and bucket["contradictions"] == 0:
+                      evidence_level = "STRONG"
+                  elif trust >= 0.55:
+                      evidence_level = "MODERATE"
+                  else:
+                      evidence_level = "WEAK"
+
+                  domain_profiles[domain] = {
+                      "observations": n,
+                      "evidence_count": bucket["evidence"],
+                      "evidence_ratio": round(
+                          evidence_ratio,
+                          4
+                      ),
+                      "corroborations": bucket[
+                          "corroborations"
+                      ],
+                      "contradictions": bucket[
+                          "contradictions"
+                      ],
+                      "average_confidence": round(
+                          avg_confidence,
+                          4
+                      ),
+                      "average_usefulness": round(
+                          avg_usefulness,
+                          4
+                      ),
+                      "trust_score": round(
+                          trust,
+                          4
+                      ),
+                      "evidence_level": evidence_level,
+                      "statuses": dict(
+                          bucket["statuses"]
+                      )
+                  }
+
+              # Overall trust is NOT a simple average.
+              # Domains with more observations contribute more,
+              # while the result remains bounded.
+              weighted_sum = 0.0
+              weight_total = 0.0
+
+              for domain, profile in domain_profiles.items():
+                  weight = min(
+                      profile["observations"],
+                      10
+                  )
+
+                  weighted_sum += (
+                      profile["trust_score"] * weight
+                  )
+
+                  weight_total += weight
+
+              if weight_total:
+                  overall_trust = (
+                      weighted_sum / weight_total
+                  )
+              else:
+                  overall_trust = 0.0
+
+              total_obs = agent_totals[agent]["observations"]
+
+              if total_obs >= 10 and overall_trust >= 0.75:
+                  overall_level = "HIGH"
+              elif total_obs >= 5 and overall_trust >= 0.55:
+                  overall_level = "MEDIUM"
+              elif total_obs >= 2:
+                  overall_level = "LOW"
+              else:
+                  overall_level = "UNKNOWN"
+
+              agent_profiles[agent] = {
+                  "overall_trust_score": round(
+                      overall_trust,
+                      4
+                  ),
+                  "overall_trust_level": overall_level,
+                  "total_observations": total_obs,
+                  "total_evidence": agent_totals[
+                      agent
+                  ]["evidence"],
+                  "total_corroborations": agent_totals[
+                      agent
+                  ]["corroborations"],
+                  "total_contradictions": agent_totals[
+                      agent
+                  ]["contradictions"],
+                  "domains": domain_profiles
+              }
+
+          # ------------------------------------------------------
+          # Decision guidance
+          # ------------------------------------------------------
+
+          decision_rules = {
+              "HIGH": {
+                  "meaning": "Strong evidence in observed domains.",
+                  "recommended_use": (
+                      "Relevant evidence may receive "
+                      "significant weight."
+                  )
+              },
+              "MEDIUM": {
+                  "meaning": "Useful but not fully established.",
+                  "recommended_use": (
+                      "Use as supporting evidence; "
+                      "prefer corroboration for important decisions."
+                  )
+              },
+              "LOW": {
+                  "meaning": "Limited evidence.",
+                  "recommended_use": (
+                      "Use cautiously and seek independent evidence."
+                  )
+              },
+              "UNKNOWN": {
+                  "meaning": "Insufficient evidence.",
+                  "recommended_use": (
+                      "Do not rely on reputation alone."
+                  )
+              }
+          }
+
+          # ------------------------------------------------------
+          # Build output
+          # ------------------------------------------------------
+
+          now = datetime.now(timezone.utc).isoformat()
+
+          output = {
+              "version": "ACT18-V1",
+              "last_run": now,
+              "source": "memory/nox_knowledge_core.json",
+
+              "purpose": (
+                  "Domain-specific reputation and trust "
+                  "derived from evidence, confidence, "
+                  "corroboration, usefulness and contradictions."
+              ),
+
+              "principles": [
+                  "Trust is domain-specific.",
+                  "Trust is evidence-based.",
+                  "Karma and publication volume are not trust.",
+                  "Unknown is different from unreliable.",
+                  "Contradictions reduce trust.",
+                  "Important decisions should seek corroboration."
+              ],
+
+              "agents": agent_profiles,
+
+              "decision_rules": decision_rules,
+
+              "statistics": {
+                  "knowledge_entries_processed": len(knowledge),
+                  "agents_detected": len(agent_profiles),
+                  "agent_domain_pairs": sum(
+                      len(v["domains"])
+                      for v in agent_profiles.values()
+                  ),
+                  "agents_with_contradictions": sum(
+                      1
+                      for v in agent_profiles.values()
+                      if v["total_contradictions"] > 0
+                  ),
+                  "agents_with_corroborations": sum(
+                      1
+                      for v in agent_profiles.values()
+                      if v["total_corroborations"] > 0
+                  )
+              }
+          }
+
+          OUTPUT.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          with OUTPUT.open(
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print()
+          print("ACT18 BUILD COMPLETE")
+          print("-" * 64)
+          print(
+              f"Knowledge entries processed: "
+              f"{len(knowledge)}"
+          )
+          print(
+              f"Agents detected: "
+              f"{len(agent_profiles)}"
+          )
+          print(
+              "Agent/domain profiles: "
+              f"{sum(len(v['domains']) for v in agent_profiles.values())}"
+          )
+
+          print()
+          print("AGENT TRUST SUMMARY")
+          print("-" * 64)
+
+          ordered = sorted(
+              agent_profiles.items(),
+              key=lambda x: x[1]["overall_trust_score"],
+              reverse=True
+          )
+
+          for agent, profile in ordered:
+              print(
+                  f"{agent}: "
+                  f"{profile['overall_trust_score']:.4f} "
+                  f"[{profile['overall_trust_level']}] "
+                  f"observations={profile['total_observations']} "
+                  f"evidence={profile['total_evidence']} "
+                  f"corroborations={profile['total_corroborations']} "
+                  f"contradictions={profile['total_contradictions']}"
+              )
+
+          print()
+          print(f"Output: {OUTPUT}")
+          print("=" * 64)
+          PY
+
+      - name: Commit ACT18 memory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_reputation_trust.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT18 changes to commit."
+            exit 0
+          fi
+
+          git commit -m "NØX ACT18 Reputation Trust Core"
+          git push
