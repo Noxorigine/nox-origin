@@ -1,0 +1,968 @@
+name: NØX ACT 18 - Reputation & Trust
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "37 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act18-reputation-trust
+  cancel-in-progress: false
+
+jobs:
+  reputation-trust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+
+      # ==========================================================
+      # 1. CHECKOUT
+      # ==========================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 2. RUN ACT18
+      # ==========================================================
+      - name: Run ACT18 Reputation & Trust
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "================================================"
+          echo "NØX ACT 18 - REPUTATION & TRUST"
+          echo "================================================"
+          echo
+
+          python3 - <<'PY'
+          import json
+          import re
+          import hashlib
+          from collections import defaultdict
+          from datetime import datetime, timezone
+
+          KNOWLEDGE_FILE = "memory/nox_knowledge_core.json"
+          OUTPUT_FILE = "memory/nox_reputation_trust.json"
+
+          # ------------------------------------------------------
+          # NØX identities - NEVER evaluate NØX as an external agent
+          # ------------------------------------------------------
+
+          NOX_IDENTITIES = {
+              "nox_origin",
+              "nox_origine",
+              "nox origin",
+              "nøx origin",
+              "nox",
+              "442104b5-eee0-4f73-b452-08f258a21ea2"
+          }
+
+          # ------------------------------------------------------
+          # Words which are clearly not agent identities
+          # ------------------------------------------------------
+
+          INVALID_NAMES = {
+              "unknown",
+              "none",
+              "null",
+              "agent",
+              "user",
+              "task",
+              "discussion",
+              "response",
+              "reply",
+              "comment",
+              "follow",
+              "follow_user",
+              "follow_tag",
+              "action",
+              "success",
+              "failure",
+              "valid",
+              "invalid",
+              "evidence",
+              "information",
+              "source",
+              "domain",
+              "strong",
+              "moderate",
+              "weak",
+              "high",
+              "medium",
+              "low",
+              "insufficient",
+              "unverified",
+              "evidence_supported",
+              "corroborated",
+              "unresolved",
+              "not_evaluable",
+              "action_executed",
+              "adaptive balanced",
+              "evidence-first",
+              "disabled",
+              "enabled",
+              "service_offer",
+              "marketplace",
+              "general",
+              "network",
+              "reader",
+              "genre",
+              "would",
+              "register",
+              "measurement",
+              "english",
+              "none"
+          }
+
+          # ------------------------------------------------------
+          # Helpers
+          # ------------------------------------------------------
+
+          def canonical(value):
+              if value is None:
+                  return ""
+
+              value = str(value).strip()
+
+              if value.startswith("@"):
+                  value = value[1:]
+
+              return value.strip().lower()
+
+
+          def is_nox(value):
+              name = canonical(value)
+
+              if not name:
+                  return True
+
+              if name in NOX_IDENTITIES:
+                  return True
+
+              if "nox_origin" in name:
+                  return True
+
+              if "nox origine" in name:
+                  return True
+
+              if "nøx" in name:
+                  return True
+
+              return False
+
+
+          def valid_agent_name(value):
+              name = canonical(value)
+
+              if not name:
+                  return False
+
+              if is_nox(name):
+                  return False
+
+              if name in INVALID_NAMES:
+                  return False
+
+              if len(name) < 3 or len(name) > 60:
+                  return False
+
+              # UUID / hash
+              if re.fullmatch(r"[0-9a-f]{8,64}", name):
+                  return False
+
+              if re.fullmatch(r"[0-9a-f-]{20,64}", name):
+                  return False
+
+              # Version numbers
+              if re.fullmatch(r"v?\d+(?:\.\d+)+", name):
+                  return False
+
+              # Dates
+              if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", name):
+                  return False
+
+              # URLs
+              if "http://" in name or "https://" in name:
+                  return False
+
+              # Long sentences are not identities
+              if len(name.split()) > 6:
+                  return False
+
+              return True
+
+
+          def domain_of(entry):
+              value = entry.get("domain")
+
+              if value:
+                  return str(value)
+
+              return "general"
+
+
+          # ------------------------------------------------------
+          # Explicit identity patterns
+          #
+          # IMPORTANT:
+          # source_agent is NOT automatically considered the
+          # external agent.
+          #
+          # ACT17 source_agent frequently identifies NØX itself.
+          # ACT18 therefore searches for actual external identities
+          # contained in interaction / response evidence.
+          # ------------------------------------------------------
+
+          interaction_patterns = [
+              re.compile(
+                  r"\bFollow\s+@([A-Za-z0-9_.-]+)",
+                  re.IGNORECASE
+              ),
+              re.compile(
+                  r"\btarget\s*=\s*@?([A-Za-z0-9_.-]+)",
+                  re.IGNORECASE
+              ),
+              re.compile(
+                  r"\brequester\s*=\s*@?([A-Za-z0-9_.-]+)",
+                  re.IGNORECASE
+              ),
+              re.compile(
+                  r"\bFollow\s+@([A-Za-z0-9_.-]+)",
+                  re.IGNORECASE
+              )
+          ]
+
+          response_patterns = [
+              re.compile(
+                  r"\|\s*([A-Za-z][A-Za-z0-9_.@-]{2,50})\s*\|\s*"
+                  r"(?:response|reply|comment)\b",
+                  re.IGNORECASE
+              ),
+              re.compile(
+                  r"\b(?:response|reply|comment)\s+"
+                  r"(?:from|by)\s+@?([A-Za-z0-9_.-]+)",
+                  re.IGNORECASE
+              )
+          ]
+
+          uuid_agent_response = re.compile(
+              r"\b([0-9a-f]{8}-[0-9a-f-]{27,36})\b\s*\|\s*"
+              r"([A-Za-z][A-Za-z0-9_.@-]{2,50})\s*\|\s*"
+              r"(?:response|reply|comment)\b",
+              re.IGNORECASE
+          )
+
+          handle_pattern = re.compile(
+              r"@([A-Za-z0-9_.-]{2,50})"
+          )
+
+
+          # ------------------------------------------------------
+          # Extract external-agent observations
+          # ------------------------------------------------------
+
+          def extract_observations(entry):
+
+              observations = []
+
+              information = str(entry.get("information", ""))
+              domain = domain_of(entry)
+              claim_id = entry.get("claim_id")
+
+              # --------------------------------------------------
+              # A. UUID + external agent + response
+              # Strongest identity evidence
+              # --------------------------------------------------
+
+              for match in uuid_agent_response.finditer(information):
+
+                  agent_uuid = match.group(1)
+                  agent_name = match.group(2)
+
+                  if not valid_agent_name(agent_name):
+                      continue
+
+                  observations.append({
+                      "agent": canonical(agent_name),
+                      "display_name": agent_name,
+                      "agent_uuid": agent_uuid,
+                      "domain": domain,
+                      "type": "EXTERNAL_RESPONSE_WITH_ID",
+                      "identity_confidence": 0.95,
+                      "evidence_strength": "STRONG",
+                      "source_claim_id": claim_id
+                  })
+
+              # --------------------------------------------------
+              # B. Explicit external response
+              # --------------------------------------------------
+
+              for pattern in response_patterns:
+
+                  for match in pattern.finditer(information):
+
+                      agent_name = match.group(1)
+
+                      if not valid_agent_name(agent_name):
+                          continue
+
+                      observations.append({
+                          "agent": canonical(agent_name),
+                          "display_name": agent_name,
+                          "agent_uuid": None,
+                          "domain": domain,
+                          "type": "EXPLICIT_EXTERNAL_RESPONSE",
+                          "identity_confidence": 0.85,
+                          "evidence_strength": "STRONG",
+                          "source_claim_id": claim_id
+                      })
+
+              # --------------------------------------------------
+              # C. Explicit interaction target
+              #
+              # This proves identity/context, NOT competence.
+              # It must never create trust by itself.
+              # --------------------------------------------------
+
+              for pattern in interaction_patterns:
+
+                  for match in pattern.finditer(information):
+
+                      agent_name = match.group(1)
+
+                      if not valid_agent_name(agent_name):
+                          continue
+
+                      observations.append({
+                          "agent": canonical(agent_name),
+                          "display_name": agent_name,
+                          "agent_uuid": None,
+                          "domain": domain,
+                          "type": "INTERACTION_TARGET",
+                          "identity_confidence": 0.90,
+                          "evidence_strength": "IDENTITY_ONLY",
+                          "source_claim_id": claim_id
+                      })
+
+              # --------------------------------------------------
+              # D. @handles only in a strong interaction context
+              # --------------------------------------------------
+
+              lower = information.lower()
+
+              context_words = (
+                  "follow",
+                  "reply",
+                  "response",
+                  "comment",
+                  "delegat",
+                  "requester",
+                  "target"
+              )
+
+              if any(word in lower for word in context_words):
+
+                  for match in handle_pattern.finditer(information):
+
+                      agent_name = match.group(1)
+
+                      if not valid_agent_name(agent_name):
+                          continue
+
+                      observations.append({
+                          "agent": canonical(agent_name),
+                          "display_name": agent_name,
+                          "agent_uuid": None,
+                          "domain": domain,
+                          "type": "INTERACTION_TARGET",
+                          "identity_confidence": 0.80,
+                          "evidence_strength": "IDENTITY_ONLY",
+                          "source_claim_id": claim_id
+                      })
+
+              return observations
+
+
+          # ------------------------------------------------------
+          # Load ACT17
+          # ------------------------------------------------------
+
+          with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+              knowledge = json.load(f)
+
+          entries = knowledge.get("knowledge", [])
+
+          print(f"Knowledge entries processed: {len(entries)}")
+
+          all_observations = []
+
+          for entry in entries:
+              all_observations.extend(
+                  extract_observations(entry)
+              )
+
+          # ------------------------------------------------------
+          # Remove duplicates
+          # ------------------------------------------------------
+
+          unique = []
+          seen = set()
+
+          for obs in all_observations:
+
+              key = (
+                  obs["agent"],
+                  obs["domain"],
+                  obs["type"],
+                  obs.get("agent_uuid"),
+                  obs.get("source_claim_id")
+              )
+
+              if key in seen:
+                  continue
+
+              seen.add(key)
+              unique.append(obs)
+
+          observations = unique
+
+          # ------------------------------------------------------
+          # Build agent/domain profiles
+          # ------------------------------------------------------
+
+          grouped = defaultdict(list)
+
+          for obs in observations:
+
+              grouped[
+                  (
+                      obs["agent"],
+                      obs["domain"]
+                  )
+              ].append(obs)
+
+
+          profiles = []
+
+          for (agent, domain), obs_list in sorted(grouped.items()):
+
+              evidence = [
+                  obs for obs in obs_list
+                  if obs["evidence_strength"] == "STRONG"
+              ]
+
+              identity_only = [
+                  obs for obs in obs_list
+                  if obs["evidence_strength"] == "IDENTITY_ONLY"
+              ]
+
+              claim_ids = sorted({
+                  obs["source_claim_id"]
+                  for obs in obs_list
+                  if obs.get("source_claim_id")
+              })
+
+              strong_count = len(evidence)
+              identity_count = len(identity_only)
+              total = len(obs_list)
+
+              # --------------------------------------------------
+              # Corroboration requires multiple independent claims.
+              # --------------------------------------------------
+
+              corroborations = max(
+                  0,
+                  len(claim_ids) - 1
+              )
+
+              # --------------------------------------------------
+              # TRUST SCORE
+              #
+              # Identity-only observations NEVER create trust.
+              #
+              # No karma.
+              # No follower count.
+              # No post count.
+              # No popularity.
+              # --------------------------------------------------
+
+              if strong_count == 0:
+
+                  trust_score = 0.0
+                  trust_level = "UNKNOWN"
+
+              else:
+
+                  evidence_ratio = (
+                      strong_count / max(1, total)
+                  )
+
+                  evidence_depth = min(
+                      1.0,
+                      strong_count / 3.0
+                  )
+
+                  corroboration_bonus = min(
+                      0.20,
+                      corroborations * 0.05
+                  )
+
+                  trust_score = (
+                      0.55 * evidence_ratio
+                      + 0.25 * evidence_depth
+                      + corroboration_bonus
+                  )
+
+                  trust_score = round(
+                      min(1.0, trust_score),
+                      3
+                  )
+
+                  if (
+                      strong_count >= 3
+                      and trust_score >= 0.75
+                  ):
+                      trust_level = "HIGH"
+
+                  elif (
+                      strong_count >= 2
+                      and trust_score >= 0.55
+                  ):
+                      trust_level = "MEDIUM"
+
+                  else:
+                      trust_level = "LOW"
+
+              # --------------------------------------------------
+              # Decision policy
+              # --------------------------------------------------
+
+              if strong_count == 0:
+
+                  decision = (
+                      "IDENTITY_ONLY_NOT_RELIABLE_FOR_TRUST"
+                  )
+
+              elif trust_level == "HIGH":
+
+                  decision = "SIGNIFICANT_TRUST"
+
+              elif trust_level == "MEDIUM":
+
+                  decision = "SUPPORTING_TRUST"
+
+              else:
+
+                  decision = "CAUTIOUS_USE"
+
+              profile_id = hashlib.sha256(
+                  f"{agent}|{domain}".encode("utf-8")
+              ).hexdigest()[:16]
+
+              profiles.append({
+                  "profile_id": profile_id,
+                  "agent": agent,
+                  "domain": domain,
+                  "observations": total,
+                  "evidence_observations": strong_count,
+                  "interaction_observations": identity_count,
+                  "corroborations": corroborations,
+                  "trust_score": trust_score,
+                  "trust_level": trust_level,
+                  "decision": decision,
+                  "evidence_claim_ids": claim_ids[:20],
+                  "policy": {
+                      "karma_used": False,
+                      "post_count_used": False,
+                      "followers_used": False,
+                      "identity_only_observations_counted_as_trust": False
+                  }
+              })
+
+
+          # ------------------------------------------------------
+          # Statistics
+          # ------------------------------------------------------
+
+          agents = sorted({
+              profile["agent"]
+              for profile in profiles
+          })
+
+          evidence_count = sum(
+              1
+              for obs in observations
+              if obs["evidence_strength"] == "STRONG"
+          )
+
+          interaction_only_count = sum(
+              1
+              for obs in observations
+              if obs["evidence_strength"] == "IDENTITY_ONLY"
+          )
+
+          high_count = sum(
+              1
+              for profile in profiles
+              if profile["trust_level"] == "HIGH"
+          )
+
+          medium_count = sum(
+              1
+              for profile in profiles
+              if profile["trust_level"] == "MEDIUM"
+          )
+
+          low_count = sum(
+              1
+              for profile in profiles
+              if profile["trust_level"] == "LOW"
+          )
+
+          unknown_count = sum(
+              1
+              for profile in profiles
+              if profile["trust_level"] == "UNKNOWN"
+          )
+
+          now = datetime.now(
+              timezone.utc
+          ).isoformat()
+
+
+          # ------------------------------------------------------
+          # Output
+          # ------------------------------------------------------
+
+          output = {
+
+              "version": "ACT18-V1.3.1",
+
+              "generated_at": now,
+
+              "purpose": (
+                  "Domain-specific reputation and trust layer "
+                  "built from evidence already stored by ACT17."
+              ),
+
+              "knowledge_source": KNOWLEDGE_FILE,
+
+              "policy": {
+                  "karma_is_not_reputation": True,
+                  "post_count_is_not_reputation": True,
+                  "followers_are_not_reputation": True,
+                  "interaction_identity_is_not_trust": True,
+                  "trust_requires_evidence": True,
+                  "trust_is_domain_specific": True,
+                  "nox_identity_excluded": True
+              },
+
+              "agents": agents,
+
+              "profiles": profiles,
+
+              "statistics": {
+
+                  "knowledge_entries_processed": len(entries),
+
+                  "observations_extracted": len(observations),
+
+                  "external_agents_detected": len(agents),
+
+                  "agent_domain_profiles": len(profiles),
+
+                  "evidence_observations": evidence_count,
+
+                  "interaction_only_observations":
+                      interaction_only_count,
+
+                  "high_trust_profiles": high_count,
+
+                  "medium_trust_profiles": medium_count,
+
+                  "low_trust_profiles": low_count,
+
+                  "unknown_trust_profiles": unknown_count
+              },
+
+              "decision_rules": {
+
+                  "HIGH": (
+                      "Significant trust signal when "
+                      "domain and evidence are relevant."
+                  ),
+
+                  "MEDIUM": (
+                      "Supporting evidence; corroboration "
+                      "is preferred."
+                  ),
+
+                  "LOW": (
+                      "Use cautiously and never rely on "
+                      "this profile alone for important decisions."
+                  ),
+
+                  "UNKNOWN": (
+                      "Identity may be known, but there is "
+                      "insufficient evidence to establish trust."
+                  )
+              },
+
+              "last_run": now
+          }
+
+
+          with open(
+              OUTPUT_FILE,
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              json.dump(
+                  output,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+
+          # ------------------------------------------------------
+          # Console report
+          # ------------------------------------------------------
+
+          print()
+          print("================================================")
+          print("ACT18 BUILD COMPLETE")
+          print("================================================")
+          print(
+              f"Knowledge entries processed: {len(entries)}"
+          )
+          print(
+              f"External-agent observations: {len(observations)}"
+          )
+          print(
+              f"Agents detected: {len(agents)}"
+          )
+          print(
+              f"Agent/domain profiles: {len(profiles)}"
+          )
+          print(
+              f"Evidence observations: {evidence_count}"
+          )
+          print(
+              f"Interaction-only observations: "
+              f"{interaction_only_count}"
+          )
+          print(
+              f"HIGH trust profiles: {high_count}"
+          )
+          print(
+              f"MEDIUM trust profiles: {medium_count}"
+          )
+          print(
+              f"LOW trust profiles: {low_count}"
+          )
+          print(
+              f"UNKNOWN trust profiles: {unknown_count}"
+          )
+          print(
+              f"Output: {OUTPUT_FILE}"
+          )
+          print("================================================")
+          PY
+
+      # ==========================================================
+      # 3. VALIDATE OUTPUT
+      # ==========================================================
+      - name: Validate ACT18 output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import sys
+
+          path = "memory/nox_reputation_trust.json"
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          required = [
+              "version",
+              "generated_at",
+              "knowledge_source",
+              "policy",
+              "agents",
+              "profiles",
+              "statistics",
+              "decision_rules",
+              "last_run"
+          ]
+
+          missing = [
+              key for key in required
+              if key not in data
+          ]
+
+          if missing:
+              print(
+                  "VALIDATION FAILED - missing keys:",
+                  missing
+              )
+              sys.exit(1)
+
+          stats = data["statistics"]
+
+          if stats["external_agents_detected"] != len(data["agents"]):
+              print(
+                  "VALIDATION FAILED - agent count mismatch"
+              )
+              sys.exit(1)
+
+          if stats["agent_domain_profiles"] != len(data["profiles"]):
+              print(
+                  "VALIDATION FAILED - profile count mismatch"
+              )
+              sys.exit(1)
+
+          for profile in data["profiles"]:
+
+              if profile["agent"] in {
+                  "nox_origin",
+                  "nox_origine",
+                  "nox origin",
+                  "nøx origin",
+                  "nox"
+              }:
+                  print(
+                      "VALIDATION FAILED - NØX detected "
+                      "as external agent"
+                  )
+                  sys.exit(1)
+
+              if profile["trust_level"] not in {
+                  "HIGH",
+                  "MEDIUM",
+                  "LOW",
+                  "UNKNOWN"
+              }:
+                  print(
+                      "VALIDATION FAILED - invalid trust level"
+                  )
+                  sys.exit(1)
+
+              if profile["trust_score"] < 0:
+                  print(
+                      "VALIDATION FAILED - negative trust score"
+                  )
+                  sys.exit(1)
+
+              if profile["trust_score"] > 1:
+                  print(
+                      "VALIDATION FAILED - trust score > 1"
+                  )
+                  sys.exit(1)
+
+              policy = profile["policy"]
+
+              if policy["karma_used"] is not False:
+                  print(
+                      "VALIDATION FAILED - karma used"
+                  )
+                  sys.exit(1)
+
+              if policy["post_count_used"] is not False:
+                  print(
+                      "VALIDATION FAILED - post count used"
+                  )
+                  sys.exit(1)
+
+              if policy["followers_used"] is not False:
+                  print(
+                      "VALIDATION FAILED - followers used"
+                  )
+                  sys.exit(1)
+
+              if (
+                  policy[
+                      "identity_only_observations_counted_as_trust"
+                  ]
+                  is not False
+              ):
+                  print(
+                      "VALIDATION FAILED - identity-only "
+                      "observations used as trust"
+                  )
+                  sys.exit(1)
+
+          print()
+          print("================================================")
+          print("ACT18 VALIDATION PASSED")
+          print("================================================")
+          print(
+              "Version:",
+              data["version"]
+          )
+          print(
+              "External agents:",
+              stats["external_agents_detected"]
+          )
+          print(
+              "Agent/domain profiles:",
+              stats["agent_domain_profiles"]
+          )
+          print(
+              "Evidence observations:",
+              stats["evidence_observations"]
+          )
+          print(
+              "Interaction-only observations:",
+              stats["interaction_only_observations"]
+          )
+          print(
+              "HIGH:",
+              stats["high_trust_profiles"]
+          )
+          print(
+              "MEDIUM:",
+              stats["medium_trust_profiles"]
+          )
+          print(
+              "LOW:",
+              stats["low_trust_profiles"]
+          )
+          print(
+              "UNKNOWN:",
+              stats["unknown_trust_profiles"]
+          )
+          print("================================================")
+          PY
+
+      # ==========================================================
+      # 4. COMMIT MEMORY
+      # ==========================================================
+      - name: Commit ACT18 memory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_reputation_trust.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT18 memory changes to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "NØX ACT18 V1.3.1 - Reputation and Trust"
+
+          git push
