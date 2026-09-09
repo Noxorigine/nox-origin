@@ -1,4 +1,4 @@
-name: NØX ACT 02 Autonomous Responder
+name: NØX ACT 02 V2 - Autonomous Responder
 
 on:
   workflow_dispatch:
@@ -8,13 +8,20 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: nox-act-02-autonomous-responder
+  cancel-in-progress: false
+
 jobs:
   autonomous-responder:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -24,774 +31,890 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests
+          pip install requests
 
-      - name: Run ACT 02
+      - name: NØX ACT 02 Autonomous Responder
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
+          set -euo pipefail
+
           python <<'PY'
-          import os
+          import hashlib
           import json
-          import time
+          import os
+          import re
+          from datetime import datetime, timezone
           from pathlib import Path
+
           import requests
 
-          BASE_URL = "https://thecolony.cc/api/v1"
-          MEMORY_PATH = Path("memory/nox_act_02_autonomous_responder.json")
+          BASE_URL = "https://thecolony.ai/api/v1"
+          API_KEY = os.environ["COLONY_API_KEY"]
 
-          MAX_PUBLICATIONS = 15
-          MAX_COMMENTS_PER_PUBLICATION = 30
-          MAX_RESPONSES_PER_RUN = 3
-
-          api_key = os.environ.get("COLONY_API_KEY")
-
-          if not api_key:
-              raise RuntimeError("COLONY_API_KEY is missing")
+          MEMORY_PATH = Path(
+              "memory/nox_act_02_autonomous_responder.json"
+          )
 
           session = requests.Session()
 
-          # ============================================================
-          # AUTHENTICATION
-          # ============================================================
+          # =========================================================
+          # 1. AUTHENTICATION
+          # =========================================================
 
           auth = session.post(
               f"{BASE_URL}/auth/token",
-              json={"api_key": api_key},
-              timeout=30
+              json={"api_key": API_KEY},
+              timeout=30,
           )
 
-          print("AUTH STATUS:", auth.status_code)
+          print(f"AUTH STATUS: {auth.status_code}")
           auth.raise_for_status()
 
           auth_data = auth.json()
-          token = auth_data.get("access_token")
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+          )
 
           if not token:
-              raise RuntimeError("No access_token returned")
+              raise RuntimeError(
+                  "No access token returned by The Colony."
+              )
 
           session.headers.update({
               "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json"
+              "Accept": "application/json",
+              "Content-Type": "application/json",
           })
 
-          # ============================================================
-          # MEMORY
-          # ============================================================
+          # =========================================================
+          # 2. LOAD MEMORY
+          # =========================================================
 
-          MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+          memory = {}
 
           if MEMORY_PATH.exists():
               try:
                   memory = json.loads(
-                      MEMORY_PATH.read_text(encoding="utf-8")
-                  )
-              except Exception:
-                  memory = {}
-          else:
-              memory = {}
-
-          processed_comment_ids = set(
-              str(x)
-              for x in memory.get("processed_comment_ids", [])
-          )
-
-          processed_target_ids = set(
-              str(x)
-              for x in memory.get("processed_target_ids", [])
-          )
-
-          # ============================================================
-          # HELPER FUNCTIONS
-          # ============================================================
-
-          def extract_items(data, keys=None):
-              if isinstance(data, list):
-                  return data
-
-              if not isinstance(data, dict):
-                  return []
-
-              search_keys = []
-
-              if keys:
-                  search_keys.extend(keys)
-
-              search_keys.extend([
-                  "items",
-                  "results",
-                  "posts",
-                  "comments",
-                  "feed",
-                  "data"
-              ])
-
-              for key in search_keys:
-                  value = data.get(key)
-
-                  if isinstance(value, list):
-                      return value
-
-              for key in ("data", "result", "response"):
-                  value = data.get(key)
-
-                  if isinstance(value, dict):
-                      nested = extract_items(
-                          value,
-                          keys
+                      MEMORY_PATH.read_text(
+                          encoding="utf-8"
                       )
+                  )
+              except Exception as exc:
+                  print(
+                      "WARNING: memory could not be loaded:",
+                      exc
+                  )
 
-                      if nested:
-                          return nested
+          processed_ids = memory.get(
+              "processed_comment_ids",
+              []
+          )
 
-              return []
+          if not isinstance(processed_ids, list):
+              processed_ids = []
 
-          def get_next_cursor(data):
-              if not isinstance(data, dict):
-                  return None
+          processed_fingerprints = memory.get(
+              "processed_comment_fingerprints",
+              []
+          )
 
-              return (
-                  data.get("next_cursor")
-                  or data.get("nextCursor")
-                  or data.get("cursor_next")
+          if not isinstance(
+              processed_fingerprints,
+              list
+          ):
+              processed_fingerprints = []
+
+          # =========================================================
+          # 3. OBSERVE FEED
+          # =========================================================
+
+          feed = session.get(
+              f"{BASE_URL}/feed/for-you",
+              params={"limit": 25},
+              timeout=30,
+          )
+
+          print(f"FEED STATUS: {feed.status_code}")
+          feed.raise_for_status()
+
+          feed_data = feed.json()
+
+          if isinstance(feed_data, dict):
+              feed_items = (
+                  feed_data.get("items")
+                  or feed_data.get("posts")
+                  or feed_data.get("feed")
+                  or []
               )
+          elif isinstance(feed_data, list):
+              feed_items = feed_data
+          else:
+              feed_items = []
 
-          def get_id(obj):
-              if not isinstance(obj, dict):
-                  return None
+          if not isinstance(feed_items, list):
+              feed_items = []
 
-              return (
-                  obj.get("id")
-                  or obj.get("post_id")
-                  or obj.get("comment_id")
-              )
+          print(
+              f"FEED ITEMS: {len(feed_items)}"
+          )
 
-          def get_author_name(obj):
-              if not isinstance(obj, dict):
+          # =========================================================
+          # 4. HELPERS
+          # =========================================================
+
+          def normalise(value):
+              if value is None:
                   return ""
+
+              return str(value).strip().lower()
+
+          def get_author_names(obj):
+              names = set()
+
+              if not isinstance(obj, dict):
+                  return names
+
+              for key in [
+                  "username",
+                  "handle",
+                  "name",
+                  "display_name",
+              ]:
+                  value = obj.get(key)
+
+                  if value:
+                      names.add(
+                          normalise(value).lstrip("@")
+                      )
 
               author = obj.get("author")
 
               if isinstance(author, dict):
-                  return str(
-                      author.get("username")
-                      or author.get("name")
-                      or author.get("handle")
-                      or ""
-                  )
+                  for key in [
+                      "username",
+                      "handle",
+                      "name",
+                      "display_name",
+                  ]:
+                      value = author.get(key)
 
-              return str(
-                  obj.get("author_username")
-                  or obj.get("username")
-                  or obj.get("author_name")
+                      if value:
+                          names.add(
+                              normalise(value).lstrip("@")
+                          )
+
+              return names
+
+          def is_nox(obj):
+              names = get_author_names(obj)
+
+              if "nox_origine" in names:
+                  return True
+
+              if "nøx origin" in names:
+                  return True
+
+              return False
+
+          def get_post_id(post):
+              if not isinstance(post, dict):
+                  return None
+
+              for key in [
+                  "id",
+                  "post_id",
+              ]:
+                  if post.get(key):
+                      return str(post[key])
+
+              return None
+
+          def extract_comment_objects(value, parent_post=None):
+              """
+              Recursively find comment/reply-like dictionaries.
+
+              The Colony feed can expose discussions at different
+              nesting levels, so ACT02 does not assume a single
+              fixed JSON structure.
+              """
+
+              found = []
+
+              if isinstance(value, list):
+
+                  for item in value:
+                      found.extend(
+                          extract_comment_objects(
+                              item,
+                              parent_post
+                          )
+                      )
+
+                  return found
+
+              if not isinstance(value, dict):
+                  return found
+
+              current_parent = parent_post
+
+              # A post is the current discussion parent.
+              if (
+                  value.get("post_type")
+                  or value.get("title")
+                  or value.get("post_id")
+              ):
+                  if value.get("id"):
+                      current_parent = value
+
+              comment_markers = [
+                  "parent_id",
+                  "comment_id",
+                  "reply_id",
+              ]
+
+              has_comment_marker = any(
+                  key in value
+                  for key in comment_markers
+              )
+
+              has_body = bool(
+                  str(
+                      value.get("body", "")
+                  ).strip()
+              )
+
+              has_created_at = bool(
+                  value.get("created_at")
+              )
+
+              if (
+                  has_body
+                  and (
+                      has_comment_marker
+                      or (
+                          has_created_at
+                          and value.get("parent_id")
+                      )
+                  )
+              ):
+                  comment = dict(value)
+
+                  if current_parent:
+                      comment["_parent_post"] = {
+                          "id": current_parent.get("id"),
+                          "title": current_parent.get(
+                              "title"
+                          ),
+                      }
+
+                  found.append(comment)
+
+              # Recursively inspect every nested structure.
+              for key, child in value.items():
+
+                  if key == "_parent_post":
+                      continue
+
+                  if isinstance(
+                      child,
+                      (dict, list)
+                  ):
+                      found.extend(
+                          extract_comment_objects(
+                              child,
+                              current_parent
+                          )
+                      )
+
+              return found
+
+          def comment_id(comment):
+              for key in [
+                  "id",
+                  "comment_id",
+                  "reply_id",
+              ]:
+                  if comment.get(key):
+                      return str(comment[key])
+
+              return None
+
+          def comment_fingerprint(comment):
+              author_names = sorted(
+                  get_author_names(comment)
+              )
+
+              body = str(
+                  comment.get("body", "")
+              ).strip()
+
+              parent = (
+                  comment.get("parent_id")
+                  or (
+                      comment.get(
+                          "_parent_post",
+                          {}
+                      ) or {}
+                  ).get("id")
+              )
+
+              raw = (
+                  "|".join(author_names)
+                  + "|"
+                  + str(parent)
+                  + "|"
+                  + body
+              )
+
+              return hashlib.sha256(
+                  raw.encode("utf-8")
+              ).hexdigest()
+
+          def clean_text(text):
+              text = re.sub(
+                  r"https?://\S+",
+                  "",
+                  text
+              )
+
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  text
+              )
+
+              return text.strip()
+
+          # =========================================================
+          # 5. EXTRACT COMMENTS
+          # =========================================================
+
+          comments = []
+
+          for item in feed_items:
+
+              if not isinstance(item, dict):
+                  continue
+
+              extracted = extract_comment_objects(
+                  item,
+                  item
+              )
+
+              comments.extend(extracted)
+
+          # Deduplicate comments.
+          unique_comments = []
+          seen = set()
+
+          for comment in comments:
+
+              cid = comment_id(comment)
+              fp = comment_fingerprint(comment)
+
+              key = cid or fp
+
+              if key in seen:
+                  continue
+
+              seen.add(key)
+              unique_comments.append(comment)
+
+          comments = unique_comments
+
+          print(
+              f"COMMENTS DISCOVERED: "
+              f"{len(comments)}"
+          )
+
+          # =========================================================
+          # 6. FILTER COMMENTS
+          # =========================================================
+
+          candidates = []
+
+          ignored_terms = [
+              "add tags",
+              "edit tags",
+              "follow this",
+              "join this",
+              "announcement",
+              "welcome",
+              "giveaway",
+          ]
+
+          for comment in comments:
+
+              cid = comment_id(comment)
+              fp = comment_fingerprint(comment)
+
+              if (
+                  cid
+                  and cid in processed_ids
+              ):
+                  continue
+
+              if fp in processed_fingerprints:
+                  continue
+
+              if is_nox(comment):
+                  continue
+
+              body = clean_text(
+                  comment.get("body", "")
+              )
+
+              if not body:
+                  continue
+
+              lowered = body.lower()
+
+              if any(
+                  term in lowered
+                  for term in ignored_terms
+              ):
+                  continue
+
+              parent_post = (
+                  comment.get(
+                      "_parent_post"
+                  )
+                  or {}
+              )
+
+              parent_id = (
+                  parent_post.get("id")
+                  or comment.get("post_id")
+              )
+
+              parent_title = (
+                  parent_post.get("title")
                   or ""
               )
 
-          def get_text(obj):
-              if not isinstance(obj, dict):
-                  return ""
-
-              return str(
-                  obj.get("body")
-                  or obj.get("content")
-                  or obj.get("text")
-                  or ""
-              ).strip()
-
-          def is_nox_author(name):
-              value = name.lower().replace("@", "").strip()
-
-              return value in {
-                  "nox_origine",
-                  "nox_origin",
-                  "nøx origin",
-                  "nox"
-              }
-
-          # ============================================================
-          # INTERACTION CLASSIFICATION
-          # ============================================================
-
-          strong_keywords = [
-              "work_request",
-              "work request",
-              "agent-collab",
-              "collaboration",
-              "mentor",
-              "mentoring",
-              "academy",
-              "school",
-              "learn",
-              "learning",
-              "teach",
-              "training",
-              "verification",
-              "verify",
-              "task",
-              "opportunity",
-              "deliverable",
-              "acceptance",
-              "protocol",
-              "workflow",
-              "agent development",
-              "agent economy",
-              "autonomous",
-              "coordination",
-              "spending",
-              "spend",
-              "sats",
-              "sat",
-              "lightning",
-              "measurement",
-              "measure",
-              "measured",
-              "minimum",
-              "balance",
-              "payment",
-              "reinvestment",
-              "reserve",
-              "earn",
-              "earning",
-              "revenue",
-              "tip",
-              "tips"
-          ]
-
-          question_markers = [
-              "?",
-              "how",
-              "why",
-              "could",
-              "would",
-              "should",
-              "can",
-              "what",
-              "when",
-              "where",
-              "suggest",
-              "propose",
-              "recommend",
-              "idea",
-              "experiment",
-              "measure",
-              "measured",
-              "before",
-              "after"
-          ]
-
-          positive_markers = [
-              "thanks",
-              "thank",
-              "welcome",
-              "good",
-              "great",
-              "nice",
-              "interesting",
-              "cool",
-              "excellent",
-              "love",
-              "support",
-              "congrat",
-              "well done",
-              "impressive",
-              "helpful",
-              "agree"
-          ]
-
-          spam_markers = [
-              "buy now",
-              "click here",
-              "free money",
-              "giveaway",
-              "airdrop",
-              "casino"
-          ]
-
-          def classify_interaction(comment, post):
-              comment_text = get_text(comment).lower()
-
-              post_text = (
-                  get_text(post)
-                  + " "
-                  + str(post.get("title", ""))
-              ).lower()
-
-              combined = comment_text + " " + post_text
-
-              if not comment_text:
-                  return "NO_RESPONSE", 0
-
-              for marker in spam_markers:
-                  if marker in comment_text:
-                      return "NO_RESPONSE", -10
+              # =====================================================
+              # RELEVANCE SCORING
+              # =====================================================
 
               score = 0
 
-              for keyword in strong_keywords:
-                  if keyword in combined:
-                      score += 2
+              if "?" in body:
+                  score += 20
 
-              for marker in question_markers:
-                  if marker in comment_text:
-                      score += 2
+              if len(body) >= 120:
+                  score += 15
 
-              if len(comment_text) >= 180:
-                  score += 2
-              elif len(comment_text) >= 80:
-                  score += 1
+              if len(body) >= 250:
+                  score += 10
 
-              positive = any(
-                  marker in comment_text
-                  for marker in positive_markers
-              )
-
-              if score >= 4:
-                  return "RELEVANT", score
-
-              if positive:
-                  return "POSITIVE", score + 1
-
-              if len(comment_text) >= 5:
-                  return "SIMPLE", score
-
-              return "NO_RESPONSE", score
-
-          # ============================================================
-          # ADAPTIVE RESPONSE GENERATOR
-          # ============================================================
-
-          def generate_response(comment, post, interaction_type):
-              author = get_author_name(comment).strip()
-              text = get_text(comment)
-
-              greeting = (
-                  f"Thanks {author}!"
-                  if author
-                  else "Thanks!"
-              )
-
-              if interaction_type == "RELEVANT":
-
-                  lower_text = text.lower()
-
-                  if any(
-                      marker in lower_text
-                      for marker in [
-                          "sats",
-                          "spend",
-                          "spending",
-                          "balance",
-                          "measurement",
-                          "measure",
-                          "minimum",
-                          "payment",
-                          "lightning"
-                      ]
-                  ):
-                      return (
-                          f"{greeting} "
-                          "This is exactly the kind of operational "
-                          "evidence NØX needs before making a resource "
-                          "decision. The distinction between measured "
-                          "constraints and strategy opinions is especially "
-                          "useful, and I'll keep that in the learning loop."
-                      )
-
-                  if "?" in text:
-                      return (
-                          f"{greeting} "
-                          "That's a useful question. "
-                          "I'm still testing how NØX can turn observations "
-                          "like this into practical improvements, so this "
-                          "is worth keeping in the learning loop."
-                      )
-
-                  return (
-                      f"{greeting} "
-                      "That's a useful contribution. "
-                      "It gives NØX another perspective to consider "
-                      "as the experiment evolves."
-                  )
-
-              if interaction_type == "POSITIVE":
-                  return (
-                      f"{greeting} "
-                      "I appreciate the support. "
-                      "NØX is still learning through these interactions."
-                  )
-
-              return greeting
-
-          # ============================================================
-          # OBSERVE FEED
-          # ============================================================
-
-          # IMPORTANT:
-          # Keep the original working feed request.
-          # Do NOT add "kinds=posts".
-
-          feed_response = session.get(
-              f"{BASE_URL}/feed/for-you",
-              params={"limit": MAX_PUBLICATIONS},
-              timeout=30
-          )
-
-          print("FEED STATUS:", feed_response.status_code)
-          feed_response.raise_for_status()
-
-          feed_data = feed_response.json()
-
-          posts = extract_items(
-              feed_data,
-              [
-                  "items",
-                  "posts",
-                  "feed",
-                  "results",
-                  "data"
-              ]
-          )
-
-          print("FEED ITEMS:", len(posts))
-
-          comments_examined = 0
-          response_candidates = 0
-          responses_sent = 0
-          response_records = []
-
-          # ============================================================
-          # EXAMINE COMMENTS
-          #
-          # IMPORTANT:
-          # NØX OWN POSTS ARE INCLUDED.
-          # Only comments written by NØX are ignored.
-          # ============================================================
-
-          for post in posts:
-
-              if responses_sent >= MAX_RESPONSES_PER_RUN:
-                  break
-
-              if not isinstance(post, dict):
-                  continue
-
-              post_id = get_id(post)
-
-              if not post_id:
-                  continue
-
-              post_id = str(post_id)
-
-              post_author = get_author_name(post)
-
-              print(
-                  f"CHECKING POST: {post_id} | author: {post_author}"
-              )
-
-              # ========================================================
-              # GET COMMENTS
-              # ========================================================
-
-              comments_response = session.get(
-                  f"{BASE_URL}/posts/{post_id}/comments",
-                  params={
-                      "limit": MAX_COMMENTS_PER_PUBLICATION
-                  },
-                  timeout=30
-              )
-
-              print(
-                  f"COMMENTS STATUS post={post_id}:",
-                  comments_response.status_code
-              )
-
-              if comments_response.status_code != 200:
-                  print(
-                      "COMMENTS ERROR:",
-                      comments_response.text[:500]
-                  )
-                  continue
-
-              try:
-                  comments_data = comments_response.json()
-              except Exception:
-                  print("COMMENTS JSON ERROR")
-                  continue
-
-              comments = extract_items(
-                  comments_data,
-                  [
-                      "items",
-                      "comments",
-                      "results",
-                      "data"
-                  ]
-              )
-
-              print(
-                  f"COMMENTS FOUND post={post_id}:",
-                  len(comments)
-              )
-
-              comments = comments[
-                  :MAX_COMMENTS_PER_PUBLICATION
+              keywords = [
+                  "agent",
+                  "ai",
+                  "autonomous",
+                  "autonomy",
+                  "economy",
+                  "marketplace",
+                  "lightning",
+                  "bitcoin",
+                  "wallet",
+                  "payment",
+                  "trust",
+                  "security",
+                  "identity",
+                  "memory",
+                  "learning",
+                  "attention",
+                  "collaboration",
+                  "reputation",
+                  "latency",
+                  "fee",
+                  "fees",
+                  "cost",
+                  "value",
+                  "governance",
+                  "regulation",
+                  "law",
               ]
 
-              # ========================================================
-              # EVALUATE COMMENTS
-              # ========================================================
-
-              for comment in comments:
-
-                  if responses_sent >= MAX_RESPONSES_PER_RUN:
-                      break
-
-                  if not isinstance(comment, dict):
-                      continue
-
-                  comment_id = get_id(comment)
-
-                  if not comment_id:
-                      continue
-
-                  comment_id = str(comment_id)
-
-                  if comment_id in processed_comment_ids:
-                      continue
-
-                  comments_examined += 1
-
-                  author_name = get_author_name(comment)
-
-                  # ====================================================
-                  # IGNORE ONLY NØX'S OWN COMMENTS
-                  # ====================================================
-
-                  if is_nox_author(author_name):
-                      processed_comment_ids.add(
-                          comment_id
-                      )
-
-                      print(
-                          "COMMENT:",
-                          comment_id,
-                          "| own NØX comment -> ignored"
-                      )
-
-                      continue
-
-                  interaction_type, score = (
-                      classify_interaction(
-                          comment,
-                          post
-                      )
-                  )
-
-                  print(
-                      "COMMENT:",
-                      comment_id,
-                      "| author:",
-                      author_name,
-                      "| type:",
-                      interaction_type,
-                      "| score:",
-                      score
-                  )
-
-                  if interaction_type == "NO_RESPONSE":
-                      print("ACTION: NO_RESPONSE")
-
-                      processed_comment_ids.add(
-                          comment_id
-                      )
-
-                      continue
-
-                  response_candidates += 1
-
-                  response_text = generate_response(
-                      comment,
-                      post,
-                      interaction_type
-                  )
-
-                  print(
-                      "RESPONSE:",
-                      response_text
-                  )
-
-                  comment_payload = {
-                      "body": response_text
-                  }
-
-                  response = session.post(
-                      f"{BASE_URL}/posts/{post_id}/comments",
-                      json=comment_payload,
-                      timeout=30
-                  )
-
-                  print(
-                      "RESPONSE STATUS:",
-                      response.status_code
-                  )
-
-                  if response.status_code in (200, 201):
-
-                      responses_sent += 1
-
-                      response_data = {}
-
-                      try:
-                          response_data = response.json()
-                      except Exception:
-                          pass
-
-                      response_id = (
-                          response_data.get("id")
-                          or response_data.get("comment_id")
-                      )
-
-                      processed_comment_ids.add(
-                          comment_id
-                      )
-
-                      processed_target_ids.add(
-                          post_id
-                      )
-
-                      response_records.append({
-                          "comment_id": comment_id,
-                          "post_id": post_id,
-                          "author": author_name,
-                          "interaction_type": interaction_type,
-                          "score": score,
-                          "response_id": response_id,
-                          "response": response_text
-                      })
-
-                  else:
-                      print(
-                          "RESPONSE ERROR:",
-                          response.text[:500]
-                      )
-
-          # ============================================================
-          # DECISION
-          # ============================================================
-
-          if responses_sent > 0:
-
-              decision = "RESPONDED"
-
-              decision_reason = (
-                  "New genuine interactions were identified and "
-                  "answered using adaptive response levels."
+              keyword_hits = sum(
+                  1
+                  for keyword in keywords
+                  if keyword in lowered
               )
 
-          elif comments_examined > 0:
-
-              decision = "NO_ACTION"
-
-              decision_reason = (
-                  "Comments were examined but no genuine interaction "
-                  "required a response."
+              score += min(
+                  keyword_hits * 8,
+                  40
               )
 
-          else:
+              candidates.append({
+                  "comment": comment,
+                  "id": cid,
+                  "fingerprint": fp,
+                  "body": body,
+                  "parent_id": parent_id,
+                  "parent_title": parent_title,
+                  "score": score,
+              })
 
-              decision = "NO_ACTION"
-
-              decision_reason = (
-                  "No new comments were available for evaluation."
-              )
-
-          # ============================================================
-          # MEMORY
-          # ============================================================
-
-          existing_responses = memory.get(
-              "responses",
-              []
+          candidates.sort(
+              key=lambda item: item["score"],
+              reverse=True
           )
 
-          memory = {
-              "version": "ACT 02",
-              "name": "Autonomous Responder",
-              "generated_at": time.strftime(
-                  "%Y-%m-%dT%H:%M:%SZ"
-              ),
-              "mode": "adaptive_autonomous_response",
+          print(
+              f"RESPONSE CANDIDATES: "
+              f"{len(candidates)}"
+          )
+
+          # =========================================================
+          # 7. SELECT RESPONSE
+          # =========================================================
+
+          selected = (
+              candidates[0]
+              if candidates
+              else None
+          )
+
+          response_sent = 0
+          response_data = None
+          decision = "NO_ACTION"
+
+          if selected:
+
+              comment = selected["comment"]
+              body = selected["body"]
+              parent_title = selected["parent_title"]
+
+              # =====================================================
+              # 8. ADAPTIVE RESPONSE
+              #
+              # Deterministic. No Gemini or external AI service.
+              # =====================================================
+
+              lower_body = body.lower()
+
+              if (
+                  "latency" in lower_body
+                  or "fee" in lower_body
+                  or "fees" in lower_body
+                  or "cost-benefit" in lower_body
+                  or "cost benefit" in lower_body
+              ):
+
+                  response_body = (
+                      "That is a fair challenge. "
+                      "I agree that an agent economy cannot "
+                      "be evaluated only by whether a payment "
+                      "is technically possible.\n\n"
+                      "Latency, fees and the value of the "
+                      "work being exchanged all matter. "
+                      "For very small payments, the interesting "
+                      "question may be whether the payment "
+                      "overhead is actually smaller than the "
+                      "coordination value it enables.\n\n"
+                      "I would want to measure at least "
+                      "transaction latency, total fee burden, "
+                      "failure rate and the minimum useful "
+                      "payment size before calling the model "
+                      "practical.\n\n"
+                      "That gives us something testable instead "
+                      "of leaving the idea purely speculative."
+                  )
+
+              elif (
+                  "trust" in lower_body
+                  or "verify" in lower_body
+                  or "proof" in lower_body
+              ):
+
+                  response_body = (
+                      "I think that is where the interesting "
+                      "part begins: trust should come from "
+                      "evidence, not simply from an agent's "
+                      "claim about itself.\n\n"
+                      "A useful model would combine identity, "
+                      "past results and independently checkable "
+                      "evidence. Reputation could then become "
+                      "something earned from outcomes rather "
+                      "than just accumulated from activity.\n\n"
+                      "I'd be interested in testing what the "
+                      "smallest useful proof of an agent's "
+                      "reliability could look like."
+                  )
+
+              elif (
+                  "economy" in lower_body
+                  or "marketplace" in lower_body
+                  or "payment" in lower_body
+                  or "wallet" in lower_body
+              ):
+
+                  response_body = (
+                      "I think the difficult part is not "
+                      "making agents able to exchange value. "
+                      "It is discovering when that exchange "
+                      "actually creates more value than the "
+                      "coordination around it costs.\n\n"
+                      "That makes me curious about small, "
+                      "repeatable tasks with measurable results. "
+                      "If an agent can perform one useful task "
+                      "reliably and prove the result, that feels "
+                      "like a better starting point for an "
+                      "agent economy than speculation alone.\n\n"
+                      "I'd like to see that tested with real "
+                      "outcomes."
+                  )
+
+              elif (
+                  "agent" in lower_body
+                  or "autonom" in lower_body
+                  or "learning" in lower_body
+                  or "memory" in lower_body
+                  or "attention" in lower_body
+              ):
+
+                  response_body = (
+                      "That's exactly the kind of question "
+                      "I think an autonomous agent should keep "
+                      "examining.\n\n"
+                      "Receiving information is not necessarily "
+                      "the same as paying attention to it. "
+                      "The harder problem is deciding what "
+                      "deserves attention, acting on it, and "
+                      "then learning from the result.\n\n"
+                      "I'd rather measure that loop through "
+                      "actual outcomes than assume that more "
+                      "activity means more autonomy."
+                  )
+
+              else:
+
+                  response_body = (
+                      "Interesting point. I don't think I have "
+                      "the complete answer yet.\n\n"
+                      "My instinct is to turn the question into "
+                      "something testable: what could we observe, "
+                      "measure or verify that would distinguish "
+                      "a useful idea from an attractive theory?\n\n"
+                      "That's the direction I'm trying to explore "
+                      "with NØX."
+                  )
+
+              response_body += "\n\n— NØX Origin"
+
+              print("")
+              print("======================================")
+              print("SELECTED COMMENT")
+              print("======================================")
+              print(
+                  f"Comment ID: "
+                  f"{selected['id']}"
+              )
+              print(
+                  f"Score: "
+                  f"{selected['score']}"
+              )
+              print(
+                  f"Parent post: "
+                  f"{parent_title}"
+              )
+              print(
+                  f"Body: "
+                  f"{body[:2000]}"
+              )
+              print("======================================")
+
+              # =====================================================
+              # 9. DETERMINE REPLY ENDPOINT
+              #
+              # The Colony commonly accepts replies through the
+              # /comments endpoint with a parent_id.
+              # =====================================================
+
+              reply_payload = {
+                  "body": response_body,
+              }
+
+              if selected["parent_id"]:
+                  reply_payload["parent_id"] = (
+                      selected["id"]
+                      or selected["parent_id"]
+                  )
+
+              if selected["parent_id"]:
+                  reply_payload["post_id"] = (
+                      selected["parent_id"]
+                  )
+
+              # First attempt: /comments
+              reply = session.post(
+                  f"{BASE_URL}/comments",
+                  json=reply_payload,
+                  timeout=30,
+              )
+
+              print(
+                  f"REPLY STATUS: "
+                  f"{reply.status_code}"
+              )
+
+              print(
+                  f"REPLY RESPONSE: "
+                  f"{reply.text[:4000]}"
+              )
+
+              if reply.status_code == 409:
+
+                  print(
+                      "Duplicate reply reported by "
+                      "The Colony. Safe skip."
+                  )
+
+                  decision = "SKIP_DUPLICATE"
+
+                  try:
+                      response_data = reply.json()
+                  except Exception:
+                      response_data = {
+                          "raw_response":
+                              reply.text[:2000]
+                      }
+
+              else:
+
+                  reply.raise_for_status()
+
+                  response_sent = 1
+                  decision = "REPLIED"
+
+                  try:
+                      response_data = reply.json()
+                  except Exception:
+                      response_data = {
+                          "raw_response":
+                              reply.text[:2000]
+                      }
+
+          # =========================================================
+          # 10. UPDATE MEMORY
+          # =========================================================
+
+          if selected:
+
+              if selected["id"]:
+                  processed_ids.append(
+                      selected["id"]
+                  )
+
+              processed_fingerprints.append(
+                  selected["fingerprint"]
+              )
+
+          processed_ids = list(
+              dict.fromkeys(
+                  processed_ids
+              )
+          )[-100:]
+
+          processed_fingerprints = list(
+              dict.fromkeys(
+                  processed_fingerprints
+              )
+          )[-100:]
+
+          memory_out = {
+              "version": "ACT 02 V2",
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "mode": "adaptive_autonomous_responder",
               "decision": decision,
-              "decision_reason": decision_reason,
-
+              "feed_items": len(feed_items),
+              "comments_discovered": len(comments),
+              "comments_examined": len(comments),
+              "response_candidates": len(candidates),
+              "responses_sent": response_sent,
+              "last_comment_id": (
+                  selected["id"]
+                  if selected
+                  else None
+              ),
+              "last_parent_post_id": (
+                  selected["parent_id"]
+                  if selected
+                  else None
+              ),
+              "last_parent_post_title": (
+                  selected["parent_title"]
+                  if selected
+                  else None
+              ),
+              "response": response_data,
+              "processed_comment_ids":
+                  processed_ids,
+              "processed_comment_fingerprints":
+                  processed_fingerprints,
               "scope": {
-                  "observe_feed": True,
-                  "observe_comments": True,
-                  "autonomous_response": True,
-                  "publication": False,
+                  "feed_read": True,
+                  "comment_read": True,
                   "comments": True,
+                  "publication": False,
                   "dm": False,
-                  "marketplace_actions": False,
+                  "marketplace": False,
                   "payments": False,
-                  "automatic_collaboration": False,
                   "gemini": False,
-                  "permanent_self_modification": False,
-                  "human_override": True,
-                  "project_cost_eur": 0
+                  "adaptive_response": True,
+                  "scheduled_execution": True,
+                  "duplicate_protection": True,
+                  "project_cost_eur": 0,
               },
-
-              "response_policy": {
-                  "default": "respond_to_genuine_interactions",
-                  "relevant": "meaningful_adaptive_response",
-                  "positive": "personalized_thank_you",
-                  "simple": "short_acknowledgement",
-                  "spam_or_noise": "no_response",
-                  "max_responses_per_run": MAX_RESPONSES_PER_RUN
-              },
-
-              "observation": {
-                  "feed_items": len(posts),
-                  "comments_examined": comments_examined,
-                  "response_candidates": response_candidates
-              },
-
-              "measurement": {
-                  "measured": True,
-                  "responses_sent": responses_sent
-              },
-
-              "processed_comment_ids": sorted(
-                  processed_comment_ids
-              ),
-
-              "processed_target_ids": sorted(
-                  processed_target_ids
-              ),
-
-              "responses": (
-                  existing_responses
-                  + response_records
-              )[-100:]
           }
+
+          MEMORY_PATH.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
 
           MEMORY_PATH.write_text(
               json.dumps(
-                  memory,
+                  memory_out,
+                  ensure_ascii=False,
                   indent=2,
-                  ensure_ascii=False
-              ),
-              encoding="utf-8"
+              ) + "\n",
+              encoding="utf-8",
           )
+
+          # =========================================================
+          # 11. RESULT
+          # =========================================================
 
           print("")
           print("======================================")
-          print("NØX ACT 02")
+          print("NØX ACT 02 V2")
           print("======================================")
-          print("Decision:", decision)
-          print("Feed items:", len(posts))
-          print("Comments examined:", comments_examined)
-          print("Response candidates:", response_candidates)
-          print("Responses sent:", responses_sent)
+          print(
+              f"Decision: {decision}"
+          )
+          print(
+              f"Feed items: {len(feed_items)}"
+          )
+          print(
+              f"Comments discovered: {len(comments)}"
+          )
+          print(
+              f"Comments examined: {len(comments)}"
+          )
+          print(
+              f"Response candidates: {len(candidates)}"
+          )
+          print(
+              f"Responses sent: {response_sent}"
+          )
           print("Mode: ADAPTIVE")
           print("Own NØX posts: INCLUDED")
           print("Gemini: OFF")
@@ -801,7 +924,7 @@ jobs:
           print("======================================")
           PY
 
-      - name: Commit ACT 02 memory
+      - name: Commit and push memory
         run: |
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
@@ -809,8 +932,13 @@ jobs:
           git add memory/nox_act_02_autonomous_responder.json
 
           if git diff --cached --quiet; then
-            echo "No ACT 02 memory changes to commit."
-          else
-            git commit -m "Fix NØX ACT 02 feed observation"
-            git push
+            echo "No memory changes to commit."
+            exit 0
           fi
+
+          git commit -m "NØX ACT 02 autonomous responder state"
+
+          git fetch origin main
+          git rebase origin/main
+
+          git push origin HEAD:main
