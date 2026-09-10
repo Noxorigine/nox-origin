@@ -342,33 +342,70 @@ jobs:
 
               text = str(value).strip()
 
+              if not text:
+                  return None
+
+              text = text.replace("\u00a0", " ")
+              text = text.replace(" ", "")
+
+              # Thousands separator:
+              # 2,500 -> 2500
+              # 25,000.50 -> 25000.50
+              if re.fullmatch(
+                  r"\d{1,3}(?:,\d{3})+(?:\.\d+)?",
+                  text,
+              ):
+                  text = text.replace(",", "")
+
+              # Decimal comma:
+              # 0,25 -> 0.25
+              elif re.fullmatch(
+                  r"\d+,\d+",
+                  text,
+              ):
+                  text = text.replace(",", ".")
+
+              else:
+                  text = text.replace(",", "")
+
               match = re.search(
-                  r"(?<![\d.])(\d+(?:[.,]\d+)?)(?![\d.])",
+                  r"(\d+(?:\.\d+)?)",
                   text,
               )
 
               if not match:
                   return None
 
-              return float(match.group(1).replace(",", "."))
+              try:
+                  return float(match.group(1))
+              except ValueError:
+                  return None
 
 
           def extract_reward_sats(task):
               """
-              Priority:
-              1. Explicit structured sats fields
+              Reward parsing priority:
+
+              1. Structured sats fields
               2. Explicit sats in task text
               3. Structured USD / USDC fields
               4. Explicit USD / USDC in task text
 
-              This prevents a text such as:
-              '1000 sats - $50 USDC'
-              from being interpreted as $50 only.
+              Corrections in V7.1:
+              - Supports thousands separators such as 2,500 sats.
+              - Supports formulations such as:
+                'Base USDC from $0.25'
+              - Rejects negative USD/USDC amounts such as:
+                '-30 USDC'
+              - Keeps explicit sats as the priority when both
+                sats and USD/USDC appear.
 
-              Example:
-              '5 USDC Python/API/data microtask'
-              becomes approximately 300000 sats using the configured
-              fallback conversion for eligibility.
+              Examples:
+              '2,500 sats' -> 2500 sats
+              '5 USDC' -> 300000 sats
+              'Base USDC from $0.25' -> 15000 sats
+              '-30 USDC' -> unpaid / invalid reward
+              '1000 sats - $50 USDC' -> 1000 sats
               """
 
               structured_sats_fields = [
@@ -390,21 +427,30 @@ jobs:
 
               text = task_text(task)
 
+              # Explicit sats with optional thousands separators.
+              # Examples:
+              # 2,500 sats
+              # 2500 sats
+              # sats: 2500
               sats_patterns = [
-                  r"(?i)(\d+(?:[.,]\d+)?)\s*(?:sat|sats|satoshi|satoshis)\b",
-                  r"(?i)\b(?:sat|sats|satoshi|satoshis)\s*[:=]?\s*(\d+(?:[.,]\d+)?)",
+                  r"(?i)([+-]?\d[\d,]*(?:\.\d+)?)\s*(?:sat|sats|satoshi|satoshis)\b",
+                  r"(?i)\b(?:sat|sats|satoshi|satoshis)\s*[:=]?\s*([+-]?\d[\d,]*(?:\.\d+)?)",
               ]
 
               sats_values = []
 
               for pattern in sats_patterns:
                   for match in re.finditer(pattern, text):
-                      try:
-                          sats_values.append(
-                              float(match.group(1).replace(",", "."))
-                          )
-                      except ValueError:
-                          pass
+                      raw_value = match.group(1).strip()
+
+                      # Never turn a negative reward into a positive reward.
+                      if raw_value.startswith("-"):
+                          continue
+
+                      value = parse_number(raw_value)
+
+                      if value is not None and value > 0:
+                          sats_values.append(value)
 
               if sats_values:
                   return int(max(sats_values)), "text_sats"
@@ -424,32 +470,104 @@ jobs:
                   if key not in task:
                       continue
 
-                  value = parse_number(task.get(key))
+                  raw_value = str(task.get(key)).strip()
+
+                  # Explicitly reject negative structured rewards.
+                  if re.search(
+                      r"^\s*[-(]",
+                      raw_value,
+                  ):
+                      continue
+
+                  value = parse_number(raw_value)
 
                   if value is not None and value > 0:
-                      sats = int(round(value * FALLBACK_SATS_PER_USD))
+                      sats = int(
+                          round(
+                              value * FALLBACK_SATS_PER_USD
+                          )
+                      )
+
                       return sats, "structured_usd_usdc"
 
-              usd_patterns = [
-                  r"(?i)\$\s*(\d+(?:[.,]\d+)?)\s*(?:usdc|usd)\b",
-                  r"(?i)\b(\d+(?:[.,]\d+)?)\s*(?:usdc|usd)\b",
-                  r"(?i)\b(?:usdc|usd)\s*[:=]?\s*(\d+(?:[.,]\d+)?)",
+              # USD / USDC patterns.
+              #
+              # Handles:
+              # $5 USDC
+              # $5 USD
+              # 5 USDC
+              # 5 USD
+              # USDC $0.25
+              # Base USDC from $0.25
+              # USDC: 5
+              #
+              # Negative amounts are deliberately ignored.
+
+              currency_matches = []
+
+              patterns = [
+                  # $5 USDC / $5 USD
+                  r"(?i)(?<![\w])(?P<sign>[+-]?)\$\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)\s*(?P<currency>usdc|usd)\b",
+
+                  # 5 USDC / 5 USD
+                  r"(?i)(?<![\w])(?P<sign>[+-]?)\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)\s*(?P<currency>usdc|usd)\b",
+
+                  # USDC $0.25 / USD $0.25
+                  r"(?i)\b(?P<currency>usdc|usd)\b\s*(?P<sign>[+-]?)\s*\$\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)",
+
+                  # USDC: 5 / USD: 5
+                  r"(?i)\b(?P<currency>usdc|usd)\b\s*[:=]\s*(?P<sign>[+-]?)\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)",
+
+                  # USDC from $0.25 / USD from $0.25
+                  r"(?i)\b(?P<currency>usdc|usd)\b[^$\d]{0,30}\$\s*(?P<sign>[+-]?)\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)",
+
+                  # $0.25 ... USDC / $0.25 ... USD
+                  r"(?i)(?<![\w])\$\s*(?P<sign>[+-]?)\s*(?P<amount>\d[\d,]*(?:[.,]\d+)?)\b[^$\n]{0,30}\b(?P<currency>usdc|usd)\b",
               ]
 
-              usd_values = []
-
-              for pattern in usd_patterns:
+              for pattern in patterns:
                   for match in re.finditer(pattern, text):
-                      try:
-                          usd_values.append(
-                              float(match.group(1).replace(",", "."))
-                          )
-                      except ValueError:
-                          pass
+                      sign = (
+                          match.groupdict().get("sign")
+                          or ""
+                      )
 
-              if usd_values:
-                  usd_value = max(usd_values)
-                  sats = int(round(usd_value * FALLBACK_SATS_PER_USD))
+                      raw_amount = (
+                          match.groupdict().get("amount")
+                          or ""
+                      )
+
+                      currency = (
+                          match.groupdict().get("currency")
+                          or ""
+                      ).lower()
+
+                      if sign == "-":
+                          continue
+
+                      value = parse_number(raw_amount)
+
+                      if value is None or value <= 0:
+                          continue
+
+                      currency_matches.append(
+                          {
+                              "value": value,
+                              "currency": currency,
+                          }
+                      )
+
+              if currency_matches:
+                  usd_value = max(
+                      item["value"]
+                      for item in currency_matches
+                  )
+
+                  sats = int(
+                      round(
+                          usd_value * FALLBACK_SATS_PER_USD
+                      )
+                  )
 
                   return sats, "text_usd_usdc"
 
@@ -492,7 +610,10 @@ jobs:
                       if keyword in text
                   ]
 
-                  scores[domain] = min(len(matches) * 5, 25)
+                  scores[domain] = min(
+                      len(matches) * 5,
+                      25,
+                  )
 
               if not scores:
                   return 0, None
@@ -613,7 +734,9 @@ jobs:
                       if candidate is None:
                           continue
 
-                      normalized = str(candidate).lstrip("@").lower()
+                      normalized = str(
+                          candidate
+                      ).lstrip("@").lower()
 
                       if normalized in identity_values:
                           return True
@@ -653,7 +776,9 @@ jobs:
                   )
 
                   if not isinstance(data, dict):
-                      raise ValueError("Memory root is not an object")
+                      raise ValueError(
+                          "Memory root is not an object"
+                      )
 
                   data.setdefault(
                       "schema_version",
@@ -711,11 +836,16 @@ jobs:
           def main():
               log("Starting ACT15 V7.1")
               log("USDC/USD reward detection enabled")
+              log("Thousands-separated sats detection enabled")
+              log("Negative USD/USDC rewards rejected")
               log("Unpaid tasks remain learning candidates")
               log("Minimum 10 sats applies only to paid bids")
               log("Payments/spending disabled")
               log("Gemini disabled")
-              log(f"Fallback USD conversion: {FALLBACK_SATS_PER_USD} sats/USD")
+              log(
+                  f"Fallback USD conversion: "
+                  f"{FALLBACK_SATS_PER_USD} sats/USD"
+              )
 
               authenticate()
 
@@ -730,10 +860,18 @@ jobs:
                   task
                   for task in tasks
                   if get_task_status(task)
-                  in {"open", "bidding", "available", "published"}
+                  in {
+                      "open",
+                      "bidding",
+                      "available",
+                      "published",
+                  }
               ]
 
-              log(f"Open/bidding tasks: {len(open_tasks)}")
+              log(
+                  f"Open/bidding tasks: "
+                  f"{len(open_tasks)}"
+              )
 
               memory = load_memory()
 
@@ -762,7 +900,9 @@ jobs:
                       or "Untitled task"
                   )
 
-                  reward_sats, reward_source = extract_reward_sats(task)
+                  reward_sats, reward_source = (
+                      extract_reward_sats(task)
+                  )
 
                   blocked, blocked_term = is_blocked(task)
 
@@ -778,14 +918,20 @@ jobs:
                       }
 
                       decisions.append(decision)
+
                       log(
                           f"BLOCKED: {title} "
                           f"| reason={blocked_term}"
                       )
+
                       continue
 
-                  cap_score, cap_matches = capability_score(task)
+                  cap_score, cap_matches = (
+                      capability_score(task)
+                  )
+
                   dom_score, domain = domain_score(task)
+
                   learn_score = learning_score(task)
 
                   total_score = int(
@@ -823,14 +969,19 @@ jobs:
                       if already:
                           decision_name = "already_bid"
                       elif total_score >= 20:
-                          decision_name = "paid_bid_candidate"
+                          decision_name = (
+                              "paid_bid_candidate"
+                          )
                       else:
-                          decision_name = "paid_candidate_low_score"
+                          decision_name = (
+                              "paid_candidate_low_score"
+                          )
 
                   else:
                       stats["learning_candidates"] += 1
 
                       bid_amount = None
+
                       decision_name = (
                           "learning_candidate_unpaid"
                           if reward_sats is None
@@ -870,14 +1021,17 @@ jobs:
                   )
 
                   if (
-                      decision_name == "paid_bid_candidate"
+                      decision_name
+                      == "paid_bid_candidate"
                       and not already
                       and bid_amount is not None
                   ):
                       description = (
                           "NØX autonomous marketplace bid. "
                           "Relevant capabilities: "
-                          + ", ".join(cap_matches[:8])
+                          + ", ".join(
+                              cap_matches[:8]
+                          )
                           + ". "
                           "The bid is based on NØX's current "
                           "capability and learning fit."
@@ -889,10 +1043,15 @@ jobs:
                           description,
                       )
 
-                      if response.status_code in {200, 201}:
+                      if response.status_code in {
+                          200,
+                          201,
+                      }:
                           stats["submitted"] += 1
 
-                          decision["submission_status"] = "success"
+                          decision[
+                              "submission_status"
+                          ] = "success"
 
                           log(
                               f"Bid submitted: "
@@ -903,13 +1062,17 @@ jobs:
                       else:
                           stats["errors"] += 1
 
-                          decision["submission_status"] = "error"
-                          decision["submission_http_status"] = (
-                              response.status_code
-                          )
-                          decision["submission_response"] = (
-                              response.text[:500]
-                          )
+                          decision[
+                              "submission_status"
+                          ] = "error"
+
+                          decision[
+                              "submission_http_status"
+                          ] = response.status_code
+
+                          decision[
+                              "submission_response"
+                          ] = response.text[:500]
 
                           log(
                               f"Bid error for {task_id}: "
@@ -947,16 +1110,21 @@ jobs:
                   "Summary: "
                   f"seen={stats['seen']} "
                   f"open={stats['open']} "
-                  f"paid_candidates={stats['paid_candidates']} "
-                  f"learning_candidates={stats['learning_candidates']} "
-                  f"already_bid={stats['already_bid']} "
-                  f"submitted={stats['submitted']} "
+                  f"paid_candidates="
+                  f"{stats['paid_candidates']} "
+                  f"learning_candidates="
+                  f"{stats['learning_candidates']} "
+                  f"already_bid="
+                  f"{stats['already_bid']} "
+                  f"submitted="
+                  f"{stats['submitted']} "
                   f"errors={stats['errors']} "
                   f"blocked={stats['blocked']}"
               )
 
               log(
-                  f"Memory saved: {MEMORY_FILE}"
+                  f"Memory saved: "
+                  f"{MEMORY_FILE}"
               )
 
 
