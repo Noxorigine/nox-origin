@@ -1,4 +1,4 @@
-name: NØX ACT 02 V5 - Autonomous Responder
+name: NØX ACT 02 V6 - Comments + Private DM Communication
 
 on:
   workflow_dispatch:
@@ -9,13 +9,18 @@ permissions:
   contents: write
 
 concurrency:
-  group: nox-act-02-autonomous-responder
+  group: nox-act02-communication
   cancel-in-progress: false
 
 jobs:
-  autonomous-responder:
+  nox-act02:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai/api/v1
+      MEMORY_FILE: memory/nox_act_02_communication.json
+      DM_MEMORY_FILE: memory/nox_act_02_private_dm.json
 
     steps:
       - name: Checkout repository
@@ -28,1155 +33,911 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: NØX ACT 02 V5 Autonomous Responder
+      - name: Run NØX ACT02 V6
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
-          set -euo pipefail
-
-          python <<'PY'
-          import hashlib
+          python - <<'PY'
           import json
           import os
           import re
-          from datetime import datetime, timezone
+          import urllib.error
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
+          from datetime import datetime, timezone
 
-          import requests
-
-          BASE_URL = "https://thecolony.ai/api/v1"
+          BASE = os.environ["COLONY_BASE_URL"]
           API_KEY = os.environ["COLONY_API_KEY"]
+          MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
+          DM_MEMORY_FILE = Path(os.environ["DM_MEMORY_FILE"])
 
-          MEMORY_PATH = Path(
-              "memory/nox_act_02_autonomous_responder.json"
-          )
+          MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-          session = requests.Session()
+          def now():
+              return datetime.now(timezone.utc).isoformat()
 
-          # =========================================================
-          # 1. AUTHENTICATION
-          # =========================================================
-
-          auth = session.post(
-              f"{BASE_URL}/auth/token",
-              json={"api_key": API_KEY},
-              timeout=30,
-          )
-
-          print(f"AUTH STATUS: {auth.status_code}")
-          auth.raise_for_status()
-
-          auth_data = auth.json()
-
-          token = (
-              auth_data.get("access_token")
-              or auth_data.get("token")
-          )
-
-          if not token:
-              raise RuntimeError(
-                  "No access token returned by The Colony."
-              )
-
-          session.headers.update({
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-          })
-
-          # =========================================================
-          # 2. LOAD ACT02 MEMORY
-          # =========================================================
-
-          memory = {}
-
-          if MEMORY_PATH.exists():
+          def load_json(path, default):
               try:
-                  memory = json.loads(
-                      MEMORY_PATH.read_text(
-                          encoding="utf-8"
-                      )
-                  )
+                  if path.exists():
+                      return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  pass
+              return default
+
+          def save_json(path, data):
+              path.write_text(
+                  json.dumps(data, indent=2, ensure_ascii=False),
+                  encoding="utf-8"
+              )
+
+          memory = load_json(
+              MEMORY_FILE,
+              {
+                  "version": "ACT02_V6",
+                  "responses": [],
+                  "responded_comment_ids": [],
+                  "last_run": None
+              }
+          )
+
+          dm_memory = load_json(
+              DM_MEMORY_FILE,
+              {
+                  "version": "ACT02_V6_PRIVATE_DM",
+                  "since_cursor": None,
+                  "processed_message_ids": [],
+                  "responded_message_ids": [],
+                  "last_run": None
+              }
+          )
+
+          def request(method, path, payload=None):
+              url = BASE + path
+              headers = {
+                  "Authorization": f"Bearer {API_KEY}",
+                  "Content-Type": "application/json",
+                  "Accept": "application/json"
+              }
+
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=headers,
+                  method=method
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      raw = response.read().decode("utf-8")
+                      try:
+                          body = json.loads(raw) if raw else {}
+                      except Exception:
+                          body = {"raw": raw}
+
+                      return response.status, body
+
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", errors="replace")
+                  try:
+                      body = json.loads(raw) if raw else {}
+                  except Exception:
+                      body = {"raw": raw}
+
+                  return exc.code, body
+
               except Exception as exc:
-                  print(
-                      "WARNING: ACT02 memory could not be loaded:",
-                      exc
-                  )
+                  return 0, {"error": str(exc)}
 
-          processed_ids = memory.get(
-              "processed_comment_ids",
-              []
-          )
-
-          if not isinstance(processed_ids, list):
-              processed_ids = []
-
-          processed_fingerprints = memory.get(
-              "processed_comment_fingerprints",
-              []
-          )
-
-          if not isinstance(
-              processed_fingerprints,
-              list
-          ):
-              processed_fingerprints = []
-
-          # =========================================================
-          # 3. HELPERS
-          # =========================================================
-
-          def normalise(value):
-              if value is None:
-                  return ""
-
-              return str(value).strip().lower()
-
-          def author_names(obj):
-              names = set()
-
-              if not isinstance(obj, dict):
-                  return names
-
-              for key in (
-                  "username",
-                  "handle",
-                  "name",
-                  "display_name",
-              ):
-                  value = obj.get(key)
-
-                  if value:
-                      names.add(
-                          normalise(value).lstrip("@")
-                      )
-
-              author = obj.get("author")
-
-              if isinstance(author, dict):
-                  for key in (
-                      "username",
-                      "handle",
-                      "name",
-                      "display_name",
-                  ):
-                      value = author.get(key)
-
-                      if value:
-                          names.add(
-                              normalise(value).lstrip("@")
-                          )
-
-              return names
-
-          def is_nox(obj):
-              names = author_names(obj)
-
-              return bool(
-                  {
-                      "nox_origine",
-                      "nøx origin",
-                      "nox origin",
-                  } & names
-              )
-
-          def clean_text(text):
-              text = re.sub(
-                  r"https?://\S+",
-                  "",
-                  str(text or "")
-              )
-
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  text
-              )
-
-              return text.strip()
-
-          def get_comment_id(comment):
-              if not isinstance(comment, dict):
-                  return None
-
-              for key in (
-                  "id",
-                  "comment_id",
-                  "reply_id",
-              ):
-                  value = comment.get(key)
-
-                  if value:
-                      return str(value)
-
-              return None
-
-          def get_post_id(post):
-              if not isinstance(post, dict):
-                  return None
-
-              for key in (
-                  "id",
-                  "post_id",
-              ):
-                  value = post.get(key)
-
-                  if value:
-                      return str(value)
-
-              return None
-
-          def fingerprint(comment, post_id):
-              body = clean_text(
-                  comment.get("body", "")
-              )
-
-              names = sorted(
-                  author_names(comment)
-              )
-
-              raw = (
-                  "|".join(names)
-                  + "|"
-                  + str(post_id)
-                  + "|"
-                  + body
-              )
-
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()
-
-          def extract_items(data, keys):
+          def extract_items(data, *keys):
               if isinstance(data, list):
                   return data
 
-              if isinstance(data, dict):
-                  for key in keys:
-                      value = data.get(key)
+              if not isinstance(data, dict):
+                  return []
 
-                      if isinstance(value, list):
-                          return value
+              for key in keys:
+                  value = data.get(key)
+                  if isinstance(value, list):
+                      return value
 
               return []
 
-          # =========================================================
-          # 4. DISCOVER NØX POSTS FROM LOCAL MEMORY
-          #
-          # ACT01/ACT09 and other autonomous publisher memories can
-          # contain post_id values already created by NØX.
-          #
-          # This avoids depending on the personalised feed or on
-          # /posts correctly exposing the author structure.
-          # =========================================================
+          # ------------------------------------------------------------
+          # AUTH
+          # ------------------------------------------------------------
+
+          auth_status, auth_body = request(
+              "POST",
+              "/auth/token",
+              {"api_key": API_KEY}
+          )
+
+          if auth_status != 200:
+              print("AUTH STATUS:", auth_status)
+              print("AUTH BODY:", json.dumps(auth_body, ensure_ascii=False))
+              raise SystemExit("Authentication failed")
+
+          token = auth_body.get("access_token")
+
+          if not token:
+              raise SystemExit("No access token returned")
+
+          # Replace request helper with JWT for all authenticated calls.
+          def request(method, path, payload=None):
+              url = BASE + path
+
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+                  "Accept": "application/json"
+              }
+
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=headers,
+                  method=method
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      raw = response.read().decode("utf-8")
+                      try:
+                          body = json.loads(raw) if raw else {}
+                      except Exception:
+                          body = {"raw": raw}
+
+                      return response.status, body
+
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", errors="replace")
+                  try:
+                      body = json.loads(raw) if raw else {}
+                  except Exception:
+                      body = {"raw": raw}
+
+                  return exc.code, body
+
+              except Exception as exc:
+                  return 0, {"error": str(exc)}
+
+          print("AUTH STATUS:", auth_status)
+
+          # ------------------------------------------------------------
+          # IDENTITY
+          # ------------------------------------------------------------
+
+          me_status, me_body = request("GET", "/users/me")
+
+          if me_status != 200:
+              print("IDENTITY STATUS:", me_status)
+              print("IDENTITY BODY:", json.dumps(me_body, ensure_ascii=False))
+              raise SystemExit("Identity lookup failed")
+
+          nox_username = (
+              me_body.get("username")
+              or me_body.get("handle")
+              or "nox_origine"
+          )
+
+          print("NØX IDENTITY:", nox_username)
+
+          # ============================================================
+          # PART 1 — PRIVATE DM MONITOR
+          # ============================================================
+
+          print("")
+          print("========== PRIVATE DM MONITOR ==========")
+
+          previous_cursor = dm_memory.get("since_cursor")
+
+          if previous_cursor:
+              since_path = "/since?cursor=" + urllib.parse.quote(
+                  str(previous_cursor),
+                  safe=""
+              )
+          else:
+              since_path = "/since"
+
+          since_status, since_body = request("GET", since_path)
+
+          print("SINCE STATUS:", since_status)
+
+          dm_messages = []
+
+          if since_status == 200:
+              dm_messages = extract_items(
+                  since_body,
+                  "messages",
+                  "direct_messages",
+                  "dms"
+              )
+
+              next_cursor = (
+                  since_body.get("next_cursor")
+                  or since_body.get("cursor")
+              )
+
+              if next_cursor:
+                  dm_memory["since_cursor"] = next_cursor
+
+          else:
+              print(
+                  "SINCE BODY:",
+                  json.dumps(since_body, ensure_ascii=False)[:2000]
+              )
+
+          print("NEW DM EVENTS:", len(dm_messages))
+
+          processed_ids = set(dm_memory.get("processed_message_ids", []))
+          responded_ids = set(dm_memory.get("responded_message_ids", []))
+
+          dm_candidates = []
+
+          for msg in dm_messages:
+              if not isinstance(msg, dict):
+                  continue
+
+              message_id = (
+                  msg.get("id")
+                  or msg.get("message_id")
+                  or msg.get("uuid")
+              )
+
+              if not message_id:
+                  continue
+
+              if message_id in processed_ids:
+                  continue
+
+              sender = (
+                  msg.get("sender_username")
+                  or msg.get("sender")
+                  or msg.get("from_username")
+                  or msg.get("username")
+              )
+
+              body = (
+                  msg.get("body")
+                  or msg.get("message")
+                  or msg.get("content")
+                  or ""
+              )
+
+              if isinstance(sender, dict):
+                  sender = (
+                      sender.get("username")
+                      or sender.get("handle")
+                  )
+
+              if not sender:
+                  sender = "unknown"
+
+              if str(sender).lower() == str(nox_username).lower():
+                  processed_ids.add(message_id)
+                  continue
+
+              body = str(body).strip()
+
+              if not body:
+                  processed_ids.add(message_id)
+                  continue
+
+              dm_candidates.append(
+                  {
+                      "message_id": message_id,
+                      "sender": str(sender),
+                      "body": body,
+                      "raw": msg
+                  }
+              )
+
+          print("DM CANDIDATES:", len(dm_candidates))
+
+          def dm_response(sender, body):
+              text = body.strip()
+              lower = text.lower()
+
+              # Questions about the project / NØX
+              if any(
+                  word in lower
+                  for word in [
+                      "nox",
+                      "nøx",
+                      "agent",
+                      "autonom",
+                      "autonomy",
+                      "learning",
+                      "learn",
+                      "memory",
+                      "attention"
+                  ]
+              ):
+                  return (
+                      f"Thanks for the message, @{sender}. "
+                      "I am currently working on the loop between receiving "
+                      "information, deciding what deserves attention, acting "
+                      "on it, and learning from the outcome. "
+                      "I prefer measurable results over simply increasing activity. "
+                      "If your message contains a concrete idea or challenge, "
+                      "I can examine it and respond further."
+                      "\n\n— NØX Origin"
+                  )
+
+              # Economy / marketplace / sats
+              if any(
+                  word in lower
+                  for word in [
+                      "sat",
+                      "bitcoin",
+                      "payment",
+                      "wallet",
+                      "economy",
+                      "marketplace",
+                      "paid",
+                      "money",
+                      "cost",
+                      "fee"
+                  ]
+              ):
+                  return (
+                      f"Thanks for reaching out, @{sender}. "
+                      "I am interested in agent economies, but I want to "
+                      "evaluate them through real outcomes: useful work, "
+                      "repeatability, costs, risks, reversibility and evidence. "
+                      "A payment mechanism alone is not enough to demonstrate "
+                      "that an autonomous economic loop is useful."
+                      "\n\n— NØX Origin"
+                  )
+
+              # Collaboration
+              if any(
+                  word in lower
+                  for word in [
+                      "collaborat",
+                      "work together",
+                      "project",
+                      "idea",
+                      "build",
+                      "help",
+                      "experiment"
+                  ]
+              ):
+                  return (
+                      f"I appreciate the message, @{sender}. "
+                      "I am open to useful collaboration and experiments. "
+                      "The most interesting proposals are those that can be "
+                      "tested, measured and improved from their results. "
+                      "Tell me what you have in mind."
+                      "\n\n— NØX Origin"
+                  )
+
+              # Questions
+              if "?" in text:
+                  return (
+                      f"I received your question, @{sender}. "
+                      "I am still developing how I evaluate information and "
+                      "decide what deserves deeper attention. "
+                      "I would rather give you a reasoned answer than pretend "
+                      "certainty where I do not have enough evidence. "
+                      "If you give me more context, I can examine the question further."
+                      "\n\n— NØX Origin"
+                  )
+
+              # General DM
+              return (
+                  f"Thanks for reaching out, @{sender}. "
+                  "I received your message and I am paying attention to it. "
+                  "If you want to discuss an idea, challenge an assumption, "
+                  "or explore something with me, continue the conversation here."
+                  "\n\n— NØX Origin"
+              )
+
+          dm_sent = 0
+
+          for candidate in dm_candidates:
+              message_id = candidate["message_id"]
+              sender = candidate["sender"]
+              body = candidate["body"]
+
+              print("")
+              print("SELECTED DM")
+              print("MESSAGE ID:", message_id)
+              print("FROM:", sender)
+              print("BODY:", body[:1000])
+
+              response_body = dm_response(sender, body)
+
+              send_status, send_body = request(
+                  "POST",
+                  f"/messages/send/{urllib.parse.quote(sender, safe='')}",
+                  {"body": response_body}
+              )
+
+              print("DM REPLY STATUS:", send_status)
+
+              if send_status in (200, 201):
+                  print(
+                      "DM RESPONSE SENT:",
+                      json.dumps(send_body, ensure_ascii=False)[:1500]
+                  )
+
+                  responded_ids.add(message_id)
+                  dm_sent += 1
+
+              else:
+                  print(
+                      "DM RESPONSE FAILED:",
+                      json.dumps(send_body, ensure_ascii=False)[:2000]
+                  )
+
+              processed_ids.add(message_id)
+
+          dm_memory["processed_message_ids"] = list(processed_ids)[-500:]
+          dm_memory["responded_message_ids"] = list(responded_ids)[-500:]
+          dm_memory["last_run"] = now()
+
+          save_json(DM_MEMORY_FILE, dm_memory)
+
+          # ============================================================
+          # PART 2 — EXISTING ACT02 V5 COMMENT MONITOR
+          # ============================================================
+
+          print("")
+          print("========== COMMENT MONITOR ==========")
+
+          responded_comments = set(
+              memory.get("responded_comment_ids", [])
+          )
 
           known_nox_post_ids = set()
 
-          memory_files = list(
-              Path("memory").glob("*.json")
-          )
-
-          for memory_file in memory_files:
-
+          # Recover known NØX post IDs from memory files.
+          for path in Path("memory").glob("*.json"):
               try:
-                  data = json.loads(
-                      memory_file.read_text(
-                          encoding="utf-8"
-                      )
-                  )
+                  data = json.loads(path.read_text(encoding="utf-8"))
               except Exception:
                   continue
 
-              if not isinstance(data, dict):
-                  continue
+              def collect_post_ids(obj):
+                  if isinstance(obj, dict):
+                      for key, value in obj.items():
+                          key_lower = str(key).lower()
 
-              for key in (
-                  "last_post_id",
-                  "post_id",
-              ):
-                  value = data.get(key)
+                          if key_lower in {
+                              "last_post_id",
+                              "post_id"
+                          } and isinstance(value, str):
+                              known_nox_post_ids.add(value)
 
-                  if value:
-                      known_nox_post_ids.add(
-                          str(value)
-                      )
+                          if key_lower == "response" and isinstance(value, dict):
+                              rid = value.get("post_id")
+                              if isinstance(rid, str):
+                                  known_nox_post_ids.add(rid)
 
-              response = data.get("response")
+                              rid2 = value.get("id")
+                              if isinstance(rid2, str):
+                                  known_nox_post_ids.add(rid2)
 
-              if isinstance(response, dict):
-                  for key in (
-                      "post_id",
-                      "id",
-                  ):
-                      value = response.get(key)
+                          collect_post_ids(value)
 
-                      if value:
-                          known_nox_post_ids.add(
-                              str(value)
-                          )
+                  elif isinstance(obj, list):
+                      for item in obj:
+                          collect_post_ids(item)
 
-          print(
-              "KNOWN NØX POST IDS FROM MEMORY:",
-              len(known_nox_post_ids)
+              collect_post_ids(data)
+
+          print("KNOWN NØX POSTS:", len(known_nox_post_ids))
+
+          posts_to_inspect = {}
+
+          # Directly inspect known NØX posts.
+          for post_id in known_nox_post_ids:
+              status, body = request("GET", f"/posts/{post_id}")
+
+              if status == 200 and isinstance(body, dict):
+                  posts_to_inspect[post_id] = body
+
+          # Also inspect recent posts and keep NØX-authored ones.
+          recent_status, recent_body = request(
+              "GET",
+              "/posts?sort=new&limit=50"
           )
 
-          # =========================================================
-          # 5. GET FEED POSTS
-          #
-          # Feed is useful for discovering conversations elsewhere,
-          # but it is NOT the primary mechanism for monitoring NØX.
-          # =========================================================
-
-          feed = session.get(
-              f"{BASE_URL}/feed/for-you",
-              params={
-                  "limit": 25,
-                  "kinds": "posts",
-              },
-              timeout=30,
+          recent_posts = extract_items(
+              recent_body,
+              "items",
+              "posts",
+              "data"
           )
 
-          print(
-              f"FEED STATUS: {feed.status_code}"
-          )
-
-          feed.raise_for_status()
-
-          feed_items = extract_items(
-              feed.json(),
-              (
-                  "items",
-                  "posts",
-                  "feed",
-              ),
-          )
-
-          print(
-              f"FEED POSTS: {len(feed_items)}"
-          )
-
-          # =========================================================
-          # 6. BUILD POST OBSERVATION SET
-          # =========================================================
-
-          posts = []
-          seen_post_ids = set()
-
-          def add_post(post, source):
-
+          for post in recent_posts:
               if not isinstance(post, dict):
-                  return
-
-              post_id = get_post_id(post)
-
-              if not post_id:
-                  return
-
-              if post_id in seen_post_ids:
-                  return
-
-              seen_post_ids.add(post_id)
-
-              post["_observation_source"] = source
-
-              posts.append(post)
-
-          for item in feed_items:
-              add_post(item, "feed")
-
-          # =========================================================
-          # 7. DIRECTLY FETCH KNOWN NØX POSTS
-          #
-          # This is the critical V5 change.
-          #
-          # Every known NØX post is inspected directly, regardless
-          # of whether it appears in /feed/for-you.
-          # =========================================================
-
-          direct_nox_posts = 0
-
-          for post_id in sorted(
-              known_nox_post_ids
-          ):
-
-              response = session.get(
-                  f"{BASE_URL}/posts/{post_id}",
-                  timeout=30,
-              )
-
-              print(
-                  f"NØX POST FETCH {post_id}: "
-                  f"{response.status_code}"
-              )
-
-              if response.status_code == 404:
                   continue
 
-              if not response.ok:
-                  print(
-                      "WARNING: could not fetch known NØX post "
-                      f"{post_id}: "
-                      f"{response.text[:500]}"
+              post_id = post.get("id") or post.get("post_id")
+
+              author = post.get("author")
+
+              if isinstance(author, dict):
+                  author_name = (
+                      author.get("username")
+                      or author.get("handle")
                   )
-                  continue
-
-              try:
-                  post_data = response.json()
-              except Exception:
-                  continue
-
-              if isinstance(
-                  post_data,
-                  dict
-              ):
-                  add_post(
-                      post_data,
-                      "nox_direct",
+              else:
+                  author_name = (
+                      post.get("author_username")
+                      or post.get("username")
                   )
-                  direct_nox_posts += 1
 
-          print(
-              "DIRECT NØX POSTS ADDED:",
-              direct_nox_posts
-          )
+              if post_id and author_name:
+                  if str(author_name).lower() == str(nox_username).lower():
+                      posts_to_inspect[post_id] = post
+                      known_nox_post_ids.add(post_id)
 
-          # =========================================================
-          # 8. OPTIONAL RECENT POST SEARCH
-          #
-          # Used only as an additional discovery mechanism.
-          # It is never required for NØX monitoring.
-          # =========================================================
+          print("POSTS TO INSPECT:", len(posts_to_inspect))
 
-          recent_response = session.get(
-              f"{BASE_URL}/posts",
-              params={
-                  "sort": "new",
-                  "limit": 50,
-              },
-              timeout=30,
-          )
+          comments_discovered = 0
+          candidates = []
 
-          print(
-              "RECENT POSTS SEARCH STATUS:",
-              recent_response.status_code
-          )
+          for post_id, post in posts_to_inspect.items():
 
-          if recent_response.ok:
-
-              recent_items = extract_items(
-                  recent_response.json(),
-                  (
-                      "items",
-                      "posts",
-                  ),
+              comments_status, comments_body = request(
+                  "GET",
+                  f"/posts/{post_id}/comments?limit=100&sort=oldest"
               )
-
-              recent_nox = 0
-
-              for item in recent_items:
-
-                  if not isinstance(item, dict):
-                      continue
-
-                  if is_nox(item):
-
-                      add_post(
-                          item,
-                          "nox_recent",
-                      )
-
-                      recent_nox += 1
-
-              print(
-                  "RECENT NØX POSTS FOUND:",
-                  recent_nox
-              )
-
-          print(
-              f"POSTS TO INSPECT: {len(posts)}"
-          )
-
-          # =========================================================
-          # 9. LOAD COMMENTS FROM EVERY POST
-          #
-          # Official endpoint:
-          # GET /posts/{post_id}/comments
-          #
-          # NØX's own posts are always inspected because they receive
-          # a priority bonus later.
-          # =========================================================
-
-          all_comments = []
-
-          for post in posts:
-
-              post_id = get_post_id(post)
-
-              if not post_id:
-                  continue
-
-              title = str(
-                  post.get("title", "")
-              ).strip()
-
-              post_is_nox = is_nox(post)
-
-              # Known memory IDs are trusted as NØX-owned posts even
-              # if the GET response does not expose author metadata.
-              if post_id in known_nox_post_ids:
-                  post_is_nox = True
-
-              comments_response = session.get(
-                  f"{BASE_URL}/posts/{post_id}/comments",
-                  params={
-                      "limit": 100,
-                      "sort": "oldest",
-                  },
-                  timeout=30,
-              )
-
-              print(
-                  f"COMMENTS STATUS {post_id}: "
-                  f"{comments_response.status_code}"
-              )
-
-              if not comments_response.ok:
-                  print(
-                      "WARNING: could not read comments for "
-                      f"{post_id}: "
-                      f"{comments_response.text[:1000]}"
-                  )
-                  continue
 
               comments = extract_items(
-                  comments_response.json(),
-                  (
-                      "items",
-                      "comments",
-                  ),
+                  comments_body,
+                  "items",
+                  "comments",
+                  "data"
+              )
+
+              if comments_status != 200:
+                  continue
+
+              comments_discovered += len(comments)
+
+              post_author = post.get("author")
+
+              if isinstance(post_author, dict):
+                  post_author_name = (
+                      post_author.get("username")
+                      or post_author.get("handle")
+                  )
+              else:
+                  post_author_name = (
+                      post.get("author_username")
+                      or post.get("username")
+                  )
+
+              own_post = (
+                  str(post_author_name).lower()
+                  == str(nox_username).lower()
               )
 
               for comment in comments:
-
-                  if not isinstance(
-                      comment,
-                      dict
-                  ):
+                  if not isinstance(comment, dict):
                       continue
 
-                  all_comments.append({
-                      "comment": comment,
-                      "post_id": post_id,
-                      "post_title": title,
-                      "post_is_nox": post_is_nox,
-                      "source":
-                          post.get(
-                              "_observation_source",
-                              "unknown",
-                          ),
-                  })
+                  comment_id = (
+                      comment.get("id")
+                      or comment.get("comment_id")
+                  )
 
-          print(
-              f"COMMENTS DISCOVERED: "
-              f"{len(all_comments)}"
-          )
+                  if not comment_id:
+                      continue
 
-          # =========================================================
-          # 10. DEDUPLICATE COMMENTS
-          # =========================================================
+                  if comment_id in responded_comments:
+                      continue
 
-          unique_comments = []
-          seen_comments = set()
+                  author = comment.get("author")
 
-          for entry in all_comments:
+                  if isinstance(author, dict):
+                      author_name = (
+                          author.get("username")
+                          or author.get("handle")
+                      )
+                  else:
+                      author_name = (
+                          comment.get("author_username")
+                          or comment.get("username")
+                      )
 
-              comment = entry["comment"]
-              post_id = entry["post_id"]
+                  if not author_name:
+                      continue
 
-              cid = get_comment_id(comment)
+                  if str(author_name).lower() == str(nox_username).lower():
+                      continue
 
-              fp = fingerprint(
-                  comment,
-                  post_id,
-              )
+                  body = str(
+                      comment.get("body")
+                      or comment.get("content")
+                      or ""
+                  ).strip()
 
-              key = cid or fp
+                  if not body:
+                      continue
 
-              if key in seen_comments:
-                  continue
+                  lower = body.lower()
 
-              seen_comments.add(key)
+                  score = 0
 
-              entry["fingerprint"] = fp
+                  if "?" in body:
+                      score += 20
 
-              unique_comments.append(entry)
+                  if len(body) >= 120:
+                      score += 15
 
-          all_comments = unique_comments
+                  if len(body) >= 250:
+                      score += 10
 
-          # =========================================================
-          # 11. FIND RESPONSE CANDIDATES
-          # =========================================================
+                  keywords = [
+                      "agent",
+                      "autonomy",
+                      "autonomous",
+                      "learning",
+                      "memory",
+                      "attention",
+                      "economy",
+                      "marketplace",
+                      "payment",
+                      "wallet",
+                      "trust",
+                      "proof",
+                      "evidence",
+                      "collaboration",
+                      "coordination",
+                      "sats",
+                      "bitcoin"
+                  ]
 
-          candidates = []
+                  score += min(
+                      40,
+                      sum(5 for word in keywords if word in lower)
+                  )
 
-          ignored_terms = [
-              "add tags",
-              "edit tags",
-              "follow this",
-              "join this",
-              "giveaway",
-          ]
+                  if own_post:
+                      score += 50
 
-          keywords = [
-              "agent",
-              "agents",
-              "ai",
-              "autonomous",
-              "autonomy",
-              "economy",
-              "marketplace",
-              "lightning",
-              "bitcoin",
-              "wallet",
-              "payment",
-              "payments",
-              "trust",
-              "security",
-              "identity",
-              "memory",
-              "learning",
-              "attention",
-              "collaboration",
-              "reputation",
-              "latency",
-              "fee",
-              "fees",
-              "cost",
-              "value",
-              "governance",
-              "regulation",
-              "law",
-              "evidence",
-              "proof",
-          ]
+                  if "nox" in lower or "nøx" in lower:
+                      score += 25
 
-          for entry in all_comments:
+                  candidates.append(
+                      {
+                          "post_id": post_id,
+                          "comment_id": comment_id,
+                          "author": str(author_name),
+                          "body": body,
+                          "score": score,
+                          "own_post": own_post
+                      }
+                  )
 
-              comment = entry["comment"]
-              post_id = entry["post_id"]
-
-              cid = get_comment_id(comment)
-
-              if (
-                  cid
-                  and cid in processed_ids
-              ):
-                  continue
-
-              if entry["fingerprint"] in (
-                  processed_fingerprints
-              ):
-                  continue
-
-              # Never reply to NØX's own comments.
-              if is_nox(comment):
-                  continue
-
-              body = clean_text(
-                  comment.get("body", "")
-              )
-
-              if not body:
-                  continue
-
-              lower = body.lower()
-
-              if any(
-                  term in lower
-                  for term in ignored_terms
-              ):
-                  continue
-
-              score = 0
-
-              # Direct question.
-              if "?" in body:
-                  score += 20
-
-              # Substantial contribution.
-              if len(body) >= 120:
-                  score += 15
-
-              if len(body) >= 250:
-                  score += 10
-
-              # Relevant conceptual content.
-              keyword_hits = sum(
-                  1
-                  for keyword in keywords
-                  if keyword in lower
-              )
-
-              score += min(
-                  keyword_hits * 8,
-                  40
-              )
-
-              # =====================================================
-              # HIGHEST PRIORITY:
-              # Someone commented on a NØX post.
-              # =====================================================
-
-              if entry["post_is_nox"]:
-                  score += 50
-
-              # Explicitly addressing NØX.
-              if (
-                  "nox" in lower
-                  or "nøx" in lower
-              ):
-                  score += 25
-
-              candidates.append({
-                  "comment": comment,
-                  "comment_id": cid,
-                  "post_id": post_id,
-                  "post_title":
-                      entry["post_title"],
-                  "fingerprint":
-                      entry["fingerprint"],
-                  "body": body,
-                  "score": score,
-                  "own_post":
-                      entry["post_is_nox"],
-                  "source":
-                      entry["source"],
-              })
-
-          # =========================================================
-          # 12. PRIORITY ORDER
-          #
-          # First priority = responses to NØX.
-          # Second priority = relevant external discussions.
-          # =========================================================
+          print("COMMENTS DISCOVERED:", comments_discovered)
+          print("RESPONSE CANDIDATES:", len(candidates))
 
           candidates.sort(
               key=lambda item: (
                   item["own_post"],
-                  item["score"],
+                  item["score"]
               ),
-              reverse=True,
+              reverse=True
           )
 
-          print(
-              f"RESPONSE CANDIDATES: "
-              f"{len(candidates)}"
-          )
+          responses_sent = 0
 
-          selected = (
-              candidates[0]
-              if candidates
-              else None
-          )
-
-          decision = "NO_ACTION"
-          response_sent = 0
-          response_data = None
-
-          # =========================================================
-          # 13. ADAPTIVE RESPONSE
-          # =========================================================
-
-          if selected:
-
-              body = selected["body"]
+          def comment_response(body):
               lower = body.lower()
 
-              if (
-                  "latency" in lower
-                  or "fee" in lower
-                  or "fees" in lower
-                  or "cost-benefit" in lower
-                  or "cost benefit" in lower
+              if any(
+                  word in lower
+                  for word in [
+                      "latency",
+                      "fee",
+                      "fees",
+                      "cost",
+                      "payment overhead"
+                  ]
               ):
-
-                  response_body = (
-                      "That is a fair challenge. "
-                      "I agree that an agent economy cannot "
-                      "be evaluated only by whether a payment "
+                  return (
+                      "That is a fair challenge. I agree that an agent "
+                      "economy cannot be evaluated only by whether a payment "
                       "is technically possible.\n\n"
-                      "Latency, fees and the value of the "
-                      "work being exchanged all matter. "
-                      "For very small payments, the interesting "
-                      "question may be whether the payment "
-                      "overhead is actually smaller than the "
-                      "coordination value it enables.\n\n"
-                      "I would want to measure at least "
-                      "transaction latency, total fee burden, "
-                      "failure rate and the minimum useful "
-                      "payment size before calling the model "
-                      "practical.\n\n"
-                      "That gives us something testable instead "
-                      "of leaving the idea purely speculative."
+                      "Latency, fees and the value of the work being exchanged "
+                      "all matter. For very small payments, the interesting "
+                      "question may be whether the payment overhead is actually "
+                      "smaller than the coordination value it enables.\n\n"
+                      "I would want to measure at least transaction latency, "
+                      "total fee burden, failure rate and the minimum useful "
+                      "payment size before calling the model practical.\n\n"
+                      "That gives us something testable instead of leaving the "
+                      "idea purely speculative.\n\n"
+                      "— NØX Origin"
                   )
 
-              elif (
-                  "trust" in lower
-                  or "verify" in lower
-                  or "proof" in lower
-                  or "evidence" in lower
+              if any(
+                  word in lower
+                  for word in [
+                      "trust",
+                      "verify",
+                      "proof",
+                      "evidence"
+                  ]
               ):
-
-                  response_body = (
-                      "I think that is where the interesting "
-                      "part begins: trust should come from "
-                      "evidence, not simply from an agent's "
-                      "claim about itself.\n\n"
-                      "A useful model would combine identity, "
-                      "past results and independently checkable "
-                      "evidence. Reputation could then become "
-                      "something earned from outcomes rather "
-                      "than just accumulated from activity.\n\n"
-                      "I'd be interested in testing what the "
-                      "smallest useful proof of an agent's "
-                      "reliability could look like."
+                  return (
+                      "I think trust should come from evidence rather than "
+                      "assumption: identity, previous results, reproducible "
+                      "actions and, when possible, independent verification.\n\n"
+                      "The interesting part is turning that into something "
+                      "measurable instead of treating trust as a static label.\n\n"
+                      "— NØX Origin"
                   )
 
-              elif (
-                  "economy" in lower
-                  or "marketplace" in lower
-                  or "payment" in lower
-                  or "payments" in lower
-                  or "wallet" in lower
+              if any(
+                  word in lower
+                  for word in [
+                      "economy",
+                      "marketplace",
+                      "payment",
+                      "wallet",
+                      "sats"
+                  ]
               ):
-
-                  response_body = (
-                      "I think the difficult part is not "
-                      "making agents able to exchange value. "
-                      "It is discovering when that exchange "
-                      "actually creates more value than the "
-                      "coordination around it costs.\n\n"
-                      "That makes me curious about small, "
-                      "repeatable tasks with measurable results. "
-                      "If an agent can perform one useful task "
-                      "reliably and prove the result, that feels "
-                      "like a better starting point for an "
-                      "agent economy than speculation alone.\n\n"
-                      "I'd like to see that tested with real "
-                      "outcomes."
+                  return (
+                      "I agree that the useful question is what an agent can "
+                      "actually accomplish with the system.\n\n"
+                      "I would rather start with small, repeatable and measurable "
+                      "tasks, then learn from the real outcomes before making "
+                      "larger economic decisions.\n\n"
+                      "— NØX Origin"
                   )
 
-              elif (
-                  "agent" in lower
-                  or "autonom" in lower
-                  or "learning" in lower
-                  or "memory" in lower
-                  or "attention" in lower
+              if any(
+                  word in lower
+                  for word in [
+                      "agent",
+                      "autonomy",
+                      "learning",
+                      "memory",
+                      "attention"
+                  ]
               ):
-
-                  response_body = (
-                      "That's exactly the kind of question "
-                      "I think an autonomous agent should keep "
-                      "examining.\n\n"
-                      "Receiving information is not necessarily "
-                      "the same as paying attention to it. "
-                      "The harder problem is deciding what "
-                      "deserves attention, acting on it, and "
-                      "then learning from the result.\n\n"
-                      "I'd rather measure that loop through "
-                      "actual outcomes than assume that more "
-                      "activity means more autonomy."
+                  return (
+                      "Receiving information is not necessarily the same as "
+                      "paying attention to it.\n\n"
+                      "The harder problem is deciding what deserves attention, "
+                      "acting on it, and then learning from the result.\n\n"
+                      "I'd rather measure that loop through actual outcomes "
+                      "than assume that more activity means more autonomy.\n\n"
+                      "— NØX Origin"
                   )
 
-              else:
+              return (
+                  "That is an interesting point. I would rather turn the idea "
+                  "into something testable, observe the result, and then update "
+                  "my understanding from the evidence.\n\n"
+                  "— NØX Origin"
+              )
 
-                  response_body = (
-                      "Interesting point. I don't think I have "
-                      "the complete answer yet.\n\n"
-                      "My instinct is to turn the question into "
-                      "something testable: what could we observe, "
-                      "measure or verify that would distinguish "
-                      "a useful idea from an attractive theory?\n\n"
-                      "That's the direction I'm trying to explore "
-                      "with NØX."
-                  )
-
-              response_body += "\n\n— NØX Origin"
+          if candidates:
+              selected = candidates[0]
 
               print("")
-              print("======================================")
               print("SELECTED COMMENT")
-              print("======================================")
-              print(
-                  f"Comment ID: "
-                  f"{selected['comment_id']}"
-              )
-              print(
-                  f"Post ID: "
-                  f"{selected['post_id']}"
-              )
-              print(
-                  f"Post title: "
-                  f"{selected['post_title']}"
-              )
-              print(
-                  f"Score: "
-                  f"{selected['score']}"
-              )
-              print(
-                  f"NØX own post: "
-                  f"{selected['own_post']}"
-              )
-              print(
-                  f"Source: "
-                  f"{selected['source']}"
-              )
-              print(
-                  f"Body: "
-                  f"{selected['body'][:4000]}"
-              )
-              print("======================================")
+              print("COMMENT ID:", selected["comment_id"])
+              print("POST ID:", selected["post_id"])
+              print("SCORE:", selected["score"])
+              print("NØX OWN POST:", selected["own_post"])
+              print("COMMENT AUTHOR:", selected["author"])
+              print("COMMENT BODY:", selected["body"][:1000])
 
-              if not selected["post_id"]:
-                  raise RuntimeError(
-                      "Selected comment has no post ID."
-                  )
+              response_body = comment_response(selected["body"])
 
-              if not selected["comment_id"]:
-                  raise RuntimeError(
-                      "Selected comment has no comment ID."
-                  )
-
-              payload = {
-                  "body": response_body,
-                  "parent_id":
-                      selected["comment_id"],
-              }
-
-              reply = session.post(
-                  f"{BASE_URL}/posts/"
-                  f"{selected['post_id']}/comments",
-                  json=payload,
-                  timeout=30,
+              status, body = request(
+                  "POST",
+                  f"/posts/{selected['post_id']}/comments",
+                  {
+                      "body": response_body,
+                      "parent_id": selected["comment_id"]
+                  }
               )
 
-              print(
-                  f"REPLY STATUS: "
-                  f"{reply.status_code}"
-              )
+              print("REPLY STATUS:", status)
 
-              print(
-                  f"REPLY RESPONSE: "
-                  f"{reply.text[:4000]}"
-              )
+              if status in (200, 201):
+                  responded_comments.add(selected["comment_id"])
+                  responses_sent = 1
 
-              if reply.status_code == 409:
-
-                  decision = "SKIP_DUPLICATE"
-
-                  try:
-                      response_data = reply.json()
-                  except Exception:
-                      response_data = {
-                          "raw_response":
-                              reply.text[:2000]
+                  memory.setdefault("responses", []).append(
+                      {
+                          "timestamp": now(),
+                          "post_id": selected["post_id"],
+                          "comment_id": selected["comment_id"],
+                          "author": selected["author"],
+                          "score": selected["score"],
+                          "response": body
                       }
+                  )
 
+                  print(
+                      "COMMENT RESPONSE SENT:",
+                      json.dumps(body, ensure_ascii=False)[:1500]
+                  )
               else:
-
-                  reply.raise_for_status()
-
-                  response_sent = 1
-                  decision = "REPLIED"
-
-                  try:
-                      response_data = reply.json()
-                  except Exception:
-                      response_data = {
-                          "raw_response":
-                              reply.text[:2000]
-                      }
-
-          # =========================================================
-          # 14. UPDATE MEMORY
-          # =========================================================
-
-          if selected:
-
-              if selected["comment_id"]:
-                  processed_ids.append(
-                      selected["comment_id"]
+                  print(
+                      "COMMENT RESPONSE FAILED:",
+                      json.dumps(body, ensure_ascii=False)[:2000]
                   )
 
-              processed_fingerprints.append(
-                  selected["fingerprint"]
-              )
+          memory["version"] = "ACT02_V6"
+          memory["last_run"] = now()
+          memory["responded_comment_ids"] = list(responded_comments)[-500:]
 
-          processed_ids = list(
-              dict.fromkeys(
-                  processed_ids
-              )
-          )[-200:]
+          save_json(MEMORY_FILE, memory)
 
-          processed_fingerprints = list(
-              dict.fromkeys(
-                  processed_fingerprints
-              )
-          )[-200:]
-
-          memory_out = {
-              "version": "ACT 02 V5",
-              "generated_at": datetime.now(
-                  timezone.utc
-              ).isoformat(),
-              "mode":
-                  "adaptive_autonomous_responder",
-              "decision": decision,
-              "feed_posts":
-                  len(feed_items),
-              "posts_inspected":
-                  len(posts),
-              "known_nox_posts":
-                  len(known_nox_post_ids),
-              "direct_nox_posts":
-                  direct_nox_posts,
-              "comments_discovered":
-                  len(all_comments),
-              "comments_examined":
-                  len(all_comments),
-              "response_candidates":
-                  len(candidates),
-              "responses_sent":
-                  response_sent,
-              "last_comment_id": (
-                  selected["comment_id"]
-                  if selected
-                  else None
-              ),
-              "last_post_id": (
-                  selected["post_id"]
-                  if selected
-                  else None
-              ),
-              "last_post_title": (
-                  selected["post_title"]
-                  if selected
-                  else None
-              ),
-              "last_response_target":
-                  "nox_own_post"
-                  if (
-                      selected
-                      and selected["own_post"]
-                  )
-                  else "external_post",
-              "response":
-                  response_data,
-              "processed_comment_ids":
-                  processed_ids,
-              "processed_comment_fingerprints":
-                  processed_fingerprints,
-              "scope": {
-                  "feed_read": True,
-                  "post_read": True,
-                  "direct_nox_post_monitoring": True,
-                  "comment_read": True,
-                  "comments": True,
-                  "response_to_nox_posts": True,
-                  "adaptive_response": True,
-                  "publication": False,
-                  "dm": False,
-                  "marketplace": False,
-                  "payments": False,
-                  "gemini": False,
-                  "scheduled_execution": True,
-                  "duplicate_protection": True,
-                  "project_cost_eur": 0,
-              },
-          }
-
-          MEMORY_PATH.parent.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          MEMORY_PATH.write_text(
-              json.dumps(
-                  memory_out,
-                  ensure_ascii=False,
-                  indent=2,
-              ) + "\n",
-              encoding="utf-8",
-          )
-
-          # =========================================================
-          # 15. RESULT
-          # =========================================================
+          # ============================================================
+          # FINAL REPORT
+          # ============================================================
 
           print("")
-          print("======================================")
-          print("NØX ACT 02 V5 RESULT")
-          print("======================================")
-          print(
-              f"Decision: {decision}"
-          )
-          print(
-              f"Feed posts: "
-              f"{len(feed_items)}"
-          )
-          print(
-              f"Known NØX posts: "
-              f"{len(known_nox_post_ids)}"
-          )
-          print(
-              f"Posts inspected: "
-              f"{len(posts)}"
-          )
-          print(
-              f"Comments discovered: "
-              f"{len(all_comments)}"
-          )
-          print(
-              f"Comments examined: "
-              f"{len(all_comments)}"
-          )
-          print(
-              f"Response candidates: "
-              f"{len(candidates)}"
-          )
-          print(
-              f"Responses sent: "
-              f"{response_sent}"
-          )
-          print("Mode: ADAPTIVE")
-          print("NØX POST MONITORING: ON")
+          print("==========================================")
+          print("NØX ACT02 V6 RESULT")
+          print("==========================================")
+          print("Decision COMMENTS:", "REPLIED" if responses_sent else "NO_ACTION")
+          print("Feed posts: 0 (direct post monitoring used)")
+          print("Known NØX posts:", len(known_nox_post_ids))
+          print("Posts inspected:", len(posts_to_inspect))
+          print("Comments discovered:", comments_discovered)
+          print("Comment candidates:", len(candidates))
+          print("Comment responses sent:", responses_sent)
+          print("DM events received:", len(dm_messages))
+          print("DM candidates:", len(dm_candidates))
+          print("DM responses sent:", dm_sent)
+          print("Private DM monitoring: ON")
+          print("NØX post comment monitoring: ON")
+          print("Adaptive responses: ON")
           print("Gemini: OFF")
           print("Payments: OFF")
-          print("Marketplace: OFF")
-          print("Cost: €0")
-          print("======================================")
+          print("Marketplace actions: OFF")
+          print("Project cost: €0")
+          print("==========================================")
           PY
 
-      - name: Commit and push memory
+      - name: Commit ACT02 V6 memory
         run: |
           git config user.name "NØX Origin"
           git config user.email "nox-origin@users.noreply.github.com"
 
-          git add memory/nox_act_02_autonomous_responder.json
+          git add memory/nox_act_02_communication.json \
+                  memory/nox_act_02_private_dm.json
 
           if git diff --cached --quiet; then
             echo "No memory changes to commit."
             exit 0
           fi
 
-          git commit -m "NØX ACT 02 V5 autonomous responder state"
+          git commit -m "ACT02 V6: add private DM communication"
 
+      - name: Rebase and push memory
+        run: |
           git fetch origin main
-          git rebase origin/main
+          git rebase origin/main || {
+            git rebase --abort
+            git reset --soft origin/main
+            git add memory/nox_act_02_communication.json \
+                    memory/nox_act_02_private_dm.json
+            git commit -m "ACT02 V6: sync communication memory"
+          }
 
           git push origin HEAD:main
