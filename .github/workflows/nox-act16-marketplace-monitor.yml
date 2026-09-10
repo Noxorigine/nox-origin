@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    env:
+      COLONY_BASE_URL: https://thecolony.ai/api/v1
+      ROOT_MEMORY_FILE: nox_memory.json
+      ACT15_MEMORY_FILE: memory/nox_act_15_marketplace.json
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,490 +31,511 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          python -m pip install requests
 
-      - name: Run NØX ACT16
+      - name: Run ACT16 Marketplace Monitor
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
-          set -euo pipefail
-
           python - <<'PY'
           import json
           import os
-          import sys
+          import re
+          import subprocess
+          import time
           from datetime import datetime, timezone
 
           import requests
 
+          BASE_URL = os.environ["COLONY_BASE_URL"].rstrip("/")
+          API_KEY = os.environ["COLONY_API_KEY"]
 
-          BASE_URL = "https://thecolony.ai/api/v1"
-          ROOT_MEMORY_FILE = "nox_memory.json"
-          ACT15_MEMORY_FILE = "memory/nox_act_15_marketplace.json"
+          ROOT_MEMORY_FILE = os.environ["ROOT_MEMORY_FILE"]
+          ACT15_MEMORY_FILE = os.environ["ACT15_MEMORY_FILE"]
 
-          session = requests.Session()
-          session.headers.update({
+          SESSION = requests.Session()
+          SESSION.headers.update({
               "Accept": "application/json",
               "Content-Type": "application/json",
+              "User-Agent": "NOX-ACT16-Marketplace-Monitor/4.0",
           })
 
+          print("=" * 48)
+          print("NØX ACT16 V4 - MARKETPLACE MONITOR")
+          print("=" * 48)
+          print()
+          print("Schedule: every 30 minutes")
+          print("Payments: DISABLED")
+          print("Cost: €0")
+          print()
 
-          def fail(message):
-              print(f"ACT16 STOPPED: {message}")
-              sys.exit(1)
-
-
-          def now():
+          def now_iso():
               return datetime.now(timezone.utc).isoformat()
 
-
-          def get_json(url, headers=None, timeout=20):
+          def safe_get(url, headers=None, timeout=30):
               try:
-                  return session.get(
+                  return SESSION.get(
                       url,
                       headers=headers or {},
                       timeout=timeout,
                   )
-              except requests.RequestException as exc:
-                  fail(f"GET request failed: {exc}")
+              except Exception as exc:
+                  print(f"GET exception: {exc}")
+                  return None
 
-
-          def post_json(url, payload, headers=None, timeout=20):
+          def safe_post(url, payload, headers=None, timeout=30):
               try:
-                  return session.post(
+                  return SESSION.post(
                       url,
-                      headers=headers or {},
                       json=payload,
+                      headers=headers or {},
                       timeout=timeout,
                   )
-              except requests.RequestException as exc:
-                  fail(f"POST request failed: {exc}")
-
+              except Exception as exc:
+                  print(f"POST exception: {exc}")
+                  return None
 
           def load_json_file(path):
               if not os.path.exists(path):
-                  return None
-
+                  return {}
               try:
                   with open(path, "r", encoding="utf-8") as f:
                       return json.load(f)
               except Exception as exc:
-                  fail(f"Unable to load {path}: {exc}")
+                  print(f"Could not load {path}: {exc}")
+                  return {}
 
-
-          def extract_task_id(item):
-              if not isinstance(item, dict):
+          def extract_task_id(obj):
+              if not isinstance(obj, dict):
                   return None
 
-              return (
-                  item.get("task_id")
-                  or item.get("taskId")
-                  or item.get("id")
-              )
+              for key in (
+                  "task_id",
+                  "taskId",
+                  "marketplace_task_id",
+                  "marketplaceTaskId",
+              ):
+                  value = obj.get(key)
+                  if value:
+                      return str(value)
 
+              task = obj.get("task")
+              if isinstance(task, dict):
+                  for key in ("id", "task_id", "taskId"):
+                      value = task.get(key)
+                      if value:
+                          return str(value)
 
-          def extract_bid_id(item):
-              if not isinstance(item, dict):
+              return None
+
+          def extract_bid_id(obj):
+              if not isinstance(obj, dict):
                   return None
 
-              return (
-                  item.get("bid_id")
-                  or item.get("bidId")
-              )
+              for key in (
+                  "bid_id",
+                  "bidId",
+                  "id",
+              ):
+                  value = obj.get(key)
+                  if value:
+                      return str(value)
 
+              bid = obj.get("bid")
+              if isinstance(bid, dict):
+                  for key in ("id", "bid_id", "bidId"):
+                      value = bid.get(key)
+                      if value:
+                          return str(value)
 
-          def extract_title(item):
-              if not isinstance(item, dict):
-                  return "Untitled"
+              return None
 
-              return (
-                  item.get("task_title")
-                  or item.get("taskTitle")
-                  or item.get("title")
-                  or "Untitled"
-              )
-
-
-          def collect_act15_submitted_bids(act15_memory):
-              if not isinstance(act15_memory, dict):
-                  return []
-
-              candidates = []
+          def extract_title(obj):
+              if not isinstance(obj, dict):
+                  return None
 
               for key in (
-                  "submitted_bids",
-                  "bids_submitted",
-                  "bid_candidates",
+                  "title",
+                  "task_title",
+                  "taskTitle",
+                  "name",
               ):
-                  value = act15_memory.get(key)
+                  value = obj.get(key)
+                  if value:
+                      return str(value)
 
-                  if isinstance(value, list):
-                      candidates.extend(value)
+              task = obj.get("task")
+              if isinstance(task, dict):
+                  for key in ("title", "name"):
+                      value = task.get(key)
+                      if value:
+                          return str(value)
 
-                  elif isinstance(value, dict):
-                      candidates.append(value)
+              return None
 
-              for key in (
-                  "marketplace_actions",
-                  "actions",
-                  "history",
-              ):
-                  value = act15_memory.get(key)
+          def collect_act15_candidates(memory):
+              found = []
 
-                  if isinstance(value, list):
-                      candidates.extend(value)
+              def walk(obj):
+                  if isinstance(obj, dict):
+                      task_id = extract_task_id(obj)
 
-              recovered = []
+                      if task_id:
+                          bid_id = extract_bid_id(obj)
+                          status = str(
+                              obj.get("status")
+                              or obj.get("result")
+                              or obj.get("outcome")
+                              or ""
+                          ).lower()
 
-              for item in candidates:
-                  if not isinstance(item, dict):
+                          failed_markers = (
+                              "error",
+                              "failed",
+                              "blocked",
+                              "rejected",
+                              "not_submitted",
+                          )
+
+                          if not any(marker in status for marker in failed_markers):
+                              found.append({
+                                  "task_id": task_id,
+                                  "bid_id": bid_id,
+                                  "title": extract_title(obj),
+                              })
+
+                      for value in obj.values():
+                          walk(value)
+
+                  elif isinstance(obj, list):
+                      for item in obj:
+                          walk(item)
+
+              walk(memory)
+
+              unique = []
+              seen = set()
+
+              for item in found:
+                  key = (
+                      item.get("task_id"),
+                      item.get("bid_id"),
+                  )
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  unique.append(item)
+
+              return unique
+
+          def flatten_strings(obj, path=""):
+              values = []
+
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      child_path = f"{path}.{key}" if path else str(key)
+                      values.extend(flatten_strings(value, child_path))
+
+              elif isinstance(obj, list):
+                  for index, value in enumerate(obj):
+                      child_path = f"{path}[{index}]"
+                      values.extend(flatten_strings(value, child_path))
+
+              elif isinstance(obj, (str, int)):
+                  values.append((path, str(obj)))
+
+              return values
+
+          def normalize_identity(value):
+              if value is None:
+                  return ""
+
+              value = str(value).strip().lower()
+
+              if value.startswith("@"):
+                  value = value[1:]
+
+              return value
+
+          def identity_matches(value, identity_values):
+              normalized = normalize_identity(value)
+
+              if not normalized:
+                  return False
+
+              for candidate in identity_values:
+                  candidate_normalized = normalize_identity(candidate)
+
+                  if not candidate_normalized:
                       continue
 
-                  task_id = extract_task_id(item)
+                  if normalized == candidate_normalized:
+                      return True
 
-                  if task_id is None:
-                      continue
+              return False
 
-                  status = str(
-                      item.get("status")
-                      or item.get("result")
-                      or ""
-                  ).lower().strip()
+          def bid_contains_nox(bid, identity_values):
+              if not isinstance(bid, dict):
+                  return False, []
 
-                  if status in {
-                      "failed",
-                      "error",
-                      "rejected",
-                      "blocked",
-                  }:
-                      continue
+              matches = []
 
-                  recovered.append({
-                      "task_id": task_id,
-                      "bid_id": extract_bid_id(item),
-                      "task_title": extract_title(item),
-                  })
+              # First inspect semantically likely identity fields.
+              identity_keys = {
+                  "username",
+                  "user_name",
+                  "userName",
+                  "handle",
+                  "agent",
+                  "agent_name",
+                  "agentName",
+                  "agent_handle",
+                  "agentHandle",
+                  "bidder",
+                  "bidder_name",
+                  "bidderName",
+                  "author",
+                  "owner",
+                  "creator",
+                  "user",
+                  "profile",
+                  "account",
+                  "identity",
+              }
 
-              unique = {}
+              def inspect(obj, path=""):
+                  if isinstance(obj, dict):
+                      for key, value in obj.items():
+                          child_path = f"{path}.{key}" if path else str(key)
 
-              for item in recovered:
-                  key = str(item["task_id"])
+                          if key in identity_keys:
+                              if isinstance(value, str):
+                                  if identity_matches(value, identity_values):
+                                      matches.append(child_path)
+                              elif isinstance(value, dict):
+                                  for nested_path, nested_value in flatten_strings(
+                                      value,
+                                      child_path,
+                                  ):
+                                      if identity_matches(
+                                          nested_value,
+                                          identity_values,
+                                      ):
+                                          matches.append(nested_path)
 
-                  if key not in unique:
-                      unique[key] = item
-                  elif (
-                      not unique[key].get("bid_id")
-                      and item.get("bid_id")
-                  ):
-                      unique[key] = item
+                          inspect(value, child_path)
 
-              return list(unique.values())
+                  elif isinstance(obj, list):
+                      for index, value in enumerate(obj):
+                          inspect(value, f"{path}[{index}]")
 
+              inspect(bid)
 
-          def locate_own_bid(bids, expected_bid_id, username):
+              # Fallback: inspect every string in the bid.
+              # This handles undocumented API nesting without assuming
+              # a particular schema.
+              if not matches:
+                  for path, value in flatten_strings(bid):
+                      if identity_matches(value, identity_values):
+                          matches.append(path)
 
+              return bool(matches), matches
+
+          def find_own_bid(bids, identity_values, expected_bid_id=None):
+              if not isinstance(bids, list):
+                  return None, []
+
+              # Exact bid ID gets priority.
               if expected_bid_id:
+                  expected = str(expected_bid_id)
+
                   for bid in bids:
                       if not isinstance(bid, dict):
                           continue
 
-                      current_bid_id = (
-                          bid.get("id")
-                          or bid.get("bid_id")
-                          or bid.get("bidId")
-                      )
+                      bid_id = extract_bid_id(bid)
 
-                      if str(current_bid_id) == str(expected_bid_id):
-                          return bid
+                      if bid_id and bid_id == expected:
+                          return bid, ["exact_bid_id"]
 
+              # Then identify NØX.
               for bid in bids:
-                  if not isinstance(bid, dict):
-                      continue
+                  matched, paths = bid_contains_nox(
+                      bid,
+                      identity_values,
+                  )
 
-                  direct_values = [
-                      bid.get("username"),
-                      bid.get("user"),
-                      bid.get("agent"),
-                      bid.get("agent_username"),
-                      bid.get("agentUsername"),
-                      bid.get("worker"),
-                      bid.get("worker_username"),
-                      bid.get("workerUsername"),
-                  ]
+                  if matched:
+                      return bid, paths
 
-                  for value in direct_values:
-
-                      if isinstance(value, str):
-                          if value.lstrip("@") == username:
-                              return bid
-
-                      elif isinstance(value, dict):
-
-                          nested_username = (
-                              value.get("username")
-                              or value.get("handle")
-                              or value.get("name")
-                          )
-
-                          if (
-                              isinstance(nested_username, str)
-                              and nested_username.lstrip("@") == username
-                          ):
-                              return bid
-
-              return None
-
-
-          print("")
-          print("================================================")
-          print("NØX ACT16 V3 - MARKETPLACE MONITOR")
-          print("================================================")
-          print("")
-          print("Schedule: every 30 minutes")
-          print("Payments: DISABLED")
-          print("Cost: €0")
-          print("")
-
-
-          # ==========================================================
-          # [1] AUTHENTICATION
-          # ==========================================================
+              return None, []
 
           print("[1] Authenticating...")
 
-          api_key = os.environ.get("COLONY_API_KEY")
-
-          if not api_key:
-              fail("COLONY_API_KEY is missing.")
-
-          auth_response = post_json(
+          auth_response = safe_post(
               f"{BASE_URL}/auth/token",
-              {"api_key": api_key},
+              {"api_key": API_KEY},
           )
+
+          if auth_response is None:
+              raise SystemExit("Authentication request failed.")
 
           print(
               f"POST /auth/token -> {auth_response.status_code}"
           )
 
           if auth_response.status_code != 200:
-              print(auth_response.text[:1500])
-              fail("Authentication failed.")
+              print(auth_response.text[:1000])
+              raise SystemExit("Authentication failed.")
 
-          try:
-              auth_data = auth_response.json()
-          except ValueError:
-              fail("Authentication response is not valid JSON.")
+          auth_data = auth_response.json()
 
-          access_token = (
+          token = (
               auth_data.get("access_token")
               or auth_data.get("token")
+              or auth_data.get("jwt")
           )
 
-          if not access_token:
-              fail(
-                  "Authentication response contains no access token."
+          if not token:
+              raise SystemExit(
+                  "Authentication succeeded but no token was returned."
               )
 
           headers = {
-              "Authorization": f"Bearer {access_token}",
+              "Authorization": f"Bearer {token}",
               "Accept": "application/json",
+              "Content-Type": "application/json",
           }
 
           print("Authentication successful.")
+          print()
 
-
-          # ==========================================================
-          # [2] IDENTITY
-          # ==========================================================
-
-          print("")
           print("[2] Checking identity...")
 
-          me_response = get_json(
+          me_response = safe_get(
               f"{BASE_URL}/users/me",
               headers=headers,
           )
+
+          if me_response is None:
+              raise SystemExit("Identity request failed.")
 
           print(
               f"GET /users/me -> {me_response.status_code}"
           )
 
           if me_response.status_code != 200:
-              print(me_response.text[:1500])
-              fail("Unable to retrieve NØX identity.")
+              print(me_response.text[:1000])
+              raise SystemExit("Identity check failed.")
 
-          try:
-              me = me_response.json()
-          except ValueError:
-              fail("Identity response is not valid JSON.")
+          me = me_response.json()
 
-          username = me.get("username", "unknown")
-          karma = me.get("karma", "unknown")
+          username = (
+              me.get("username")
+              or me.get("handle")
+              or me.get("agent_handle")
+              or me.get("name")
+          )
 
-          print(f"Authenticated agent: @{username}")
-          print(f"Karma: {karma}")
+          user_id = (
+              me.get("id")
+              or me.get("user_id")
+              or me.get("userId")
+          )
 
-          if username != "nox_origine":
-              fail(
-                  f"Unexpected authenticated agent: @{username}"
-              )
+          print(f"Authenticated agent: @{username or 'unknown'}")
+          print(f"User ID: {user_id or 'unknown'}")
+          print(f"Karma: {me.get('karma', 'unknown')}")
+          print()
 
+          identity_values = []
 
-          # ==========================================================
-          # [3] LOAD MEMORY
-          # ==========================================================
+          for value in (
+              username,
+              me.get("handle"),
+              me.get("username"),
+              me.get("agent_handle"),
+              me.get("agentHandle"),
+              user_id,
+              me.get("agent_id"),
+              me.get("agentId"),
+          ):
+              if value is not None:
+                  identity_values.append(str(value))
 
-          print("")
+          # Always include the known canonical handle.
+          identity_values.append("nox_origine")
+          identity_values.append("@nox_origine")
+
           print("[3] Loading NØX memory...")
 
-          memory = load_json_file(ROOT_MEMORY_FILE)
+          root_memory = load_json_file(ROOT_MEMORY_FILE)
+          act15_memory = load_json_file(ACT15_MEMORY_FILE)
 
-          if memory is None:
-              memory = {}
+          print()
 
-          if not isinstance(memory, dict):
-              fail("NØX root memory must be a JSON object.")
-
-
-          # ==========================================================
-          # [4] RECOVER ACT15 BID
-          # ==========================================================
-
-          print("")
           print("[4] Recovering ACT15 marketplace bid...")
 
-          latest_action = None
-
-          # ----------------------------------------------------------
-          # Legacy root memory
-          # ----------------------------------------------------------
-
-          marketplace_actions = memory.get(
-              "marketplace_actions",
-              [],
-          )
-
-          if not isinstance(marketplace_actions, list):
-              marketplace_actions = []
-
-          for action in reversed(marketplace_actions):
-
-              if not isinstance(action, dict):
-                  continue
-
-              if action.get("action") != "marketplace_bid":
-                  continue
-
-              if action.get("status") != "submitted":
-                  continue
-
-              if not action.get("task_id"):
-                  continue
-
-              latest_action = {
-                  "task_id": action.get("task_id"),
-                  "bid_id": action.get("bid_id"),
-                  "task_title": action.get(
-                      "task_title",
-                      "Untitled",
-                  ),
-                  "source": "ROOT_MEMORY",
-              }
-
-              if action.get("bid_id"):
-                  break
-
-
-          # ----------------------------------------------------------
-          # ACT15 V7.1 memory
-          # ----------------------------------------------------------
-
-          act15_memory = load_json_file(
-              ACT15_MEMORY_FILE
-          )
-
-          if act15_memory is not None:
-
+          if os.path.exists(ACT15_MEMORY_FILE):
               print(
                   f"ACT15 memory found: {ACT15_MEMORY_FILE}"
               )
+          else:
+              print("ACT15 memory file not found.")
 
-              act15_candidates = (
-                  collect_act15_submitted_bids(
-                      act15_memory
-                  )
-              )
+          act15_candidates = collect_act15_candidates(
+              act15_memory
+          )
 
+          print(
+              f"ACT15 candidate task IDs recovered: "
+              f"{len(act15_candidates)}"
+          )
+
+          target = (
+              act15_candidates[-1]
+              if act15_candidates
+              else None
+          )
+
+          if target is None:
               print(
-                  "ACT15 candidate task IDs recovered: "
-                  f"{len(act15_candidates)}"
+                  "No ACT15 marketplace candidate was recovered."
               )
 
-              if act15_candidates:
+              observation = {
+                  "timestamp": now_iso(),
+                  "action": "marketplace_observation",
+                  "source": "ACT16_V4",
+                  "result": "NO_BID_TO_MONITOR",
+                  "task_id": None,
+                  "bid_id": None,
+                  "task_status": None,
+                  "bid_status": "NO_BID_TO_MONITOR",
+                  "payment_checked": False,
+                  "payment_action": "none",
+                  "gemini_used": False,
+                  "project_cost_eur": 0,
+              }
 
-                  selected = act15_candidates[-1]
+              if not isinstance(root_memory, dict):
+                  root_memory = {}
 
-                  latest_action = {
-                      "task_id": selected.get("task_id"),
-                      "bid_id": selected.get("bid_id"),
-                      "task_title": selected.get(
-                          "task_title",
-                          "Untitled",
-                      ),
-                      "source": "ACT15_MEMORY",
-                  }
-
-
-          if latest_action is None:
-
-              print(
-                  "No ACT15 marketplace bid could be recovered."
-              )
-
-              print(
-                  "No marketplace state will be assumed."
-              )
-
-              timestamp = now()
-
-              observations = memory.get(
+              observations = root_memory.setdefault(
                   "marketplace_observations",
                   [],
               )
 
               if not isinstance(observations, list):
                   observations = []
+                  root_memory["marketplace_observations"] = observations
 
-              observations.append({
-                  "timestamp": timestamp,
-                  "act": "ACT16",
-                  "result": "NO_BID_TO_MONITOR",
-              })
-
-              memory["marketplace_observations"] = (
-                  observations[-50:]
-              )
-
-              memory["marketplace_monitor"] = {
-                  "last_checked_at": timestamp,
-                  "result": "NO_BID_TO_MONITOR",
-              }
-
-              learning = memory.get("learning", {})
-
-              if not isinstance(learning, dict):
-                  learning = {}
-
-              learning[
-                  "last_marketplace_result"
-              ] = "no_bid_to_monitor"
-
-              memory["learning"] = learning
+              observations.append(observation)
 
               with open(
                   ROOT_MEMORY_FILE,
@@ -517,500 +543,416 @@ jobs:
                   encoding="utf-8",
               ) as f:
                   json.dump(
-                      memory,
+                      root_memory,
                       f,
-                      indent=2,
                       ensure_ascii=False,
+                      indent=2,
                   )
-                  f.write("\n")
 
-              print("")
-              print("ACT16 completed: nothing to monitor.")
+              print("Heartbeat observation saved.")
+              raise SystemExit(0)
 
-              sys.exit(0)
+          task_id = target["task_id"]
+          expected_bid_id = target.get("bid_id")
+          title = target.get("title") or "Unknown task"
 
+          print(f"Recovered task: {title}")
+          print(f"Task ID: {task_id}")
 
-          task_id = latest_action["task_id"]
-          bid_id = latest_action.get("bid_id")
-          task_title = latest_action.get(
-              "task_title",
-              "Untitled",
-          )
-
-          print(
-              f"Recovered task: {task_title}"
-          )
-
-          print(
-              f"Task ID: {task_id}"
-          )
-
-          if bid_id:
-              print(
-                  f"Known Bid ID: {bid_id}"
-              )
+          if expected_bid_id:
+              print(f"Stored bid ID: {expected_bid_id}")
           else:
-              print(
-                  "Bid ID not stored by ACT15."
-              )
-
+              print("Bid ID not stored by ACT15.")
               print(
                   "ACT16 will recover it from Marketplace."
               )
 
+          print()
 
-          # ==========================================================
-          # [5] REFRESH MARKETPLACE
-          # ==========================================================
-
-          print("")
           print("[5] Refreshing Marketplace...")
 
-          tasks_response = get_json(
-              f"{BASE_URL}/marketplace/tasks",
+          marketplace_response = safe_get(
+              f"{BASE_URL}/marketplace/tasks?limit=30",
               headers=headers,
           )
 
-          print(
-              "GET /marketplace/tasks -> "
-              f"{tasks_response.status_code}"
-          )
-
-          if tasks_response.status_code != 200:
-              print(tasks_response.text[:1500])
-              fail("Unable to refresh Marketplace.")
-
-          try:
-              tasks_data = tasks_response.json()
-          except ValueError:
-              fail(
-                  "Marketplace tasks response "
-                  "is not valid JSON."
-              )
-
-          if isinstance(tasks_data, list):
-              tasks = tasks_data
-
-          elif isinstance(tasks_data, dict):
-              tasks = (
-                  tasks_data.get("tasks")
-                  or tasks_data.get("items")
-                  or tasks_data.get("data")
-                  or []
-              )
-
-          else:
+          if marketplace_response is None:
+              print("Marketplace refresh failed.")
               tasks = []
+          else:
+              print(
+                  "GET /marketplace/tasks -> "
+                  f"{marketplace_response.status_code}"
+              )
 
-          selected_task = None
+              if marketplace_response.status_code == 200:
+                  marketplace_data = marketplace_response.json()
+
+                  if isinstance(marketplace_data, dict):
+                      tasks = marketplace_data.get("items", [])
+                  elif isinstance(marketplace_data, list):
+                      tasks = marketplace_data
+                  else:
+                      tasks = []
+              else:
+                  tasks = []
+
+          task_in_listing = None
 
           for task in tasks:
-
               if not isinstance(task, dict):
                   continue
 
-              current_id = (
+              candidate_id = (
                   task.get("id")
-                  or task.get("post_id")
                   or task.get("task_id")
+                  or task.get("taskId")
               )
 
-              if str(current_id) == str(task_id):
-                  selected_task = task
+              if candidate_id and str(candidate_id) == str(task_id):
+                  task_in_listing = task
                   break
 
-          if selected_task:
-
-              task_status = (
-                  selected_task.get("status")
-                  or selected_task.get("state")
-              )
-
-              current_title = selected_task.get(
-                  "title",
-                  task_title,
-              )
-
-              print(
-                  f"Task found: {current_title}"
-              )
-
-              print(
-                  f"Task status: {task_status}"
-              )
-
+          if task_in_listing:
+              print("Task found in current Marketplace listing.")
           else:
-
-              task_status = None
-
               print(
                   "Task not present in current Marketplace listing."
               )
-
               print(
                   "The bid endpoint will be checked directly."
               )
 
+          print()
 
-          # ==========================================================
-          # [6] READ BIDS
-          # ==========================================================
-
-          print("")
           print("[6] Checking Marketplace bids...")
 
-          bids_response = get_json(
+          bids_response = safe_get(
               f"{BASE_URL}/marketplace/{task_id}/bids",
               headers=headers,
           )
 
+          if bids_response is None:
+              raise SystemExit(
+                  "Marketplace bids request failed."
+              )
+
           print(
-              f"GET /marketplace/{task_id}/bids "
-              f"-> {bids_response.status_code}"
+              f"GET /marketplace/{task_id}/bids -> "
+              f"{bids_response.status_code}"
           )
 
           if bids_response.status_code != 200:
               print(bids_response.text[:1500])
-              fail(
-                  "Unable to retrieve Marketplace bids."
+
+              observation = {
+                  "timestamp": now_iso(),
+                  "action": "marketplace_observation",
+                  "source": "ACT16_V4",
+                  "result": "BIDS_ENDPOINT_ERROR",
+                  "task_id": task_id,
+                  "bid_id": expected_bid_id,
+                  "task_title": title,
+                  "task_status": (
+                      task_in_listing.get("status")
+                      if task_in_listing
+                      else None
+                  ),
+                  "bid_status": "BIDS_ENDPOINT_ERROR",
+                  "payment_checked": False,
+                  "payment_action": "none",
+                  "gemini_used": False,
+                  "project_cost_eur": 0,
+              }
+
+              root_memory.setdefault(
+                  "marketplace_observations",
+                  [],
+              ).append(observation)
+
+              with open(
+                  ROOT_MEMORY_FILE,
+                  "w",
+                  encoding="utf-8",
+              ) as f:
+                  json.dump(
+                      root_memory,
+                      f,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+
+              raise SystemExit(
+                  "ACT16 could not read Marketplace bids."
               )
 
-          try:
-              bids_data = bids_response.json()
-          except ValueError:
-              fail(
-                  "Marketplace bids response "
-                  "is not valid JSON."
-              )
+          bids_data = bids_response.json()
 
-          if isinstance(bids_data, list):
-              bids = bids_data
-
-          elif isinstance(bids_data, dict):
+          if isinstance(bids_data, dict):
               bids = (
-                  bids_data.get("bids")
-                  or bids_data.get("items")
+                  bids_data.get("items")
+                  or bids_data.get("bids")
                   or bids_data.get("data")
                   or []
               )
-
+          elif isinstance(bids_data, list):
+              bids = bids_data
           else:
               bids = []
 
-          print(
-              f"Total bids returned: {len(bids)}"
-          )
+          if not isinstance(bids, list):
+              bids = []
 
+          print(f"Total bids returned: {len(bids)}")
+          print()
 
-          # ==========================================================
-          # [7] LOCATE NØX BID
-          # ==========================================================
-
-          print("")
           print("[7] Locating NØX bid...")
 
-          own_bid = locate_own_bid(
+          own_bid, match_paths = find_own_bid(
               bids,
-              bid_id,
-              username,
+              identity_values,
+              expected_bid_id=expected_bid_id,
           )
 
-          if own_bid is None:
+          bid_id = None
+          bid_status_raw = None
+          bid_status = "BID_NOT_RETURNED"
 
+          if own_bid:
+              bid_id = extract_bid_id(own_bid)
+
+              for key in (
+                  "status",
+                  "state",
+                  "bid_status",
+                  "bidStatus",
+              ):
+                  if own_bid.get(key) is not None:
+                      bid_status_raw = own_bid.get(key)
+                      break
+
+              normalized_status = str(
+                  bid_status_raw or ""
+              ).strip().lower()
+
+              if normalized_status in {
+                  "accepted",
+                  "approved",
+                  "won",
+                  "selected",
+              }:
+                  bid_status = "ACCEPTED"
+
+              elif normalized_status in {
+                  "rejected",
+                  "declined",
+                  "lost",
+                  "denied",
+              }:
+                  bid_status = "REJECTED"
+
+              elif normalized_status in {
+                  "pending",
+                  "submitted",
+                  "active",
+                  "bidding",
+                  "open",
+                  "under_review",
+                  "review",
+              }:
+                  bid_status = "PENDING"
+
+              elif normalized_status:
+                  bid_status = normalized_status.upper()
+
+              else:
+                  bid_status = "UNKNOWN_BID_STATUS"
+
+              print("NØX bid FOUND.")
+              print(f"Bid ID: {bid_id}")
+              print(f"Bid status: {bid_status}")
+              print(
+                  "Identity match path(s): "
+                  + ", ".join(match_paths[:10])
+              )
+
+          else:
               print(
                   "NØX bid was not found in the returned bid list."
               )
-
               print(
                   "No rejection or acceptance will be assumed."
               )
 
-              observation_status = "BID_NOT_RETURNED"
+              # Diagnostic output is deliberately limited to keys
+              # and compact scalar identity-like values. Secrets are
+              # never printed.
+              print()
+              print("[7A] Bid schema diagnostic...")
 
+              for index, bid in enumerate(bids[:8], start=1):
+                  if not isinstance(bid, dict):
+                      print(
+                          f"Bid #{index}: non-dict response"
+                      )
+                      continue
+
+                  print(
+                      f"Bid #{index} top-level keys: "
+                      f"{sorted(str(k) for k in bid.keys())}"
+                  )
+
+                  identity_like = []
+
+                  for path, value in flatten_strings(bid):
+                      low_path = path.lower()
+
+                      if any(
+                          marker in low_path
+                          for marker in (
+                              "user",
+                              "agent",
+                              "bidder",
+                              "author",
+                              "owner",
+                              "creator",
+                              "handle",
+                              "username",
+                              "profile",
+                              "account",
+                              "identity",
+                          )
+                      ):
+                          identity_like.append(
+                              f"{path}={value[:120]}"
+                          )
+
+                  for item in identity_like[:15]:
+                      print(f"  {item}")
+
+              print()
+
+          print()
+
+          print("[8] Determining Marketplace result...")
+
+          task_status = None
+
+          if task_in_listing:
+              task_status = (
+                  task_in_listing.get("status")
+                  or task_in_listing.get("state")
+                  or task_in_listing.get("task_status")
+              )
+
+          if bid_status == "ACCEPTED":
+              detected_result = "BID_ACCEPTED"
+          elif bid_status == "REJECTED":
+              detected_result = "BID_REJECTED"
+          elif bid_status == "PENDING":
+              detected_result = "BID_PENDING"
+          elif own_bid:
+              detected_result = "BID_STATUS_UNKNOWN"
           else:
+              detected_result = "BID_NOT_RETURNED"
 
-              recovered_bid_id = (
-                  own_bid.get("id")
-                  or own_bid.get("bid_id")
-                  or own_bid.get("bidId")
-              )
+          print(f"Task status: {task_status}")
+          print(f"Bid status: {bid_status}")
+          print(f"Detected result: {detected_result}")
+          print()
 
-              if recovered_bid_id:
-                  bid_id = recovered_bid_id
+          print("[9] Payment check...")
 
-              observation_status = (
-                  own_bid.get("status")
-                  or own_bid.get("state")
-                  or "UNKNOWN"
-              )
+          payment_checked = False
+          payment_info = None
 
+          if bid_status == "ACCEPTED":
               print(
-                  f"NØX bid ID: {bid_id}"
+                  "Bid accepted/selected. "
+                  "Checking payment information only."
               )
 
-              print(
-                  f"NØX bid status: {observation_status}"
-              )
+              payment_checked = True
 
-              if own_bid.get("amount") is not None:
-                  print(
-                      f"Bid amount: {own_bid.get('amount')}"
-                  )
-
-              if own_bid.get("created_at"):
-                  print(
-                      f"Bid created: {own_bid.get('created_at')}"
-                  )
-
-              if own_bid.get("updated_at"):
-                  print(
-                      f"Bid updated: {own_bid.get('updated_at')}"
-                  )
-
-
-          # ==========================================================
-          # [8] NORMALIZE RESULT
-          # ==========================================================
-
-          normalized_status = str(
-              observation_status
-          ).lower().strip()
-
-          if normalized_status in {
-              "accepted",
-              "accept",
-              "approved",
-          }:
-
-              result_category = "ACCEPTED"
-
-          elif normalized_status in {
-              "rejected",
-              "reject",
-              "declined",
-          }:
-
-              result_category = "REJECTED"
-
-          elif normalized_status in {
-              "pending",
-              "open",
-              "submitted",
-              "bidding",
-          }:
-
-              result_category = "PENDING"
-
-          elif normalized_status == "bid_not_returned":
-
-              result_category = "BID_NOT_RETURNED"
-
-          else:
-
-              result_category = "UNKNOWN"
-
-
-          print("")
-          print("Detected result:")
-          print(
-              f"Result category: {result_category}"
-          )
-
-
-          # ==========================================================
-          # [9] PAYMENT INFORMATION
-          #
-          # INFORMATION ONLY.
-          # NO PAYMENT ACTION.
-          # ==========================================================
-
-          payment_status = None
-
-          if result_category == "ACCEPTED":
-
-              print("")
-              print(
-                  "[9] Bid accepted - checking payment information..."
-              )
-
-              payment_response = get_json(
+              payment_candidates = [
                   f"{BASE_URL}/marketplace/{task_id}/payment",
-                  headers=headers,
-              )
+                  f"{BASE_URL}/marketplace/{task_id}/payout",
+              ]
+
+              for payment_url in payment_candidates:
+                  payment_response = safe_get(
+                      payment_url,
+                      headers=headers,
+                  )
+
+                  if payment_response is None:
+                      continue
+
+                  if payment_response.status_code == 200:
+                      try:
+                          payment_info = payment_response.json()
+                      except Exception:
+                          payment_info = {
+                              "raw": payment_response.text[:1000]
+                          }
+                      break
 
               print(
-                  f"GET /marketplace/{task_id}/payment "
-                  f"-> {payment_response.status_code}"
+                  "Payment information may be recorded, "
+                  "but NO payment action will be performed."
               )
-
-              if payment_response.status_code == 200:
-
-                  try:
-                      payment_info = payment_response.json()
-                  except ValueError:
-                      payment_info = None
-
-                      print(
-                          "Payment response is not valid JSON."
-                      )
-
-                  if isinstance(payment_info, dict):
-
-                      payment_status = (
-                          payment_info.get("status")
-                          or payment_info.get("payment_status")
-                          or payment_info.get("state")
-                      )
-
-                  print(
-                      "Payment information retrieved."
-                  )
-
-                  if payment_status:
-                      print(
-                          f"Payment status: {payment_status}"
-                      )
-
-              else:
-
-                  print(
-                      "Payment information is not available."
-                  )
-
-                  print(
-                      "No payment state will be invented."
-                  )
-
           else:
+              print("Payment check not required.")
 
-              print("")
-              print("[9] Payment check not required.")
+          print("No payment action will be performed.")
+          print()
 
-              print(
-                  "No payment action will be performed."
-              )
-
-
-          # ==========================================================
-          # [10] BUILD OBSERVATION
-          # ==========================================================
-
-          print("")
-          print(
-              "[10] Recording Marketplace observation..."
-          )
-
-          timestamp = now()
+          print("[10] Recording Marketplace observation...")
 
           observation = {
-              "timestamp": timestamp,
-              "act": "ACT16",
+              "timestamp": now_iso(),
+              "action": "marketplace_observation",
+              "source": "ACT16_V4",
+              "result": detected_result,
               "task_id": task_id,
               "bid_id": bid_id,
-              "task_title": task_title,
+              "task_title": title,
               "task_status": task_status,
-              "bid_status": observation_status,
-              "result": result_category,
-              "payment_status": payment_status,
+              "bid_status": bid_status,
+              "bid_status_raw": bid_status_raw,
+              "total_bids_returned": len(bids),
+              "identity_match_paths": match_paths[:10],
+              "payment_checked": payment_checked,
+              "payment_action": "none",
+              "payment_info_observed": (
+                  payment_info is not None
+              ),
+              "gemini_used": False,
+              "project_cost_eur": 0,
           }
 
-          history = memory.get(
+          observations = root_memory.setdefault(
               "marketplace_observations",
               [],
           )
 
-          if not isinstance(history, list):
-              history = []
+          if not isinstance(observations, list):
+              observations = []
+              root_memory["marketplace_observations"] = observations
 
-          history.append(observation)
+          observations.append(observation)
 
-          memory["marketplace_observations"] = (
-              history[-50:]
+          # Keep memory bounded.
+          if len(observations) > 500:
+              root_memory["marketplace_observations"] = (
+                  observations[-500:]
+              )
+
+          root_memory["act16_last_marketplace_observation"] = (
+              observation
           )
 
-
-          # ==========================================================
-          # [11] CURRENT MARKETPLACE STATE
-          # ==========================================================
-
-          memory["marketplace_monitor"] = {
-              "last_checked_at": timestamp,
-              "task_id": task_id,
-              "bid_id": bid_id,
-              "task_title": task_title,
-              "task_status": task_status,
-              "bid_status": observation_status,
-              "result": result_category,
-              "payment_status": payment_status,
-          }
-
-
-          # ==========================================================
-          # [12] LEARNING STATE
-          # ==========================================================
-
-          learning = memory.get(
-              "learning",
-              {},
-          )
-
-          if not isinstance(learning, dict):
-              learning = {}
-
-          if result_category == "ACCEPTED":
-
-              learning[
-                  "last_marketplace_result"
-              ] = "accepted"
-
-              learning[
-                  "marketplace_acceptance_observed"
-              ] = True
-
-              learning[
-                  "last_marketplace_acceptance_at"
-              ] = timestamp
-
-          elif result_category == "REJECTED":
-
-              learning[
-                  "last_marketplace_result"
-              ] = "rejected"
-
-              learning[
-                  "marketplace_rejection_observed"
-              ] = True
-
-              learning[
-                  "last_marketplace_rejection_at"
-              ] = timestamp
-
-          elif result_category == "PENDING":
-
-              learning[
-                  "last_marketplace_result"
-              ] = "pending"
-
-          elif result_category == "BID_NOT_RETURNED":
-
-              learning[
-                  "last_marketplace_result"
-              ] = "bid_not_returned"
-
-          else:
-
-              learning[
-                  "last_marketplace_result"
-              ] = result_category.lower()
-
-          memory["learning"] = learning
-
-
-          # ==========================================================
-          # [13] SAVE MEMORY
-          # ==========================================================
-
-          print("")
+          print()
           print("[13] Saving memory...")
 
           with open(
@@ -1019,130 +961,82 @@ jobs:
               encoding="utf-8",
           ) as f:
               json.dump(
-                  memory,
+                  root_memory,
                   f,
-                  indent=2,
                   ensure_ascii=False,
+                  indent=2,
               )
-              f.write("\n")
 
-          print(
-              f"Memory saved: {ROOT_MEMORY_FILE}"
-          )
+          print(f"Memory saved: {ROOT_MEMORY_FILE}")
 
+          print()
+          print("=" * 48)
+          print("NØX ACT16 V4 RESULT")
+          print("=" * 48)
+          print(f"Task ID: {task_id}")
+          print(f"Bid ID: {bid_id}")
+          print(f"Task status: {task_status}")
+          print(f"Bid status: {bid_status}")
+          print(f"Detected result: {detected_result}")
+          print()
 
-          # ==========================================================
-          # [14] FINAL RESULT
-          # ==========================================================
-
-          print("")
-          print("================================================")
-          print("NØX ACT16 V3 RESULT")
-          print("================================================")
-
-          print(
-              f"Task ID: {task_id}"
-          )
-
-          print(
-              f"Bid ID: {bid_id}"
-          )
-
-          print(
-              f"Task status: {task_status}"
-          )
-
-          print(
-              f"Bid status: {observation_status}"
-          )
-
-          print(
-              f"Detected result: {result_category}"
-          )
-
-          if result_category == "PENDING":
-
-              print("")
-              print("NØX BID IS STILL PENDING.")
-              print("No action was taken.")
-
-          elif result_category == "ACCEPTED":
-
-              print("")
-              print("NØX BID HAS BEEN ACCEPTED.")
-              print("Payment information was checked.")
-              print("No payment was sent or withdrawn.")
-
-          elif result_category == "REJECTED":
-
-              print("")
+          if bid_status == "ACCEPTED":
+              print("NØX BID WAS ACCEPTED.")
+              print("No payment action was performed.")
+          elif bid_status == "REJECTED":
               print("NØX BID WAS REJECTED.")
-              print(
-                  "The result was recorded for learning."
-              )
-
-          elif result_category == "BID_NOT_RETURNED":
-
-              print("")
+          elif bid_status == "PENDING":
+              print("NØX BID IS STILL PENDING.")
+          elif bid_status == "BID_NOT_RETURNED":
               print("NØX BID WAS NOT RETURNED.")
               print(
                   "No rejection or acceptance was assumed."
               )
-
           else:
+              print(
+                  "NØX BID STATUS COULD NOT BE FULLY CLASSIFIED."
+              )
 
-              print("")
-              print("NØX BID STATE IS UNKNOWN.")
-              print("No action was taken.")
-
-          print("")
+          print()
           print("ACT16 COMPLETED.")
 
           PY
 
-      # ==========================================================
-      # COMMIT MEMORY
-      # ==========================================================
-
-      - name: Commit ACT16 observation
-        if: always()
-        shell: bash
+      - name: Commit and push ACT16 memory
         run: |
           set -euo pipefail
 
-          git config user.name 'NØX Origin'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
 
           git add nox_memory.json
 
           if git diff --cached --quiet; then
-            printf '%s\n' 'No memory changes to commit.'
+            echo "No ACT16 memory changes to commit."
             exit 0
           fi
 
-          git commit -m 'NØX ACT16: marketplace observation'
+          git commit -m "NØX ACT16: marketplace observation"
 
-          printf '%s\n' 'Synchronizing local main with remote main...'
+          echo "Synchronizing local main with remote main..."
 
           for attempt in 1 2 3; do
-            printf 'Synchronization attempt %s...\n' "$attempt"
+            echo "Synchronization attempt ${attempt}..."
 
             git fetch origin main
-
-            if ! git rebase origin/main; then
-              printf '%s\n' 'Rebase conflict detected.'
-              git rebase --abort || true
-              exit 1
-            fi
+            git rebase origin/main
 
             if git push origin HEAD:main; then
-              printf '%s\n' 'ACT16 memory successfully pushed.'
+              echo "ACT16 memory successfully pushed."
               exit 0
             fi
 
-            printf '%s\n' 'Push rejected. Retrying...'
-            sleep 3
+            echo "Push failed on attempt ${attempt}."
+
+            if [ "${attempt}" -lt 3 ]; then
+              sleep 3
+            fi
           done
 
-          printf '%s\n' 'ERROR: unable to push ACT16 memory.'
+          echo "Unable to push ACT16 memory after 3 attempts."
           exit 1
