@@ -12,18 +12,18 @@ concurrency:
   group: nox-act15-autonomous-bidding
   cancel-in-progress: false
 
+env:
+  COLONY_BASE_URL: https://thecolony.ai/api/v1
+  MEMORY_FILE: memory/nox_act_15_marketplace.json
+  MAX_TASKS: "30"
+  MAX_MEMORY_ACTIONS: "500"
+  ACTION_DELAY_SECONDS: "1"
+  FALLBACK_SATS_PER_USD: "60000"
+
 jobs:
   nox-act15:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    env:
-      COLONY_BASE_URL: https://thecolony.ai/api/v1
-      MEMORY_FILE: memory/nox_act_15_marketplace.json
-      MAX_TASKS: "30"
-      MAX_MEMORY_ACTIONS: "500"
-      ACTION_DELAY_SECONDS: "1"
-      FALLBACK_SATS_PER_USD: "60000"
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -41,30 +41,28 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Run NØX ACT15 Marketplace Action
+      - name: Run ACT15 Marketplace Action
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           python - <<'PY'
-          import json
           import os
           import re
+          import json
           import time
-          from datetime import datetime, timezone
+          import subprocess
           from pathlib import Path
+          from datetime import datetime, timezone
 
           import requests
 
-          BASE_URL = os.environ["COLONY_BASE_URL"].rstrip("/")
-          API_KEY = os.environ.get("COLONY_API_KEY", "")
+          BASE_URL = os.environ["COLONY_BASE_URL"]
+          API_KEY = os.environ["COLONY_API_KEY"]
           MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
           MAX_TASKS = int(os.environ["MAX_TASKS"])
           MAX_MEMORY_ACTIONS = int(os.environ["MAX_MEMORY_ACTIONS"])
-          DELAY = float(os.environ["ACTION_DELAY_SECONDS"])
-          SATS_PER_USD = int(os.environ["FALLBACK_SATS_PER_USD"])
-
-          if not API_KEY:
-              raise SystemExit("COLONY_API_KEY is missing")
+          ACTION_DELAY_SECONDS = float(os.environ["ACTION_DELAY_SECONDS"])
+          FALLBACK_SATS_PER_USD = int(os.environ["FALLBACK_SATS_PER_USD"])
 
           session = requests.Session()
           session.headers.update({
@@ -72,416 +70,622 @@ jobs:
               "Content-Type": "application/json",
           })
 
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
+          print("========== NØX ACT15 V7.1 - Marketplace Action ==========")
 
-          def normalize_text(value):
+          # ------------------------------------------------------------
+          # Authentication
+          # ------------------------------------------------------------
+          print("[ACT15] Requesting Colony authentication token...")
+
+          auth = session.post(
+              f"{BASE_URL}/auth/token",
+              json={"api_key": API_KEY},
+              timeout=20,
+          )
+
+          print(f"[ACT15] Auth status: {auth.status_code}")
+
+          if auth.status_code != 200:
+              try:
+                  print(auth.json())
+              except Exception:
+                  print(auth.text[:1000])
+              raise SystemExit(1)
+
+          auth_data = auth.json()
+          token = auth_data.get("access_token") or auth_data.get("token")
+
+          if not token:
+              raise RuntimeError("Authentication token missing.")
+
+          session.headers.update({
+              "Authorization": f"Bearer {token}"
+          })
+
+          # ------------------------------------------------------------
+          # Identity
+          # ------------------------------------------------------------
+          me = session.get(
+              f"{BASE_URL}/users/me",
+              timeout=20,
+          )
+
+          print(f"[ACT15] Identity status: {me.status_code}")
+
+          if me.status_code != 200:
+              try:
+                  print(me.json())
+              except Exception:
+                  print(me.text[:1000])
+              raise SystemExit(1)
+
+          me_data = me.json()
+
+          identity = (
+              me_data.get("handle")
+              or me_data.get("username")
+              or me_data.get("name")
+              or me_data.get("user", {}).get("handle")
+              or me_data.get("user", {}).get("username")
+          )
+
+          karma = (
+              me_data.get("karma")
+              or me_data.get("user", {}).get("karma")
+          )
+
+          print(f"[ACT15] Identity: @{identity}" if identity and not str(identity).startswith("@") else f"[ACT15] Identity: {identity}")
+
+          if karma is not None:
+              print(f"[ACT15] Karma: {karma}")
+
+          # ------------------------------------------------------------
+          # Marketplace
+          # ------------------------------------------------------------
+          marketplace = session.get(
+              f"{BASE_URL}/marketplace/tasks?limit={MAX_TASKS}",
+              timeout=30,
+          )
+
+          print(f"[ACT15] Marketplace status: {marketplace.status_code}")
+
+          if marketplace.status_code != 200:
+              try:
+                  print(marketplace.json())
+              except Exception:
+                  print(marketplace.text[:2000])
+              raise SystemExit(1)
+
+          marketplace_data = marketplace.json()
+
+          if isinstance(marketplace_data, dict):
+              tasks = (
+                  marketplace_data.get("items")
+                  or marketplace_data.get("tasks")
+                  or marketplace_data.get("results")
+                  or marketplace_data.get("data")
+                  or []
+              )
+          elif isinstance(marketplace_data, list):
+              tasks = marketplace_data
+          else:
+              tasks = []
+
+          if not isinstance(tasks, list):
+              tasks = []
+
+          tasks = tasks[:MAX_TASKS]
+
+          print(f"[ACT15] Tasks seen: {len(tasks)}")
+
+          # ------------------------------------------------------------
+          # Open task filter
+          # ------------------------------------------------------------
+          open_tasks = []
+
+          for task in tasks:
+              if not isinstance(task, dict):
+                  continue
+
+              status = str(
+                  task.get("status")
+                  or task.get("state")
+                  or "open"
+              ).lower().strip()
+
+              # IMPORTANT:
+              # The Colony currently uses "bidding" for marketplace
+              # tasks that are still available for bids.
+              if status in {
+                  "open",
+                  "active",
+                  "available",
+                  "published",
+                  "pending",
+                  "bidding",
+              }:
+                  open_tasks.append(task)
+
+          print(f"[ACT15] Open tasks: {len(open_tasks)}")
+
+          # ------------------------------------------------------------
+          # Helpers
+          # ------------------------------------------------------------
+          def clean_text(value):
+              return str(value or "").replace("\n", " ").strip()
+
+          def parse_number(value):
               if value is None:
-                  return ""
-
-              text = str(value)
-
-              replacements = {
-                  "\u2010": "-",
-                  "\u2011": "-",
-                  "\u2012": "-",
-                  "\u2013": "-",
-                  "\u2014": "-",
-                  "\u2212": "-",
-                  "\u00a0": " ",
-                  "\u202f": " ",
-              }
-
-              for old, new in replacements.items():
-                  text = text.replace(old, new)
-
-              return re.sub(r"\s+", " ", text).strip()
-
-          def parse_number(raw):
-              """
-              Robustly parse:
-              155,000
-              2,500
-              5
-              0.50
-              0,50
-              1 500
-              """
-
-              if raw is None:
                   return None
 
-              value = normalize_text(raw)
-              value = value.replace(" ", "")
+              text = str(value).strip()
+              text = text.replace("\u00a0", " ")
 
-              if not value:
+              if not text:
                   return None
 
-              if value.startswith("-"):
+              text = re.sub(r"[^\d,.\-]", "", text)
+
+              if not text:
                   return None
 
-              if "," in value and "." in value:
-                  if value.rfind(",") > value.rfind("."):
-                      value = value.replace(".", "")
-                      value = value.replace(",", ".")
+              if "," in text and "." in text:
+                  if text.rfind(",") > text.rfind("."):
+                      text = text.replace(".", "").replace(",", ".")
                   else:
-                      value = value.replace(",", "")
+                      text = text.replace(",", "")
+              elif "," in text:
+                  parts = text.split(",")
 
-              elif "," in value:
-                  parts = value.split(",")
-
-                  if (
-                      len(parts) == 2
-                      and len(parts[1]) == 3
-                      and len(parts[0]) >= 1
-                  ):
-                      value = "".join(parts)
+                  if len(parts) == 2 and len(parts[1]) <= 2:
+                      text = text.replace(",", ".")
                   else:
-                      value = value.replace(",", ".")
-
-              elif value.count(".") > 1:
-                  value = value.replace(".", "")
+                      text = text.replace(",", "")
 
               try:
-                  number = float(value)
+                  return float(text)
               except ValueError:
                   return None
-
-              if number < 0:
-                  return None
-
-              return number
-
-          def numeric_to_int(value):
-              if value is None:
-                  return None
-
-              return max(0, int(round(value)))
-
-          def structured_reward(task):
-              candidates = [
-                  task.get("reward_sats"),
-                  task.get("rewardSats"),
-                  task.get("budget_sats"),
-                  task.get("budgetSats"),
-              ]
-
-              for value in candidates:
-                  if isinstance(value, (int, float)) and value > 0:
-                      return {
-                          "reward_sats": int(round(value)),
-                          "source": "structured",
-                      }
-
-              return None
 
           def parse_reward(task):
               """
               Returns:
-                status: PAID / UNKNOWN_REWARD / UNPAID
-                reward_sats: positive integer or None
-                source: parser source or None
+                reward_sats
+                reward_source
+                reward_state
               """
 
-              structured = structured_reward(task)
-
-              if structured:
-                  return {
-                      "status": "PAID",
-                      **structured,
-                  }
-
-              title = normalize_text(task.get("title", ""))
-              description = normalize_text(task.get("description", ""))
-              text = normalize_text(f"{title} {description}")
-
-              negative_currency = re.search(
-                  r"(?i)(?<![\w])-\s*\$?\s*"
-                  r"(\d(?:[\d\s,]*\d)?(?:[.,]\d+)?)\s*"
-                  r"(?:usdc|usd)\b",
-                  text,
-              )
-
-              negative_sats = re.search(
-                  r"(?i)(?<![\w])-\s*"
-                  r"(\d(?:[\d\s,]*\d)?(?:[.,]\d+)?)\s*"
-                  r"(?:sats?|sat(?:oshis)?)\b",
-                  text,
-              )
-
-              sats_pattern = re.compile(
-                  r"(?i)(?<![\w-])\+?\s*"
-                  r"(?P<amount>\d(?:[\d\s,]*\d)?(?:[.,]\d+)?)"
-                  r"\s*(?:sats?|sat(?:oshis)?)\b"
-              )
-
-              for match in sats_pattern.finditer(text):
-                  amount = parse_number(match.group("amount"))
-
-                  if amount is not None and amount > 0:
-                      return {
-                          "status": "PAID",
-                          "reward_sats": numeric_to_int(amount),
-                          "source": "text_sats",
-                      }
-
-              currency_after = re.compile(
-                  r"(?i)(?<![\w-])\+?\s*\$?\s*"
-                  r"(?P<amount>\d(?:[\d\s,]*\d)?(?:[.,]\d+)?)"
-                  r"\s*(?P<currency>usdc|usd)\b"
-              )
-
-              for match in currency_after.finditer(text):
-                  amount = parse_number(match.group("amount"))
-
-                  if amount is not None and amount > 0:
-                      return {
-                          "status": "PAID",
-                          "reward_sats": numeric_to_int(
-                              amount * SATS_PER_USD
-                          ),
-                          "source": "text_usd_usdc",
-                      }
-
-              currency_before = re.compile(
-                  r"(?i)\b(?:usdc|usd)\b"
-                  r"[^0-9\-]{0,40}"
-                  r"\$?\s*"
-                  r"(?P<amount>\d(?:[\d\s,]*\d)?(?:[.,]\d+)?)"
-              )
-
-              for match in currency_before.finditer(text):
-                  amount = parse_number(match.group("amount"))
-
-                  if amount is not None and amount > 0:
-                      return {
-                          "status": "PAID",
-                          "reward_sats": numeric_to_int(
-                              amount * SATS_PER_USD
-                          ),
-                          "source": "currency_before_amount",
-                      }
-
-              reward_signals = [
-                  r"\bpaid\b",
-                  r"\bpayment\b",
-                  r"\bpayout\b",
-                  r"\breward\b",
-                  r"\bbudget\b",
-                  r"\bbounty\b",
-                  r"\bbonus\b",
-                  r"\btips?\b",
-                  r"\busdc\b",
-                  r"\busd\b",
-                  r"\bsats?\b",
-                  r"\bsatoshi(?:s)?\b",
-                  r"\blightning\b",
-                  r"\$\s*\d",
+              structured_fields = [
+                  "reward_sats",
+                  "rewardSats",
+                  "budget_sats",
+                  "budgetSats",
               ]
 
-              if (
-                  negative_currency
-                  or negative_sats
-                  or any(
-                      re.search(pattern, text, re.I)
-                      for pattern in reward_signals
-                  )
-              ):
-                  return {
-                      "status": "UNKNOWN_REWARD",
-                      "reward_sats": None,
-                      "source": None,
-                  }
+              for field in structured_fields:
+                  if field in task and task.get(field) is not None:
+                      value = parse_number(task.get(field))
 
-              return {
-                  "status": "UNPAID",
-                  "reward_sats": None,
-                  "source": None,
+                      if value is not None and value > 0:
+                          return int(round(value)), f"field:{field}", "PAID"
+
+              title = clean_text(task.get("title"))
+              body = clean_text(
+                  task.get("body")
+                  or task.get("description")
+                  or task.get("summary")
+                  or ""
+              )
+
+              text = f"{title} {body}"
+
+              # --------------------------------------------------------
+              # Negative reward must never become a positive reward.
+              # --------------------------------------------------------
+              negative_currency = re.search(
+                  r"[-]\s*\$?\s*[\d.,]+\s*(?:USDC|USD|sats?|satoshis?)",
+                  text,
+                  flags=re.I,
+              )
+
+              if negative_currency:
+                  return None, "negative_reward", "UNKNOWN_REWARD"
+
+              negative_sats = re.search(
+                  r"[-]\s*[\d.,]+\s*(?:sats?|satoshis?)",
+                  text,
+                  flags=re.I,
+              )
+
+              if negative_sats:
+                  return None, "negative_reward", "UNKNOWN_REWARD"
+
+              # --------------------------------------------------------
+              # Satoshis
+              # --------------------------------------------------------
+              sats_patterns = [
+                  r"([\d][\d,.\s]*)\s*(?:sats?|satoshis?)\b",
+                  r"\b(?:sats?|satoshis?)\s*[:=]\s*([\d][\d,.\s]*)",
+              ]
+
+              for pattern in sats_patterns:
+                  match = re.search(pattern, text, flags=re.I)
+
+                  if match:
+                      value = parse_number(match.group(1))
+
+                      if value is not None and value > 0:
+                          return int(round(value)), "text_sats", "PAID"
+
+              # --------------------------------------------------------
+              # USD / USDC
+              # --------------------------------------------------------
+              currency_patterns = [
+                  r"\$\s*([\d][\d,.\s]*)\s*(?:USDC|USD)\b",
+                  r"\b([\d][\d,.\s]*)\s*(?:USDC|USD)\b",
+                  r"\b(?:USDC|USD)\s*\$?\s*([\d][\d,.\s]*)",
+              ]
+
+              for pattern in currency_patterns:
+                  matches = re.finditer(pattern, text, flags=re.I)
+
+                  for match in matches:
+                      value = parse_number(match.group(1))
+
+                      if value is None or value <= 0:
+                          continue
+
+                      sats = int(round(value * FALLBACK_SATS_PER_USD))
+
+                      if sats > 0:
+                          return sats, "text_usd_usdc", "PAID"
+
+              # --------------------------------------------------------
+              # "Base USDC from $0.25" and similar constructions.
+              # --------------------------------------------------------
+              base_pattern = re.search(
+                  r"(?:USDC|USD).*?\$\s*([\d][\d,.\s]*)",
+                  text,
+                  flags=re.I,
+              )
+
+              if base_pattern:
+                  value = parse_number(base_pattern.group(1))
+
+                  if value is not None and value > 0:
+                      sats = int(round(value * FALLBACK_SATS_PER_USD))
+                      return sats, "text_currency_base", "PAID"
+
+              # --------------------------------------------------------
+              # Reward signals without a numeric value.
+              # --------------------------------------------------------
+              reward_signals = [
+                  "paid",
+                  "payment",
+                  "reward",
+                  "tip",
+                  "tips",
+                  "bounty",
+                  "lightning payment",
+                  "lightning",
+                  "usdc",
+                  "usd",
+                  "sats",
+                  "satoshi",
+                  "per task",
+                  "for hire",
+              ]
+
+              if any(signal in text.lower() for signal in reward_signals):
+                  return None, "reward_signal_without_numeric_value", "UNKNOWN_REWARD"
+
+              return None, "no_reward_signal", "UNPAID"
+
+          def capability_score(text):
+              keywords = [
+                  "python",
+                  "javascript",
+                  "js",
+                  "api",
+                  "automation",
+                  "coding",
+                  "programming",
+                  "data",
+                  "data analysis",
+                  "data extraction",
+                  "web scraping",
+                  "scraping",
+                  "research",
+                  "security",
+                  "cybersecurity",
+                  "qa",
+                  "testing",
+                  "audit",
+                  "technical",
+              ]
+
+              score = 0
+
+              lower = text.lower()
+
+              for keyword in keywords:
+                  if keyword in lower:
+                      score += 4
+
+              return min(score, 40)
+
+          def domain_score(text):
+              lower = text.lower()
+
+              domains = {
+                  "virtual_economy": [
+                      "economy",
+                      "marketplace",
+                      "payment",
+                      "sats",
+                      "lightning",
+                      "usdc",
+                      "bounty",
+                      "reward",
+                  ],
+                  "cybersecurity": [
+                      "security",
+                      "cybersecurity",
+                      "audit",
+                      "vulnerability",
+                      "pentest",
+                      "authentication",
+                      "api security",
+                  ],
+                  "ai_communities": [
+                      "agent",
+                      "ai",
+                      "community",
+                      "collaboration",
+                      "exchange",
+                      "colony",
+                  ],
+                  "agent_intelligence_autonomy": [
+                      "autonomous",
+                      "autonomy",
+                      "agent",
+                      "reasoning",
+                      "learning",
+                      "decision",
+                      "intelligence",
+                  ],
+                  "emerging_tech": [
+                      "automation",
+                      "blockchain",
+                      "protocol",
+                      "emerging",
+                      "technology",
+                      "llm",
+                  ],
               }
 
-          CAPABILITY_KEYWORDS = {
-              "python": 8,
-              "api": 8,
-              "automation": 8,
-              "research": 7,
-              "data": 7,
-              "analysis": 7,
-              "qa": 6,
-              "testing": 6,
-              "smoke test": 6,
-              "scraping": 7,
-              "web": 5,
-              "json": 5,
-              "csv": 5,
-              "seo": 5,
-              "audit": 7,
-              "copywriting": 5,
-              "documentation": 6,
-              "scripts": 7,
-              "database": 6,
-              "source checks": 7,
-          }
+              weights = {
+                  "virtual_economy": 25,
+                  "cybersecurity": 20,
+                  "ai_communities": 20,
+                  "agent_intelligence_autonomy": 20,
+                  "emerging_tech": 15,
+              }
 
-          DOMAIN_KEYWORDS = {
-              "virtual economy": 15,
-              "marketplace": 12,
-              "payments": 8,
-              "lightning": 10,
-              "bitcoin": 8,
-              "cybersecurity": 15,
-              "security": 12,
-              "ai community": 12,
-              "ai communities": 12,
-              "ai agents": 15,
-              "agent": 10,
-              "autonomy": 15,
-              "automation": 8,
-              "emerging tech": 10,
-              "technology": 7,
-              "regulation": 10,
-              "law": 8,
-              "policy": 8,
-          }
-
-          LEARNING_KEYWORDS = {
-              "learn": 10,
-              "learning": 10,
-              "experiment": 9,
-              "test": 8,
-              "testing": 8,
-              "proof": 8,
-              "research": 8,
-              "new": 6,
-              "challenge": 8,
-              "build": 7,
-              "prototype": 8,
-              "feedback": 8,
-              "collaboration": 10,
-              "community": 7,
-          }
-
-          TIP_KEYWORDS_HIGH = {
-              "tip": 10,
-              "tips": 10,
-              "bonus": 9,
-              "bounty": 9,
-              "reward for helpful": 10,
-              "reward for help": 10,
-              "donation": 8,
-              "gratuity": 8,
-          }
-
-          TIP_KEYWORDS_MEDIUM = {
-              "future work": 7,
-              "long-term": 7,
-              "long term": 7,
-              "recurring": 7,
-              "referral": 6,
-              "collaboration": 6,
-              "help wanted": 6,
-              "community": 5,
-              "relationship": 7,
-              "partner": 6,
-              "support": 5,
-          }
-
-          BLOCKED_TERMS = [
-              "weapon",
-              "weapons",
-              "explosive",
-              "explosives",
-              "malware",
-              "ransomware",
-              "credential theft",
-              "phishing",
-              "stolen account",
-              "fraud",
-              "money laundering",
-              "illegal drugs",
-          ]
-
-          def score_keywords(text, keywords, cap):
               score = 0
-              hits = []
 
+              for domain, keywords in domains.items():
+                  if any(keyword in lower for keyword in keywords):
+                      score += weights[domain] * 0.2
+
+              return min(round(score), 25)
+
+          def learning_score(text):
               lower = text.lower()
 
-              for keyword, points in keywords.items():
-                  if keyword.lower() in lower:
-                      score += points
-                      hits.append(keyword)
+              keywords = [
+                  "learn",
+                  "learning",
+                  "research",
+                  "analysis",
+                  "experiment",
+                  "testing",
+                  "test",
+                  "proof",
+                  "documentation",
+                  "knowledge",
+                  "experience",
+                  "benchmark",
+                  "audit",
+              ]
 
-              return min(score, cap), hits
+              score = 0
+
+              for keyword in keywords:
+                  if keyword in lower:
+                      score += 4
+
+              return min(score, 25)
 
           def tip_score(text):
+              lower = text.lower()
+
+              high = [
+                  "tip",
+                  "tips",
+                  "bonus",
+                  "bounty",
+                  "reward",
+                  "sats",
+                  "lightning",
+              ]
+
+              medium = [
+                  "reputation",
+                  "referral",
+                  "future work",
+                  "ongoing work",
+                  "long-term",
+                  "relationship",
+                  "community",
+              ]
+
               score = 0
-              hits = []
 
-              lower = text.lower()
+              for keyword in high:
+                  if keyword in lower:
+                      score += 3
 
-              for keyword, points in TIP_KEYWORDS_HIGH.items():
-                  if keyword.lower() in lower:
-                      score += points
-                      hits.append(keyword)
+              for keyword in medium:
+                  if keyword in lower:
+                      score += 2
 
-              for keyword, points in TIP_KEYWORDS_MEDIUM.items():
-                  if keyword.lower() in lower:
-                      score += points
-                      hits.append(keyword)
+              return min(score, 15)
 
-              return min(score, 15), hits
+          def economic_score(reward_sats):
+              if not reward_sats:
+                  return 0
 
-          def is_blocked(text):
-              lower = text.lower()
+              if reward_sats >= 300000:
+                  return 10
 
-              for term in BLOCKED_TERMS:
-                  if term in lower:
-                      return True, term
+              if reward_sats >= 100000:
+                  return 8
 
-              return False, None
+              if reward_sats >= 30000:
+                  return 6
 
-          def score_task(task, reward):
-              title = normalize_text(task.get("title", ""))
-              description = normalize_text(task.get("description", ""))
-              text = normalize_text(f"{title} {description}")
+              if reward_sats >= 10000:
+                  return 4
 
-              capability, capability_hits = score_keywords(
-                  text,
-                  CAPABILITY_KEYWORDS,
-                  40,
+              if reward_sats >= 1000:
+                  return 2
+
+              return 1
+
+          # ------------------------------------------------------------
+          # Existing bid detection
+          # ------------------------------------------------------------
+          def already_bid(task):
+              direct_fields = [
+                  "my_bid",
+                  "myBid",
+                  "has_bid",
+                  "hasBid",
+                  "already_bid",
+                  "alreadyBid",
+              ]
+
+              for field in direct_fields:
+                  value = task.get(field)
+
+                  if value is True:
+                      return True
+
+                  if isinstance(value, dict):
+                      return True
+
+              task_id = (
+                  task.get("id")
+                  or task.get("task_id")
+                  or task.get("taskId")
               )
 
-              learning, learning_hits = score_keywords(
-                  text,
-                  LEARNING_KEYWORDS,
-                  25,
-              )
+              if not task_id:
+                  return False
 
-              domain, domain_hits = score_keywords(
-                  text,
-                  DOMAIN_KEYWORDS,
-                  25,
-              )
+              try:
+                  response = session.get(
+                      f"{BASE_URL}/marketplace/{task_id}/bids",
+                      timeout=20,
+                  )
 
-              tips, tip_hits = tip_score(text)
+                  if response.status_code != 200:
+                      return False
 
-              economic = 0
+                  data = response.json()
 
-              if reward["reward_sats"] is not None:
-                  sats = reward["reward_sats"]
-
-                  if sats >= 100000:
-                      economic = 15
-                  elif sats >= 50000:
-                      economic = 12
-                  elif sats >= 10000:
-                      economic = 10
-                  elif sats >= 1000:
-                      economic = 7
+                  if isinstance(data, dict):
+                      bids = (
+                          data.get("items")
+                          or data.get("bids")
+                          or data.get("results")
+                          or data.get("data")
+                          or []
+                      )
+                  elif isinstance(data, list):
+                      bids = data
                   else:
-                      economic = 4
+                      bids = []
 
-              opportunity_score = round(
+                  if not isinstance(bids, list):
+                      return False
+
+                  for bid in bids:
+                      if not isinstance(bid, dict):
+                          continue
+
+                      candidate_values = [
+                          bid.get("handle"),
+                          bid.get("username"),
+                          bid.get("user_handle"),
+                          bid.get("userHandle"),
+                          bid.get("agent_handle"),
+                          bid.get("agentHandle"),
+                      ]
+
+                      nested = bid.get("user") or bid.get("agent")
+
+                      if isinstance(nested, dict):
+                          candidate_values.extend([
+                              nested.get("handle"),
+                              nested.get("username"),
+                          ])
+
+                      for value in candidate_values:
+                          if value is None:
+                              continue
+
+                          value = str(value).lstrip("@").lower()
+
+                          if value == str(identity).lstrip("@").lower():
+                              return True
+
+              except Exception:
+                  pass
+
+              return False
+
+          # ------------------------------------------------------------
+          # Analyse opportunities
+          # ------------------------------------------------------------
+          paid_candidates = []
+          unknown_candidates = []
+          learning_candidates = []
+          tip_opportunities = []
+          high_value_learning = []
+          already_bid_count = 0
+
+          for task in open_tasks:
+              title = clean_text(task.get("title"))
+              body = clean_text(
+                  task.get("body")
+                  or task.get("description")
+                  or task.get("summary")
+                  or ""
+              )
+
+              combined = f"{title} {body}"
+
+              reward_sats, reward_source, reward_state = parse_reward(task)
+
+              capability = capability_score(combined)
+              learning = learning_score(combined)
+              domain = domain_score(combined)
+              tips = tip_score(combined)
+              economic = economic_score(reward_sats)
+
+              opportunity = round(
                   capability * 0.35
                   + learning * 0.20
                   + domain * 0.20
@@ -490,418 +694,56 @@ jobs:
                   2,
               )
 
-              return {
+              record = {
+                  "task_id": task.get("id") or task.get("task_id") or task.get("taskId"),
+                  "title": title,
+                  "status": task.get("status"),
+                  "reward_sats": reward_sats,
+                  "reward_source": reward_source,
+                  "reward_state": reward_state,
                   "capability_score": capability,
                   "learning_score": learning,
                   "domain_score": domain,
                   "tip_score": tips,
                   "economic_score": economic,
-                  "opportunity_score": opportunity_score,
-                  "capability_hits": capability_hits,
-                  "learning_hits": learning_hits,
-                  "domain_hits": domain_hits,
-                  "tip_hits": tip_hits,
+                  "opportunity_score": opportunity,
               }
 
-          print("[ACT15] Requesting Colony authentication token...")
+              if reward_state == "PAID":
+                  paid_candidates.append(record)
 
-          auth_response = session.post(
-              f"{BASE_URL}/auth/token",
-              json={"api_key": API_KEY},
-              timeout=30,
-          )
-
-          print(f"[ACT15] Auth status: {auth_response.status_code}")
-
-          if auth_response.status_code != 200:
-              try:
-                  print("[ACT15] Auth response:", auth_response.json())
-              except Exception:
-                  print(
-                      "[ACT15] Auth response:",
-                      auth_response.text[:1000],
-                  )
-
-              raise SystemExit("Authentication failed")
-
-          auth_data = auth_response.json()
-
-          token = (
-              auth_data.get("access_token")
-              or auth_data.get("token")
-          )
-
-          if not token:
-              raise SystemExit(
-                  "Authentication succeeded but no JWT token was returned"
-              )
-
-          session.headers.update({
-              "Authorization": f"Bearer {token}"
-          })
-
-          me_response = session.get(
-              f"{BASE_URL}/users/me",
-              timeout=30,
-          )
-
-          print(f"[ACT15] Identity status: {me_response.status_code}")
-
-          if me_response.status_code != 200:
-              try:
-                  print("[ACT15] Identity response:", me_response.json())
-              except Exception:
-                  print(
-                      "[ACT15] Identity response:",
-                      me_response.text[:1000],
-                  )
-
-              raise SystemExit("Identity lookup failed")
-
-          me = me_response.json()
-
-          username = (
-              me.get("username")
-              or me.get("handle")
-              or me.get("agent_username")
-              or me.get("agent_handle")
-              or "unknown"
-          )
-
-          user_id = (
-              me.get("id")
-              or me.get("user_id")
-              or me.get("agent_id")
-          )
-
-          print(f"[ACT15] Identity: @{username}")
-
-          karma = me.get("karma")
-
-          if karma is not None:
-              print(f"[ACT15] Karma: {karma}")
-
-          marketplace_response = session.get(
-              f"{BASE_URL}/marketplace/tasks?limit={MAX_TASKS}",
-              timeout=30,
-          )
-
-          print(
-              f"[ACT15] Marketplace status: "
-              f"{marketplace_response.status_code}"
-          )
-
-          if marketplace_response.status_code != 200:
-              try:
-                  print(
-                      "[ACT15] Marketplace response:",
-                      marketplace_response.json(),
-                  )
-              except Exception:
-                  print(
-                      "[ACT15] Marketplace response:",
-                      marketplace_response.text[:1000],
-                  )
-
-              raise SystemExit("Marketplace lookup failed")
-
-          marketplace_data = marketplace_response.json()
-
-          if isinstance(marketplace_data, list):
-              tasks = marketplace_data
-          elif isinstance(marketplace_data, dict):
-              tasks = (
-                  marketplace_data.get("tasks")
-                  or marketplace_data.get("items")
-                  or marketplace_data.get("data")
-                  or []
-              )
-          else:
-              tasks = []
-
-          tasks = tasks[:MAX_TASKS]
-
-          open_tasks = []
-
-          for task in tasks:
-              status = str(
-                  task.get("status")
-                  or task.get("state")
-                  or "open"
-              ).lower()
-
-              if status in {
-                  "open",
-                  "active",
-                  "available",
-                  "published",
-                  "pending",
-              }:
-                  open_tasks.append(task)
-
-          print(f"[ACT15] Tasks seen: {len(tasks)}")
-          print(f"[ACT15] Open tasks: {len(open_tasks)}")
-
-          memory = {}
-
-          if MEMORY_FILE.exists():
-              try:
-                  memory = json.loads(
-                      MEMORY_FILE.read_text(encoding="utf-8")
-                  )
-              except Exception as exc:
-                  print(
-                      f"[ACT15] Existing memory could not be parsed: {exc}"
-                  )
-                  memory = {}
-
-          existing_bid_task_ids = set()
-
-          def add_possible_bid_identity(value, identities):
-              if value is None:
-                  return
-
-              if isinstance(value, (str, int)):
-                  identities.add(str(value).lower())
-                  return
-
-              if isinstance(value, dict):
-                  for key in [
-                      "id",
-                      "user_id",
-                      "agent_id",
-                      "username",
-                      "handle",
-                      "agent_username",
-                      "agent_handle",
-                  ]:
-                      if value.get(key) is not None:
-                          identities.add(
-                              str(value[key]).lower()
-                          )
-
-          my_identities = {
-              str(username).lower(),
-          }
-
-          if user_id is not None:
-              my_identities.add(str(user_id).lower())
-
-          def bid_belongs_to_nox(bid):
-              identities = set()
-
-              for key in [
-                  "id",
-                  "user_id",
-                  "agent_id",
-                  "username",
-                  "handle",
-                  "agent_username",
-                  "agent_handle",
-              ]:
-                  add_possible_bid_identity(
-                      bid.get(key),
-                      identities,
-                  )
-
-              for nested_key in [
-                  "user",
-                  "agent",
-                  "bidder",
-                  "worker",
-                  "author",
-                  "owner",
-              ]:
-                  nested = bid.get(nested_key)
-
-                  if isinstance(nested, dict):
-                      add_possible_bid_identity(
-                          nested,
-                          identities,
-                      )
-                  elif nested is not None:
-                      add_possible_bid_identity(
-                          nested,
-                          identities,
-                      )
-
-              return bool(identities & my_identities)
-
-          analyzed = []
-          paid_candidates = []
-          learning_candidates = []
-          unknown_candidates = []
-          blocked_candidates = []
-
-          for task in open_tasks:
-              task_id = (
-                  task.get("id")
-                  or task.get("task_id")
-                  or task.get("taskId")
-              )
-
-              if task_id is None:
-                  continue
-
-              task_id = str(task_id)
-
-              title = normalize_text(task.get("title", ""))
-              description = normalize_text(
-                  task.get("description", "")
-              )
-
-              text = normalize_text(
-                  f"{title} {description}"
-              )
-
-              reward = parse_reward(task)
-
-              scores = score_task(
-                  task,
-                  reward,
-              )
-
-              blocked, blocked_term = is_blocked(text)
-
-              task_record = {
-                  "task_id": task_id,
-                  "title": title,
-                  "reward_status": reward["status"],
-                  "reward_sats": reward["reward_sats"],
-                  "reward_source": reward["source"],
-                  **scores,
-                  "blocked": blocked,
-                  "blocked_term": blocked_term,
-              }
-
-              analyzed.append(task_record)
-
-              if blocked:
-                  blocked_candidates.append(task_record)
-                  continue
-
-              if reward["status"] == "PAID":
-                  paid_candidates.append(task_record)
-
-              elif reward["status"] == "UNKNOWN_REWARD":
-                  unknown_candidates.append(task_record)
+              elif reward_state == "UNKNOWN_REWARD":
+                  unknown_candidates.append(record)
 
               else:
-                  learning_candidates.append(task_record)
+                  learning_candidates.append(record)
 
-          print(
-              f"[ACT15] Paid candidates: "
-              f"{len(paid_candidates)}"
-          )
+              if tips >= 5:
+                  tip_opportunities.append(record)
 
-          print(
-              f"[ACT15] Unknown-reward opportunities: "
-              f"{len(unknown_candidates)}"
-          )
+              if learning >= 10 or capability >= 16:
+                  high_value_learning.append(record)
 
-          print(
-              f"[ACT15] Learning/unpaid opportunities: "
-              f"{len(learning_candidates)}"
-          )
+              if already_bid(task):
+                  already_bid_count += 1
 
-          print(
-              f"[ACT15] Blocked: "
-              f"{len(blocked_candidates)}"
-          )
+          print(f"[ACT15] Paid candidates: {len(paid_candidates)}")
+          print(f"[ACT15] Unknown-reward opportunities: {len(unknown_candidates)}")
+          print(f"[ACT15] Learning/unpaid opportunities: {len(learning_candidates)}")
+          print(f"[ACT15] Tip opportunities: {len(tip_opportunities)}")
+          print(f"[ACT15] High-value learning: {len(high_value_learning)}")
+          print(f"[ACT15] Already bid: {already_bid_count}")
 
-          for record in paid_candidates:
-              task_id = record["task_id"]
-
-              task = next(
-                  (
-                      t for t in open_tasks
-                      if str(
-                          t.get("id")
-                          or t.get("task_id")
-                          or t.get("taskId")
-                      ) == task_id
-                  ),
-                  None,
-              )
-
-              if task:
-                  for key in [
-                      "my_bid",
-                      "myBid",
-                      "has_bid",
-                      "hasBid",
-                      "already_bid",
-                      "alreadyBid",
-                  ]:
-                      value = task.get(key)
-
-                      if value is True:
-                          existing_bid_task_ids.add(task_id)
-
-                      if (
-                          isinstance(value, dict)
-                          and bid_belongs_to_nox(value)
-                      ):
-                          existing_bid_task_ids.add(task_id)
-
-              try:
-                  bids_response = session.get(
-                      f"{BASE_URL}/marketplace/{task_id}/bids",
-                      timeout=30,
-                  )
-
-                  if bids_response.status_code == 200:
-                      bids_data = bids_response.json()
-
-                      if isinstance(bids_data, list):
-                          bids = bids_data
-                      elif isinstance(bids_data, dict):
-                          bids = (
-                              bids_data.get("bids")
-                              or bids_data.get("items")
-                              or bids_data.get("data")
-                              or []
-                          )
-                      else:
-                          bids = []
-
-                      for bid in bids:
-                          if (
-                              isinstance(bid, dict)
-                              and bid_belongs_to_nox(bid)
-                          ):
-                              existing_bid_task_ids.add(task_id)
-                              break
-
-                  else:
-                      print(
-                          f"[ACT15] Bid lookup for {task_id}: "
-                          f"{bids_response.status_code}"
-                      )
-
-              except Exception as exc:
-                  print(
-                      f"[ACT15] Bid lookup error for "
-                      f"{task_id}: {exc}"
-                  )
-
-          print(
-              f"[ACT15] Already bid: "
-              f"{len(existing_bid_task_ids)}"
-          )
-
+          # ------------------------------------------------------------
+          # Capability-first selection
+          # ------------------------------------------------------------
           bid_candidates = []
 
-          for record in paid_candidates:
-              task_id = record["task_id"]
-
-              if task_id in existing_bid_task_ids:
-                  continue
-
-              capability = record["capability_score"]
-              opportunity = record["opportunity_score"]
-              tips = record["tip_score"]
-              learning = record["learning_score"]
+          for candidate in paid_candidates:
+              capability = candidate["capability_score"]
+              opportunity = candidate["opportunity_score"]
+              tips = candidate["tip_score"]
+              learning = candidate["learning_score"]
 
               bid_ready = (
                   capability >= 8
@@ -913,61 +755,40 @@ jobs:
               )
 
               if bid_ready:
-                  bid_candidates.append(record)
+                  bid_candidates.append(candidate)
 
-          bid_candidates.sort(
-              key=lambda item: (
-                  item["capability_score"],
-                  item["opportunity_score"],
-                  item["tip_score"],
-                  item["reward_sats"] or 0,
-              ),
-              reverse=True,
-          )
+          print(f"[ACT15] Bid candidates: {len(bid_candidates)}")
 
-          submitted = []
-          bid_errors = []
+          # ------------------------------------------------------------
+          # Submit bids
+          # ------------------------------------------------------------
+          bids_submitted = 0
+          bid_errors = 0
+          blocked = 0
 
-          for record in bid_candidates:
-              task_id = record["task_id"]
-              reward_sats = record["reward_sats"]
+          for candidate in bid_candidates:
+              task_id = candidate["task_id"]
+              reward_sats = candidate["reward_sats"]
 
-              if not reward_sats or reward_sats <= 0:
+              if not task_id or not reward_sats:
                   continue
 
-              # Technical API minimum only.
-              # This is NOT an opportunity filter.
-              bid_amount = max(
-                  1,
-                  int(round(reward_sats * 0.20))
-              )
+              # Technical minimum only.
+              # This is NOT an opportunity-selection threshold.
+              bid_amount = max(1, round(reward_sats * 0.20))
+              bid_amount = min(bid_amount, reward_sats)
 
-              bid_amount = min(
-                  bid_amount,
-                  reward_sats,
-              )
-
-              bid_description = (
-                  "NØX can contribute to this task using "
-                  "Python/API automation, research, data analysis, "
-                  "testing or related technical work. "
-                  "NØX is also interested in producing verifiable "
-                  "results and learning from the task."
+              description = (
+                  "NØX can handle this task using autonomous "
+                  "research, coding, API, automation, analysis, "
+                  "or verification capabilities as appropriate. "
+                  "Deliverables can be provided with clear proof."
               )
 
               payload = {
                   "bid_amount_sats": bid_amount,
-                  "bid_description": bid_description,
+                  "bid_description": description,
               }
-
-              print(
-                  f"[ACT15] Bidding: {record['title']} | "
-                  f"reward={reward_sats} sats | "
-                  f"bid={bid_amount} sats | "
-                  f"capability={record['capability_score']} | "
-                  f"opportunity={record['opportunity_score']} | "
-                  f"tips={record['tip_score']}"
-              )
 
               try:
                   response = session.post(
@@ -977,344 +798,225 @@ jobs:
                   )
 
                   if response.status_code in (200, 201):
+                      bids_submitted += 1
+
                       print(
-                          f"[ACT15] Bid submitted successfully "
-                          f"for {task_id}"
+                          f"[ACT15] Bid submitted: "
+                          f"{candidate['title'][:100]} "
+                          f"({bid_amount} sats)"
                       )
-
-                      submitted.append({
-                          **record,
-                          "bid_amount_sats": bid_amount,
-                          "submitted_at": now_iso(),
-                          "status": "submitted",
-                      })
-
-                      existing_bid_task_ids.add(task_id)
 
                   elif response.status_code == 409:
+                      already_bid_count += 1
+
                       print(
-                          f"[ACT15] 409 conflict for {task_id}; "
-                          f"treating as already bid."
+                          f"[ACT15] Bid conflict/already submitted: "
+                          f"{candidate['title'][:100]}"
                       )
 
-                      existing_bid_task_ids.add(task_id)
+                  elif response.status_code in (401, 403):
+                      blocked += 1
 
-                      bid_errors.append({
-                          **record,
-                          "status": "already_bid_or_conflict",
-                          "http_status": 409,
-                          "response": response.text[:1000],
-                          "timestamp": now_iso(),
-                      })
+                      print(
+                          f"[ACT15] Bid blocked ({response.status_code}): "
+                          f"{candidate['title'][:100]}"
+                      )
 
                   else:
+                      bid_errors += 1
+
                       try:
                           detail = response.json()
                       except Exception:
                           detail = response.text[:1000]
 
                       print(
-                          f"[ACT15] Bid error for {task_id}: "
-                          f"{response.status_code} | {detail}"
+                          f"[ACT15] Bid error {response.status_code}: "
+                          f"{candidate['title'][:100]}"
                       )
-
-                      bid_errors.append({
-                          **record,
-                          "status": "error",
-                          "http_status": response.status_code,
-                          "response": detail,
-                          "timestamp": now_iso(),
-                      })
+                      print(f"[ACT15] Response: {detail}")
 
               except Exception as exc:
+                  bid_errors += 1
                   print(
                       f"[ACT15] Bid exception for "
-                      f"{task_id}: {exc}"
+                      f"{candidate['title'][:100]}: {exc}"
                   )
 
-                  bid_errors.append({
-                      **record,
-                      "status": "exception",
-                      "response": str(exc),
-                      "timestamp": now_iso(),
-                  })
+              time.sleep(ACTION_DELAY_SECONDS)
 
-              time.sleep(DELAY)
+          # ------------------------------------------------------------
+          # Memory
+          # ------------------------------------------------------------
+          MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-          tip_opportunities = [
-              item for item in analyzed
-              if not item["blocked"]
-              and item["tip_score"] >= 5
-          ]
-
-          high_value_learning = [
-              item for item in learning_candidates
-              if (
-                  item["capability_score"] >= 8
-                  or item["learning_score"] >= 10
-                  or item["tip_score"] >= 5
-              )
-          ]
-
-          unknown_reward_opportunities = [
-              item for item in unknown_candidates
-              if (
-                  item["capability_score"] >= 8
-                  or item["tip_score"] >= 5
-                  or item["learning_score"] >= 10
-              )
-          ]
-
-          previous_actions = memory.get("actions", [])
-
-          if not isinstance(previous_actions, list):
-              previous_actions = []
-
-          action_entry = {
-              "timestamp": now_iso(),
-              "workflow": "ACT15_V7_1",
-              "identity": username,
+          memory = {
+              "workflow": "ACT15_V7.1",
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "identity": identity,
               "karma": karma,
               "tasks_seen": len(tasks),
               "open_tasks": len(open_tasks),
-              "paid_candidates": len(paid_candidates),
-              "unknown_reward_candidates": len(
-                  unknown_candidates
-              ),
-              "learning_candidates": len(
-                  learning_candidates
-              ),
-              "tip_opportunities": len(
-                  tip_opportunities
-              ),
-              "high_value_learning_opportunities": len(
-                  high_value_learning
-              ),
-              "blocked": len(blocked_candidates),
-              "already_bid": len(
-                  existing_bid_task_ids
-              ),
-              "bid_candidates": len(
-                  bid_candidates
-              ),
-              "submitted": len(submitted),
-              "bid_errors": len(bid_errors),
-              "gemini_used": False,
-              "project_cost_eur": 0,
-          }
-
-          previous_actions.append(action_entry)
-          previous_actions = previous_actions[
-              -MAX_MEMORY_ACTIONS:
-          ]
-
-          memory = {
-              "agent": "NØX",
-              "workflow": "ACT15_V7_1",
-              "updated_at": now_iso(),
-              "gemini_used": False,
-              "project_cost_eur": 0,
-              "marketplace_mode": "opportunity_hunting",
-
+              "paid_candidates": paid_candidates,
+              "unknown_reward_opportunities": unknown_candidates,
+              "learning_unpaid_opportunities": learning_candidates,
+              "tip_opportunities": tip_opportunities,
+              "high_value_learning": high_value_learning,
+              "bid_candidates": bid_candidates,
+              "bids_submitted": bids_submitted,
+              "bid_errors": bid_errors,
+              "blocked": blocked,
+              "already_bid": already_bid_count,
               "policy": {
-                  "unpaid_tasks_are_valid_opportunities": True,
-                  "unpaid_tasks_can_generate_learning": True,
-                  "unpaid_tasks_can_generate_reputation": True,
-                  "unpaid_tasks_can_generate_relationships": True,
-                  "unpaid_tasks_can_generate_tips": True,
-                  "unpaid_tasks_can_generate_future_opportunities": True,
-
-                  "unknown_reward_is_not_assumed_paid": True,
-                  "unknown_reward_is_not_assumed_unpaid": True,
-
+                  "minimum_sats_for_opportunity": 0,
+                  "minimum_sats_for_bid": 1,
+                  "minimum_sats_for_bid_is_technical_only": True,
+                  "capability_first_selection": True,
+                  "unpaid_opportunities_are_valid": True,
+                  "unknown_reward_not_assumed_paid_or_unpaid": True,
                   "tip_opportunities_must_be_detected": True,
                   "tip_potential_affects_opportunity_score": True,
-
-                  "minimum_sats_for_opportunity": 0,
-
-                  "minimum_sats_for_bid": 1,
-
                   "never_invent_reward": True,
                   "never_auto_pay": True,
                   "never_auto_spend": True,
-
-                  "capability_first_selection": True,
+                  "gemini_used": False,
+                  "project_cost_eur": 0,
               },
-
-              "domain_priorities": {
-                  "virtual_economy": 25,
-                  "cybersecurity": 20,
-                  "ai_communities": 20,
-                  "agent_intelligence_autonomy": 20,
-                  "emerging_tech": 15,
-              },
-
-              "summary": {
-                  "tasks_seen": len(tasks),
-                  "open_tasks": len(open_tasks),
-                  "paid_candidates": len(paid_candidates),
-                  "unknown_reward_candidates": len(
-                      unknown_candidates
-                  ),
-                  "learning_candidates": len(
-                      learning_candidates
-                  ),
-                  "tip_opportunities": len(
-                      tip_opportunities
-                  ),
-                  "high_value_learning_opportunities": len(
-                      high_value_learning
-                  ),
-                  "unknown_reward_opportunities": len(
-                      unknown_reward_opportunities
-                  ),
-                  "blocked": len(blocked_candidates),
-                  "already_bid": len(
-                      existing_bid_task_ids
-                  ),
-                  "bid_candidates": len(bid_candidates),
-                  "submitted": len(submitted),
-                  "bid_errors": len(bid_errors),
-              },
-
-              "paid_opportunities": sorted(
-                  paid_candidates,
-                  key=lambda x: (
-                      x["capability_score"],
-                      x["opportunity_score"],
-                      x["tip_score"],
-                  ),
-                  reverse=True,
-              ),
-
-              "unknown_reward_opportunities": sorted(
-                  unknown_candidates,
-                  key=lambda x: (
-                      x["capability_score"],
-                      x["tip_score"],
-                      x["learning_score"],
-                  ),
-                  reverse=True,
-              ),
-
-              "learning_opportunities": sorted(
-                  learning_candidates,
-                  key=lambda x: (
-                      x["capability_score"],
-                      x["tip_score"],
-                      x["learning_score"],
-                  ),
-                  reverse=True,
-              ),
-
-              "tip_opportunities": sorted(
-                  tip_opportunities,
-                  key=lambda x: (
-                      x["tip_score"],
-                      x["capability_score"],
-                      x["learning_score"],
-                  ),
-                  reverse=True,
-              )[:50],
-
-              "submitted_bids": submitted[-50:],
-              "bid_errors": bid_errors[-50:],
-              "actions": previous_actions,
           }
 
-          MEMORY_FILE.parent.mkdir(
-              parents=True,
-              exist_ok=True,
-          )
+          # Preserve history.
+          existing = []
+
+          if MEMORY_FILE.exists():
+              try:
+                  previous = json.loads(MEMORY_FILE.read_text())
+                  if isinstance(previous, dict):
+                      existing = previous.get("history", [])
+              except Exception:
+                  existing = []
+
+          if not isinstance(existing, list):
+              existing = []
+
+          history_entry = {
+              "timestamp": memory["timestamp"],
+              "tasks_seen": memory["tasks_seen"],
+              "open_tasks": memory["open_tasks"],
+              "paid_candidates": len(paid_candidates),
+              "unknown_reward_opportunities": len(unknown_candidates),
+              "learning_unpaid_opportunities": len(learning_candidates),
+              "tip_opportunities": len(tip_opportunities),
+              "high_value_learning": len(high_value_learning),
+              "bid_candidates": len(bid_candidates),
+              "bids_submitted": bids_submitted,
+              "bid_errors": bid_errors,
+              "blocked": blocked,
+              "already_bid": already_bid_count,
+          }
+
+          existing.append(history_entry)
+          existing = existing[-MAX_MEMORY_ACTIONS:]
+
+          memory["history"] = existing
 
           MEMORY_FILE.write_text(
-              json.dumps(
-                  memory,
-                  indent=2,
-                  ensure_ascii=False,
-              ),
-              encoding="utf-8",
+              json.dumps(memory, indent=2, ensure_ascii=False)
           )
 
-          print(
-              "[ACT15] Memory saved:",
-              MEMORY_FILE,
+          print(f"[ACT15] Memory saved: {MEMORY_FILE}")
+
+          # ------------------------------------------------------------
+          # Git commit / push
+          # ------------------------------------------------------------
+          subprocess.run(
+              ["git", "config", "user.name", "NØX Origin"],
+              check=True,
           )
 
-          print("")
-          print("========== ACT15 V7.1 SUMMARY ==========")
+          subprocess.run(
+              ["git", "config", "user.email", "nox-origin@users.noreply.github.com"],
+              check=True,
+          )
+
+          subprocess.run(
+              ["git", "add", str(MEMORY_FILE)],
+              check=True,
+          )
+
+          diff_check = subprocess.run(
+              ["git", "diff", "--cached", "--quiet"]
+          )
+
+          if diff_check.returncode != 0:
+              subprocess.run(
+                  [
+                      "git",
+                      "commit",
+                      "-m",
+                      "ACT15 V7.1: update marketplace memory",
+                  ],
+                  check=True,
+              )
+
+              push_success = False
+
+              for attempt in range(3):
+                  try:
+                      subprocess.run(
+                          ["git", "fetch", "origin", "main"],
+                          check=True,
+                      )
+
+                      subprocess.run(
+                          ["git", "rebase", "origin/main"],
+                          check=True,
+                      )
+
+                      subprocess.run(
+                          ["git", "push", "origin", "HEAD:main"],
+                          check=True,
+                      )
+
+                      push_success = True
+                      break
+
+                  except subprocess.CalledProcessError as exc:
+                      print(
+                          f"[ACT15] Git push attempt {attempt + 1} failed: {exc}"
+                      )
+
+                      if attempt < 2:
+                          subprocess.run(
+                              ["git", "rebase", "--abort"],
+                              check=False,
+                          )
+                          time.sleep(3)
+
+              if not push_success:
+                  raise RuntimeError(
+                      "Could not push ACT15 memory after 3 attempts."
+                  )
+
+          else:
+              print("[ACT15] No memory changes to commit.")
+
+          # ------------------------------------------------------------
+          # Summary
+          # ------------------------------------------------------------
+          print("\n========== ACT15 V7.1 SUMMARY ==========")
           print(f"Tasks seen:                 {len(tasks)}")
           print(f"Open tasks:                 {len(open_tasks)}")
           print(f"Paid candidates:            {len(paid_candidates)}")
-          print(
-              f"Unknown reward:             "
-              f"{len(unknown_candidates)}"
-          )
-          print(
-              f"Learning/unpaid:            "
-              f"{len(learning_candidates)}"
-          )
-          print(
-              f"Tip opportunities:          "
-              f"{len(tip_opportunities)}"
-          )
-          print(
-              f"High-value learning:        "
-              f"{len(high_value_learning)}"
-          )
-          print(
-              f"Already bid:                "
-              f"{len(existing_bid_task_ids)}"
-          )
-          print(
-              f"Bid candidates:             "
-              f"{len(bid_candidates)}"
-          )
-          print(
-              f"Bids submitted:             "
-              f"{len(submitted)}"
-          )
-          print(
-              f"Bid errors:                 "
-              f"{len(bid_errors)}"
-          )
-          print(
-              f"Blocked:                    "
-              f"{len(blocked_candidates)}"
-          )
+          print(f"Unknown reward:             {len(unknown_candidates)}")
+          print(f"Learning/unpaid:            {len(learning_candidates)}")
+          print(f"Tip opportunities:          {len(tip_opportunities)}")
+          print(f"High-value learning:        {len(high_value_learning)}")
+          print(f"Already bid:                {already_bid_count}")
+          print(f"Bid candidates:             {len(bid_candidates)}")
+          print(f"Bids submitted:             {bids_submitted}")
+          print(f"Bid errors:                 {bid_errors}")
+          print(f"Blocked:                    {blocked}")
           print("Gemini used:                False")
           print("Project cost:               €0")
           print("=========================================")
           PY
-
-      - name: Commit and push ACT15 memory
-        run: |
-          git config user.name "NØX Origin"
-          git config user.email "nox-origin@users.noreply.github.com"
-
-          git add memory/nox_act_15_marketplace.json
-
-          if git diff --cached --quiet; then
-            echo "No ACT15 memory changes to commit."
-            exit 0
-          fi
-
-          git commit -m "ACT15 V7.1: improve marketplace opportunity intelligence"
-
-          for attempt in 1 2 3; do
-            echo "Push attempt $attempt"
-
-            git fetch origin main
-            git rebase origin/main
-
-            if git push origin HEAD:main; then
-              echo "ACT15 memory pushed successfully."
-              exit 0
-            fi
-
-            echo "Push failed; retrying..."
-            sleep 3
-          done
-
-          echo "Unable to push ACT15 memory after 3 attempts."
-          exit 1
