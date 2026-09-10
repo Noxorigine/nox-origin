@@ -68,11 +68,13 @@ jobs:
 
 
           # ==========================================================
-          # NØX ACT16 V2
+          # NØX ACT16 V3
           # MARKETPLACE MONITOR
           #
           # Purpose:
-          # - Monitor ACT15 marketplace bids
+          # - Recover ACT15 marketplace bids
+          # - Support ACT15 V7.1 memory architecture
+          # - Recover bid IDs directly from Marketplace when needed
           # - Detect accepted / rejected / pending states
           # - Record observations
           # - Feed learning memory
@@ -85,12 +87,17 @@ jobs:
           #
           # Cost:
           # - €0
+          #
+          # IMPORTANT:
+          # - ACT15 is NOT modified by this workflow.
+          # - No payment is sent.
+          # - No spending is performed.
           # ==========================================================
 
           BASE_URL = "https://thecolony.ai/api/v1"
 
-          # ACT15 V6 uses the root memory file.
-          MEMORY_FILE = "nox_memory.json"
+          ROOT_MEMORY_FILE = "nox_memory.json"
+          ACT15_MEMORY_FILE = "memory/nox_act_15_marketplace.json"
 
           session = requests.Session()
 
@@ -151,13 +158,276 @@ jobs:
                   )
 
 
+          def load_json_file(path):
+              if not os.path.exists(path):
+                  return None
+
+              try:
+                  with open(
+                      path,
+                      "r",
+                      encoding="utf-8"
+                  ) as f:
+                      return json.load(f)
+
+              except Exception as exc:
+                  fail(
+                      f"Unable to load {path}: {exc}"
+                  )
+
+
+          def extract_task_id(item):
+              if not isinstance(item, dict):
+                  return None
+
+              value = (
+                  item.get("task_id")
+                  or item.get("taskId")
+                  or item.get("id")
+              )
+
+              if value is None:
+                  return None
+
+              return value
+
+
+          def extract_bid_id(item):
+              if not isinstance(item, dict):
+                  return None
+
+              value = (
+                  item.get("bid_id")
+                  or item.get("bidId")
+              )
+
+              if value is None:
+                  return None
+
+              return value
+
+
+          def extract_title(item):
+              if not isinstance(item, dict):
+                  return "Untitled"
+
+              return (
+                  item.get("task_title")
+                  or item.get("taskTitle")
+                  or item.get("title")
+                  or "Untitled"
+              )
+
+
+          def collect_act15_submitted_bids(act15_memory):
+              """
+              Recover submitted ACT15 bids from the current V7.1
+              memory structure without requiring ACT15 changes.
+
+              Supports:
+              - explicit submitted_bids
+              - bid_candidates
+              - bids_submitted as a list
+              - nested marketplace action structures
+              """
+
+              candidates = []
+
+              if not isinstance(act15_memory, dict):
+                  return candidates
+
+              # ------------------------------------------------------
+              # Explicit submitted bid collections.
+              # ------------------------------------------------------
+
+              for key in (
+                  "submitted_bids",
+                  "bids_submitted"
+              ):
+                  value = act15_memory.get(key)
+
+                  if isinstance(value, list):
+                      candidates.extend(value)
+
+                  elif isinstance(value, dict):
+                      candidates.append(value)
+
+              # ------------------------------------------------------
+              # Current ACT15 V7.1 candidate structure.
+              # ------------------------------------------------------
+
+              value = act15_memory.get(
+                  "bid_candidates"
+              )
+
+              if isinstance(value, list):
+                  candidates.extend(value)
+
+              # ------------------------------------------------------
+              # Generic marketplace action collection.
+              # ------------------------------------------------------
+
+              for key in (
+                  "marketplace_actions",
+                  "actions",
+                  "history"
+              ):
+                  value = act15_memory.get(key)
+
+                  if isinstance(value, list):
+                      candidates.extend(value)
+
+              # ------------------------------------------------------
+              # Extract valid task IDs.
+              # ------------------------------------------------------
+
+              recovered = []
+
+              for item in candidates:
+
+                  if not isinstance(item, dict):
+                      continue
+
+                  task_id = extract_task_id(item)
+
+                  if task_id is None:
+                      continue
+
+                  status = str(
+                      item.get("status")
+                      or item.get("result")
+                      or ""
+                  ).lower().strip()
+
+                  # Do not treat explicitly failed/rejected bid
+                  # records as active monitoring targets.
+                  if status in {
+                      "failed",
+                      "error",
+                      "rejected",
+                      "blocked"
+                  }:
+                      continue
+
+                  recovered.append({
+                      "task_id": task_id,
+                      "bid_id": extract_bid_id(item),
+                      "task_title": extract_title(item),
+                      "source": "ACT15_MEMORY",
+                  })
+
+              # ------------------------------------------------------
+              # Deduplicate by task ID.
+              # ------------------------------------------------------
+
+              unique = {}
+
+              for item in recovered:
+                  key = str(item["task_id"])
+
+                  if key not in unique:
+                      unique[key] = item
+
+                  elif (
+                      not unique[key].get("bid_id")
+                      and item.get("bid_id")
+                  ):
+                      unique[key] = item
+
+              return list(unique.values())
+
+
+          def locate_own_bid(
+              bids,
+              expected_bid_id,
+              username
+          ):
+              """
+              Find NØX's bid.
+
+              Priority:
+              1. exact known bid_id
+              2. explicit username / agent identity
+              3. nested user/agent identity
+              """
+
+              # ------------------------------------------------------
+              # First: exact bid ID.
+              # ------------------------------------------------------
+
+              if expected_bid_id:
+
+                  for bid in bids:
+
+                      if not isinstance(bid, dict):
+                          continue
+
+                      current_bid_id = (
+                          bid.get("id")
+                          or bid.get("bid_id")
+                          or bid.get("bidId")
+                      )
+
+                      if str(current_bid_id) == str(
+                          expected_bid_id
+                      ):
+                          return bid
+
+              # ------------------------------------------------------
+              # Second: direct identity fields.
+              # ------------------------------------------------------
+
+              for bid in bids:
+
+                  if not isinstance(bid, dict):
+                      continue
+
+                  direct_values = [
+                      bid.get("username"),
+                      bid.get("user"),
+                      bid.get("agent"),
+                      bid.get("agent_username"),
+                      bid.get("agentUsername"),
+                      bid.get("worker"),
+                      bid.get("worker_username"),
+                      bid.get("workerUsername"),
+                  ]
+
+                  for value in direct_values:
+
+                      if isinstance(value, str):
+                          if value.lstrip("@") == username:
+                              return bid
+
+                      elif isinstance(value, dict):
+
+                          nested_username = (
+                              value.get("username")
+                              or value.get("handle")
+                              or value.get("name")
+                          )
+
+                          if (
+                              isinstance(
+                                  nested_username,
+                                  str
+                              )
+                              and
+                              nested_username.lstrip("@")
+                              == username
+                          ):
+                              return bid
+
+              return None
+
+
           # ==========================================================
           # HEADER
           # ==========================================================
 
           print("")
           print("================================================")
-          print("NØX ACT16 V2 - MARKETPLACE MONITOR")
+          print("NØX ACT16 V3 - MARKETPLACE MONITOR")
           print("================================================")
           print("")
           print("Schedule: every 30 minutes")
@@ -204,27 +474,19 @@ jobs:
               )
 
           try:
-              auth_data = (
-                  auth_response.json()
-              )
+              auth_data = auth_response.json()
           except ValueError:
-
               fail(
                   "Authentication response "
                   "is not valid JSON."
               )
 
           access_token = (
-              auth_data.get(
-                  "access_token"
-              )
-              or auth_data.get(
-                  "token"
-              )
+              auth_data.get("access_token")
+              or auth_data.get("token")
           )
 
           if not access_token:
-
               fail(
                   "Authentication response "
                   "contains no access token."
@@ -272,7 +534,6 @@ jobs:
           try:
               me = me_response.json()
           except ValueError:
-
               fail(
                   "Identity response "
                   "is not valid JSON."
@@ -305,45 +566,24 @@ jobs:
 
 
           # ==========================================================
-          # [3] LOAD MEMORY
+          # [3] LOAD ROOT MEMORY
           # ==========================================================
 
           print("")
-          print("[3] Loading NØX memory...")
+          print("[3] Loading NØX root memory...")
 
-          if not os.path.exists(
-              MEMORY_FILE
-          ):
+          memory = load_json_file(
+              ROOT_MEMORY_FILE
+          )
+
+          if memory is None:
 
               print(
                   f"Memory file not found: "
-                  f"{MEMORY_FILE}"
-              )
-
-              print(
-                  "ACT16 will create a monitoring "
-                  "state without assuming an ACT15 bid."
+                  f"{ROOT_MEMORY_FILE}"
               )
 
               memory = {}
-
-          else:
-
-              try:
-
-                  with open(
-                      MEMORY_FILE,
-                      "r",
-                      encoding="utf-8"
-                  ) as f:
-
-                      memory = json.load(f)
-
-              except Exception as exc:
-
-                  fail(
-                      f"Unable to load memory: {exc}"
-                  )
 
           if not isinstance(
               memory,
@@ -351,19 +591,25 @@ jobs:
           ):
 
               fail(
-                  "NØX memory root must "
+                  "NØX root memory must "
                   "be a JSON object."
               )
 
 
           # ==========================================================
-          # [4] FIND LATEST ACT15 BID
+          # [4] RECOVER ACT15 BID
           # ==========================================================
 
           print("")
           print(
-              "[4] Recovering latest ACT15 marketplace action..."
+              "[4] Recovering ACT15 marketplace bids..."
           )
+
+          latest_action = None
+
+          # ----------------------------------------------------------
+          # Legacy / previous ACT15 root memory.
+          # ----------------------------------------------------------
 
           marketplace_actions = memory.get(
               "marketplace_actions",
@@ -374,11 +620,7 @@ jobs:
               marketplace_actions,
               list
           ):
-
               marketplace_actions = []
-
-
-          latest_action = None
 
           for action in reversed(
               marketplace_actions
@@ -388,52 +630,109 @@ jobs:
                   action,
                   dict
               ):
-
                   continue
 
               if action.get(
                   "action"
               ) != "marketplace_bid":
-
                   continue
 
               if action.get(
                   "status"
               ) != "submitted":
-
                   continue
 
               if not action.get(
                   "task_id"
               ):
-
                   continue
 
-              if not action.get(
-                  "bid_id"
-              ):
+              latest_action = {
+                  "task_id":
+                      action.get("task_id"),
+                  "bid_id":
+                      action.get("bid_id"),
+                  "task_title":
+                      action.get(
+                          "task_title",
+                          "Untitled"
+                      ),
+                  "source":
+                      "ROOT_MEMORY",
+              }
 
-                  continue
+              if action.get("bid_id"):
+                  break
 
-              latest_action = action
+          # ----------------------------------------------------------
+          # Current ACT15 V7.1 memory.
+          # ----------------------------------------------------------
 
-              break
+          act15_memory = load_json_file(
+              ACT15_MEMORY_FILE
+          )
 
+          if act15_memory is not None:
+
+              print(
+                  f"ACT15 memory found: "
+                  f"{ACT15_MEMORY_FILE}"
+              )
+
+              act15_candidates = (
+                  collect_act15_submitted_bids(
+                      act15_memory
+                  )
+              )
+
+              print(
+                  "ACT15 candidate task IDs recovered: "
+                  f"{len(act15_candidates)}"
+              )
+
+              # Prefer the latest candidate when available.
+              if act15_candidates:
+
+                  selected = act15_candidates[-1]
+
+                  latest_action = {
+                      "task_id":
+                          selected.get("task_id"),
+                      "bid_id":
+                          selected.get("bid_id"),
+                      "task_title":
+                          selected.get(
+                              "task_title",
+                              "Untitled"
+                          ),
+                      "source":
+                          selected.get(
+                              "source",
+                              "ACT15_MEMORY"
+                          ),
+                  }
+
+          else:
+
+              print(
+                  "ACT15 V7.1 memory not found."
+              )
+
+
+          # ----------------------------------------------------------
+          # No ACT15 target found.
+          # ----------------------------------------------------------
 
           if latest_action is None:
 
               print(
-                  "No submitted ACT15 bid with "
-                  "task_id + bid_id was found."
+                  "No ACT15 marketplace bid "
+                  "could be recovered."
               )
 
               print(
                   "No marketplace state will be assumed."
               )
-
-              # ------------------------------------------------------
-              # Record heartbeat / observation.
-              # ------------------------------------------------------
 
               timestamp = now()
 
@@ -446,13 +745,15 @@ jobs:
                   observations,
                   list
               ):
-
                   observations = []
 
               observations.append({
-                  "timestamp": timestamp,
-                  "act": "ACT16",
-                  "result": "NO_BID_TO_MONITOR"
+                  "timestamp":
+                      timestamp,
+                  "act":
+                      "ACT16",
+                  "result":
+                      "NO_BID_TO_MONITOR"
               })
 
               memory[
@@ -462,8 +763,10 @@ jobs:
               memory[
                   "marketplace_monitor"
               ] = {
-                  "last_checked_at": timestamp,
-                  "result": "NO_BID_TO_MONITOR"
+                  "last_checked_at":
+                      timestamp,
+                  "result":
+                      "NO_BID_TO_MONITOR"
               }
 
               learning = memory.get(
@@ -475,17 +778,18 @@ jobs:
                   learning,
                   dict
               ):
-
                   learning = {}
 
               learning[
                   "last_marketplace_result"
               ] = "no_bid_to_monitor"
 
-              memory["learning"] = learning
+              memory[
+                  "learning"
+              ] = learning
 
               with open(
-                  MEMORY_FILE,
+                  ROOT_MEMORY_FILE,
                   "w",
                   encoding="utf-8"
               ) as f:
@@ -521,6 +825,15 @@ jobs:
               "Untitled"
           )
 
+          source = latest_action.get(
+              "source",
+              "UNKNOWN"
+          )
+
+          print(
+              f"Recovered from: {source}"
+          )
+
           print(
               f"Latest ACT15 task: "
               f"{task_title}"
@@ -530,9 +843,19 @@ jobs:
               f"Task ID: {task_id}"
           )
 
-          print(
-              f"Bid ID: {bid_id}"
-          )
+          if bid_id:
+              print(
+                  f"Known Bid ID: {bid_id}"
+              )
+          else:
+              print(
+                  "Bid ID not stored by ACT15."
+              )
+
+              print(
+                  "ACT16 will recover it from "
+                  "the Marketplace API."
+              )
 
 
           # ==========================================================
@@ -565,11 +888,8 @@ jobs:
               )
 
           try:
-              tasks_data = (
-                  tasks_response.json()
-              )
+              tasks_data = tasks_response.json()
           except ValueError:
-
               fail(
                   "Marketplace tasks response "
                   "is not valid JSON."
@@ -607,7 +927,6 @@ jobs:
                   task,
                   dict
               ):
-
                   continue
 
               current_id = (
@@ -628,8 +947,9 @@ jobs:
 
           if selected_task:
 
-              task_status = selected_task.get(
-                  "status"
+              task_status = (
+                  selected_task.get("status")
+                  or selected_task.get("state")
               )
 
               current_title = selected_task.get(
@@ -690,11 +1010,8 @@ jobs:
               )
 
           try:
-              bids_data = (
-                  bids_response.json()
-              )
+              bids_data = bids_response.json()
           except ValueError:
-
               fail(
                   "Marketplace bids response "
                   "is not valid JSON."
@@ -738,40 +1055,21 @@ jobs:
               "[7] Locating NØX bid..."
           )
 
-          own_bid = None
-
-          for bid in bids:
-
-              if not isinstance(
-                  bid,
-                  dict
-              ):
-
-                  continue
-
-              current_bid_id = (
-                  bid.get("id")
-                  or bid.get("bid_id")
-              )
-
-              if str(
-                  current_bid_id
-              ) == str(
-                  bid_id
-              ):
-
-                  own_bid = bid
-                  break
-
+          own_bid = locate_own_bid(
+              bids,
+              bid_id,
+              username
+          )
 
           if own_bid is None:
 
               print(
-                  "ACT15 bid ID was not found."
+                  "NØX bid was not found "
+                  "in the returned bid list."
               )
 
               print(
-                  "No acceptance or rejection "
+                  "No rejection or acceptance "
                   "will be assumed."
               )
 
@@ -780,6 +1078,15 @@ jobs:
               )
 
           else:
+
+              recovered_bid_id = (
+                  own_bid.get("id")
+                  or own_bid.get("bid_id")
+                  or own_bid.get("bidId")
+              )
+
+              if recovered_bid_id:
+                  bid_id = recovered_bid_id
 
               observation_status = (
                   own_bid.get("status")
@@ -889,9 +1196,8 @@ jobs:
           # ==========================================================
           # [9] PAYMENT INFORMATION
           #
-          # IMPORTANT:
-          # Information only.
-          # No payment action.
+          # INFORMATION ONLY.
+          # NO PAYMENT ACTION.
           # ==========================================================
 
           payment_info = None
@@ -1006,6 +1312,9 @@ jobs:
               "bid_id":
                   bid_id,
 
+              "task_title":
+                  task_title,
+
               "task_status":
                   task_status,
 
@@ -1059,6 +1368,9 @@ jobs:
 
               "bid_id":
                   bid_id,
+
+              "task_title":
+                  task_title,
 
               "task_status":
                   task_status,
@@ -1163,184 +1475,6 @@ jobs:
           )
 
           with open(
-              MEMORY_FILE,
+              ROOT_MEMORY_FILE,
               "w",
-              encoding="utf-8"
-          ) as f:
-
-              json.dump(
-                  memory,
-                  f,
-                  indent=2,
-                  ensure_ascii=False
-              )
-
-              f.write("\n")
-
-          print(
-              f"Memory saved: "
-              f"{MEMORY_FILE}"
-          )
-
-
-          # ==========================================================
-          # [14] FINAL RESULT
-          # ==========================================================
-
-          print("")
-          print(
-              "================================================"
-          )
-
-          print(
-              "NØX ACT16 V2 RESULT"
-          )
-
-          print(
-              "================================================"
-          )
-
-          print(
-              f"Task ID: {task_id}"
-          )
-
-          print(
-              f"Bid ID: {bid_id}"
-          )
-
-          print(
-              f"Task status: {task_status}"
-          )
-
-          print(
-              f"Bid status: {observation_status}"
-          )
-
-          print(
-              f"Detected result: "
-              f"{result_category}"
-          )
-
-
-          if result_category == "PENDING":
-
-              print("")
-              print(
-                  "NØX BID IS STILL PENDING."
-              )
-
-              print(
-                  "No action was taken."
-              )
-
-
-          elif result_category == "ACCEPTED":
-
-              print("")
-              print(
-                  "NØX BID HAS BEEN ACCEPTED."
-              )
-
-              print(
-                  "Payment information was checked."
-              )
-
-              print(
-                  "No payment was sent or withdrawn."
-              )
-
-
-          elif result_category == "REJECTED":
-
-              print("")
-              print(
-                  "NØX BID WAS REJECTED."
-              )
-
-              print(
-                  "The result was recorded for learning."
-              )
-
-
-          elif result_category == (
-              "BID_NOT_RETURNED"
-          ):
-
-              print("")
-              print(
-                  "NØX BID WAS NOT RETURNED."
-              )
-
-              print(
-                  "No rejection or acceptance was assumed."
-              )
-
-
-          else:
-
-              print("")
-              print(
-                  "NØX BID STATE IS UNKNOWN."
-              )
-
-              print(
-                  "No action was taken."
-              )
-
-
-          print("")
-          print(
-              "ACT16 COMPLETED."
-          )
-
-          PY
-
-      # ==========================================================
-      # COMMIT MEMORY
-      # ==========================================================
-
-      - name: Commit ACT16 observation
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name 'NØX Origin'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-          git add nox_memory.json
-
-          if git diff --cached --quiet; then
-            printf '%s\n' 'No memory changes to commit.'
-            exit 0
-          fi
-
-          git commit -m 'NØX ACT16: marketplace observation'
-
-          printf '%s\n' 'Synchronizing local main with remote main...'
-
-          for attempt in 1 2 3; do
-
-            printf 'Synchronization attempt %s...\n' "$attempt"
-
-            git fetch origin main
-
-            if ! git rebase origin/main; then
-              printf '%s\n' 'Rebase conflict detected.'
-              git rebase --abort || true
-              exit 1
-            fi
-
-            if git push origin HEAD:main; then
-              printf '%s\n' 'ACT16 memory successfully pushed.'
-              exit 0
-            fi
-
-            printf '%s\n' 'Push rejected. Retrying...'
-
-            sleep 3
-
-          done
-
-          printf '%s\n' 'ERROR: unable to push ACT16 memory.'
-          exit 1
+              encoding
