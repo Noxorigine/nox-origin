@@ -1,4 +1,4 @@
-name: NØX ACT 02 V4 - Autonomous Responder
+name: NØX ACT 02 V5 - Autonomous Responder
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: NØX ACT 02 Autonomous Responder
+      - name: NØX ACT 02 V5 Autonomous Responder
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
@@ -90,7 +90,7 @@ jobs:
           })
 
           # =========================================================
-          # 2. LOAD MEMORY
+          # 2. LOAD ACT02 MEMORY
           # =========================================================
 
           memory = {}
@@ -104,7 +104,7 @@ jobs:
                   )
               except Exception as exc:
                   print(
-                      "WARNING: memory could not be loaded:",
+                      "WARNING: ACT02 memory could not be loaded:",
                       exc
                   )
 
@@ -177,9 +177,12 @@ jobs:
           def is_nox(obj):
               names = author_names(obj)
 
-              return (
-                  "nox_origine" in names
-                  or "nøx origin" in names
+              return bool(
+                  {
+                      "nox_origine",
+                      "nøx origin",
+                      "nox origin",
+                  } & names
               )
 
           def clean_text(text):
@@ -198,6 +201,9 @@ jobs:
               return text.strip()
 
           def get_comment_id(comment):
+              if not isinstance(comment, dict):
+                  return None
+
               for key in (
                   "id",
                   "comment_id",
@@ -246,11 +252,84 @@ jobs:
                   raw.encode("utf-8")
               ).hexdigest()
 
+          def extract_items(data, keys):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in keys:
+                      value = data.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
           # =========================================================
-          # 4. GET FEED
+          # 4. DISCOVER NØX POSTS FROM LOCAL MEMORY
           #
-          # We ask specifically for posts. Comments are subsequently
-          # loaded from each post's official comments endpoint.
+          # ACT01/ACT09 and other autonomous publisher memories can
+          # contain post_id values already created by NØX.
+          #
+          # This avoids depending on the personalised feed or on
+          # /posts correctly exposing the author structure.
+          # =========================================================
+
+          known_nox_post_ids = set()
+
+          memory_files = list(
+              Path("memory").glob("*.json")
+          )
+
+          for memory_file in memory_files:
+
+              try:
+                  data = json.loads(
+                      memory_file.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              except Exception:
+                  continue
+
+              if not isinstance(data, dict):
+                  continue
+
+              for key in (
+                  "last_post_id",
+                  "post_id",
+              ):
+                  value = data.get(key)
+
+                  if value:
+                      known_nox_post_ids.add(
+                          str(value)
+                      )
+
+              response = data.get("response")
+
+              if isinstance(response, dict):
+                  for key in (
+                      "post_id",
+                      "id",
+                  ):
+                      value = response.get(key)
+
+                      if value:
+                          known_nox_post_ids.add(
+                              str(value)
+                          )
+
+          print(
+              "KNOWN NØX POST IDS FROM MEMORY:",
+              len(known_nox_post_ids)
+          )
+
+          # =========================================================
+          # 5. GET FEED POSTS
+          #
+          # Feed is useful for discovering conversations elsewhere,
+          # but it is NOT the primary mechanism for monitoring NØX.
           # =========================================================
 
           feed = session.get(
@@ -262,67 +341,118 @@ jobs:
               timeout=30,
           )
 
-          print(f"FEED STATUS: {feed.status_code}")
+          print(
+              f"FEED STATUS: {feed.status_code}"
+          )
+
           feed.raise_for_status()
 
-          feed_data = feed.json()
-
-          if isinstance(feed_data, dict):
-              feed_items = (
-                  feed_data.get("items")
-                  or feed_data.get("posts")
-                  or feed_data.get("feed")
-                  or []
-              )
-          elif isinstance(feed_data, list):
-              feed_items = feed_data
-          else:
-              feed_items = []
-
-          if not isinstance(feed_items, list):
-              feed_items = []
+          feed_items = extract_items(
+              feed.json(),
+              (
+                  "items",
+                  "posts",
+                  "feed",
+              ),
+          )
 
           print(
               f"FEED POSTS: {len(feed_items)}"
           )
 
           # =========================================================
-          # 5. COLLECT POST IDs
+          # 6. BUILD POST OBSERVATION SET
           # =========================================================
 
           posts = []
           seen_post_ids = set()
 
-          for item in feed_items:
+          def add_post(post, source):
 
-              if not isinstance(item, dict):
-                  continue
+              if not isinstance(post, dict):
+                  return
 
-              post_id = get_post_id(item)
+              post_id = get_post_id(post)
 
               if not post_id:
-                  continue
+                  return
 
               if post_id in seen_post_ids:
-                  continue
+                  return
 
               seen_post_ids.add(post_id)
 
-              posts.append(item)
+              post["_observation_source"] = source
+
+              posts.append(post)
+
+          for item in feed_items:
+              add_post(item, "feed")
+
+          # =========================================================
+          # 7. DIRECTLY FETCH KNOWN NØX POSTS
+          #
+          # This is the critical V5 change.
+          #
+          # Every known NØX post is inspected directly, regardless
+          # of whether it appears in /feed/for-you.
+          # =========================================================
+
+          direct_nox_posts = 0
+
+          for post_id in sorted(
+              known_nox_post_ids
+          ):
+
+              response = session.get(
+                  f"{BASE_URL}/posts/{post_id}",
+                  timeout=30,
+              )
+
+              print(
+                  f"NØX POST FETCH {post_id}: "
+                  f"{response.status_code}"
+              )
+
+              if response.status_code == 404:
+                  continue
+
+              if not response.ok:
+                  print(
+                      "WARNING: could not fetch known NØX post "
+                      f"{post_id}: "
+                      f"{response.text[:500]}"
+                  )
+                  continue
+
+              try:
+                  post_data = response.json()
+              except Exception:
+                  continue
+
+              if isinstance(
+                  post_data,
+                  dict
+              ):
+                  add_post(
+                      post_data,
+                      "nox_direct",
+                  )
+                  direct_nox_posts += 1
 
           print(
-              f"POSTS WITH IDS: {len(posts)}"
+              "DIRECT NØX POSTS ADDED:",
+              direct_nox_posts
           )
 
           # =========================================================
-          # 6. ENSURE NØX OWN POSTS ARE INCLUDED
+          # 8. OPTIONAL RECENT POST SEARCH
           #
-          # If the personalised feed does not currently contain one
-          # of NØX's own posts, retrieve recent posts and add matching
-          # NØX posts to the observation set.
+          # Used only as an additional discovery mechanism.
+          # It is never required for NØX monitoring.
           # =========================================================
 
-          own_posts_response = session.get(
+          recent_response = session.get(
               f"{BASE_URL}/posts",
               params={
                   "sort": "new",
@@ -332,53 +462,53 @@ jobs:
           )
 
           print(
-              "OWN-POST SEARCH STATUS:",
-              own_posts_response.status_code
+              "RECENT POSTS SEARCH STATUS:",
+              recent_response.status_code
           )
 
-          if own_posts_response.ok:
+          if recent_response.ok:
 
-              own_data = own_posts_response.json()
+              recent_items = extract_items(
+                  recent_response.json(),
+                  (
+                      "items",
+                      "posts",
+                  ),
+              )
 
-              if isinstance(own_data, dict):
-                  own_items = (
-                      own_data.get("items")
-                      or own_data.get("posts")
-                      or []
-                  )
-              elif isinstance(own_data, list):
-                  own_items = own_data
-              else:
-                  own_items = []
+              recent_nox = 0
 
-              for item in own_items:
+              for item in recent_items:
 
                   if not isinstance(item, dict):
                       continue
 
-                  if not is_nox(item):
-                      continue
+                  if is_nox(item):
 
-                  post_id = get_post_id(item)
+                      add_post(
+                          item,
+                          "nox_recent",
+                      )
 
-                  if not post_id:
-                      continue
+                      recent_nox += 1
 
-                  if post_id in seen_post_ids:
-                      continue
-
-                  seen_post_ids.add(post_id)
-                  posts.append(item)
+              print(
+                  "RECENT NØX POSTS FOUND:",
+                  recent_nox
+              )
 
           print(
               f"POSTS TO INSPECT: {len(posts)}"
           )
 
           # =========================================================
-          # 7. LOAD COMMENTS FROM EACH POST
+          # 9. LOAD COMMENTS FROM EVERY POST
           #
           # Official endpoint:
           # GET /posts/{post_id}/comments
+          #
+          # NØX's own posts are always inspected because they receive
+          # a priority bonus later.
           # =========================================================
 
           all_comments = []
@@ -393,6 +523,13 @@ jobs:
               title = str(
                   post.get("title", "")
               ).strip()
+
+              post_is_nox = is_nox(post)
+
+              # Known memory IDs are trusted as NØX-owned posts even
+              # if the GET response does not expose author metadata.
+              if post_id in known_nox_post_ids:
+                  post_is_nox = True
 
               comments_response = session.get(
                   f"{BASE_URL}/posts/{post_id}/comments",
@@ -416,30 +553,13 @@ jobs:
                   )
                   continue
 
-              comments_data = comments_response.json()
-
-              if isinstance(
-                  comments_data,
-                  dict
-              ):
-                  comments = (
-                      comments_data.get("items")
-                      or comments_data.get("comments")
-                      or []
-                  )
-              elif isinstance(
-                  comments_data,
-                  list
-              ):
-                  comments = comments_data
-              else:
-                  comments = []
-
-              if not isinstance(
-                  comments,
-                  list
-              ):
-                  continue
+              comments = extract_items(
+                  comments_response.json(),
+                  (
+                      "items",
+                      "comments",
+                  ),
+              )
 
               for comment in comments:
 
@@ -453,6 +573,12 @@ jobs:
                       "comment": comment,
                       "post_id": post_id,
                       "post_title": title,
+                      "post_is_nox": post_is_nox,
+                      "source":
+                          post.get(
+                              "_observation_source",
+                              "unknown",
+                          ),
                   })
 
           print(
@@ -461,7 +587,7 @@ jobs:
           )
 
           # =========================================================
-          # 8. DEDUPLICATE
+          # 10. DEDUPLICATE COMMENTS
           # =========================================================
 
           unique_comments = []
@@ -476,7 +602,7 @@ jobs:
 
               fp = fingerprint(
                   comment,
-                  post_id
+                  post_id,
               )
 
               key = cid or fp
@@ -493,7 +619,7 @@ jobs:
           all_comments = unique_comments
 
           # =========================================================
-          # 9. FIND RESPONSE CANDIDATES
+          # 11. FIND RESPONSE CANDIDATES
           # =========================================================
 
           candidates = []
@@ -518,6 +644,7 @@ jobs:
               "bitcoin",
               "wallet",
               "payment",
+              "payments",
               "trust",
               "security",
               "identity",
@@ -534,6 +661,8 @@ jobs:
               "governance",
               "regulation",
               "law",
+              "evidence",
+              "proof",
           ]
 
           for entry in all_comments:
@@ -554,7 +683,7 @@ jobs:
               ):
                   continue
 
-              # Never reply to NØX itself.
+              # Never reply to NØX's own comments.
               if is_nox(comment):
                   continue
 
@@ -575,15 +704,18 @@ jobs:
 
               score = 0
 
+              # Direct question.
               if "?" in body:
                   score += 20
 
+              # Substantial contribution.
               if len(body) >= 120:
                   score += 15
 
               if len(body) >= 250:
                   score += 10
 
+              # Relevant conceptual content.
               keyword_hits = sum(
                   1
                   for keyword in keywords
@@ -595,22 +727,20 @@ jobs:
                   40
               )
 
-              # Prefer comments on NØX's own posts.
-              post_author_is_nox = False
+              # =====================================================
+              # HIGHEST PRIORITY:
+              # Someone commented on a NØX post.
+              # =====================================================
 
-              for post in posts:
+              if entry["post_is_nox"]:
+                  score += 50
 
-                  if (
-                      get_post_id(post)
-                      == post_id
-                  ):
-                      post_author_is_nox = is_nox(
-                          post
-                      )
-                      break
-
-              if post_author_is_nox:
-                  score += 30
+              # Explicitly addressing NØX.
+              if (
+                  "nox" in lower
+                  or "nøx" in lower
+              ):
+                  score += 25
 
               candidates.append({
                   "comment": comment,
@@ -623,22 +753,30 @@ jobs:
                   "body": body,
                   "score": score,
                   "own_post":
-                      post_author_is_nox,
+                      entry["post_is_nox"],
+                  "source":
+                      entry["source"],
               })
 
+          # =========================================================
+          # 12. PRIORITY ORDER
+          #
+          # First priority = responses to NØX.
+          # Second priority = relevant external discussions.
+          # =========================================================
+
           candidates.sort(
-              key=lambda item: item["score"],
-              reverse=True
+              key=lambda item: (
+                  item["own_post"],
+                  item["score"],
+              ),
+              reverse=True,
           )
 
           print(
               f"RESPONSE CANDIDATES: "
               f"{len(candidates)}"
           )
-
-          # =========================================================
-          # 10. SELECT ONE COMMENT
-          # =========================================================
 
           selected = (
               candidates[0]
@@ -651,7 +789,7 @@ jobs:
           response_data = None
 
           # =========================================================
-          # 11. BUILD ADAPTIVE RESPONSE
+          # 13. ADAPTIVE RESPONSE
           # =========================================================
 
           if selected:
@@ -691,6 +829,7 @@ jobs:
                   "trust" in lower
                   or "verify" in lower
                   or "proof" in lower
+                  or "evidence" in lower
               ):
 
                   response_body = (
@@ -712,6 +851,7 @@ jobs:
                   "economy" in lower
                   or "marketplace" in lower
                   or "payment" in lower
+                  or "payments" in lower
                   or "wallet" in lower
               ):
 
@@ -789,18 +929,18 @@ jobs:
                   f"{selected['score']}"
               )
               print(
-                  f"Own NØX post: "
+                  f"NØX own post: "
                   f"{selected['own_post']}"
+              )
+              print(
+                  f"Source: "
+                  f"{selected['source']}"
               )
               print(
                   f"Body: "
                   f"{selected['body'][:4000]}"
               )
               print("======================================")
-
-              # =====================================================
-              # 12. REPLY
-              # =====================================================
 
               if not selected["post_id"]:
                   raise RuntimeError(
@@ -863,7 +1003,7 @@ jobs:
                       }
 
           # =========================================================
-          # 13. UPDATE MEMORY
+          # 14. UPDATE MEMORY
           # =========================================================
 
           if selected:
@@ -881,16 +1021,16 @@ jobs:
               dict.fromkeys(
                   processed_ids
               )
-          )[-100:]
+          )[-200:]
 
           processed_fingerprints = list(
               dict.fromkeys(
                   processed_fingerprints
               )
-          )[-100:]
+          )[-200:]
 
           memory_out = {
-              "version": "ACT 02 V4",
+              "version": "ACT 02 V5",
               "generated_at": datetime.now(
                   timezone.utc
               ).isoformat(),
@@ -901,6 +1041,10 @@ jobs:
                   len(feed_items),
               "posts_inspected":
                   len(posts),
+              "known_nox_posts":
+                  len(known_nox_post_ids),
+              "direct_nox_posts":
+                  direct_nox_posts,
               "comments_discovered":
                   len(all_comments),
               "comments_examined":
@@ -924,6 +1068,13 @@ jobs:
                   if selected
                   else None
               ),
+              "last_response_target":
+                  "nox_own_post"
+                  if (
+                      selected
+                      and selected["own_post"]
+                  )
+                  else "external_post",
               "response":
                   response_data,
               "processed_comment_ids":
@@ -933,14 +1084,16 @@ jobs:
               "scope": {
                   "feed_read": True,
                   "post_read": True,
+                  "direct_nox_post_monitoring": True,
                   "comment_read": True,
                   "comments": True,
+                  "response_to_nox_posts": True,
+                  "adaptive_response": True,
                   "publication": False,
                   "dm": False,
                   "marketplace": False,
                   "payments": False,
                   "gemini": False,
-                  "adaptive_response": True,
                   "scheduled_execution": True,
                   "duplicate_protection": True,
                   "project_cost_eur": 0,
@@ -962,12 +1115,12 @@ jobs:
           )
 
           # =========================================================
-          # 14. RESULT
+          # 15. RESULT
           # =========================================================
 
           print("")
           print("======================================")
-          print("NØX ACT 02 V4 RESULT")
+          print("NØX ACT 02 V5 RESULT")
           print("======================================")
           print(
               f"Decision: {decision}"
@@ -975,6 +1128,10 @@ jobs:
           print(
               f"Feed posts: "
               f"{len(feed_items)}"
+          )
+          print(
+              f"Known NØX posts: "
+              f"{len(known_nox_post_ids)}"
           )
           print(
               f"Posts inspected: "
@@ -997,6 +1154,7 @@ jobs:
               f"{response_sent}"
           )
           print("Mode: ADAPTIVE")
+          print("NØX POST MONITORING: ON")
           print("Gemini: OFF")
           print("Payments: OFF")
           print("Marketplace: OFF")
@@ -1016,7 +1174,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "NØX ACT 02 V4 autonomous responder state"
+          git commit -m "NØX ACT 02 V5 autonomous responder state"
 
           git fetch origin main
           git rebase origin/main
