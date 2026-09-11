@@ -1,13 +1,27 @@
-# NØX ACT46 — Strategy Arbitration V2
+# NØX ACT46 — Strategy Arbitration V3
 
-- Timestamp: `2026-09-11T22:25:52.120262+00:00`
-- Version: `V2`
+- Timestamp: `2026-09-11T22:29:46.388651+00:00`
+- Version: `V3`
 - Gemini used: `false`
 - Project cost: `0 EUR`
 
 ## Objective
 
-Determine whether one strategy deserves priority over the others using only evidence actually available.
+Read the real ACT45 output structure, identify its actual strategy candidates, then arbitrate only when the evidence supports a meaningful comparison.
+
+## ACT45 discovery
+
+- ACT45 loaded: `True`
+- Source: `memory/nox_act_45_adaptive_strategy_selection.json`
+- Nodes inspected: `100`
+- Dictionary nodes: `12`
+- List nodes: `2`
+- Raw candidates discovered: `0`
+- Normalized candidates: `0`
+
+### Strategy containers discovered
+
+- None
 
 ## Decision
 
@@ -15,30 +29,22 @@ Determine whether one strategy deserves priority over the others using only evid
 
 Confidence: **none**
 
-The available evidence is insufficient to perform a defensible strategy arbitration.
+No sufficient evidence exists to perform a defensible strategy arbitration.
 
-## Evidence policy
+## Candidate ranking
 
-- No fabricated default scores.
-- No arbitrary winner.
-- Missing evidence remains missing.
-- A tie is a valid result.
-- Insufficient evidence is a valid result.
+| Rank | Strategy | Score | Completeness | State |
+|---:|---|---:|---:|---|
 
-## Candidate evaluation
+## V2 learning
 
-| Strategy | Score | Completeness | State | Known metrics |
-|---|---:|---:|---|---|
+V2 loaded ACT45 but extracted zero candidates because candidate discovery depended too heavily on expected field names.
 
-## V1 learning
+ACT46 could not arbitrate because it did not reliably understand the actual structure of ACT45 output.
 
-V1 assigned identical default scores to strategies when explicit metrics were unavailable.
+V3 recursively inspects ACT45, discovers strategy containers, strategy keys and structured strategy-like objects, then normalizes and deduplicates real candidates.
 
-Identical fallback values created an artificial ranking and selected the first strategy despite a zero comparison margin.
-
-V2 never fabricates missing metrics and can return INSUFFICIENT_EVIDENCE, INSUFFICIENT_COMPARISON or TIE.
-
-**Principle:** Absence of discriminating evidence must remain an explicit decision state rather than being converted into a fabricated priority.
+**Principle:** A cognitive layer must understand the actual output of the previous layer before claiming that the information is absent.
 
 ## Cognitive progression
 
