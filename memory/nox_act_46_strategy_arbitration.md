@@ -1,55 +1,68 @@
-# NØX ACT46 — Strategy Arbitration
+# NØX ACT46 V5 — Strategy Arbitration
 
-- Timestamp: `2026-09-11T22:35:18.606071+00:00`
-- Version: `V1`
-- Gemini used: `false`
-- Project cost: `0 EUR`
+**Timestamp:** `2026-09-11T22:45:43.847722+00:00`
 
-## Objective
+## Decision
 
-Determine which strategy deserves priority when several strategies are simultaneously available.
+- **Decision:** `INSUFFICIENT_COMPARISON`
+- **Selected strategy:** `None`
+- **Candidate count:** `3`
+- **Comparison possible:** `False`
 
-## Selected strategy
+## Recursive discovery
 
-**deepen_current_strategy**
+- Nodes inspected: `100`
+- Strategy field occurrences: `7`
+- Fields found: `adaptation_candidates, adaptive_strategy_preference, declining_strategy, inconsistent_strategy, neutral_strategies, stable_strategy, strategy_preferences`
 
-Arbitration score: **57.5**
+### Actual ACT45 strategy field paths
 
-Confidence: **weak**
+- `adaptation_candidates` → `$.adaptive_strategy_selection.adaptation_candidates` (int)
+- `strategy_preferences` → `$.strategy_preferences` (list)
+- `neutral_strategies` → `$.neutral_strategies` (list)
+- `stable_strategy` → `$.adaptation_rules.stable_strategy` (str)
+- `declining_strategy` → `$.adaptation_rules.declining_strategy` (str)
+- `inconsistent_strategy` → `$.adaptation_rules.inconsistent_strategy` (str)
+- `adaptive_strategy_preference` → `$.cognitive_separation.adaptive_strategy_preference` (bool)
 
-'deepen_current_strategy' receives the highest arbitration score (57.5) after comparing 3 candidate strategies using relevance, evidence, potential, confidence, risk and effort. The score margin over the next strategy is 0.0.
+## Candidates
 
-## Ranking
+### Decrease future preference when repeated comparable empirical evidence indicates decline.
 
-| Rank | Strategy | Score | Relevance | Evidence | Potential | Confidence | Risk | Effort |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 1 | deepen_current_strategy | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
-| 2 | explore_alternative | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
-| 3 | reduce_risk | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
+- Sources: declining_strategy
+- Categories: declining
+- Paths: $.adaptation_rules.declining_strategy
+- Candidate-specific metrics: none
 
-## Decision principles
+### Increase future preference only when repeated comparable empirical evidence supports stability.
 
-- Prefer strategies with strong current relevance.
-- Prefer strategies supported by stronger evidence.
-- Consider expected potential and impact.
-- Account for confidence before prioritizing.
-- Penalize unnecessary risk.
-- Penalize unnecessary effort.
-- Do not invent missing evidence.
-- Do not execute external actions.
+- Sources: stable_strategy
+- Categories: stable
+- Paths: $.adaptation_rules.stable_strategy
+- Candidate-specific metrics: none
 
-## Cognitive progression
+### Preserve uncertainty and request further testing instead of automatically promoting or rejecting.
 
-ACT45 — Adapt
+- Sources: inconsistent_strategy
+- Categories: inconsistent
+- Paths: $.adaptation_rules.inconsistent_strategy
+- Candidate-specific metrics: none
 
-↓
+## Arbitration
 
-**ACT46 — Arbitrate**
+ACT45 contains multiple explicit strategy candidates, but no candidate-specific metric is available for comparing at least two strategies. Qualitative states and global metrics were preserved without inventing numeric weights.
 
-↓
+## Evidence integrity
 
-ACT47 — Combine
+- Fabricated candidates: `false`
+- Fabricated metrics: `false`
+- Arbitrary selection: `false`
+- Missing evidence preserved: `true`
 
-## Next step
+## Learning
 
-ACT47 will determine whether several valuable strategies can be combined into a coherent strategy set.
+ACT46 V5 learned that cognitive-layer interoperability requires structural discovery before interpretation. ACT45 strategy information may be nested, so NØX must locate fields recursively, preserve their original paths, normalize their values, and only arbitrate when candidate-specific evidence permits a defensible comparison.
+
+## Next cognitive step
+
+Remain in ACT46 until defensible arbitration evidence exists
