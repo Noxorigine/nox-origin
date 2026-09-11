@@ -1,55 +1,57 @@
-# NØX ACT46 — Strategy Arbitration
+# NØX ACT46 — Strategy Arbitration V2
 
-- Timestamp: `2026-09-11T22:01:45.792610+00:00`
-- Version: `V1`
+- Timestamp: `2026-09-11T22:25:52.120262+00:00`
+- Version: `V2`
 - Gemini used: `false`
 - Project cost: `0 EUR`
 
 ## Objective
 
-Determine which strategy deserves priority when several strategies are simultaneously available.
+Determine whether one strategy deserves priority over the others using only evidence actually available.
 
-## Selected strategy
+## Decision
 
-**deepen_current_strategy**
+**INSUFFICIENT_EVIDENCE**
 
-Arbitration score: **57.5**
+Confidence: **none**
 
-Confidence: **weak**
+The available evidence is insufficient to perform a defensible strategy arbitration.
 
-'deepen_current_strategy' receives the highest arbitration score (57.5) after comparing 3 candidate strategies using relevance, evidence, potential, confidence, risk and effort. The score margin over the next strategy is 0.0.
+## Evidence policy
 
-## Ranking
+- No fabricated default scores.
+- No arbitrary winner.
+- Missing evidence remains missing.
+- A tie is a valid result.
+- Insufficient evidence is a valid result.
 
-| Rank | Strategy | Score | Relevance | Evidence | Potential | Confidence | Risk | Effort |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 1 | deepen_current_strategy | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
-| 2 | explore_alternative | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
-| 3 | reduce_risk | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
+## Candidate evaluation
 
-## Decision principles
+| Strategy | Score | Completeness | State | Known metrics |
+|---|---:|---:|---|---|
 
-- Prefer strategies with strong current relevance.
-- Prefer strategies supported by stronger evidence.
-- Consider expected potential and impact.
-- Account for confidence before prioritizing.
-- Penalize unnecessary risk.
-- Penalize unnecessary effort.
-- Do not invent missing evidence.
-- Do not execute external actions.
+## V1 learning
+
+V1 assigned identical default scores to strategies when explicit metrics were unavailable.
+
+Identical fallback values created an artificial ranking and selected the first strategy despite a zero comparison margin.
+
+V2 never fabricates missing metrics and can return INSUFFICIENT_EVIDENCE, INSUFFICIENT_COMPARISON or TIE.
+
+**Principle:** Absence of discriminating evidence must remain an explicit decision state rather than being converted into a fabricated priority.
 
 ## Cognitive progression
 
-ACT45 — Adapt
+ACT45 — Adapter
 
 ↓
 
-**ACT46 — Arbitrate**
+**ACT46 — Arbitrer**
 
 ↓
 
-ACT47 — Combine
+ACT47 — Combiner
 
 ## Next step
 
-ACT47 will determine whether several valuable strategies can be combined into a coherent strategy set.
+ACT47 will examine whether multiple valuable strategies can be combined without unnecessary conflict or complexity.
