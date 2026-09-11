@@ -1,49 +1,36 @@
-# NØX ACT45 V6 — Adaptive Strategy Selection
-
-## Execution
-
-- ACT: `ACT45`
-- Version: `V6`
-- Timestamp: `2026-09-11T22:56:44.198711+00:00`
-- Cost: `0 EUR`
-- Gemini: `false`
-- External AI: `false`
-- External API: `false`
-- Spending: `false`
-- Payments: `false`
+# ACT45 V7 — Adaptive Strategy Selection
 
 ## Decision
 
-**INSUFFICIENT_COMPARISON**
+- Decision: `INSUFFICIENT_EVIDENCE`
+- Selected strategy: `None`
+- Confidence: `insufficient`
 
-Selected strategy:
+## Current cognitive lineage
 
-**none**
+ACT40 → ACT41 → ACT42 → ACT43 → ACT44 → ACT45
 
-Comparison possible:
+## Evidence policy
 
-**False**
-
-Reason:
-
-Strategies were discovered, but fewer than two strategies have enough comparable empirical observations.
+- Current lineage only.
+- ACT30 candidates are ignored.
+- No free-text strategy matching.
+- No fabricated candidates.
+- No fabricated metrics.
+- No global metrics used as candidate metrics.
+- No arbitrary strategy selection.
+- Minimum 3 comparable observations per strategy.
+- Minimum 2 strategies for comparison.
 
 ## Candidates
 
-Number of candidates:
+No current strategy with explicit structural empirical evidence was found.
 
-**5**
+## Integrity
 
-## Evidence integrity
-
-- Fabricated candidates: `false`
-- Fabricated metrics: `false`
-- Arbitrary selection: `false`
-- Global metrics reused as candidate metrics: `false`
-- Missing evidence preserved: `true`
-- Qualitative states preserved: `true`
-- Recursive discovery: `true`
-
-## Next cognitive step
-
-**Remain in ACT45 until stronger empirical evidence exists**
+- Cost: €0
+- Gemini: false
+- External AI: false
+- External API: false
+- Spending: false
+- Payments: false
