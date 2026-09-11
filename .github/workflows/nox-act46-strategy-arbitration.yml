@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ACT46 Strategy Arbitration
+      - name: Run ACT46 V2
         shell: bash
         run: |
           set -euo pipefail
@@ -36,376 +36,604 @@ jobs:
           import json
           import os
           import glob
+          import re
           from datetime import datetime, timezone
 
           ACT = "ACT46"
-          VERSION = "V1"
-
+          VERSION = "V2"
           timestamp = datetime.now(timezone.utc).isoformat()
 
-          # ---------------------------------------------------------
-          # 1. Load ACT45 result
-          # ---------------------------------------------------------
+          # =========================================================
+          # Helpers
+          # =========================================================
+
+          def load_json(path):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return None
+
+          def flatten_strings(value, prefix=""):
+              results = []
+
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      path = f"{prefix}.{key}" if prefix else str(key)
+                      results.extend(flatten_strings(item, path))
+
+              elif isinstance(value, list):
+                  for index, item in enumerate(value):
+                      path = f"{prefix}[{index}]"
+                      results.extend(flatten_strings(item, path))
+
+              elif isinstance(value, (str, int, float, bool)):
+                  results.append((prefix, str(value)))
+
+              return results
+
+          def normalize_name(value):
+              if not isinstance(value, str):
+                  return ""
+
+              value = value.lower().strip()
+              value = re.sub(r"[^a-z0-9]+", "_", value)
+              return value.strip("_")
+
+          def clamp(value):
+              return max(0.0, min(100.0, float(value)))
+
+          def extract_numeric(item, keys):
+              if not isinstance(item, dict):
+                  return None
+
+              for key in keys:
+                  if key not in item:
+                      continue
+
+                  value = item.get(key)
+
+                  try:
+                      number = float(value)
+
+                      # Accept either 0-1 or 0-100 representations.
+                      if 0 <= number <= 1:
+                          number *= 100
+
+                      if 0 <= number <= 100:
+                          return round(number, 2)
+
+                  except (TypeError, ValueError):
+                      pass
+
+              return None
+
+          # =========================================================
+          # Load ACT45
+          # =========================================================
 
           act45_candidates = [
               "memory/nox_act_45_adaptive_strategy_selection.json",
-              "memory/nox_act_45_adaptive_strategy_selection_v1.json"
+              "memory/nox_act_45_adaptive_strategy_selection_v1.json",
+              "memory/nox_act_45_adaptive_strategy_selection_v2.json"
           ]
 
           act45_path = None
+          act45 = {}
 
           for path in act45_candidates:
               if os.path.exists(path):
                   act45_path = path
+                  act45 = load_json(path) or {}
                   break
 
-          act45 = {}
+          # =========================================================
+          # Load memory files
+          # =========================================================
 
-          if act45_path:
-              try:
-                  with open(act45_path, "r", encoding="utf-8") as f:
-                      act45 = json.load(f)
-              except Exception:
-                  act45 = {}
+          memory_files = []
 
-          # ---------------------------------------------------------
-          # 2. Load recent ACT memory
-          # ---------------------------------------------------------
+          for path in glob.glob("memory/*.json"):
+              data = load_json(path)
 
-          memories = []
-
-          for path in glob.glob("memory/nox_act_*.json"):
-              try:
-                  with open(path, "r", encoding="utf-8") as f:
-                      data = json.load(f)
-
-                  memories.append({
+              if data is not None:
+                  memory_files.append({
                       "path": path,
                       "data": data
                   })
 
-              except Exception:
-                  continue
+          def extract_act_number(path):
+              match = re.search(r"act_(\d+)", os.path.basename(path).lower())
 
-          def act_number(path):
-              name = os.path.basename(path)
-              digits = ""
-              for char in name:
-                  if char.isdigit():
-                      digits += char
-                  elif digits:
-                      break
-              try:
-                  return int(digits)
-              except Exception:
-                  return 0
+              if match:
+                  return int(match.group(1))
 
-          memories.sort(
-              key=lambda item: act_number(item["path"]),
+              return 0
+
+          memory_files.sort(
+              key=lambda item: extract_act_number(item["path"]),
               reverse=True
           )
 
-          recent_memories = memories[:20]
+          recent_memories = memory_files[:30]
 
-          # ---------------------------------------------------------
-          # 3. Extract candidate strategies from ACT45
-          # ---------------------------------------------------------
+          # =========================================================
+          # Extract ACT45 strategies
+          # =========================================================
 
-          candidates = []
+          raw_candidates = []
 
-          possible_fields = [
+          candidate_fields = [
               "strategies",
               "candidate_strategies",
               "candidates",
-              "strategy_candidates"
+              "strategy_candidates",
+              "alternatives"
           ]
 
-          for field in possible_fields:
+          for field in candidate_fields:
               value = act45.get(field)
 
               if isinstance(value, list):
-                  candidates.extend(value)
+                  raw_candidates.extend(value)
 
-          # ACT45 may expose one preferred strategy plus alternatives.
           preferred = act45.get("preferred_strategy")
 
           if isinstance(preferred, dict):
-              candidates.append(preferred)
+              raw_candidates.append(preferred)
 
-          alternatives = act45.get("alternatives")
+          elif isinstance(preferred, str):
+              raw_candidates.append({
+                  "name": preferred
+              })
 
-          if isinstance(alternatives, list):
-              candidates.extend(alternatives)
+          # =========================================================
+          # Normalize strategies
+          # =========================================================
 
-          # ---------------------------------------------------------
-          # 4. Normalize candidates
-          # ---------------------------------------------------------
-
-          normalized = []
+          strategies = []
           seen = set()
 
-          for index, candidate in enumerate(candidates):
+          for index, candidate in enumerate(raw_candidates):
 
               if isinstance(candidate, str):
-                  name = candidate
-                  item = {
-                      "name": name
+                  candidate = {
+                      "name": candidate
                   }
 
-              elif isinstance(candidate, dict):
-                  item = dict(candidate)
-
-                  name = (
-                      item.get("name")
-                      or item.get("strategy")
-                      or item.get("id")
-                      or f"strategy_{index + 1}"
-                  )
-
-                  item["name"] = name
-
-              else:
+              if not isinstance(candidate, dict):
                   continue
 
-              key = str(name).strip().lower()
+              name = (
+                  candidate.get("name")
+                  or candidate.get("strategy")
+                  or candidate.get("id")
+              )
+
+              if not name:
+                  continue
+
+              key = normalize_name(name)
 
               if not key or key in seen:
                   continue
 
               seen.add(key)
-              normalized.append(item)
 
-          # ---------------------------------------------------------
-          # 5. Fallback strategic candidates
-          # ---------------------------------------------------------
-
-          if not normalized:
-              normalized = [
-                  {
-                      "name": "deepen_current_strategy",
-                      "description": "Continue improving the currently strongest strategy."
-                  },
-                  {
-                      "name": "explore_alternative",
-                      "description": "Investigate a promising alternative strategy."
-                  },
-                  {
-                      "name": "reduce_risk",
-                      "description": "Prefer a lower-risk strategy while evidence remains limited."
-                  }
-              ]
-
-          # ---------------------------------------------------------
-          # 6. Build arbitration signals
-          # ---------------------------------------------------------
-
-          def number(value, default=0.0):
-              try:
-                  return float(value)
-              except Exception:
-                  return default
-
-          def get_score(item, keys):
-              for key in keys:
-                  if key in item:
-                      return number(item.get(key))
-              return 0.0
-
-          scored = []
-
-          for index, item in enumerate(normalized):
-
-              relevance = get_score(
-                  item,
-                  ["relevance", "relevance_score", "context_score"]
-              )
-
-              evidence = get_score(
-                  item,
-                  ["evidence", "evidence_score", "evidence_quality"]
-              )
-
-              potential = get_score(
-                  item,
-                  ["potential", "potential_score", "impact", "impact_score"]
-              )
-
-              confidence = get_score(
-                  item,
-                  ["confidence", "confidence_score"]
-              )
-
-              risk = get_score(
-                  item,
-                  ["risk", "risk_score"]
-              )
-
-              effort = get_score(
-                  item,
-                  ["effort", "effort_score", "cost"]
-              )
-
-              # If scores are absent, ACT46 remains conservative.
-              # The candidate receives a neutral baseline rather than
-              # inventing evidence.
-              if relevance == 0:
-                  relevance = 50.0
-
-              if evidence == 0:
-                  evidence = 50.0
-
-              if potential == 0:
-                  potential = 50.0
-
-              if confidence == 0:
-                  confidence = 50.0
-
-              # Lower risk and lower effort are preferable.
-              risk_penalty = min(max(risk, 0.0), 100.0)
-              effort_penalty = min(max(effort, 0.0), 100.0)
-
-              arbitration_score = (
-                  relevance * 0.25
-                  + evidence * 0.20
-                  + potential * 0.25
-                  + confidence * 0.15
-                  + (100.0 - risk_penalty) * 0.10
-                  + (100.0 - effort_penalty) * 0.05
-              )
-
-              scored.append({
-                  "rank": 0,
-                  "name": item["name"],
-                  "description": item.get("description", ""),
-                  "relevance": round(relevance, 2),
-                  "evidence": round(evidence, 2),
-                  "potential": round(potential, 2),
-                  "confidence": round(confidence, 2),
-                  "risk": round(risk_penalty, 2),
-                  "effort": round(effort_penalty, 2),
-                  "arbitration_score": round(arbitration_score, 2)
+              strategies.append({
+                  "name": str(name),
+                  "normalized_name": key,
+                  "source": candidate
               })
 
-          # ---------------------------------------------------------
-          # 7. Rank strategies
-          # ---------------------------------------------------------
+          # =========================================================
+          # No invented strategy candidates.
+          # If ACT45 gives no candidates, arbitration cannot happen.
+          # =========================================================
 
-          scored.sort(
-              key=lambda x: x["arbitration_score"],
+          if not strategies:
+              strategies = []
+
+          # =========================================================
+          # Build evidence corpus
+          # =========================================================
+
+          evidence_corpus = []
+
+          for memory in recent_memories:
+              path = memory["path"]
+              data = memory["data"]
+
+              text_parts = flatten_strings(data)
+
+              text = "\n".join(
+                  f"{key}: {value}"
+                  for key, value in text_parts
+              )
+
+              evidence_corpus.append({
+                  "path": path,
+                  "text": text.lower()
+              })
+
+          # =========================================================
+          # Strategy evaluation
+          # =========================================================
+
+          evaluated = []
+
+          metric_aliases = {
+              "relevance": [
+                  "relevance",
+                  "relevance_score",
+                  "context_score"
+              ],
+              "evidence": [
+                  "evidence",
+                  "evidence_score",
+                  "evidence_quality"
+              ],
+              "potential": [
+                  "potential",
+                  "potential_score",
+                  "impact",
+                  "impact_score"
+              ],
+              "confidence": [
+                  "confidence",
+                  "confidence_score"
+              ],
+              "risk": [
+                  "risk",
+                  "risk_score"
+              ],
+              "effort": [
+                  "effort",
+                  "effort_score",
+                  "cost"
+              ]
+          }
+
+          for strategy in strategies:
+
+              source = strategy["source"]
+
+              metrics = {}
+
+              # -----------------------------------------------------
+              # First priority: explicit metrics in ACT45
+              # -----------------------------------------------------
+
+              for metric, aliases in metric_aliases.items():
+                  metrics[metric] = extract_numeric(source, aliases)
+
+              # -----------------------------------------------------
+              # Second priority: evidence found in memory
+              # -----------------------------------------------------
+
+              matching_files = []
+
+              strategy_name = strategy["normalized_name"]
+
+              for evidence in evidence_corpus:
+
+                  normalized_text = normalize_name(evidence["text"])
+
+                  if strategy_name and strategy_name in normalized_text:
+                      matching_files.append(evidence["path"])
+
+              # -----------------------------------------------------
+              # Third priority: nested strategy evidence
+              # -----------------------------------------------------
+
+              nested_evidence = source.get("evidence")
+
+              if isinstance(nested_evidence, dict):
+
+                  for metric, aliases in metric_aliases.items():
+
+                      if metrics.get(metric) is not None:
+                          continue
+
+                      metrics[metric] = extract_numeric(
+                          nested_evidence,
+                          aliases
+                      )
+
+              # -----------------------------------------------------
+              # Determine actual evidence availability
+              # -----------------------------------------------------
+
+              known_metrics = [
+                  key for key, value in metrics.items()
+                  if value is not None
+              ]
+
+              known_count = len(known_metrics)
+              total_metrics = len(metric_aliases)
+
+              completeness = round(
+                  (known_count / total_metrics) * 100,
+                  2
+              )
+
+              # -----------------------------------------------------
+              # No fabricated values.
+              # -----------------------------------------------------
+
+              score = None
+
+              if known_count >= 4:
+
+                  relevance = metrics["relevance"]
+                  evidence_score = metrics["evidence"]
+                  potential = metrics["potential"]
+                  confidence = metrics["confidence"]
+                  risk = metrics["risk"]
+                  effort = metrics["effort"]
+
+                  # Missing optional metrics are NOT silently replaced.
+                  # They reduce the maximum possible confidence instead.
+                  components = []
+                  weights = []
+
+                  values = {
+                      "relevance": (relevance, 0.25),
+                      "evidence": (evidence_score, 0.20),
+                      "potential": (potential, 0.25),
+                      "confidence": (confidence, 0.15),
+                      "risk": (100 - risk, 0.10),
+                      "effort": (100 - effort, 0.05)
+                  }
+
+                  for metric, (value, weight) in values.items():
+
+                      if value is not None:
+                          components.append(value * weight)
+                          weights.append(weight)
+
+                  if weights:
+                      score = round(
+                          sum(components) / sum(weights),
+                          2
+                      )
+
+              # -----------------------------------------------------
+              # Evidence state
+              # -----------------------------------------------------
+
+              if score is None:
+                  arbitration_state = "INSUFFICIENT_EVIDENCE"
+
+              elif completeness < 70:
+                  arbitration_state = "LIMITED_EVIDENCE"
+
+              else:
+                  arbitration_state = "COMPARABLE"
+
+              evaluated.append({
+                  "name": strategy["name"],
+                  "metrics": metrics,
+                  "known_metrics": known_metrics,
+                  "completeness": completeness,
+                  "matching_memory_files": matching_files[:10],
+                  "score": score,
+                  "state": arbitration_state
+              })
+
+          # =========================================================
+          # Arbitration
+          # =========================================================
+
+          comparable = [
+              item for item in evaluated
+              if item["score"] is not None
+              and item["completeness"] >= 70
+          ]
+
+          comparable.sort(
+              key=lambda item: item["score"],
               reverse=True
           )
 
-          for rank, item in enumerate(scored, start=1):
-              item["rank"] = rank
+          decision = "INSUFFICIENT_EVIDENCE"
+          selected = None
+          margin = None
+          confidence = "none"
 
-          winner = scored[0]
+          if len(comparable) >= 1:
 
-          alternatives = scored[1:]
+              selected = comparable[0]
 
-          # ---------------------------------------------------------
-          # 8. Determine arbitration margin
-          # ---------------------------------------------------------
+              if len(comparable) == 1:
 
-          if len(scored) > 1:
-              margin = round(
-                  winner["arbitration_score"]
-                  - scored[1]["arbitration_score"],
-                  2
+                  decision = "INSUFFICIENT_COMPARISON"
+                  confidence = "limited"
+
+              else:
+
+                  margin = round(
+                      comparable[0]["score"]
+                      - comparable[1]["score"],
+                      2
+                  )
+
+                  if margin >= 10:
+
+                      decision = "PRIORITIZE"
+                      confidence = "strong"
+
+                  elif margin >= 5:
+
+                      decision = "PRIORITIZE"
+                      confidence = "moderate"
+
+                  else:
+
+                      decision = "TIE"
+                      confidence = "weak"
+                      selected = None
+
+          # =========================================================
+          # Explicitly detect V1 failure mode
+          # =========================================================
+
+          v1_failure_detected = False
+
+          if len(evaluated) >= 2:
+
+              scores = [
+                  item["score"]
+                  for item in evaluated
+                  if item["score"] is not None
+              ]
+
+              if len(scores) >= 2 and len(set(scores)) == 1:
+                  v1_failure_detected = True
+
+          # =========================================================
+          # Rationale
+          # =========================================================
+
+          if decision == "PRIORITIZE":
+
+              rationale = (
+                  f"'{selected['name']}' is prioritized because it has "
+                  f"the strongest evidence-supported score ({selected['score']}) "
+                  f"with a comparison margin of {margin}."
               )
-          else:
-              margin = None
 
-          if margin is None:
-              arbitration_confidence = "limited_comparison"
-          elif margin >= 20:
-              arbitration_confidence = "strong"
-          elif margin >= 10:
-              arbitration_confidence = "moderate"
-          else:
-              arbitration_confidence = "weak"
+          elif decision == "TIE":
 
-          # ---------------------------------------------------------
-          # 9. Produce decision rationale
-          # ---------------------------------------------------------
-
-          rationale = (
-              f"'{winner['name']}' receives the highest arbitration score "
-              f"({winner['arbitration_score']}) after comparing "
-              f"{len(scored)} candidate strategies using relevance, "
-              f"evidence, potential, confidence, risk and effort."
-          )
-
-          if margin is not None:
-              rationale += (
-                  f" The score margin over the next strategy is {margin}."
+              rationale = (
+                  "No strategy receives a sufficiently distinct advantage. "
+                  "The available evidence does not justify an arbitrary priority."
               )
 
-          # ---------------------------------------------------------
-          # 10. Build memory artifact
-          # ---------------------------------------------------------
+          elif decision == "INSUFFICIENT_COMPARISON":
+
+              rationale = (
+                  "Only one strategy has enough comparable evidence. "
+                  "ACT46 refuses to treat an isolated score as a valid arbitration."
+              )
+
+          else:
+
+              rationale = (
+                  "The available evidence is insufficient to perform a "
+                  "defensible strategy arbitration."
+              )
+
+          # =========================================================
+          # Learning from V1
+          # =========================================================
+
+          learning = {
+              "source": "ACT46_V1",
+              "observation": (
+                  "V1 assigned identical default scores to strategies "
+                  "when explicit metrics were unavailable."
+              ),
+              "problem": (
+                  "Identical fallback values created an artificial ranking "
+                  "and selected the first strategy despite a zero comparison margin."
+              ),
+              "correction": (
+                  "V2 never fabricates missing metrics and can return "
+                  "INSUFFICIENT_EVIDENCE, INSUFFICIENT_COMPARISON or TIE."
+              ),
+              "principle": (
+                  "Absence of discriminating evidence must remain an explicit "
+                  "decision state rather than being converted into a fabricated priority."
+              )
+          }
+
+          # =========================================================
+          # Build final result
+          # =========================================================
 
           result = {
               "act": ACT,
               "version": VERSION,
               "name": "Strategy Arbitration",
               "timestamp": timestamp,
+
               "gemini_used": False,
               "project_cost_eur": 0,
 
               "purpose": (
-                  "Arbitrate between multiple strategies and determine "
-                  "which strategy deserves priority in the current context."
+                  "Compare multiple strategies and determine whether "
+                  "one deserves priority based only on available evidence."
               ),
 
               "input": {
                   "act45_loaded": bool(act45_path),
                   "act45_source": act45_path,
-                  "recent_memory_files_loaded": len(recent_memories),
-                  "candidate_count": len(scored)
+                  "memory_files_loaded": len(recent_memories),
+                  "candidate_count": len(strategies)
               },
 
               "arbitration": {
-                  "selected_strategy": winner["name"],
-                  "selected_score": winner["arbitration_score"],
+                  "decision": decision,
+                  "selected_strategy": (
+                      selected["name"] if selected else None
+                  ),
+                  "selected_score": (
+                      selected["score"] if selected else None
+                  ),
                   "comparison_margin": margin,
-                  "confidence": arbitration_confidence,
+                  "confidence": confidence,
                   "rationale": rationale
               },
 
-              "ranking": scored,
+              "ranking": evaluated,
 
-              "alternatives": [
-                  {
-                      "name": item["name"],
-                      "score": item["arbitration_score"],
-                      "rank": item["rank"]
-                  }
-                  for item in alternatives
-              ],
+              "comparison": {
+                  "comparable_candidates": len(comparable),
+                  "required_minimum_metrics": 4,
+                  "required_completeness_percent": 70,
+                  "arbitration_requires_difference": True,
+                  "fabricated_defaults_used": False
+              },
+
+              "v1_learning": learning,
 
               "decision_policy": {
-                  "primary_goal": "Choose the strategy with the strongest overall current value.",
-                  "priority_factors": [
-                      "relevance",
-                      "evidence",
-                      "potential",
-                      "confidence",
-                      "risk",
-                      "effort"
-                  ],
-                  "avoid": [
-                      "choosing solely from historical popularity",
-                      "treating uncertainty as certainty",
-                      "inventing evidence",
-                      "executing external actions"
+                  "primary_goal": (
+                      "Choose a strategy only when the evidence supports "
+                      "a meaningful comparison."
+                  ),
+                  "rules": [
+                      "Never invent missing evidence.",
+                      "Never use arbitrary default scores.",
+                      "Do not prioritize the first candidate merely because it appears first.",
+                      "Require sufficient evidence for comparison.",
+                      "Require a meaningful score difference for PRIORITIZE.",
+                      "Use TIE when candidates are effectively indistinguishable.",
+                      "Use INSUFFICIENT_EVIDENCE when evidence is inadequate.",
+                      "Preserve uncertainty instead of hiding it."
                   ]
+              },
+
+              "learning_signal": {
+                  "v1_failure_detected": v1_failure_detected,
+                  "lesson": (
+                      "When evidence cannot distinguish strategies, "
+                      "the correct cognitive action is to preserve uncertainty "
+                      "rather than manufacture a priority."
+                  )
               },
 
               "next_step": {
                   "act": "ACT47",
                   "capability": "Strategy Combination",
+                  "condition": (
+                      "Proceed only after ACT46 can provide a defensible "
+                      "arbitration result or demonstrate that strategies "
+                      "should remain jointly considered."
+                  ),
                   "question": (
-                      "Can multiple high-value strategies be combined "
+                      "Can multiple valuable strategies be combined "
                       "without creating unnecessary conflict or complexity?"
                   )
               },
@@ -413,107 +641,140 @@ jobs:
               "status": "SUCCESS"
           }
 
-          # ---------------------------------------------------------
-          # 11. Write JSON memory
-          # ---------------------------------------------------------
+          # =========================================================
+          # Write JSON
+          # =========================================================
 
           json_path = "memory/nox_act_46_strategy_arbitration.json"
 
           with open(json_path, "w", encoding="utf-8") as f:
-              json.dump(result, f, indent=2, ensure_ascii=False)
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
 
-          # ---------------------------------------------------------
-          # 12. Write Markdown report
-          # ---------------------------------------------------------
+          # =========================================================
+          # Write Markdown report
+          # =========================================================
 
           md_path = "memory/nox_act_46_strategy_arbitration.md"
 
           lines = [
-              "# NØX ACT46 — Strategy Arbitration",
+              "# NØX ACT46 — Strategy Arbitration V2",
               "",
               f"- Timestamp: `{timestamp}`",
-              "- Version: `V1`",
+              "- Version: `V2`",
               "- Gemini used: `false`",
               "- Project cost: `0 EUR`",
               "",
               "## Objective",
               "",
-              "Determine which strategy deserves priority when several "
-              "strategies are simultaneously available.",
+              "Determine whether one strategy deserves priority over "
+              "the others using only evidence actually available.",
               "",
-              "## Selected strategy",
+              "## Decision",
               "",
-              f"**{winner['name']}**",
+              f"**{decision}**",
               "",
-              f"Arbitration score: **{winner['arbitration_score']}**",
-              "",
-              f"Confidence: **{arbitration_confidence}**",
+              f"Confidence: **{confidence}**",
               "",
               rationale,
               "",
-              "## Ranking",
+              "## Evidence policy",
               "",
-              "| Rank | Strategy | Score | Relevance | Evidence | Potential | Confidence | Risk | Effort |",
-              "|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+              "- No fabricated default scores.",
+              "- No arbitrary winner.",
+              "- Missing evidence remains missing.",
+              "- A tie is a valid result.",
+              "- Insufficient evidence is a valid result.",
+              "",
+              "## Candidate evaluation",
+              "",
+              "| Strategy | Score | Completeness | State | Known metrics |",
+              "|---|---:|---:|---|---|"
           ]
 
-          for item in scored:
+          for item in evaluated:
+
+              known = ", ".join(item["known_metrics"]) or "none"
+
+              score = (
+                  str(item["score"])
+                  if item["score"] is not None
+                  else "N/A"
+              )
+
               lines.append(
-                  f"| {item['rank']} | {item['name']} | "
-                  f"{item['arbitration_score']} | "
-                  f"{item['relevance']} | "
-                  f"{item['evidence']} | "
-                  f"{item['potential']} | "
-                  f"{item['confidence']} | "
-                  f"{item['risk']} | "
-                  f"{item['effort']} |"
+                  f"| {item['name']} | {score} | "
+                  f"{item['completeness']}% | "
+                  f"{item['state']} | {known} |"
               )
 
           lines.extend([
               "",
-              "## Decision principles",
+              "## V1 learning",
               "",
-              "- Prefer strategies with strong current relevance.",
-              "- Prefer strategies supported by stronger evidence.",
-              "- Consider expected potential and impact.",
-              "- Account for confidence before prioritizing.",
-              "- Penalize unnecessary risk.",
-              "- Penalize unnecessary effort.",
-              "- Do not invent missing evidence.",
-              "- Do not execute external actions.",
+              learning["observation"],
+              "",
+              learning["problem"],
+              "",
+              learning["correction"],
+              "",
+              f"**Principle:** {learning['principle']}",
               "",
               "## Cognitive progression",
               "",
-              "ACT45 — Adapt",
+              "ACT45 — Adapter",
               "",
               "↓",
               "",
-              "**ACT46 — Arbitrate**",
+              "**ACT46 — Arbitrer**",
               "",
               "↓",
               "",
-              "ACT47 — Combine",
+              "ACT47 — Combiner",
               "",
               "## Next step",
               "",
-              "ACT47 will determine whether several valuable strategies "
-              "can be combined into a coherent strategy set."
+              "ACT47 will examine whether multiple valuable strategies "
+              "can be combined without unnecessary conflict or complexity."
           ])
 
           with open(md_path, "w", encoding="utf-8") as f:
               f.write("\n".join(lines))
 
-          print("ACT46 SUCCESS")
-          print(f"Selected strategy: {winner['name']}")
-          print(f"Score: {winner['arbitration_score']}")
-          print(f"Candidates: {len(scored)}")
-          print(f"Confidence: {arbitration_confidence}")
+          # =========================================================
+          # Runtime diagnostics
+          # =========================================================
+
+          print("========================================")
+          print("NØX ACT46 V2")
+          print("========================================")
+          print(f"Decision: {decision}")
+          print(f"Confidence: {confidence}")
+          print(f"Candidates: {len(evaluated)}")
+          print(f"Comparable: {len(comparable)}")
+          print(f"V1 failure detected: {v1_failure_detected}")
+          print("Fabricated defaults: false")
+
+          if selected:
+              print(f"Selected strategy: {selected['name']}")
+              print(f"Selected score: {selected['score']}")
+          else:
+              print("Selected strategy: NONE")
+
+          if margin is not None:
+              print(f"Comparison margin: {margin}")
+
           print(f"Memory: {json_path}")
           print(f"Report: {md_path}")
+          print("========================================")
 
           PY
 
-      - name: Commit ACT46 results
+      - name: Commit ACT46 V2 results
         shell: bash
         run: |
           set -euo pipefail
@@ -525,11 +786,11 @@ jobs:
           git add memory/nox_act_46_strategy_arbitration.md
 
           if git diff --cached --quiet; then
-            echo "No ACT46 changes to commit."
+            echo "No ACT46 V2 changes to commit."
             exit 0
           fi
 
-          git commit -m "feat: add ACT46 strategy arbitration"
+          git commit -m "feat: improve ACT46 strategy arbitration"
 
           git pull --rebase origin main
 
