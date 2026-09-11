@@ -1,68 +1,38 @@
-# NØX ACT46 V5 — Strategy Arbitration
-
-**Timestamp:** `2026-09-11T22:45:43.847722+00:00`
+# ACT46 V6 — Strategy Arbitration
 
 ## Decision
 
-- **Decision:** `INSUFFICIENT_COMPARISON`
-- **Selected strategy:** `None`
-- **Candidate count:** `3`
-- **Comparison possible:** `False`
+- Decision: `INSUFFICIENT_COMPARISON`
+- Selected strategy: `None`
+- Comparison possible: `False`
 
-## Recursive discovery
+## Source
 
-- Nodes inspected: `100`
-- Strategy field occurrences: `7`
-- Fields found: `adaptation_candidates, adaptive_strategy_preference, declining_strategy, inconsistent_strategy, neutral_strategies, stable_strategy, strategy_preferences`
+ACT45 V7:
+`memory/nox_act_45_adaptive_strategy_selection.json`
 
-### Actual ACT45 strategy field paths
+## Arbitration policy
 
-- `adaptation_candidates` → `$.adaptive_strategy_selection.adaptation_candidates` (int)
-- `strategy_preferences` → `$.strategy_preferences` (list)
-- `neutral_strategies` → `$.neutral_strategies` (list)
-- `stable_strategy` → `$.adaptation_rules.stable_strategy` (str)
-- `declining_strategy` → `$.adaptation_rules.declining_strategy` (str)
-- `inconsistent_strategy` → `$.adaptation_rules.inconsistent_strategy` (str)
-- `adaptive_strategy_preference` → `$.cognitive_separation.adaptive_strategy_preference` (bool)
+- ACT45 V7 is the only candidate source.
+- No candidates are invented.
+- No metrics are invented.
+- No arbitrary first-candidate selection.
+- No hidden scoring.
+- No global metrics.
+- No ACT30 fallback.
+- Minimum 2 comparable strategies.
+- Minimum 3 comparable observations per strategy.
+- Contradictory evidence remains explicit.
 
-## Candidates
+## Result
 
-### Decrease future preference when repeated comparable empirical evidence indicates decline.
+ACT45 V7 did not provide at least two strategies with sufficient comparable empirical evidence.
 
-- Sources: declining_strategy
-- Categories: declining
-- Paths: $.adaptation_rules.declining_strategy
-- Candidate-specific metrics: none
+## Integrity
 
-### Increase future preference only when repeated comparable empirical evidence supports stability.
-
-- Sources: stable_strategy
-- Categories: stable
-- Paths: $.adaptation_rules.stable_strategy
-- Candidate-specific metrics: none
-
-### Preserve uncertainty and request further testing instead of automatically promoting or rejecting.
-
-- Sources: inconsistent_strategy
-- Categories: inconsistent
-- Paths: $.adaptation_rules.inconsistent_strategy
-- Candidate-specific metrics: none
-
-## Arbitration
-
-ACT45 contains multiple explicit strategy candidates, but no candidate-specific metric is available for comparing at least two strategies. Qualitative states and global metrics were preserved without inventing numeric weights.
-
-## Evidence integrity
-
-- Fabricated candidates: `false`
-- Fabricated metrics: `false`
-- Arbitrary selection: `false`
-- Missing evidence preserved: `true`
-
-## Learning
-
-ACT46 V5 learned that cognitive-layer interoperability requires structural discovery before interpretation. ACT45 strategy information may be nested, so NØX must locate fields recursively, preserve their original paths, normalize their values, and only arbitrate when candidate-specific evidence permits a defensible comparison.
-
-## Next cognitive step
-
-Remain in ACT46 until defensible arbitration evidence exists
+- Cost: €0
+- Gemini: false
+- External AI: false
+- External API: false
+- Spending: false
+- Payments: false
