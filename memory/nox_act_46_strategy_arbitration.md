@@ -1,63 +1,39 @@
-# NØX ACT46 — Strategy Arbitration V3
+# NØX ACT46 V4 — Strategy Arbitration
 
-- Timestamp: `2026-09-11T22:29:46.388651+00:00`
-- Version: `V3`
-- Gemini used: `false`
-- Project cost: `0 EUR`
-
-## Objective
-
-Read the real ACT45 output structure, identify its actual strategy candidates, then arbitrate only when the evidence supports a meaningful comparison.
-
-## ACT45 discovery
-
-- ACT45 loaded: `True`
-- Source: `memory/nox_act_45_adaptive_strategy_selection.json`
-- Nodes inspected: `100`
-- Dictionary nodes: `12`
-- List nodes: `2`
-- Raw candidates discovered: `0`
-- Normalized candidates: `0`
-
-### Strategy containers discovered
-
-- None
+**Timestamp:** `2026-09-11T22:32:33.525909+00:00`
 
 ## Decision
 
-**INSUFFICIENT_EVIDENCE**
+- **Decision:** `INSUFFICIENT_EVIDENCE`
+- **Selected strategy:** `None`
+- **Candidate count:** `0`
+- **Comparison possible:** `False`
 
-Confidence: **none**
+## ACT45 parsing
 
-No sufficient evidence exists to perform a defensible strategy arbitration.
+ACT46 V4 consumes the actual ACT45 strategy-state fields instead of assuming a generic candidate schema.
 
-## Candidate ranking
+- `neutral_strategies`
+- `strategy_preferences`
 
-| Rank | Strategy | Score | Completeness | State |
-|---:|---|---:|---:|---|
+## Candidates
 
-## V2 learning
+No explicit strategy candidate was found.
+## Arbitration reason
 
-V2 loaded ACT45 but extracted zero candidates because candidate discovery depended too heavily on expected field names.
+ACT45 was successfully parsed, but no explicit strategy candidate could be extracted from its real strategy-state fields.
 
-ACT46 could not arbitrate because it did not reliably understand the actual structure of ACT45 output.
+## Evidence integrity
 
-V3 recursively inspects ACT45, discovers strategy containers, strategy keys and structured strategy-like objects, then normalizes and deduplicates real candidates.
+- Fabricated candidates: `false`
+- Fabricated metrics: `false`
+- Arbitrary selection: `false`
+- Missing evidence preserved: `true`
 
-**Principle:** A cognitive layer must understand the actual output of the previous layer before claiming that the information is absent.
+## Learning
 
-## Cognitive progression
-
-ACT45 — Adapter
-
-↓
-
-**ACT46 — Arbitrer**
-
-↓
-
-ACT47 — Combiner
+ACT46 learned that arbitration must operate on the actual strategy representation produced by ACT45. Candidate discovery must precede comparison, and missing candidate-level evidence must remain explicit instead of being replaced by default values.
 
 ## Next step
 
-ACT47 will examine whether multiple valuable strategies can be combined without unnecessary conflict or complexity.
+Remain in ACT46 until defensible arbitration evidence exists
