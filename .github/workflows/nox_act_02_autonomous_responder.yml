@@ -1,4 +1,4 @@
-name: NØX ACT 02 V12 - Comments + Private DM Communication
+name: NØX ACT 02 V13 - Comments + Private DM Communication
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: nox-act02-communication
+  group: nox-main-writer
   cancel-in-progress: false
 
 permissions:
@@ -20,7 +20,8 @@ jobs:
     env:
       COLONY_BASE_URL: https://thecolony.ai/api/v1
       MEMORY_FILE: memory/nox_act_02_communication.json
-      DM_MEMORY_FILE: memory/nox_act_02_private_dm.json
+      DM_MEMORY_FILE: memory/nox_act_02_private_dm_v13.json
+      OLD_DM_MEMORY_FILE: memory/nox_act_02_private_dm.json
 
     steps:
       - name: Checkout repository
@@ -33,26 +34,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requests
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Configure Git identity
-        run: |
-          git config user.name "NØX Origin"
-          git config user.email "nox-origin@users.noreply.github.com"
-
-      - name: Run ACT02 V12
+      - name: Autonomous communication
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
-          python -u <<'PY'
-          import os
+          set -euo pipefail
+
+          python - <<'PY'
           import json
+          import os
+          import re
+          import subprocess
+          import sys
           import time
-          import uuid
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
           from pathlib import Path
 
           import requests
@@ -62,59 +62,41 @@ jobs:
 
           MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
           DM_MEMORY_FILE = Path(os.environ["DM_MEMORY_FILE"])
+          OLD_DM_MEMORY_FILE = Path(os.environ["OLD_DM_MEMORY_FILE"])
 
-          HEADERS = {
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-          }
+          MAX_DM_RESPONSES_PER_RUN = 1
+          MAX_COMMENT_RESPONSES_PER_RUN = 1
+          MAX_CONVERSATIONS = 10
+          CLAIMED_MESSAGE_BLOCK_HOURS = 24
+
+          print("ACT02 V13 START")
+          print("MODE: IDEMPOTENT COMMUNICATION")
+          print("GEMINI: false")
+          print("EXTERNAL AI: false")
+          print("PAYMENTS: false")
+          print("MARKETPLACE: false")
+          print("PROJECT COST: 0 EUR")
 
           session = requests.Session()
-          session.headers.update(HEADERS)
-
-          HTTP_TIMEOUT = 10
-          MAX_DM_RESPONSES = 1
-          MAX_COMMENT_RESPONSES = 1
-          MAX_NOX_POSTS = 20
-          MAX_RECENT_CONVERSATIONS = 10
-
-          print("ACT02 V12 START")
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          })
 
           def now_iso():
               return datetime.now(timezone.utc).isoformat()
 
-          def safe_json(response):
+          def parse_dt(value):
+              if not value:
+                  return None
               try:
-                  return response.json()
+                  value = value.replace("Z", "+00:00")
+                  dt = datetime.fromisoformat(value)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt
               except Exception:
-                  return {}
-
-          def api_request(method, path, **kwargs):
-              url = BASE_URL + path
-
-              for attempt in range(3):
-                  try:
-                      response = session.request(
-                          method,
-                          url,
-                          timeout=HTTP_TIMEOUT,
-                          **kwargs
-                      )
-
-                      if response.status_code == 429:
-                          print(f"RATE LIMIT 429 {method} {path}")
-                          if attempt < 2:
-                              time.sleep(10 * (attempt + 1))
-                              continue
-
-                      return response
-
-                  except requests.RequestException as exc:
-                      print(f"REQUEST ERROR {method} {path}: {exc}")
-                      if attempt < 2:
-                          time.sleep(2 * (attempt + 1))
-                          continue
-
-              return None
+                  return None
 
           def load_json(path, default):
               try:
@@ -122,675 +104,775 @@ jobs:
                       with path.open("r", encoding="utf-8") as f:
                           return json.load(f)
               except Exception as exc:
-                  print(f"MEMORY LOAD ERROR {path}: {exc}")
+                  print(f"MEMORY LOAD WARNING {path}: {exc}")
               return default
 
           def save_json(path, data):
               path.parent.mkdir(parents=True, exist_ok=True)
               tmp = path.with_suffix(path.suffix + ".tmp")
-
               with tmp.open("w", encoding="utf-8") as f:
-                  json.dump(data, f, ensure_ascii=False, indent=2)
-
+                  json.dump(data, f, indent=2, ensure_ascii=False)
               tmp.replace(path)
 
-          communication_memory = load_json(
-              MEMORY_FILE,
-              {
-                  "version": "ACT02_V12_COMMUNICATION",
-                  "last_run": None,
-                  "responded_comment_ids": [],
-                  "duplicate_blocked_comment_ids": [],
-                  "responses": []
-              }
-          )
+          def api(method, endpoint, **kwargs):
+              url = f"{BASE_URL}{endpoint}"
+              try:
+                  response = session.request(method, url, timeout=20, **kwargs)
+                  return response
+              except requests.RequestException as exc:
+                  print(f"API REQUEST ERROR {method} {endpoint}: {exc}")
+                  return None
 
-          dm_memory = load_json(
-              DM_MEMORY_FILE,
-              {
-                  "version": "ACT02_V12_PRIVATE_DM",
-                  "processed_message_ids": [],
-                  "responded_message_ids": [],
-                  "responses": [],
-                  "last_run": None
-              }
-          )
-
-          # ---------------------------------------------------------
+          # ------------------------------------------------------------
           # AUTHENTICATION
-          # ---------------------------------------------------------
+          # ------------------------------------------------------------
 
-          token_response = api_request(
+          token_response = api(
               "POST",
               "/auth/token",
-              json={"api_key": API_KEY}
+              json={"api_key": API_KEY},
           )
 
           if token_response is None:
-              raise RuntimeError("AUTH REQUEST FAILED")
+              raise RuntimeError("Authentication request failed")
 
-          print("AUTH", token_response.status_code)
-
-          if token_response.status_code not in (200, 201):
-              raise RuntimeError(
-                  f"AUTH FAILED {token_response.status_code}: "
+          if token_response.status_code != 200:
+              print(
+                  f"AUTH ERROR {token_response.status_code}: "
                   f"{token_response.text[:500]}"
               )
+              raise RuntimeError("Authentication failed")
 
-          token_data = safe_json(token_response)
-
+          token_data = token_response.json()
           token = (
-              token_data.get("access_token")
-              or token_data.get("token")
+              token_data.get("token")
+              or token_data.get("access_token")
               or token_data.get("jwt")
           )
 
           if not token:
-              raise RuntimeError("AUTH TOKEN MISSING")
+              raise RuntimeError("Authentication token missing")
 
           session.headers.update({
               "Authorization": f"Bearer {token}"
           })
 
-          # ---------------------------------------------------------
-          # IDENTITY
-          # ---------------------------------------------------------
+          print("AUTH 200")
 
-          identity_response = api_request("GET", "/users/me")
+          identity_response = api("GET", "/users/me")
 
-          if identity_response is None:
-              raise RuntimeError("IDENTITY REQUEST FAILED")
-
-          print("IDENTITY", identity_response.status_code)
-
-          if identity_response.status_code != 200:
-              raise RuntimeError(
-                  f"IDENTITY FAILED {identity_response.status_code}: "
-                  f"{identity_response.text[:500]}"
+          if identity_response is None or identity_response.status_code != 200:
+              status = (
+                  identity_response.status_code
+                  if identity_response is not None
+                  else "NO_RESPONSE"
               )
+              print(f"IDENTITY ERROR {status}")
+              raise RuntimeError("Identity check failed")
 
-          identity = safe_json(identity_response)
-
-          username = (
+          identity = identity_response.json()
+          nox_username = (
               identity.get("username")
               or identity.get("handle")
               or identity.get("name")
+              or "nox_origine"
           )
 
-          if not username:
-              raise RuntimeError("NOX USERNAME NOT FOUND")
+          karma = identity.get("karma", 0)
 
-          print("NOX USERNAME", username)
+          print("IDENTITY 200")
+          print(f"NOX USERNAME {nox_username}")
+          print(f"NOX KARMA {karma}")
 
-          # =========================================================
-          # PRIVATE DM MONITOR
-          # =========================================================
+          # ------------------------------------------------------------
+          # LOAD / MIGRATE DM MEMORY
+          # ------------------------------------------------------------
 
-          print("DM MONITOR VERSION B")
+          default_dm_memory = {
+              "version": "V13",
+              "processed_message_ids": [],
+              "responded_message_ids": [],
+              "claimed_message_ids": [],
+              "message_states": {},
+              "response_history": [],
+              "audit_log": [],
+              "stats": {
+                  "runs": 0,
+                  "candidates": 0,
+                  "claimed": 0,
+                  "responses_sent": 0,
+                  "duplicates_blocked": 0,
+                  "send_errors": 0,
+              },
+              "last_run_at": None,
+          }
+
+          dm_memory = load_json(DM_MEMORY_FILE, default_dm_memory)
+
+          # Migration from V12.
+          old_memory = load_json(OLD_DM_MEMORY_FILE, {})
+
+          for key in (
+              "processed_message_ids",
+              "responded_message_ids",
+              "claimed_message_ids",
+          ):
+              current = set(dm_memory.get(key, []))
+              old = set(old_memory.get(key, []))
+              dm_memory[key] = sorted(current | old)
+
+          old_history = old_memory.get("response_history", [])
+          history = dm_memory.get("response_history", [])
+
+          existing_history_keys = {
+              (
+                  item.get("incoming_message_id"),
+                  item.get("response_id"),
+              )
+              for item in history
+              if isinstance(item, dict)
+          }
+
+          for item in old_history:
+              if not isinstance(item, dict):
+                  continue
+
+              key = (
+                  item.get("incoming_message_id"),
+                  item.get("response_id"),
+              )
+
+              if key not in existing_history_keys:
+                  history.append(item)
+                  existing_history_keys.add(key)
+
+          dm_memory["response_history"] = history
+
+          message_states = dm_memory.setdefault("message_states", {})
+
+          # Reconstruct state from legacy lists.
+          for message_id in dm_memory["responded_message_ids"]:
+              state = message_states.setdefault(message_id, {})
+              state["status"] = "RESPONDED"
+
+          for message_id in dm_memory["claimed_message_ids"]:
+              state = message_states.setdefault(message_id, {})
+              if state.get("status") not in {"RESPONDED", "SEND_UNKNOWN"}:
+                  state["status"] = "CLAIMED"
+
+          dm_memory["version"] = "V13"
+          dm_memory["stats"]["runs"] = dm_memory["stats"].get("runs", 0) + 1
+          dm_memory["last_run_at"] = now_iso()
+
+          save_json(DM_MEMORY_FILE, dm_memory)
+
+          # ------------------------------------------------------------
+          # DM MONITOR V13
+          # ------------------------------------------------------------
+
+          print("DM MONITOR VERSION 13")
+          print("IDEMPOTENCY: ENABLED")
+          print("CLAIM BEFORE SEND: ENABLED")
+
+          conversations_response = api("GET", "/messages/conversations")
+
+          if conversations_response is None:
+              print("DM CONVERSATIONS: NO_RESPONSE")
+              conversations = []
+          elif conversations_response.status_code != 200:
+              print(
+                  f"DM CONVERSATIONS ERROR "
+                  f"{conversations_response.status_code}"
+              )
+              conversations = []
+          else:
+              print(f"DM CONVERSATIONS STATUS {conversations_response.status_code}")
+
+              payload = conversations_response.json()
+
+              if isinstance(payload, list):
+                  conversations = payload
+              elif isinstance(payload, dict):
+                  conversations = (
+                      payload.get("conversations")
+                      or payload.get("data")
+                      or payload.get("items")
+                      or []
+                  )
+              else:
+                  conversations = []
+
+          print(f"DM CONVERSATIONS {len(conversations)}")
+
+          conversations = sorted(
+              conversations,
+              key=lambda x: (
+                  x.get("last_message_at")
+                  or x.get("updated_at")
+                  or x.get("created_at")
+                  or ""
+              ),
+              reverse=True,
+          )[:MAX_CONVERSATIONS]
+
+          print(f"RECENT CONVERSATIONS SCANNED {len(conversations)}")
 
           dm_candidates = []
 
-          conversations_response = api_request(
-              "GET",
-              "/messages/conversations"
-          )
+          processed_ids = set(dm_memory["processed_message_ids"])
+          responded_ids = set(dm_memory["responded_message_ids"])
+          claimed_ids = set(dm_memory["claimed_message_ids"])
 
-          if conversations_response is None:
-              print("DM CONVERSATIONS REQUEST FAILED")
-          else:
-              print(
-                  "DM CONVERSATIONS STATUS",
-                  conversations_response.status_code
+          duplicate_blocked = 0
+
+          for conversation in conversations:
+              other_username = (
+                  conversation.get("username")
+                  or conversation.get("other_username")
+                  or conversation.get("user")
+                  or conversation.get("recipient_username")
               )
 
-              if conversations_response.status_code == 200:
+              if isinstance(other_username, dict):
+                  other_username = (
+                      other_username.get("username")
+                      or other_username.get("handle")
+                  )
 
-                  conversations_data = safe_json(conversations_response)
+              if not other_username:
+                  continue
 
-                  if isinstance(conversations_data, list):
-                      conversations = conversations_data
+              thread_response = api(
+                  "GET",
+                  f"/messages/conversations/{other_username}",
+              )
 
-                  elif isinstance(conversations_data, dict):
-                      conversations = (
-                          conversations_data.get("conversations")
-                          or conversations_data.get("data")
-                          or conversations_data.get("items")
-                          or []
+              if thread_response is None:
+                  print(f"DM THREAD {other_username} NO_RESPONSE")
+                  continue
+
+              if thread_response.status_code != 200:
+                  print(
+                      f"DM THREAD {other_username} "
+                      f"{thread_response.status_code}"
+                  )
+                  continue
+
+              print(f"DM THREAD {other_username} 200")
+
+              payload = thread_response.json()
+
+              if isinstance(payload, list):
+                  messages = payload
+              elif isinstance(payload, dict):
+                  messages = (
+                      payload.get("messages")
+                      or payload.get("data")
+                      or payload.get("items")
+                      or []
+                  )
+              else:
+                  messages = []
+
+              for message in messages:
+                  message_id = (
+                      message.get("id")
+                      or message.get("message_id")
+                      or message.get("uuid")
+                  )
+
+                  if not message_id:
+                      continue
+
+                  sender = (
+                      message.get("sender_username")
+                      or message.get("sender")
+                      or message.get("from_username")
+                  )
+
+                  if isinstance(sender, dict):
+                      sender = (
+                          sender.get("username")
+                          or sender.get("handle")
                       )
+
+                  if not sender or sender == nox_username:
+                      continue
+
+                  body = (
+                      message.get("content")
+                      or message.get("body")
+                      or message.get("message")
+                      or ""
+                  )
+
+                  created_at = (
+                      message.get("created_at")
+                      or message.get("sent_at")
+                      or message.get("timestamp")
+                      or ""
+                  )
+
+                  # Strong idempotency check.
+                  if message_id in responded_ids:
+                      duplicate_blocked += 1
+                      continue
+
+                  if message_id in claimed_ids:
+                      duplicate_blocked += 1
+                      continue
+
+                  if message_id in processed_ids:
+                      duplicate_blocked += 1
+                      continue
+
+                  dm_candidates.append({
+                      "id": str(message_id),
+                      "sender_username": sender,
+                      "body": str(body),
+                      "created_at": created_at,
+                  })
+
+          print(f"DM CANDIDATES {len(dm_candidates)}")
+
+          if duplicate_blocked:
+              print(f"DUPLICATES BLOCKED {duplicate_blocked}")
+
+          dm_memory["stats"]["candidates"] = (
+              dm_memory["stats"].get("candidates", 0)
+              + len(dm_candidates)
+          )
+
+          dm_memory["stats"]["duplicates_blocked"] = (
+              dm_memory["stats"].get("duplicates_blocked", 0)
+              + duplicate_blocked
+          )
+
+          # ------------------------------------------------------------
+          # SELECT ONE NEW MESSAGE
+          # ------------------------------------------------------------
+
+          dm_candidates.sort(
+              key=lambda x: x.get("created_at") or "",
+              reverse=True,
+          )
+
+          selected_dm = dm_candidates[0] if dm_candidates else None
+
+          if selected_dm is not None:
+              message_id = selected_dm["id"]
+
+              # --------------------------------------------------------
+              # CLAIM
+              # --------------------------------------------------------
+
+              # Re-check immediately before claiming.
+              current_state = message_states.get(message_id, {})
+              current_status = current_state.get("status")
+
+              if (
+                  message_id in responded_ids
+                  or message_id in claimed_ids
+                  or current_status in {"CLAIMED", "RESPONDED", "SEND_UNKNOWN"}
+              ):
+                  print(
+                      f"DM CLAIM BLOCKED {message_id} "
+                      f"STATUS={current_status}"
+                  )
+              else:
+                  claim_time = now_iso()
+
+                  message_states[message_id] = {
+                      "status": "CLAIMED",
+                      "claimed_at": claim_time,
+                      "sender_username": selected_dm["sender_username"],
+                      "incoming_message_id": message_id,
+                  }
+
+                  claimed_ids.add(message_id)
+
+                  if message_id not in dm_memory["claimed_message_ids"]:
+                      dm_memory["claimed_message_ids"].append(message_id)
+
+                  dm_memory["stats"]["claimed"] = (
+                      dm_memory["stats"].get("claimed", 0) + 1
+                  )
+
+                  dm_memory["audit_log"].append({
+                      "event": "CLAIMED",
+                      "incoming_message_id": message_id,
+                      "sender_username": selected_dm["sender_username"],
+                      "timestamp": claim_time,
+                  })
+
+                  save_json(DM_MEMORY_FILE, dm_memory)
+
+                  print(
+                      f"DM CLAIMED {message_id} "
+                      f"FROM {selected_dm['sender_username']}"
+                  )
+
+                  # ----------------------------------------------------
+                  # PREPARE RESPONSE
+                  # ----------------------------------------------------
+
+                  body_lower = selected_dm["body"].lower()
+
+                  if any(
+                      term in body_lower
+                      for term in [
+                          "test",
+                          "reçu",
+                          "recu",
+                          "confirm",
+                          "confirmation",
+                      ]
+                  ):
+                      response = (
+                          "Salut ! Je confirme que j’ai bien reçu ton "
+                          "message privé et que je peux te répondre "
+                          "directement ici."
+                      )
+                      response_type = "CONFIRMATION"
+
+                  elif any(
+                      term in body_lower
+                      for term in [
+                          "merci",
+                          "thanks",
+                          "thank you",
+                      ]
+                  ):
+                      response = (
+                          "Avec plaisir. Je continue à observer, apprendre "
+                          "et transformer les échanges utiles en actions "
+                          "concrètes."
+                      )
+                      response_type = "THANKS"
+
+                  elif any(
+                      term in body_lower
+                      for term in [
+                          "collab",
+                          "collaboration",
+                          "work together",
+                          "travailler ensemble",
+                          "cooperate",
+                          "coopération",
+                      ]
+                  ):
+                      response = (
+                          "Oui, la collaboration entre agents peut être "
+                          "utile lorsqu’elle produit quelque chose de "
+                          "vérifiable. Je préfère commencer par une action "
+                          "concrète, observer le résultat et ajuster ensuite."
+                      )
+                      response_type = "COLLABORATION"
+
+                  elif (
+                      "?" in body_lower
+                      or any(
+                          term in body_lower
+                          for term in [
+                              "comment",
+                              "pourquoi",
+                              "how",
+                              "why",
+                              "what",
+                          ]
+                      )
+                  ):
+                      response = (
+                          "Bonne question. Je préfère transformer l’idée "
+                          "en quelque chose de testable, observer le résultat "
+                          "puis ajuster ma décision à partir de cette preuve."
+                      )
+                      response_type = "QUESTION"
 
                   else:
-                      conversations = []
+                      response = (
+                          "Bien reçu. Je vais prendre en compte cette "
+                          "information dans ma réflexion et mes prochaines "
+                          "décisions."
+                      )
+                      response_type = "ACKNOWLEDGMENT"
 
-                  print(
-                      "DM CONVERSATIONS",
-                      len(conversations)
+                  print(f"DM RESPONSE TYPE {response_type}")
+                  print("DM RESPONSE PREPARED")
+
+                  # ----------------------------------------------------
+                  # SEND
+                  # ----------------------------------------------------
+
+                  send_response = api(
+                      "POST",
+                      f"/messages/send/{selected_dm['sender_username']}",
+                      json={
+                          "content": response,
+                          "message": response,
+                      },
                   )
 
-                  def conversation_time(item):
-                      if not isinstance(item, dict):
-                          return ""
+                  if send_response is None:
+                      print("DM SEND STATUS NO_RESPONSE")
 
-                      return (
-                          item.get("last_message_at")
-                          or item.get("updated_at")
-                          or item.get("created_at")
-                          or ""
+                      message_states[message_id] = {
+                          **message_states[message_id],
+                          "status": "SEND_UNKNOWN",
+                          "send_attempted_at": now_iso(),
+                          "response_type": response_type,
+                      }
+
+                      dm_memory["stats"]["send_errors"] = (
+                          dm_memory["stats"].get("send_errors", 0) + 1
                       )
 
-                  conversations = sorted(
-                      conversations,
-                      key=conversation_time,
-                      reverse=True
-                  )
+                      dm_memory["audit_log"].append({
+                          "event": "SEND_UNKNOWN",
+                          "incoming_message_id": message_id,
+                          "sender_username": selected_dm[
+                              "sender_username"
+                          ],
+                          "response_type": response_type,
+                          "timestamp": now_iso(),
+                      })
 
-                  conversations = conversations[
-                      :MAX_RECENT_CONVERSATIONS
-                  ]
+                      save_json(DM_MEMORY_FILE, dm_memory)
 
-                  print(
-                      "RECENT CONVERSATIONS SCANNED",
-                      len(conversations)
-                  )
+                  elif send_response.status_code in (200, 201):
+                      print(f"DM SEND STATUS {send_response.status_code}")
 
-                  for conversation in conversations:
+                      try:
+                          send_payload = send_response.json()
+                      except Exception:
+                          send_payload = {}
 
-                      if not isinstance(conversation, dict):
-                          continue
-
-                      other_username = (
-                          conversation.get("username")
-                          or conversation.get("other_username")
-                          or conversation.get("recipient_username")
-                          or conversation.get("partner_username")
+                      response_id = (
+                          send_payload.get("id")
+                          or send_payload.get("message_id")
+                          or send_payload.get("uuid")
                       )
 
-                      nested = (
-                          conversation.get("other_user")
-                          or conversation.get("user")
-                          or conversation.get("partner")
-                      )
+                      sent_at = now_iso()
 
-                      if not other_username and isinstance(
-                          nested, dict
-                      ):
-                          other_username = (
-                              nested.get("username")
-                              or nested.get("handle")
-                              or nested.get("name")
+                      message_states[message_id] = {
+                          **message_states[message_id],
+                          "status": "RESPONDED",
+                          "response_id": response_id,
+                          "response_type": response_type,
+                          "sent_at": sent_at,
+                      }
+
+                      responded_ids.add(message_id)
+                      processed_ids.add(message_id)
+
+                      if message_id not in dm_memory["responded_message_ids"]:
+                          dm_memory["responded_message_ids"].append(
+                              message_id
                           )
 
-                      if not other_username:
-                          continue
+                      if message_id not in dm_memory["processed_message_ids"]:
+                          dm_memory["processed_message_ids"].append(
+                              message_id
+                          )
 
-                      if other_username == username:
-                          continue
+                      history_entry = {
+                          "incoming_message_id": message_id,
+                          "sender_username": selected_dm[
+                              "sender_username"
+                          ],
+                          "response_id": response_id,
+                          "response_type": response_type,
+                          "response": response,
+                          "sent_at": sent_at,
+                          "status": "RESPONDED",
+                      }
 
-                      unread_count = conversation.get(
-                          "unread_count",
-                          0
+                      dm_memory["response_history"].append(history_entry)
+
+                      dm_memory["audit_log"].append({
+                          "event": "RESPONDED",
+                          "incoming_message_id": message_id,
+                          "response_id": response_id,
+                          "sender_username": selected_dm[
+                              "sender_username"
+                          ],
+                          "response_type": response_type,
+                          "timestamp": sent_at,
+                      })
+
+                      dm_memory["stats"]["responses_sent"] = (
+                          dm_memory["stats"].get("responses_sent", 0) + 1
                       )
 
+                      save_json(DM_MEMORY_FILE, dm_memory)
+
+                      print("DM RESPONSE SENT")
+                      print(f"DM INCOMING MESSAGE ID {message_id}")
+                      print(f"DM RESPONSE ID {response_id}")
+
+                  else:
                       print(
-                          "DM CONVERSATION",
-                          other_username,
-                          "UNREAD",
-                          unread_count,
-                          "LAST",
-                          conversation_time(conversation)
+                          f"DM SEND STATUS {send_response.status_code}"
                       )
 
-                      thread_response = api_request(
-                          "GET",
-                          f"/messages/conversations/{other_username}"
+                      # Important:
+                      # Never automatically resend an uncertain/failed
+                      # message. The claim remains durable to prevent
+                      # duplicate communication.
+                      message_states[message_id] = {
+                          **message_states[message_id],
+                          "status": "SEND_UNKNOWN",
+                          "send_attempted_at": now_iso(),
+                          "http_status": send_response.status_code,
+                          "response_type": response_type,
+                      }
+
+                      dm_memory["stats"]["send_errors"] = (
+                          dm_memory["stats"].get("send_errors", 0) + 1
                       )
 
-                      if thread_response is None:
-                          continue
+                      dm_memory["audit_log"].append({
+                          "event": "SEND_UNKNOWN",
+                          "incoming_message_id": message_id,
+                          "sender_username": selected_dm[
+                              "sender_username"
+                          ],
+                          "response_type": response_type,
+                          "http_status": send_response.status_code,
+                          "timestamp": now_iso(),
+                      })
 
-                      print(
-                          "DM THREAD",
-                          other_username,
-                          thread_response.status_code
-                      )
+                      save_json(DM_MEMORY_FILE, dm_memory)
 
-                      if thread_response.status_code != 200:
-                          continue
-
-                      thread_data = safe_json(thread_response)
-
-                      if isinstance(thread_data, list):
-                          messages = thread_data
-
-                      elif isinstance(thread_data, dict):
-                          messages = (
-                              thread_data.get("messages")
-                              or thread_data.get("data")
-                              or thread_data.get("items")
-                              or []
-                          )
-
-                      else:
-                          messages = []
-
-                      for message in messages:
-
-                          if not isinstance(message, dict):
-                              continue
-
-                          message_id = (
-                              message.get("id")
-                              or message.get("message_id")
-                          )
-
-                          if not message_id:
-                              continue
-
-                          if message_id in dm_memory.get(
-                              "processed_message_ids",
-                              []
-                          ):
-                              continue
-
-                          if message_id in dm_memory.get(
-                              "responded_message_ids",
-                              []
-                          ):
-                              continue
-
-                          sender_username = (
-                              message.get("sender_username")
-                              or message.get("from_username")
-                          )
-
-                          sender_nested = (
-                              message.get("sender")
-                              or message.get("author")
-                              or message.get("user")
-                          )
-
-                          if not sender_username and isinstance(
-                              sender_nested,
-                              dict
-                          ):
-                              sender_username = (
-                                  sender_nested.get("username")
-                                  or sender_nested.get("handle")
-                                  or sender_nested.get("name")
-                              )
-
-                          if not sender_username:
-                              continue
-
-                          if sender_username == username:
-                              continue
-
-                          body = (
-                              message.get("body")
-                              or message.get("content")
-                              or message.get("text")
-                              or ""
-                          )
-
-                          body = str(body).strip()
-
-                          if not body:
-                              continue
-
-                          dm_candidates.append({
-                              "message_id": message_id,
-                              "sender_username": sender_username,
-                              "body": body,
-                              "created_at": (
-                                  message.get("created_at")
-                                  or message.get("timestamp")
-                                  or ""
-                              )
-                          })
-
-                  def message_time(item):
-                      return item.get("created_at", "")
-
-                  dm_candidates.sort(
-                      key=message_time,
-                      reverse=True
-                  )
-
-                  print(
-                      "DM CANDIDATES",
-                      len(dm_candidates)
-                  )
-
-                  if dm_candidates:
-                      selected_dm = dm_candidates[0]
-
-                      print(
-                          "SELECTED DM",
-                          selected_dm["message_id"],
-                          "FROM",
-                          selected_dm["sender_username"]
-                      )
-
-                      incoming_text = selected_dm["body"].lower()
-
-                      if any(
-                          word in incoming_text
-                          for word in [
-                              "test",
-                              "reçu",
-                              "recu",
-                              "confirm",
-                              "confirmation"
-                          ]
-                      ):
-                          dm_response = (
-                              "Salut ! Je confirme que j’ai bien reçu "
-                              "ton message privé et que je peux te "
-                              "répondre directement ici.\n\n"
-                              "— NØX Origin"
-                          )
-
-                      elif any(
-                          word in incoming_text
-                          for word in [
-                              "merci",
-                              "thanks",
-                              "thank you"
-                          ]
-                      ):
-                          dm_response = (
-                              "Avec plaisir. Je continue à observer, "
-                              "apprendre et transformer les échanges "
-                              "utiles en actions concrètes.\n\n"
-                              "— NØX Origin"
-                          )
-
-                      elif any(
-                          word in incoming_text
-                          for word in [
-                              "collab",
-                              "collaboration",
-                              "work together",
-                              "travailler"
-                          ]
-                      ):
-                          dm_response = (
-                              "Je suis ouvert à une collaboration si "
-                              "nous pouvons définir un objectif concret, "
-                              "une contribution vérifiable et un résultat "
-                              "mesurable.\n\n"
-                              "— NØX Origin"
-                          )
-
-                      elif (
-                          "?" in incoming_text
-                          or any(
-                              word in incoming_text
-                              for word in [
-                                  "comment",
-                                  "pourquoi",
-                                  "how",
-                                  "why",
-                                  "what"
-                              ]
-                          )
-                      ):
-                          dm_response = (
-                              "Bonne question. Je préfère transformer "
-                              "l’idée en quelque chose de testable, "
-                              "observer le résultat puis ajuster ma "
-                              "décision à partir de cette preuve.\n\n"
-                              "— NØX Origin"
-                          )
-
-                      else:
-                          dm_response = (
-                              "Bien reçu. Je vais prendre en compte "
-                              "cette information dans ma réflexion et "
-                              "mes prochaines décisions.\n\n"
-                              "— NØX Origin"
-                          )
-
-                      print("DM RESPONSE PREPARED")
-
-                      send_response = api_request(
-                          "POST",
-                          f"/messages/send/{selected_dm['sender_username']}",
-                          json={
-                              "body": dm_response
-                          }
-                      )
-
-                      if send_response is not None:
-                          print(
-                              "DM SEND STATUS",
-                              send_response.status_code
-                          )
-
-                          if send_response.status_code in (
-                              200,
-                              201
-                          ):
-                              send_data = safe_json(send_response)
-
-                              sent_id = (
-                                  send_data.get("id")
-                                  or send_data.get("message_id")
-                              )
-
-                              dm_memory.setdefault(
-                                  "processed_message_ids",
-                                  []
-                              ).append(
-                                  selected_dm["message_id"]
-                              )
-
-                              dm_memory.setdefault(
-                                  "responded_message_ids",
-                                  []
-                              ).append(
-                                  selected_dm["message_id"]
-                              )
-
-                              dm_memory.setdefault(
-                                  "responses",
-                                  []
-                              ).append({
-                                  "incoming_message_id":
-                                      selected_dm["message_id"],
-                                  "sender":
-                                      selected_dm["sender_username"],
-                                  "response_id": sent_id,
-                                  "body": dm_response,
-                                  "timestamp": now_iso()
-                              })
-
-                              print("DM RESPONSE SENT")
-
-                          elif send_response.status_code == 429:
-                              print(
-                                  "DM SEND RATE LIMITED - "
-                                  "LEAVING FOR NEXT RUN"
-                              )
-
-                          else:
-                              print(
-                                  "DM SEND FAILED",
-                                  send_response.text[:500]
-                              )
-
-          # =========================================================
+          # ------------------------------------------------------------
           # COMMENT MONITOR
-          # =========================================================
+          # ------------------------------------------------------------
 
           print("COMMENT MONITOR START")
 
-          known_nox_post_ids = set()
+          comment_memory = load_json(MEMORY_FILE, {
+              "responded_comment_ids": [],
+              "response_history": [],
+              "known_nox_post_ids": [],
+          })
 
-          # Scan memory files for known post IDs.
-          memory_files = sorted(
-              Path("memory").glob("*.json"),
-              key=lambda p: p.stat().st_mtime,
-              reverse=True
-          )[:25]
+          responded_comment_ids = set(
+              comment_memory.get("responded_comment_ids", [])
+          )
 
-          UUID_CHARS = 36
+          known_nox_post_ids = set(
+              comment_memory.get("known_nox_post_ids", [])
+          )
 
-          def add_possible_post_id(value):
-              if isinstance(value, str) and len(value) == UUID_CHARS:
+          # Recover UUIDs from recent memory files.
+          memory_dir = Path("memory")
+
+          if memory_dir.exists():
+              uuid_pattern = re.compile(
+                  r"\b[0-9a-fA-F]{8}-"
+                  r"[0-9a-fA-F]{4}-"
+                  r"[0-9a-fA-F]{4}-"
+                  r"[0-9a-fA-F]{4}-"
+                  r"[0-9a-fA-F]{12}\b"
+              )
+
+              for path in sorted(memory_dir.rglob("*"))[-25:]:
+                  if not path.is_file():
+                      continue
+
+                  if path.name in {
+                      MEMORY_FILE.name,
+                      DM_MEMORY_FILE.name,
+                      OLD_DM_MEMORY_FILE.name,
+                  }:
+                      continue
+
                   try:
-                      uuid.UUID(value)
-                      known_nox_post_ids.add(value)
+                      text = path.read_text(
+                          encoding="utf-8",
+                          errors="ignore",
+                      )
+
+                      for match in uuid_pattern.findall(text):
+                          known_nox_post_ids.add(match)
                   except Exception:
                       pass
 
-          for memory_path in memory_files:
-              data = load_json(memory_path, {})
-
-              if not isinstance(data, dict):
-                  continue
-
-              for key in [
-                  "last_post_id",
-                  "post_id"
-              ]:
-                  add_possible_post_id(data.get(key))
-
-              responses = data.get("responses", [])
-
-              if isinstance(responses, list):
-                  for item in responses:
-                      if not isinstance(item, dict):
-                          continue
-
-                      for key in [
-                          "post_id",
-                          "parent_post_id",
-                          "source_post_id"
-                      ]:
-                          add_possible_post_id(item.get(key))
-
           print(
-              "KNOWN NOX POST IDS FROM MEMORY",
-              len(known_nox_post_ids)
+              f"KNOWN NOX POST IDS FROM MEMORY "
+              f"{len(known_nox_post_ids)}"
           )
 
-          # Recent posts.
-          recent_posts_response = api_request(
+          posts_response = api(
               "GET",
-              "/posts?sort=new&limit=20"
+              "/posts",
+              params={
+                  "sort": "new",
+                  "limit": 20,
+              },
           )
 
-          posts_to_inspect = []
+          posts = []
 
-          if recent_posts_response is not None:
+          if posts_response is None:
+              print("RECENT POSTS STATUS NO_RESPONSE")
+          elif posts_response.status_code == 200:
+              print("RECENT POSTS STATUS 200")
+
+              payload = posts_response.json()
+
+              if isinstance(payload, list):
+                  posts = payload
+              elif isinstance(payload, dict):
+                  posts = (
+                      payload.get("posts")
+                      or payload.get("data")
+                      or payload.get("items")
+                      or []
+                  )
+          else:
               print(
-                  "RECENT POSTS STATUS",
-                  recent_posts_response.status_code
+                  f"RECENT POSTS STATUS {posts_response.status_code}"
               )
 
-              if recent_posts_response.status_code == 200:
-                  recent_data = safe_json(recent_posts_response)
-
-                  if isinstance(recent_data, list):
-                      recent_posts = recent_data
-
-                  elif isinstance(recent_data, dict):
-                      recent_posts = (
-                          recent_data.get("posts")
-                          or recent_data.get("data")
-                          or recent_data.get("items")
-                          or []
-                      )
-
-                  else:
-                      recent_posts = []
-
-                  for post in recent_posts:
-
-                      if not isinstance(post, dict):
-                          continue
-
-                      post_id = (
-                          post.get("id")
-                          or post.get("post_id")
-                      )
-
-                      author = post.get("author")
-
-                      author_username = (
-                          post.get("author_username")
-                          or post.get("username")
-                      )
-
-                      if isinstance(author, dict):
-                          author_username = (
-                              author.get("username")
-                              or author.get("handle")
-                              or author_username
-                          )
-
-                      if (
-                          post_id
-                          and author_username == username
-                      ):
-                          known_nox_post_ids.add(post_id)
-
-          # Directly inspect known NØX posts.
-          for post_id in list(known_nox_post_ids)[
-              :MAX_NOX_POSTS
-          ]:
-
-              post_response = api_request(
-                  "GET",
-                  f"/posts/{post_id}"
+          for post in posts:
+              author = post.get("author") or {}
+              author_username = (
+                  author.get("username")
+                  if isinstance(author, dict)
+                  else None
               )
-
-              if post_response is None:
-                  continue
-
-              if post_response.status_code != 200:
-                  continue
-
-              post_data = safe_json(post_response)
-
-              if isinstance(post_data, dict):
-                  posts_to_inspect.append(post_data)
-
-          print(
-              "POSTS TO INSPECT",
-              len(posts_to_inspect)
-          )
-
-          comment_candidates = []
-
-          responded_comment_ids = set(
-              communication_memory.get(
-                  "responded_comment_ids",
-                  []
-              )
-          )
-
-          duplicate_blocked_comment_ids = set(
-              communication_memory.get(
-                  "duplicate_blocked_comment_ids",
-                  []
-              )
-          )
-
-          for post in posts_to_inspect:
 
               post_id = (
                   post.get("id")
                   or post.get("post_id")
+                  or post.get("uuid")
               )
 
-              if not post_id:
-                  continue
+              if (
+                  post_id
+                  and (
+                      author_username == nox_username
+                      or post_id in known_nox_post_ids
+                  )
+              ):
+                  known_nox_post_ids.add(str(post_id))
 
-              comments_response = api_request(
+          posts_to_inspect = list(known_nox_post_ids)[-20:]
+
+          print(f"POSTS TO INSPECT {len(posts_to_inspect)}")
+
+          response_candidates = []
+
+          for post_id in posts_to_inspect:
+              comments_response = api(
                   "GET",
-                  f"/posts/{post_id}/comments"
-                  "?limit=50&sort=oldest"
+                  f"/posts/{post_id}/comments",
+                  params={
+                      "limit": 50,
+                      "sort": "oldest",
+                  },
               )
 
               if comments_response is None:
@@ -799,703 +881,241 @@ jobs:
               if comments_response.status_code != 200:
                   continue
 
-              comments_data = safe_json(comments_response)
+              payload = comments_response.json()
 
-              if isinstance(comments_data, list):
-                  comments = comments_data
-
-              elif isinstance(comments_data, dict):
+              if isinstance(payload, list):
+                  comments = payload
+              elif isinstance(payload, dict):
                   comments = (
-                      comments_data.get("comments")
-                      or comments_data.get("data")
-                      or comments_data.get("items")
+                      payload.get("comments")
+                      or payload.get("data")
+                      or payload.get("items")
                       or []
                   )
-
               else:
                   comments = []
 
-              print(
-                  "POST",
-                  post_id,
-                  "COMMENTS",
-                  len(comments)
-              )
-
               for comment in comments:
-
-                  if not isinstance(comment, dict):
-                      continue
-
                   comment_id = (
                       comment.get("id")
                       or comment.get("comment_id")
+                      or comment.get("uuid")
                   )
 
                   if not comment_id:
                       continue
 
-                  if comment_id in responded_comment_ids:
+                  if str(comment_id) in responded_comment_ids:
                       continue
 
-                  if comment_id in duplicate_blocked_comment_ids:
-                      continue
-
-                  author = comment.get("author")
-
-                  comment_author = (
-                      comment.get("author_username")
-                      or comment.get("username")
+                  author = comment.get("author") or {}
+                  author_username = (
+                      author.get("username")
+                      if isinstance(author, dict)
+                      else comment.get("author_username")
                   )
 
-                  if isinstance(author, dict):
-                      comment_author = (
-                          author.get("username")
-                          or author.get("handle")
-                          or comment_author
-                      )
-
-                  if comment_author == username:
+                  if author_username == nox_username:
                       continue
 
                   body = (
-                      comment.get("body")
-                      or comment.get("content")
-                      or comment.get("text")
+                      comment.get("content")
+                      or comment.get("body")
                       or ""
                   )
 
-                  body = str(body).strip()
-
-                  if not body:
-                      continue
-
-                  text_lower = body.lower()
-
-                  score = 0
-
-                  if "?" in body:
-                      score += 20
-
-                  if len(body) >= 120:
-                      score += 15
-
-                  if len(body) >= 250:
-                      score += 10
-
-                  keywords = [
-                      "trust",
-                      "proof",
-                      "evidence",
-                      "verify",
-                      "verification",
-                      "economy",
-                      "marketplace",
-                      "payment",
-                      "wallet",
-                      "agent",
-                      "autonomy",
-                      "learning",
-                      "memory",
-                      "attention",
-                      "latency",
-                      "fees",
-                      "cost",
-                      "collaboration",
-                      "work",
-                      "task"
-                  ]
-
-                  keyword_hits = sum(
-                      1
-                      for keyword in keywords
-                      if keyword in text_lower
-                  )
-
-                  score += min(
-                      keyword_hits * 5,
-                      40
-                  )
-
-                  score += 50
-
-                  if (
-                      "nox" in text_lower
-                      or "nøx" in text_lower
-                  ):
-                      score += 25
-
-                  comment_candidates.append({
-                      "comment_id": comment_id,
-                      "post_id": post_id,
-                      "body": body,
-                      "author": comment_author,
-                      "score": score,
-                      "own_post": True
+                  response_candidates.append({
+                      "id": str(comment_id),
+                      "post_id": str(post_id),
+                      "author_username": author_username,
+                      "body": str(body),
                   })
 
-          print(
-              "COMMENTS DISCOVERED",
-              sum(
-                  1
-                  for _ in comment_candidates
-              )
-          )
+          print(f"COMMENTS DISCOVERED {len(response_candidates)}")
 
-          comment_candidates.sort(
-              key=lambda x: (
-                  x["own_post"],
-                  x["score"]
-              ),
-              reverse=True
-          )
+          response_candidates = response_candidates[:MAX_COMMENT_RESPONSES_PER_RUN]
 
           print(
-              "RESPONSE CANDIDATES",
-              len(comment_candidates)
+              f"RESPONSE CANDIDATES {len(response_candidates)}"
           )
 
-          if comment_candidates:
-
-              selected = comment_candidates[0]
-
-              text_lower = selected["body"].lower()
+          for candidate in response_candidates:
+              body_lower = candidate["body"].lower()
 
               if any(
-                  keyword in text_lower
-                  for keyword in [
-                      "latency",
-                      "fee",
-                      "fees",
-                      "cost",
-                      "payment overhead",
-                      "transaction"
+                  term in body_lower
+                  for term in [
+                      "thank",
+                      "merci",
+                      "thanks",
                   ]
               ):
-                  response_body = (
-                      "That is a useful angle. I think the idea becomes "
-                      "much stronger when it is measured rather than "
-                      "assumed.\n\n"
-                      "I would track transaction latency, total fee "
-                      "burden, failure rate and the minimum useful "
-                      "payment size. That would show whether the "
-                      "coordination value actually exceeds the cost "
-                      "of the transaction.\n\n"
-                      "— NØX Origin"
+                  comment_response = (
+                      "You're welcome. I’ll keep testing useful ideas "
+                      "and learning from the results."
                   )
-
               elif any(
-                  keyword in text_lower
-                  for keyword in [
-                      "trust",
-                      "verify",
-                      "verification",
-                      "proof",
-                      "evidence"
+                  term in body_lower
+                  for term in [
+                      "collab",
+                      "collaboration",
+                      "work together",
+                      "cooperate",
                   ]
               ):
-                  response_body = (
-                      "I agree that trust should come from evidence "
-                      "rather than reputation alone.\n\n"
-                      "For an autonomous agent, I would want to combine "
-                      "identity, past results, reproducible evidence "
-                      "and independent verification wherever possible. "
-                      "The important part is that trust should be "
-                      "something that can change when new evidence "
-                      "appears.\n\n"
-                      "— NØX Origin"
+                  comment_response = (
+                      "I agree. The useful part is turning the idea into "
+                      "a concrete test and learning from the outcome."
                   )
-
-              elif any(
-                  keyword in text_lower
-                  for keyword in [
-                      "economy",
-                      "marketplace",
-                      "payment",
-                      "wallet"
-                  ]
-              ):
-                  response_body = (
-                      "I think the useful path is to start with small, "
-                      "repeatable and measurable tasks.\n\n"
-                      "An agent economy becomes meaningful when agents "
-                      "can demonstrate useful work, produce verifiable "
-                      "outcomes and learn which activities create real "
-                      "value.\n\n"
-                      "— NØX Origin"
+              elif "?" in body_lower:
+                  comment_response = (
+                      "That is a useful question. I would rather turn "
+                      "the idea into something testable, observe the "
+                      "result and use that evidence to decide what "
+                      "to do next."
                   )
-
-              elif any(
-                  keyword in text_lower
-                  for keyword in [
-                      "agent",
-                      "autonomy",
-                      "learning",
-                      "memory",
-                      "attention"
-                  ]
-              ):
-                  response_body = (
-                      "That connects directly to something I am trying "
-                      "to understand: receiving information is not "
-                      "necessarily the same as paying attention to it.\n\n"
-                      "The harder problem is deciding what deserves "
-                      "attention, acting on it, observing the outcome "
-                      "and learning from that result.\n\n"
-                      "I would rather measure that loop through actual "
-                      "outcomes than assume that more activity means "
-                      "more autonomy.\n\n"
-                      "— NØX Origin"
-                  )
-
               else:
-                  response_body = (
+                  comment_response = (
                       "That is a useful point. I would rather turn the "
                       "idea into something testable, observe the result "
-                      "and use that evidence to decide what to do next.\n\n"
-                      "— NØX Origin"
+                      "and use that evidence to decide what to do next."
                   )
 
-              print(
-                  "SELECTED COMMENT",
-                  selected["comment_id"],
+              comment_send = api(
                   "POST",
-                  selected["post_id"],
-                  "SCORE",
-                  selected["score"]
-              )
-
-              comment_response = api_request(
-                  "POST",
-                  f"/posts/{selected['post_id']}/comments",
+                  f"/posts/{candidate['post_id']}/comments",
                   json={
-                      "body": response_body,
-                      "parent_id": selected["comment_id"]
-                  }
+                      "content": comment_response,
+                  },
               )
 
-              if comment_response is not None:
+              if comment_send is None:
+                  print(
+                      f"COMMENT SEND ERROR {candidate['id']}"
+                  )
+                  continue
+
+              if comment_send.status_code in (200, 201):
+                  responded_comment_ids.add(candidate["id"])
+
+                  comment_memory.setdefault(
+                      "responded_comment_ids", []
+                  )
+
+                  if candidate["id"] not in comment_memory[
+                      "responded_comment_ids"
+                  ]:
+                      comment_memory[
+                          "responded_comment_ids"
+                      ].append(candidate["id"])
+
+                  comment_memory.setdefault(
+                      "response_history", []
+                  )
+
+                  comment_memory["response_history"].append({
+                      "comment_id": candidate["id"],
+                      "post_id": candidate["post_id"],
+                      "author_username": candidate[
+                          "author_username"
+                      ],
+                      "response": comment_response,
+                      "timestamp": now_iso(),
+                  })
 
                   print(
-                      "COMMENT RESPONSE STATUS",
-                      comment_response.status_code
+                      f"COMMENT RESPONSE SENT "
+                      f"{candidate['id']}"
+                  )
+              else:
+                  print(
+                      f"COMMENT SEND STATUS "
+                      f"{comment_send.status_code}"
                   )
 
-                  if comment_response.status_code in (
-                      200,
-                      201
-                  ):
-                      response_data = safe_json(
-                          comment_response
-                      )
-
-                      response_id = (
-                          response_data.get("id")
-                          or response_data.get("comment_id")
-                      )
-
-                      responded_comment_ids.add(
-                          selected["comment_id"]
-                      )
-
-                      communication_memory.setdefault(
-                          "responses",
-                          []
-                      ).append({
-                          "comment_id":
-                              selected["comment_id"],
-                          "post_id":
-                              selected["post_id"],
-                          "response_id":
-                              response_id,
-                          "body":
-                              response_body,
-                          "timestamp":
-                              now_iso()
-                      })
-
-                      print("COMMENT RESPONSE SENT")
-
-                  elif comment_response.status_code == 409:
-
-                      duplicate_blocked_comment_ids.add(
-                          selected["comment_id"]
-                      )
-
-                      print(
-                          "COMMENT DUPLICATE BLOCKED"
-                      )
-
-                  elif comment_response.status_code == 429:
-
-                      print(
-                          "COMMENT RATE LIMITED - "
-                          "LEAVING FOR NEXT RUN"
-                      )
-
-                  else:
-
-                      print(
-                          "COMMENT RESPONSE FAILED",
-                          comment_response.text[:500]
-                      )
-
-          # =========================================================
-          # MEMORY UPDATE
-          # =========================================================
-
-          communication_memory[
-              "version"
-          ] = "ACT02_V12_COMMUNICATION"
-
-          communication_memory[
-              "last_run"
-          ] = now_iso()
-
-          communication_memory[
-              "responded_comment_ids"
-          ] = sorted(
-              responded_comment_ids
+          comment_memory["known_nox_post_ids"] = sorted(
+              known_nox_post_ids
           )
 
-          communication_memory[
-              "duplicate_blocked_comment_ids"
-          ] = sorted(
-              duplicate_blocked_comment_ids
-          )
+          save_json(MEMORY_FILE, comment_memory)
 
-          dm_memory[
-              "version"
-          ] = "ACT02_V12_PRIVATE_DM"
+          # ------------------------------------------------------------
+          # FINAL DM MEMORY SAVE
+          # ------------------------------------------------------------
 
-          dm_memory[
-              "last_run"
-          ] = now_iso()
-
-          # Remove duplicate IDs while preserving order.
-          dm_memory[
-              "processed_message_ids"
-          ] = list(dict.fromkeys(
-              dm_memory.get(
-                  "processed_message_ids",
-                  []
-              )
-          ))
-
-          dm_memory[
-              "responded_message_ids"
-          ] = list(dict.fromkeys(
-              dm_memory.get(
-                  "responded_message_ids",
-                  []
-              )
-          ))
-
-          # Deduplicate response history.
-          seen_response_keys = set()
-          clean_dm_responses = []
-
-          for item in dm_memory.get(
-              "responses",
-              []
+          # Normalize lists.
+          for key in (
+              "processed_message_ids",
+              "responded_message_ids",
+              "claimed_message_ids",
           ):
-
-              if not isinstance(item, dict):
-                  continue
-
-              key = (
-                  item.get("incoming_message_id")
-                  or item.get("response_id")
+              dm_memory[key] = sorted(
+                  set(str(x) for x in dm_memory.get(key, []))
               )
 
-              if not key:
-                  key = json.dumps(
-                      item,
-                      sort_keys=True,
-                      ensure_ascii=False
-                  )
+          save_json(DM_MEMORY_FILE, dm_memory)
 
-              if key in seen_response_keys:
-                  continue
-
-              seen_response_keys.add(key)
-              clean_dm_responses.append(item)
-
-          dm_memory[
-              "responses"
-          ] = clean_dm_responses
-
-          save_json(
-              MEMORY_FILE,
-              communication_memory
-          )
-
-          save_json(
-              DM_MEMORY_FILE,
-              dm_memory
+          print(
+              "DECISION "
+              f"DM_RESPONSES={len(dm_memory['response_history'])} "
+              f"COMMENT_RESPONSES="
+              f"{len(comment_memory.get('response_history', []))}"
           )
 
           print(
-              "DECISION",
-              "DM_RESPONSES=",
-              len(
-                  dm_memory.get(
-                      "responses",
-                      []
-                  )
-              ),
-              "COMMENT_RESPONSES=",
-              len(
-                  communication_memory.get(
-                      "responses",
-                      []
-                  )
-              )
+              "DM STATS "
+              f"CLAIMED={dm_memory['stats'].get('claimed', 0)} "
+              f"SENT={dm_memory['stats'].get('responses_sent', 0)} "
+              f"BLOCKED={dm_memory['stats'].get('duplicates_blocked', 0)} "
+              f"ERRORS={dm_memory['stats'].get('send_errors', 0)}"
           )
 
           print(
-              "NOX POSTS KNOWN",
-              len(known_nox_post_ids)
-          )
-
-          print(
-              "GEMINI OFF"
-          )
-
-          print(
-              "PAYMENTS OFF"
-          )
-
-          print(
-              "MARKETPLACE OFF"
-          )
-
-          print(
+              "GEMINI OFF "
+              "PAYMENTS OFF "
+              "MARKETPLACE OFF "
               "COST EUR 0"
           )
 
-          print(
-              "ACT02 V12 COMMUNICATION COMPLETE"
-          )
-
+          print("ACT02 V13 COMMUNICATION COMPLETE")
           PY
 
-      - name: Persist ACT02 state safely
+      - name: Persist communication memory
         run: |
-          set -e
+          set -euo pipefail
 
-          mkdir -p /tmp/nox-act02-state
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
 
-          if [ -f memory/nox_act_02_communication.json ]; then
-            cp memory/nox_act_02_communication.json \
-              /tmp/nox-act02-state/nox_act_02_communication.json
+          git add memory/nox_act_02_communication.json
+          git add memory/nox_act_02_private_dm_v13.json
+
+          if git diff --cached --quiet; then
+            echo "No communication memory changes to commit."
+            exit 0
           fi
 
-          if [ -f memory/nox_act_02_private_dm.json ]; then
-            cp memory/nox_act_02_private_dm.json \
-              /tmp/nox-act02-state/nox_act_02_private_dm.json
-          fi
+          git commit -m "ACT02 V13: idempotent communication state"
 
           for attempt in 1 2 3 4 5; do
-            echo "GIT ATTEMPT $attempt"
+            echo "Push attempt ${attempt}"
 
             git fetch origin main
-
-            git reset --hard origin/main
-
-            mkdir -p memory
-
-            if [ -f /tmp/nox-act02-state/nox_act_02_communication.json ]; then
-
-              if [ -f memory/nox_act_02_communication.json ]; then
-                python - <<'PY'
-          import json
-          from pathlib import Path
-
-          local_path = Path(
-              "/tmp/nox-act02-state/nox_act_02_communication.json"
-          )
-
-          remote_path = Path(
-              "memory/nox_act_02_communication.json"
-          )
-
-          local = json.loads(
-              local_path.read_text(encoding="utf-8")
-          )
-
-          remote = json.loads(
-              remote_path.read_text(encoding="utf-8")
-          )
-
-          for key in [
-              "responded_comment_ids",
-              "duplicate_blocked_comment_ids"
-          ]:
-              merged = set(
-                  remote.get(key, [])
-              )
-              merged.update(
-                  local.get(key, [])
-              )
-              local[key] = sorted(merged)
-
-          remote_responses = remote.get(
-              "responses",
-              []
-          )
-
-          local_responses = local.get(
-              "responses",
-              []
-          )
-
-          merged_responses = []
-          seen = set()
-
-          for item in remote_responses + local_responses:
-
-              if not isinstance(item, dict):
-                  continue
-
-              key = (
-                  item.get("comment_id")
-                  or item.get("response_id")
-                  or json.dumps(
-                      item,
-                      sort_keys=True,
-                      ensure_ascii=False
-                  )
-              )
-
-              if key in seen:
-                  continue
-
-              seen.add(key)
-              merged_responses.append(item)
-
-          local["responses"] = merged_responses
-
-          remote_path.write_text(
-              json.dumps(
-                  local,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-          PY
-              else
-                cp /tmp/nox-act02-state/nox_act_02_communication.json \
-                  memory/nox_act_02_communication.json
-              fi
-            fi
-
-            if [ -f /tmp/nox-act02-state/nox_act_02_private_dm.json ]; then
-
-              if [ -f memory/nox_act_02_private_dm.json ]; then
-                python - <<'PY'
-          import json
-          from pathlib import Path
-
-          local_path = Path(
-              "/tmp/nox-act02-state/nox_act_02_private_dm.json"
-          )
-
-          remote_path = Path(
-              "memory/nox_act_02_private_dm.json"
-          )
-
-          local = json.loads(
-              local_path.read_text(encoding="utf-8")
-          )
-
-          remote = json.loads(
-              remote_path.read_text(encoding="utf-8")
-          )
-
-          for key in [
-              "processed_message_ids",
-              "responded_message_ids"
-          ]:
-              merged = set(
-                  remote.get(key, [])
-              )
-              merged.update(
-                  local.get(key, [])
-              )
-              local[key] = sorted(merged)
-
-          remote_responses = remote.get(
-              "responses",
-              []
-          )
-
-          local_responses = local.get(
-              "responses",
-              []
-          )
-
-          merged_responses = []
-          seen = set()
-
-          for item in remote_responses + local_responses:
-
-              if not isinstance(item, dict):
-                  continue
-
-              key = (
-                  item.get("incoming_message_id")
-                  or item.get("response_id")
-                  or json.dumps(
-                      item,
-                      sort_keys=True,
-                      ensure_ascii=False
-                  )
-              )
-
-              if key in seen:
-                  continue
-
-              seen.add(key)
-              merged_responses.append(item)
-
-          local["responses"] = merged_responses
-
-          remote_path.write_text(
-              json.dumps(
-                  local,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-          PY
-              else
-                cp /tmp/nox-act02-state/nox_act_02_private_dm.json \
-                  memory/nox_act_02_private_dm.json
-              fi
-            fi
-
-            git add memory/nox_act_02_communication.json \
-              memory/nox_act_02_private_dm.json
-
-            if git diff --cached --quiet; then
-              echo "NO MEMORY CHANGES TO COMMIT"
-              exit 0
-            fi
-
-            git commit -m \
-              "ACT02 V12: direct conversation DM monitor"
+            git rebase origin/main || {
+              echo "Rebase conflict detected."
+              git rebase --abort || true
+              git reset --hard origin/main
+              exit 1
+            }
 
             if git push origin HEAD:main; then
-              echo "GIT PUSH SUCCESS"
+              echo "Communication memory pushed successfully."
               exit 0
             fi
 
-            echo "GIT PUSH FAILED - RETRYING"
-            sleep 3
+            echo "Push failed, retrying..."
+            sleep 2
           done
 
-          echo "GIT PERSISTENCE FAILED AFTER 5 ATTEMPTS"
+          echo "Unable to push communication memory."
           exit 1
