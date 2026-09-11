@@ -1,39 +1,55 @@
-# NØX ACT46 V4 — Strategy Arbitration
+# NØX ACT46 — Strategy Arbitration
 
-**Timestamp:** `2026-09-11T22:32:33.525909+00:00`
+- Timestamp: `2026-09-11T22:35:18.606071+00:00`
+- Version: `V1`
+- Gemini used: `false`
+- Project cost: `0 EUR`
 
-## Decision
+## Objective
 
-- **Decision:** `INSUFFICIENT_EVIDENCE`
-- **Selected strategy:** `None`
-- **Candidate count:** `0`
-- **Comparison possible:** `False`
+Determine which strategy deserves priority when several strategies are simultaneously available.
 
-## ACT45 parsing
+## Selected strategy
 
-ACT46 V4 consumes the actual ACT45 strategy-state fields instead of assuming a generic candidate schema.
+**deepen_current_strategy**
 
-- `neutral_strategies`
-- `strategy_preferences`
+Arbitration score: **57.5**
 
-## Candidates
+Confidence: **weak**
 
-No explicit strategy candidate was found.
-## Arbitration reason
+'deepen_current_strategy' receives the highest arbitration score (57.5) after comparing 3 candidate strategies using relevance, evidence, potential, confidence, risk and effort. The score margin over the next strategy is 0.0.
 
-ACT45 was successfully parsed, but no explicit strategy candidate could be extracted from its real strategy-state fields.
+## Ranking
 
-## Evidence integrity
+| Rank | Strategy | Score | Relevance | Evidence | Potential | Confidence | Risk | Effort |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | deepen_current_strategy | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
+| 2 | explore_alternative | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
+| 3 | reduce_risk | 57.5 | 50.0 | 50.0 | 50.0 | 50.0 | 0.0 | 0.0 |
 
-- Fabricated candidates: `false`
-- Fabricated metrics: `false`
-- Arbitrary selection: `false`
-- Missing evidence preserved: `true`
+## Decision principles
 
-## Learning
+- Prefer strategies with strong current relevance.
+- Prefer strategies supported by stronger evidence.
+- Consider expected potential and impact.
+- Account for confidence before prioritizing.
+- Penalize unnecessary risk.
+- Penalize unnecessary effort.
+- Do not invent missing evidence.
+- Do not execute external actions.
 
-ACT46 learned that arbitration must operate on the actual strategy representation produced by ACT45. Candidate discovery must precede comparison, and missing candidate-level evidence must remain explicit instead of being replaced by default values.
+## Cognitive progression
+
+ACT45 — Adapt
+
+↓
+
+**ACT46 — Arbitrate**
+
+↓
+
+ACT47 — Combine
 
 ## Next step
 
-Remain in ACT46 until defensible arbitration evidence exists
+ACT47 will determine whether several valuable strategies can be combined into a coherent strategy set.
