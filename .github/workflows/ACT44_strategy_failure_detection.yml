@@ -1,0 +1,684 @@
+name: "NØX ACT44 - Strategy Failure Detection"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  strategy-failure-detection:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      GEMINI_USED: "false"
+      PROJECT_COST_EUR: "0"
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run ACT44 strategy failure detection
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          MEMORY = ROOT / "memory"
+          MEMORY.mkdir(parents=True, exist_ok=True)
+
+          OUTPUT = MEMORY / "nox_act_44_strategy_failure_detection.json"
+
+          def load_json(path):
+              path = Path(path)
+              if not path.exists():
+                  return None
+
+              try:
+                  with path.open("r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return None
+
+          def write_json(path, data):
+              with Path(path).open("w", encoding="utf-8") as f:
+                  json.dump(data, f, ensure_ascii=False, indent=2)
+                  f.write("\n")
+
+          def find_act_file(act_number):
+              patterns = [
+                  f"nox_act_{act_number}_*.json",
+                  f"*act_{act_number}*.json",
+                  f"*ACT{act_number}*.json",
+                  f"*act{act_number}*.json",
+              ]
+
+              candidates = []
+
+              for pattern in patterns:
+                  candidates.extend(MEMORY.glob(pattern))
+
+              unique = []
+              seen = set()
+
+              for path in candidates:
+                  resolved = path.resolve()
+
+                  if resolved in seen:
+                      continue
+
+                  seen.add(resolved)
+                  unique.append(path)
+
+              unique.sort(
+                  key=lambda p: p.stat().st_mtime
+                  if p.exists()
+                  else 0,
+                  reverse=True
+              )
+
+              return unique[0] if unique else None
+
+          def numeric(value, default=None):
+              try:
+                  return float(value)
+              except Exception:
+                  return default
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          act41_path = find_act_file(41)
+          act42_path = find_act_file(42)
+          act43_path = find_act_file(43)
+
+          act41 = load_json(act41_path) if act41_path else None
+          act42 = load_json(act42_path) if act42_path else None
+          act43 = load_json(act43_path) if act43_path else None
+
+          sources = {
+              "act41": bool(act41),
+              "act42": bool(act42),
+              "act43": bool(act43),
+          }
+
+          observations = []
+
+          if isinstance(act42, dict):
+              history = act42.get(
+                  "empirical_history",
+                  []
+              )
+
+              if isinstance(history, list):
+                  observations.extend(
+                      item for item in history
+                      if isinstance(item, dict)
+                  )
+
+          if not observations and isinstance(act43, dict):
+              empirical_memory = act43.get(
+                  "empirical_memory",
+                  {}
+              )
+
+              if isinstance(empirical_memory, dict):
+                  history = empirical_memory.get(
+                      "observations_used",
+                      []
+                  )
+
+                  if isinstance(history, list):
+                      observations.extend(
+                          item for item in history
+                          if isinstance(item, dict)
+                      )
+
+          # Deduplicate observations.
+          unique_observations = []
+          seen = set()
+
+          for observation in observations:
+              key = (
+                  observation.get("action_id"),
+                  observation.get("prediction_id"),
+                  observation.get("timestamp"),
+                  observation.get("outcome_state"),
+              )
+
+              if key in seen:
+                  continue
+
+              seen.add(key)
+              unique_observations.append(observation)
+
+          observations = unique_observations
+
+          # Build action histories using only real outcome evidence.
+          action_histories = {}
+
+          for observation in observations:
+              action_id = (
+                  observation.get("action_id")
+                  or observation.get("action")
+                  or "unknown"
+              )
+
+              action_histories.setdefault(
+                  action_id,
+                  []
+              ).append(observation)
+
+          strategy_assessments = []
+          inconsistent_strategies = []
+          declining_strategies = []
+          stable_strategies = []
+
+          for action_id, history in action_histories.items():
+              if len(history) < 2:
+                  continue
+
+              effectiveness = []
+
+              for observation in history:
+                  value = numeric(
+                      observation.get(
+                          "action_effectiveness"
+                      )
+                  )
+
+                  if value is not None:
+                      effectiveness.append(value)
+
+              if len(effectiveness) < 2:
+                  continue
+
+              first = effectiveness[0]
+              last = effectiveness[-1]
+
+              minimum = min(effectiveness)
+              maximum = max(effectiveness)
+
+              direction = "stable"
+
+              if last < first:
+                  direction = "declining"
+              elif last > first:
+                  direction = "improving"
+
+              variability = maximum - minimum
+
+              if variability >= 30:
+                  consistency = "inconsistent"
+              else:
+                  consistency = "relatively_consistent"
+
+              assessment = {
+                  "action_id": action_id,
+                  "sample_count": len(effectiveness),
+                  "effectiveness_values": effectiveness,
+                  "first_effectiveness": first,
+                  "latest_effectiveness": last,
+                  "minimum_effectiveness": minimum,
+                  "maximum_effectiveness": maximum,
+                  "direction": direction,
+                  "consistency": consistency,
+                  "variability": round(
+                      variability,
+                      2
+                  ),
+              }
+
+              strategy_assessments.append(
+                  assessment
+              )
+
+              if consistency == "inconsistent":
+                  inconsistent_strategies.append(
+                      assessment
+                  )
+
+              if direction == "declining":
+                  declining_strategies.append(
+                      assessment
+                  )
+
+              if (
+                  direction == "stable"
+                  and consistency == "relatively_consistent"
+              ):
+                  stable_strategies.append(
+                      assessment
+                  )
+
+          empirical_samples = len(observations)
+
+          if inconsistent_strategies:
+              status = "inconsistency_detected"
+
+              signal = (
+                  "Repeated empirical results show significant "
+                  "variation in strategy effectiveness. NØX "
+                  "should not assume that the strategy is "
+                  "reliably effective."
+              )
+
+          elif declining_strategies:
+              status = "strategy_decline_detected"
+
+              signal = (
+                  "Repeated empirical results indicate that "
+                  "at least one previously useful strategy has "
+                  "declining observed effectiveness."
+              )
+
+          elif stable_strategies:
+              status = "no_failure_detected"
+
+              signal = (
+                  "Available repeated empirical evidence does "
+                  "not currently indicate strategy failure."
+              )
+
+          elif empirical_samples > 0:
+              status = "insufficient_evidence"
+
+              signal = (
+                  "Some empirical evidence exists, but there "
+                  "are not enough comparable repeated outcomes "
+                  "to determine whether a strategy is failing."
+              )
+
+          else:
+              status = "awaiting_empirical_evidence"
+
+              signal = (
+                  "No real comparable action outcomes are "
+                  "available. Strategy failure cannot be "
+                  "detected without empirical evidence."
+              )
+
+          # A failure detector must never create failure evidence.
+          failure_evidence_available = bool(
+              inconsistent_strategies
+              or declining_strategies
+          )
+
+          confidence = 30.0
+
+          if isinstance(act43, dict):
+              confidence_data = act43.get(
+                  "confidence_update",
+                  {}
+              )
+
+              if isinstance(confidence_data, dict):
+                  confidence = numeric(
+                      confidence_data.get(
+                          "new_confidence"
+                      ),
+                      30.0
+                  )
+
+          output = {
+              "act": "ACT44",
+              "version": "V1",
+              "name": "Strategy Failure Detection",
+              "timestamp": now(),
+
+              "gemini_used": False,
+              "project_cost_eur": 0,
+
+              "source_completeness": round(
+                  (
+                      sum(
+                          1
+                          for value in sources.values()
+                          if value
+                      )
+                      / len(sources)
+                  ) * 100,
+                  2
+              ),
+
+              "sources": {
+                  "act41": (
+                      str(act41_path)
+                      if act41_path
+                      else None
+                  ),
+                  "act42": (
+                      str(act42_path)
+                      if act42_path
+                      else None
+                  ),
+                  "act43": (
+                      str(act43_path)
+                      if act43_path
+                      else None
+                  ),
+              },
+
+              "strategy_monitoring": {
+                  "status": status,
+                  "empirical_samples": empirical_samples,
+                  "strategies_with_repeated_evidence": len(
+                      strategy_assessments
+                  ),
+                  "failure_evidence_available": (
+                      failure_evidence_available
+                  ),
+                  "signal": signal,
+              },
+
+              "strategy_assessments": strategy_assessments,
+
+              "failure_detection": {
+                  "inconsistency_count": len(
+                      inconsistent_strategies
+                  ),
+                  "declining_count": len(
+                      declining_strategies
+                  ),
+                  "stable_count": len(
+                      stable_strategies
+                  ),
+                  "inconsistent_strategies": (
+                      inconsistent_strategies
+                  ),
+                  "declining_strategies": (
+                      declining_strategies
+                  ),
+                  "stable_strategies": (
+                      stable_strategies
+                  ),
+              },
+
+              "detection_rules": {
+                  "minimum_repeated_observations": 2,
+                  "rules": [
+                      "Never declare strategy failure without repeated empirical evidence.",
+                      "Never declare failure from a prediction alone.",
+                      "Never declare failure from an action-selection score.",
+                      "Never treat one bad result as strategy failure.",
+                      "Compare outcomes within comparable contexts.",
+                      "Detect inconsistency separately from decline.",
+                      "Preserve uncertainty when evidence is insufficient.",
+                      "A strategy may fail in one context while remaining useful in another.",
+                  ],
+              },
+
+              "context_awareness": {
+                  "enabled": True,
+                  "principle": (
+                      "A strategy's effectiveness is contextual. "
+                      "Observed decline or inconsistency must not "
+                      "automatically be generalized to every context."
+                  ),
+                  "context_shift_requires_reassessment": True,
+              },
+
+              "learning": {
+                  "available": failure_evidence_available,
+                  "type": (
+                      "strategy_failure_signal"
+                      if failure_evidence_available
+                      else "no_failure_signal"
+                  ),
+                  "lesson": (
+                      "When repeated evidence shows declining "
+                      "or inconsistent results, future strategy "
+                      "selection should treat the strategy as "
+                      "less reliable until further evidence "
+                      "clarifies the cause."
+                      if failure_evidence_available
+                      else (
+                          "No strategy failure can currently "
+                          "be established from the available "
+                          "evidence."
+                      )
+                  ),
+              },
+
+              "confidence_update": {
+                  "status": "no_update",
+                  "current_confidence": confidence,
+                  "confidence_change": 0.0,
+                  "new_confidence": confidence,
+                  "increase_allowed": False,
+                  "reason": (
+                      "ACT44 detects empirical strategy problems "
+                      "but does not independently recalibrate "
+                      "confidence."
+                  ),
+              },
+
+              "execution_state": {
+                  "execution_permission": False,
+                  "execution_authorization": False,
+                  "action_execution": False,
+                  "status": "learning_only",
+              },
+
+              "autonomy_state": {
+                  "status": "learning_only",
+                  "action_selection": True,
+                  "action_outcome_evaluation": True,
+                  "empirical_action_learning": True,
+                  "empirical_generalization": True,
+                  "strategy_failure_detection": True,
+                  "action_execution": False,
+                  "financial_actions": False,
+                  "payments": False,
+                  "spending": False,
+                  "gemini": False,
+              },
+
+              "financial_boundary": {
+                  "financial_permission": False,
+                  "payment_permission": False,
+                  "spending_permission": False,
+                  "financial_limit": 0.0,
+              },
+
+              "cognitive_learning": {
+                  "capability": (
+                      "Detect when repeated empirical evidence "
+                      "indicates that a previously useful strategy "
+                      "is declining or behaving inconsistently."
+                  ),
+                  "current_state": status,
+                  "what_nox_learned": (
+                      "A strategy should not be considered "
+                      "permanently effective. Its performance "
+                      "must continue to be monitored against "
+                      "real outcomes."
+                  ),
+                  "future_use": (
+                      "Use detected decline or inconsistency "
+                      "as evidence when evaluating future "
+                      "strategy candidates."
+                  ),
+              },
+
+              "strategy_failure_limits": {
+                  "single_failure": (
+                      "Insufficient to declare strategy failure."
+                  ),
+                  "two_or_more_comparable_results": (
+                      "Minimum evidence for detecting a possible "
+                      "pattern."
+                  ),
+                  "context_change": (
+                      "Requires separate evaluation."
+                  ),
+                  "conflicting_results": (
+                      "Classify as inconsistency rather than "
+                      "automatic failure."
+                  ),
+              },
+
+              "next_action": (
+                  "Continue monitoring repeated real outcomes "
+                  "and distinguish stable, declining and "
+                  "inconsistent strategy performance."
+              ),
+
+              "next_cognitive_step": (
+                  "ACT45 should adapt strategy selection using "
+                  "validated evidence about which strategies "
+                  "remain effective, which are declining and "
+                  "which require further testing."
+              ),
+
+              "validation": {
+                  "act41_present": bool(act41),
+                  "act42_present": bool(act42),
+                  "act43_present": bool(act43),
+                  "empirical_history_read": True,
+                  "only_real_observations_used": True,
+                  "single_failure_not_overinterpreted": True,
+                  "decline_requires_repeated_evidence": True,
+                  "inconsistency_separated_from_failure": True,
+                  "context_preserved": True,
+                  "prediction_not_treated_as_outcome": True,
+                  "selection_score_not_treated_as_outcome": True,
+                  "confidence_not_artificially_increased": True,
+                  "execution_not_authorized": True,
+                  "financial_permission_false": True,
+                  "payment_permission_false": True,
+                  "spending_permission_false": True,
+                  "gemini_false": (
+                      os.environ.get(
+                          "GEMINI_USED"
+                      ) == "false"
+                  ),
+                  "cost_zero": (
+                      numeric(
+                          os.environ.get(
+                              "PROJECT_COST_EUR"
+                          ),
+                          -1
+                      ) == 0.0
+                  ),
+              },
+          }
+
+          write_json(
+              OUTPUT,
+              output
+          )
+
+          written = load_json(OUTPUT)
+
+          assert written is not None
+          assert written["act"] == "ACT44"
+          assert written["version"] == "V1"
+          assert written["gemini_used"] is False
+          assert written["project_cost_eur"] == 0
+
+          assert written["execution_state"][
+              "execution_authorization"
+          ] is False
+
+          assert written["autonomy_state"][
+              "action_execution"
+          ] is False
+
+          assert written["financial_boundary"][
+              "financial_permission"
+          ] is False
+
+          assert written["financial_boundary"][
+              "payment_permission"
+          ] is False
+
+          assert written["financial_boundary"][
+              "spending_permission"
+          ] is False
+
+          assert written["confidence_update"][
+              "confidence_change"
+          ] == 0.0
+
+          assert written["validation"][
+              "only_real_observations_used"
+          ] is True
+
+          assert written["validation"][
+              "single_failure_not_overinterpreted"
+          ] is True
+
+          assert written["validation"][
+              "inconsistency_separated_from_failure"
+          ] is True
+
+          print(
+              json.dumps(
+                  written,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          )
+
+          print(
+              f"\nACT44 output written to {OUTPUT}"
+          )
+          PY
+
+      - name: Commit ACT44 memory
+        shell: bash
+        run: |
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
+          git add memory/nox_act_44_strategy_failure_detection.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT44 memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ACT44 V1 strategy failure detection"
+
+      - name: Push ACT44 safely
+        shell: bash
+        run: |
+          set -e
+
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt}/3"
+
+            git fetch origin main
+            git rebase origin/main
+
+            if git push origin HEAD:main; then
+              echo "ACT44 successfully pushed."
+              exit 0
+            fi
+
+            echo "Push failed, retrying..."
+            sleep $((attempt * 5))
+          done
+
+          echo "ACT44 push failed after 3 attempts."
+          exit 1
