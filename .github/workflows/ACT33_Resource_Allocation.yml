@@ -1,0 +1,560 @@
+name: NØX ACT33 - Resource Allocation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  resource-allocation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Allocate resources
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          BASE = Path("memory")
+          BASE.mkdir(parents=True, exist_ok=True)
+
+          def load_json(path, default):
+              p = Path(path)
+              if not p.exists():
+                  return default
+              try:
+                  with p.open("r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return default
+
+          act32 = load_json(
+              BASE / "nox_act_32_experiment_designer.json",
+              {}
+          )
+
+          act31 = load_json(
+              BASE / "nox_act_31_strategy_evaluation.json",
+              {}
+          )
+
+          experiments = act32.get("candidate_experiments", [])
+          selected_experiment = act32.get("selected_experiment", {})
+
+          if not experiments and selected_experiment:
+              experiments = [selected_experiment]
+
+          if not experiments:
+              raise SystemExit("No ACT32 experiments available.")
+
+          # ------------------------------------------------------------
+          # Resource model
+          #
+          # NØX does not currently have a monetary budget.
+          # Its scarce resources are modeled as:
+          #   attention
+          #   observation capacity
+          #   execution capacity
+          #   time
+          #   operational risk
+          #
+          # The budget is deliberately abstract and normalized.
+          # ------------------------------------------------------------
+
+          TOTAL_BUDGET = 100.0
+
+          resource_limits = {
+              "attention_budget": 100.0,
+              "observation_budget": 100.0,
+              "execution_budget": 100.0,
+              "time_budget": 100.0,
+              "risk_budget": 100.0,
+              "financial_budget_eur": 0.0
+          }
+
+          def clamp(value, low=0.0, high=100.0):
+              return max(low, min(high, float(value)))
+
+          def bool_score(value):
+              return 100.0 if bool(value) else 0.0
+
+          def experiment_score(exp):
+              """
+              Resource allocation is intentionally different from ACT32
+              experiment selection.
+
+              ACT32 asks:
+                  Which experiment is most useful to design?
+
+              ACT33 asks:
+                  How much of NØX's limited capacity should be allocated
+                  to each experiment now?
+              """
+
+              base = clamp(exp.get("experiment_score", 0.0))
+
+              priority = clamp(exp.get("priority", 0.0))
+
+              # ACT32 currently contains some priority values as 0.0.
+              # When available, recover the prediction priority from
+              # ACT31 verification targets.
+              prediction_id = exp.get("prediction_id")
+
+              recovered_priority = 0.0
+              for target in act31.get("expected_outcomes", []):
+                  if target.get("prediction_id") == prediction_id:
+                      recovered_priority = clamp(
+                          target.get("priority", 0.0)
+                      )
+                      break
+
+              effective_priority = max(priority, recovered_priority)
+
+              reversibility = 100.0 if (
+                  str(exp.get("reversibility", "")).lower()
+                  in {"high", "very_high"}
+              ) else 70.0
+
+              zero_cost = 100.0 if (
+                  str(exp.get("cost", "")).lower() == "zero"
+                  and not exp.get("requires_payment", False)
+              ) else 0.0
+
+              paid_ai_free = 100.0 if (
+                  not exp.get("requires_gemini", False)
+                  and not exp.get("requires_external_paid_ai", False)
+              ) else 0.0
+
+              observability = clamp(
+                  100.0 if exp.get("observation_variables") else 30.0
+              )
+
+              evidence_need = clamp(
+                  100.0 if exp.get("required_evidence") else 40.0
+              )
+
+              direct_actionability = 0.0
+
+              domain = str(exp.get("domain", "")).lower()
+              trigger = str(exp.get("trigger_to_watch", "")).lower()
+
+              if domain == "marketplace":
+                  direct_actionability += 25.0
+
+              if trigger in {
+                  "relevant_task_detected",
+                  "agent_communication",
+                  "communication_event",
+                  "interaction_with_another_agent"
+              }:
+                  direct_actionability += 20.0
+
+              direct_actionability = clamp(direct_actionability)
+
+              # Risk starts low for all current experiments because
+              # ACT32 explicitly designed them as reversible and zero-cost.
+              risk_score = 100.0 if reversibility >= 90 else 70.0
+
+              # Resource efficiency:
+              # high evidence yield with low operational burden.
+              resource_efficiency = clamp(
+                  (
+                      observability * 0.35
+                      + evidence_need * 0.25
+                      + reversibility * 0.20
+                      + zero_cost * 0.20
+                  )
+              )
+
+              # Learning value:
+              # preference is given to experiments that close a known
+              # epistemic gap and can produce directly comparable evidence.
+              learning_value = clamp(
+                  (
+                      effective_priority * 0.30
+                      + observability * 0.25
+                      + evidence_need * 0.20
+                      + direct_actionability * 0.15
+                      + resource_efficiency * 0.10
+                  )
+              )
+
+              allocation_score = clamp(
+                  (
+                      learning_value * 0.30
+                      + effective_priority * 0.20
+                      + resource_efficiency * 0.20
+                      + reversibility * 0.10
+                      + zero_cost * 0.08
+                      + paid_ai_free * 0.05
+                      + risk_score * 0.04
+                      + direct_actionability * 0.03
+                  )
+              )
+
+              # If the experiment requires money or paid AI, it is
+              # structurally rejected under the current project policy.
+              if exp.get("requires_payment", False):
+                  allocation_score = 0.0
+
+              if exp.get("requires_gemini", False):
+                  allocation_score = 0.0
+
+              if exp.get("requires_external_paid_ai", False):
+                  allocation_score = 0.0
+
+              return {
+                  "experiment_id": exp.get("experiment_id"),
+                  "prediction_id": prediction_id,
+                  "domain": exp.get("domain"),
+                  "trigger_to_watch": exp.get("trigger_to_watch"),
+                  "effective_prediction_priority": round(
+                      effective_priority, 2
+                  ),
+                  "learning_value": round(learning_value, 2),
+                  "resource_efficiency": round(resource_efficiency, 2),
+                  "observability": round(observability, 2),
+                  "reversibility": round(reversibility, 2),
+                  "risk_score": round(risk_score, 2),
+                  "zero_cost_score": round(zero_cost, 2),
+                  "paid_ai_free_score": round(paid_ai_free, 2),
+                  "direct_actionability": round(
+                      direct_actionability, 2
+                  ),
+                  "allocation_score": round(allocation_score, 2)
+              }
+
+          scored = [experiment_score(e) for e in experiments]
+
+          scored.sort(
+              key=lambda x: (
+                  x["allocation_score"],
+                  x["learning_value"],
+                  x["effective_prediction_priority"]
+              ),
+              reverse=True
+          )
+
+          # ------------------------------------------------------------
+          # Allocation policy
+          #
+          # NØX should not put 100% of its resources into one hypothesis.
+          # The current policy creates:
+          #
+          #   primary allocation = 60%
+          #   secondary allocation = 25%
+          #   reserve = 15%
+          #
+          # The reserve exists for unexpected high-value evidence.
+          # ------------------------------------------------------------
+
+          allocations = []
+
+          for index, item in enumerate(scored):
+              if index == 0:
+                  allocation = 60.0
+                  role = "primary"
+              elif index == 1:
+                  allocation = 25.0
+                  role = "secondary"
+              else:
+                  allocation = 0.0
+                  role = "queued"
+
+              allocations.append({
+                  **item,
+                  "allocation_percent": allocation,
+                  "resource_role": role
+              })
+
+          reserve_percent = 15.0
+
+          selected = allocations[0]
+
+          # ------------------------------------------------------------
+          # Attention budget
+          #
+          # A high allocation does not mean automatic execution.
+          # It means this experiment receives priority when its trigger
+          # becomes observable.
+          # ------------------------------------------------------------
+
+          attention_plan = {
+              "primary_experiment": selected["experiment_id"],
+              "primary_allocation_percent": selected["allocation_percent"],
+              "secondary_experiment": (
+                  allocations[1]["experiment_id"]
+                  if len(allocations) > 1
+                  else None
+              ),
+              "secondary_allocation_percent": (
+                  allocations[1]["allocation_percent"]
+                  if len(allocations) > 1
+                  else 0.0
+              ),
+              "reserve_percent": reserve_percent,
+              "execution_policy": (
+                  "allocation_is_priority_not_permission; "
+                  "an experiment may execute only when its trigger, "
+                  "authorization and safety conditions are actually met"
+              )
+          }
+
+          # ------------------------------------------------------------
+          # Reallocation rules
+          # ------------------------------------------------------------
+
+          reallocation_rules = [
+              "increase allocation when new evidence increases expected learning value",
+              "decrease allocation when repeated observations produce little new information",
+              "pause allocation when evidence contradicts the experiment assumptions",
+              "reallocate when a higher-value observable experiment appears",
+              "preserve reserve capacity for unexpected high-value evidence",
+              "never allocate financial spending under the current zero-cost policy",
+              "never allocate resources to Gemini or external paid AI",
+              "do not convert allocation into automatic execution permission",
+              "do not sacrifice evidence quality merely to increase activity",
+              "prefer measurable outcomes over activity volume"
+          ]
+
+          # ------------------------------------------------------------
+          # Resource state
+          # ------------------------------------------------------------
+
+          resource_state = {
+              "attention": round(
+                  selected["allocation_score"] * 0.60, 2
+              ),
+              "observation": round(
+                  selected["observability"] * 0.60, 2
+              ),
+              "execution": round(
+                  selected["direct_actionability"] * 0.60, 2
+              ),
+              "time": round(
+                  selected["resource_efficiency"] * 0.60, 2
+              ),
+              "risk_consumption": round(
+                  100.0 - selected["risk_score"], 2
+              ),
+              "financial_spending_eur": 0.0
+          }
+
+          # ------------------------------------------------------------
+          # Resource opportunity / scarcity
+          # ------------------------------------------------------------
+
+          scarcity = {
+              "financial": "hard_zero",
+              "attention": "limited",
+              "observation_capacity": "limited",
+              "execution_capacity": "limited",
+              "time": "limited",
+              "risk": "limited",
+              "reserve_capacity": "protected"
+          }
+
+          allocation_quality = clamp(
+              selected["allocation_score"] * 0.70
+              + selected["resource_efficiency"] * 0.20
+              + reserve_percent * 0.10
+          )
+
+          result = {
+              "act": "ACT33",
+              "name": "Resource Allocation",
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "gemini_used": False,
+              "project_cost_eur": 0,
+              "purpose": (
+                  "Allocate limited cognitive and operational resources "
+                  "among experiments designed by ACT32."
+              ),
+              "principle": (
+                  "NØX should not treat every possible action as equally "
+                  "valuable. It should allocate attention, observation, "
+                  "execution capacity and time according to expected "
+                  "learning value, evidence needs, reversibility, risk "
+                  "and resource efficiency."
+              ),
+              "source_act": "ACT32",
+              "evaluation_source": "ACT31",
+              "experiments_available": len(experiments),
+              "scored_experiments": len(scored),
+              "resource_limits": resource_limits,
+              "resource_scarcity": scarcity,
+              "ranked_experiments": allocations,
+              "selected_allocation": {
+                  "experiment_id": selected["experiment_id"],
+                  "prediction_id": selected["prediction_id"],
+                  "role": "primary",
+                  "allocation_percent": 60.0,
+                  "allocation_score": selected["allocation_score"],
+                  "learning_value": selected["learning_value"],
+                  "effective_prediction_priority": selected[
+                      "effective_prediction_priority"
+                  ],
+                  "resource_efficiency": selected[
+                      "resource_efficiency"
+                  ],
+                  "reason": (
+                      "Highest evidence-adjusted learning value under "
+                      "current resource constraints."
+                  )
+              },
+              "attention_plan": attention_plan,
+              "reserve_percent": reserve_percent,
+              "resource_state": resource_state,
+              "reallocation_rules": reallocation_rules,
+              "allocation_quality": round(
+                  allocation_quality, 2
+              ),
+              "allocation_is_provisional": True,
+              "execution_not_granted": True,
+              "financial_spending_allowed": False,
+              "gemini_allowed": False,
+              "external_paid_ai_allowed": False,
+              "learning": [
+                  (
+                      "Resources are finite even when financial cost is zero."
+                  ),
+                  (
+                      "Attention and observation capacity should be "
+                      "allocated according to expected information gain."
+                  ),
+                  (
+                      "A primary experiment should receive priority "
+                      "without monopolizing all available capacity."
+                  ),
+                  (
+                      "A reserve protects NØX from missing unexpected "
+                      "high-value evidence."
+                  ),
+                  (
+                      "Resource allocation is not equivalent to permission "
+                      "to execute an action."
+                  )
+              ],
+              "next_action": "observe_trigger_and_allocate_capacity",
+              "next_cognitive_step": (
+                  "ACT34 should transform accumulated evidence and "
+                  "resource constraints into explicit goals that NØX "
+                  "can pursue and evaluate."
+              )
+          }
+
+          output = BASE / "nox_act_33_resource_allocation.json"
+
+          with output.open("w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+
+          print("==============================================")
+          print("NØX ACT33 - RESOURCE ALLOCATION")
+          print("==============================================")
+          print(f"Experiments available: {len(experiments)}")
+          print(f"Experiments scored: {len(scored)}")
+          print()
+          print("RESOURCE MODEL:")
+          print("- Financial budget: 0 EUR")
+          print("- Attention: limited")
+          print("- Observation capacity: limited")
+          print("- Execution capacity: limited")
+          print("- Time: limited")
+          print("- Reserve: 15%")
+          print()
+          print("ALLOCATION:")
+          for item in allocations:
+              print(
+                  f"[{item['resource_role']}] "
+                  f"{item['experiment_id']} | "
+                  f"{item['allocation_percent']:.1f}% | "
+                  f"score={item['allocation_score']:.2f}"
+              )
+
+          print()
+          print("PRIMARY EXPERIMENT:")
+          print(f"- {selected['experiment_id']}")
+          print(f"- Prediction: {selected['prediction_id']}")
+          print(
+              f"- Allocation: "
+              f"{selected['allocation_percent']:.1f}%"
+          )
+          print(
+              f"- Learning value: "
+              f"{selected['learning_value']:.2f}"
+          )
+          print(
+              f"- Resource efficiency: "
+              f"{selected['resource_efficiency']:.2f}"
+          )
+
+          print()
+          print("RESOURCE STATE:")
+          for key, value in resource_state.items():
+              print(f"- {key}: {value}")
+
+          print()
+          print(
+              f"Allocation quality: "
+              f"{allocation_quality:.2f}"
+          )
+          print("Execution granted: False")
+          print("Financial spending allowed: False")
+          print("Gemini allowed: False")
+          print("External paid AI allowed: False")
+          print()
+          print(f"Memory written: {output}")
+          PY
+
+      - name: Commit ACT33 memory
+        run: |
+          git config user.name "NØX"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_33_resource_allocation.json
+
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Add NØX ACT33 resource allocation"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main || {
+              git rebase --abort || true
+              git reset --hard origin/main
+              git add memory/nox_act_33_resource_allocation.json
+              git commit -m "Add NØX ACT33 resource allocation" || true
+            }
+
+            if git push origin HEAD:main; then
+              echo "Push succeeded."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Push failed after retries."
+          exit 1
