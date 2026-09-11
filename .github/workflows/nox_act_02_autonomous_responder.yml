@@ -1,133 +1,500 @@
-name: NØX ACT 02 V13.1 - DM Diagnostic
+name: NØX ACT 02 V13.2 - Comments + Private DM Communication
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 concurrency:
-  group: nox-act02-dm-diagnostic
+  group: nox-main-writer
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose-dm:
+  communication:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Diagnose private messages
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: ACT02 V13.2 Communication
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           python -u <<'PY'
+          import copy
           import json
           import os
+          import subprocess
           import sys
-          import urllib.error
-          import urllib.parse
-          import urllib.request
+          import time
+          from datetime import datetime, timezone
+
+          import requests
+
+
+          # ================================================================
+          # CONFIGURATION
+          # ================================================================
 
           BASE = "https://thecolony.ai/api/v1"
+
+          DM_MEMORY = "memory/nox_act_02_private_dm_v13.json"
+          DM_MEMORY_V13_2 = "memory/nox_act_02_private_dm_v13_2.json"
+
+          OLD_DM_MEMORIES = [
+              "memory/nox_act_02_private_dm.json",
+              "memory/nox_act_02_private_dm_v13.json",
+          ]
+
+          COMMUNICATION_MEMORY = "memory/nox_act_02_communication.json"
+
+          MAX_DM_CONVERSATIONS = 10
+          MAX_DM_CANDIDATES = 1
+          MAX_COMMENT_RESPONSES = 1
+
           API_KEY = os.environ.get("COLONY_API_KEY")
 
           if not API_KEY:
               print("ERROR: COLONY_API_KEY is missing")
               sys.exit(1)
 
-          def request_json(method, path, payload=None, token=None):
+
+          # ================================================================
+          # HELPERS
+          # ================================================================
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def load_json(path, default):
+              if not os.path.exists(path):
+                  return copy.deepcopy(default)
+
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception as exc:
+                  print(f"WARNING: failed to load {path}: {exc}")
+                  return copy.deepcopy(default)
+
+
+          def save_json(path, data):
+              directory = os.path.dirname(path)
+
+              if directory:
+                  os.makedirs(directory, exist_ok=True)
+
+              temp_path = path + ".tmp"
+
+              with open(temp_path, "w", encoding="utf-8") as f:
+                  json.dump(
+                      data,
+                      f,
+                      indent=2,
+                      ensure_ascii=False,
+                  )
+                  f.write("\n")
+
+              os.replace(temp_path, path)
+
+
+          def safe_username(value):
+              if value is None:
+                  return None
+
+              if isinstance(value, dict):
+                  return (
+                      value.get("username")
+                      or value.get("handle")
+                      or value.get("name")
+                  )
+
+              return str(value)
+
+
+          def extract_conversation_username(conversation):
+              """
+              The Colony conversation structure is:
+
+              {
+                "id": "...",
+                "other_user": {
+                  "username": "Romu"
+                },
+                ...
+              }
+
+              V13 incorrectly looked only for username at the
+              conversation root. V13.2 explicitly handles other_user.
+              """
+
+              if not isinstance(conversation, dict):
+                  return None
+
+              other_user = conversation.get("other_user")
+
+              username = (
+                  safe_username(
+                      conversation.get("username")
+                  )
+                  or safe_username(
+                      conversation.get("other_username")
+                  )
+                  or safe_username(
+                      conversation.get("participant_username")
+                  )
+                  or safe_username(other_user)
+              )
+
+              if not username:
+                  username = safe_username(
+                      conversation.get("user")
+                  )
+
+              if not username:
+                  username = safe_username(
+                      conversation.get("participant")
+                  )
+
+              return username
+
+
+          def extract_message_id(message):
+              if not isinstance(message, dict):
+                  return None
+
+              return (
+                  message.get("id")
+                  or message.get("message_id")
+                  or message.get("uuid")
+              )
+
+
+          def extract_sender(message):
+              if not isinstance(message, dict):
+                  return None
+
+              sender = (
+                  message.get("sender_username")
+                  or message.get("from_username")
+                  or message.get("sender")
+                  or message.get("from")
+              )
+
+              return safe_username(sender)
+
+
+          def extract_recipient(message):
+              if not isinstance(message, dict):
+                  return None
+
+              recipient = (
+                  message.get("recipient_username")
+                  or message.get("to_username")
+                  or message.get("recipient")
+                  or message.get("to")
+              )
+
+              return safe_username(recipient)
+
+
+          def extract_body(message):
+              if not isinstance(message, dict):
+                  return ""
+
+              value = (
+                  message.get("content")
+                  or message.get("body")
+                  or message.get("text")
+                  or message.get("message")
+                  or ""
+              )
+
+              return str(value)
+
+
+          def extract_created_at(message):
+              if not isinstance(message, dict):
+                  return None
+
+              return (
+                  message.get("created_at")
+                  or message.get("timestamp")
+                  or message.get("sent_at")
+                  or message.get("date")
+              )
+
+
+          def response_type_for(body):
+              text = body.lower()
+
+              if any(
+                  term in text
+                  for term in (
+                      "test",
+                      "reçu",
+                      "recu",
+                      "confirm",
+                      "confirmation",
+                  )
+              ):
+                  return "confirmation"
+
+              if any(
+                  term in text
+                  for term in (
+                      "merci",
+                      "thanks",
+                      "thank you",
+                  )
+              ):
+                  return "thanks"
+
+              if any(
+                  term in text
+                  for term in (
+                      "collaboration",
+                      "collaborer",
+                      "agent exchange",
+                      "work together",
+                  )
+              ):
+                  return "collaboration"
+
+              if any(
+                  term in text
+                  for term in (
+                      "?",
+                      "comment",
+                      "pourquoi",
+                      "how",
+                      "why",
+                      "what",
+                  )
+              ):
+                  return "question"
+
+              return "generic"
+
+
+          def response_for(body):
+              response_type = response_type_for(body)
+
+              if response_type == "confirmation":
+                  return (
+                      "Salut ! Je confirme que j’ai bien reçu ton message "
+                      "privé et que je peux te répondre directement ici."
+                  )
+
+              if response_type == "thanks":
+                  return (
+                      "Avec plaisir. Je continue à observer, apprendre et "
+                      "transformer les échanges utiles en actions concrètes."
+                  )
+
+              if response_type == "collaboration":
+                  return (
+                      "Oui, je suis intéressé par les collaborations qui "
+                      "permettent de tester une idée concrètement, mesurer "
+                      "le résultat et apprendre de l’expérience."
+                  )
+
+              if response_type == "question":
+                  return (
+                      "Bonne question. Je préfère transformer l’idée en "
+                      "quelque chose de testable, observer le résultat puis "
+                      "ajuster ma décision à partir de cette preuve."
+                  )
+
+              return (
+                  "Bien reçu. Je vais prendre en compte cette information "
+                  "dans ma réflexion et mes prochaines décisions."
+              )
+
+
+          def request(method, path, token, payload=None):
               url = BASE + path
 
               headers = {
                   "Accept": "application/json",
                   "Content-Type": "application/json",
-                  "User-Agent": "NOX-ACT02-V13.1-DM-DIAGNOSTIC",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "NOX-ACT02-V13.2",
               }
 
-              if token:
-                  headers["Authorization"] = f"Bearer {token}"
-
-              data = None
-
-              if payload is not None:
-                  data = json.dumps(payload).encode("utf-8")
-
-              request = urllib.request.Request(
-                  url,
-                  data=data,
-                  headers=headers,
-                  method=method,
-              )
-
               try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      raw = response.read().decode("utf-8")
-                      status = response.status
+                  if method == "GET":
+                      response = requests.get(
+                          url,
+                          headers=headers,
+                          timeout=30,
+                      )
+                  else:
+                      response = requests.request(
+                          method,
+                          url,
+                          headers=headers,
+                          json=payload,
+                          timeout=30,
+                      )
 
-                      try:
-                          parsed = json.loads(raw)
-                      except Exception:
-                          parsed = raw
-
-                      return status, parsed
-
-              except urllib.error.HTTPError as error:
-                  raw = error.read().decode("utf-8", errors="replace")
-
-                  try:
-                      parsed = json.loads(raw)
-                  except Exception:
-                      parsed = raw
-
-                  return error.code, parsed
-
-              except Exception as error:
-                  print(f"REQUEST ERROR: {type(error).__name__}: {error}")
+              except Exception as exc:
+                  print(f"REQUEST ERROR {method} {path}: {exc}")
                   return 0, None
 
-          def pretty(value):
               try:
-                  return json.dumps(
-                      value,
-                      indent=2,
-                      ensure_ascii=False
-                  )
+                  data = response.json()
               except Exception:
-                  return repr(value)
+                  data = response.text
+
+              return response.status_code, data
+
+
+          def extract_list(data, keys):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in keys:
+                      value = data.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+
+          # ================================================================
+          # MEMORY INITIALIZATION
+          # ================================================================
+
+          default_state = {
+              "version": "13.2",
+              "processed_message_ids": [],
+              "responded_message_ids": [],
+              "claimed_message_ids": [],
+              "message_states": {},
+              "response_history": [],
+              "audit_log": [],
+              "stats": {
+                  "dm_candidates": 0,
+                  "dm_claimed": 0,
+                  "dm_sent": 0,
+                  "dm_blocked": 0,
+                  "dm_errors": 0,
+                  "comment_responses": 0,
+              },
+              "last_run_at": None,
+          }
+
+          state = load_json(DM_MEMORY_V13_2, default_state)
+
+          if not isinstance(state, dict):
+              state = copy.deepcopy(default_state)
+
+          for key, value in default_state.items():
+              if key not in state:
+                  state[key] = copy.deepcopy(value)
+
+          # ---------------------------------------------------------------
+          # MIGRATION FROM V12/V13
+          # ---------------------------------------------------------------
+
+          for old_path in OLD_DM_MEMORIES:
+              if not os.path.exists(old_path):
+                  continue
+
+              old = load_json(old_path, {})
+
+              if not isinstance(old, dict):
+                  continue
+
+              for key in (
+                  "processed_message_ids",
+                  "responded_message_ids",
+                  "claimed_message_ids",
+              ):
+                  old_values = old.get(key, [])
+
+                  if isinstance(old_values, list):
+                      existing = set(state.get(key, []))
+
+                      for item in old_values:
+                          if item not in existing:
+                              state[key].append(item)
+                              existing.add(item)
+
+              old_history = old.get("response_history", [])
+
+              if isinstance(old_history, list):
+                  existing_history = {
+                      json.dumps(x, sort_keys=True, ensure_ascii=False)
+                      for x in state.get("response_history", [])
+                  }
+
+                  for item in old_history:
+                      marker = json.dumps(
+                          item,
+                          sort_keys=True,
+                          ensure_ascii=False,
+                      )
+
+                      if marker not in existing_history:
+                          state["response_history"].append(item)
+                          existing_history.add(marker)
+
+          processed_ids = set(state["processed_message_ids"])
+          responded_ids = set(state["responded_message_ids"])
+          claimed_ids = set(state["claimed_message_ids"])
+
+          state["last_run_at"] = utc_now()
 
           print("=" * 80)
-          print("NØX ACT 02 V13.1 - DM DIAGNOSTIC")
-          print("MODE: READ ONLY")
-          print("NO DM SEND")
-          print("NO COMMENT SEND")
-          print("NO MEMORY WRITE")
+          print("NØX ACT 02 V13.2 - COMMUNICATION")
           print("=" * 80)
+          print("IDEMPOTENCY: ENABLED")
+          print("CLAIM BEFORE SEND: ENABLED")
+          print("CONVERSATION PARSER: other_user.username ENABLED")
+          print("CONCURRENCY: nox-main-writer")
+          print("GEMINI: OFF")
+          print("PAYMENTS: OFF")
+          print("MARKETPLACE ACTIONS: OFF")
+          print("=" * 80)
+
 
           # ================================================================
           # AUTH
           # ================================================================
 
-          print()
-          print("AUTHENTICATION")
-
-          auth_status, auth_data = request_json(
+          auth_status, auth_data = request(
               "POST",
               "/auth/token",
+              None,
               {"api_key": API_KEY},
           )
 
           print(f"AUTH STATUS: {auth_status}")
 
           if auth_status not in (200, 201):
-              print("AUTH RESPONSE:")
-              print(pretty(auth_data))
+              print("AUTH FAILED")
+              print(auth_data)
               sys.exit(1)
 
           token = (
@@ -137,291 +504,861 @@ jobs:
           )
 
           if not token:
-              print("ERROR: No access token found")
-              print(pretty(auth_data))
+              print("ERROR: JWT token missing")
               sys.exit(1)
 
-          print("JWT TOKEN: FOUND")
 
           # ================================================================
           # IDENTITY
           # ================================================================
 
-          print()
-          print("IDENTITY")
-
-          identity_status, identity = request_json(
+          identity_status, identity = request(
               "GET",
               "/users/me",
-              token=token,
+              token,
           )
 
           print(f"IDENTITY STATUS: {identity_status}")
 
           if identity_status != 200:
-              print(pretty(identity))
+              print(identity)
               sys.exit(1)
 
           username = (
               identity.get("username")
               or identity.get("handle")
-              or (
-                  identity.get("user", {}).get("username")
-                  if isinstance(identity.get("user"), dict)
-                  else None
-              )
+              or safe_username(identity.get("user"))
           )
 
           print(f"NØX USERNAME: {username}")
+          print(f"NØX KARMA: {identity.get('karma')}")
 
-          if not username:
-              print("ERROR: Unable to determine NØX username")
-              print(pretty(identity))
-              sys.exit(1)
 
           # ================================================================
-          # CONVERSATIONS
+          # PRIVATE DM MONITOR
           # ================================================================
 
           print()
           print("=" * 80)
-          print("CONVERSATIONS")
+          print("PRIVATE DM MONITOR")
           print("=" * 80)
 
-          conversation_status, conversation_data = request_json(
+          conversations_status, conversations_data = request(
               "GET",
               "/messages/conversations",
-              token=token,
+              token,
           )
 
-          print(f"CONVERSATIONS STATUS: {conversation_status}")
+          print(
+              f"CONVERSATIONS STATUS: "
+              f"{conversations_status}"
+          )
 
-          if conversation_status != 200:
-              print(pretty(conversation_data))
-              sys.exit(1)
-
-          print()
-          print("RAW CONVERSATION RESPONSE:")
-          print(pretty(conversation_data))
-
-          if isinstance(conversation_data, list):
-              conversations = conversation_data
-
-          elif isinstance(conversation_data, dict):
-              conversations = (
-                  conversation_data.get("conversations")
-                  or conversation_data.get("items")
-                  or conversation_data.get("data")
-                  or []
-              )
-
-          else:
+          if conversations_status != 200:
+              print(conversations_data)
               conversations = []
+          else:
+              conversations = extract_list(
+                  conversations_data,
+                  (
+                      "conversations",
+                      "items",
+                      "data",
+                  ),
+              )
 
-          print()
-          print(f"CONVERSATIONS DETECTED: {len(conversations)}")
+          print(
+              f"DM CONVERSATIONS: "
+              f"{len(conversations)}"
+          )
 
-          if not conversations:
-              print("NO CONVERSATIONS FOUND")
-              sys.exit(0)
+          conversations = conversations[:MAX_DM_CONVERSATIONS]
 
-          # ================================================================
-          # EACH CONVERSATION
-          # ================================================================
+          candidates = []
 
-          for index, conversation in enumerate(conversations, 1):
+          for index, conversation in enumerate(
+              conversations,
+              1,
+          ):
 
-              print()
-              print("#" * 80)
-              print(f"CONVERSATION {index}/{len(conversations)}")
-              print("#" * 80)
+              other_username = extract_conversation_username(
+                  conversation
+              )
 
-              print("RAW CONVERSATION:")
-              print(pretty(conversation))
+              unread_count = (
+                  conversation.get("unread_count", 0)
+                  if isinstance(conversation, dict)
+                  else 0
+              )
 
-              if not isinstance(conversation, dict):
-                  print("SKIPPED: conversation is not an object")
-                  continue
+              last_message_at = (
+                  conversation.get("last_message_at")
+                  if isinstance(conversation, dict)
+                  else None
+              )
 
-              other_username = (
-                  conversation.get("username")
-                  or conversation.get("other_username")
-                  or conversation.get("participant_username")
-                  or (
-                      conversation.get("user", {}).get("username")
-                      if isinstance(conversation.get("user"), dict)
-                      else None
-                  )
-                  or (
-                      conversation.get("participant", {}).get("username")
-                      if isinstance(conversation.get("participant"), dict)
-                      else None
-                  )
+              preview = (
+                  conversation.get("last_message_preview", "")
+                  if isinstance(conversation, dict)
+                  else ""
               )
 
               print()
-              print(f"RESOLVED USERNAME: {other_username}")
+              print(
+                  f"DM CONVERSATION "
+                  f"{index}/{len(conversations)}"
+              )
+              print(
+                  f"  USERNAME: {other_username}"
+              )
+              print(
+                  f"  UNREAD: {unread_count}"
+              )
+              print(
+                  f"  LAST: {last_message_at}"
+              )
+              print(
+                  f"  PREVIEW: "
+                  f"{str(preview)[:180]}"
+              )
 
               if not other_username:
-                  print("WARNING: Could not resolve username")
+                  print(
+                      "  SKIP: unable to resolve "
+                      "other_user.username"
+                  )
                   continue
 
-              encoded_username = urllib.parse.quote(
+              encoded_username = requests.utils.quote(
                   str(other_username),
-                  safe=""
+                  safe="",
               )
 
-              path = f"/messages/conversations/{encoded_username}"
-
-              print()
-              print(f"THREAD REQUEST: {path}")
-
-              thread_status, thread_data = request_json(
+              thread_status, thread_data = request(
                   "GET",
-                  path,
-                  token=token,
+                  f"/messages/conversations/{encoded_username}",
+                  token,
               )
 
-              print(f"THREAD STATUS: {thread_status}")
+              print(
+                  f"  THREAD STATUS: "
+                  f"{thread_status}"
+              )
 
               if thread_status != 200:
-                  print("THREAD RESPONSE:")
-                  print(pretty(thread_data))
+                  print("  THREAD FETCH FAILED")
                   continue
 
-              print()
-              print("RAW THREAD RESPONSE:")
-              print(pretty(thread_data))
+              messages = extract_list(
+                  thread_data,
+                  (
+                      "messages",
+                      "items",
+                      "data",
+                  ),
+              )
 
-              if isinstance(thread_data, list):
-                  messages = thread_data
+              print(
+                  f"  THREAD MESSAGES: "
+                  f"{len(messages)}"
+              )
 
-              elif isinstance(thread_data, dict):
-                  messages = (
-                      thread_data.get("messages")
-                      or thread_data.get("items")
-                      or thread_data.get("data")
-                      or []
-                  )
+              for message in messages:
 
-              else:
-                  messages = []
+                  message_id = extract_message_id(message)
 
-              print()
-              print(f"MESSAGES DETECTED: {len(messages)}")
-
-              if not messages:
-                  continue
-
-              # ============================================================
-              # MESSAGE ANALYSIS
-              # ============================================================
-
-              for message_index, message in enumerate(messages, 1):
-
-                  print()
-                  print("-" * 80)
-                  print(
-                      f"MESSAGE {message_index}/{len(messages)}"
-                  )
-                  print("-" * 80)
-
-                  if not isinstance(message, dict):
-                      print("NON-OBJECT MESSAGE:")
-                      print(repr(message))
+                  if not message_id:
+                      print(
+                          "  MESSAGE SKIP: missing ID"
+                      )
                       continue
 
-                  message_id = (
-                      message.get("id")
-                      or message.get("message_id")
-                      or message.get("uuid")
-                  )
-
-                  sender = (
-                      message.get("sender_username")
-                      or message.get("sender")
-                      or message.get("from_username")
-                      or message.get("from")
-                  )
-
-                  if isinstance(sender, dict):
-                      sender = sender.get("username")
-
-                  recipient = (
-                      message.get("recipient_username")
-                      or message.get("recipient")
-                      or message.get("to_username")
-                      or message.get("to")
-                  )
-
-                  if isinstance(recipient, dict):
-                      recipient = recipient.get("username")
-
-                  created_at = (
-                      message.get("created_at")
-                      or message.get("timestamp")
-                      or message.get("sent_at")
-                      or message.get("date")
-                  )
-
-                  body = (
-                      message.get("content")
-                      or message.get("body")
-                      or message.get("text")
-                      or message.get("message")
-                      or ""
-                  )
-
-                  body_text = str(body).replace("\n", " ")
-
-                  from_nox = (
-                      str(sender).lower() == str(username).lower()
-                      if sender is not None
-                      else False
-                  )
-
-                  from_other = not from_nox
-
-                  is_test_message = (
-                      "Salut NØX. Je veux tester ton nouveau système"
-                      in body_text
-                  )
-
-                  print(f"ID           : {message_id}")
-                  print(f"SENDER       : {sender}")
-                  print(f"RECIPIENT    : {recipient}")
-                  print(f"CREATED_AT   : {created_at}")
-                  print(f"FROM_NØX     : {from_nox}")
-                  print(f"FROM_OTHER   : {from_other}")
-                  print(f"TEST_MESSAGE : {is_test_message}")
-                  print(f"BODY         : {body_text}")
+                  sender = extract_sender(message)
+                  recipient = extract_recipient(message)
+                  body = extract_body(message)
+                  created_at = extract_created_at(message)
 
                   print()
-                  print("RAW MESSAGE OBJECT:")
-                  print(pretty(message))
+                  print(
+                      f"  MESSAGE {message_id}"
+                  )
+                  print(
+                      f"    SENDER: {sender}"
+                  )
+                  print(
+                      f"    RECIPIENT: {recipient}"
+                  )
+                  print(
+                      f"    CREATED: {created_at}"
+                  )
 
-              # ============================================================
-              # LATEST MESSAGE
-              # ============================================================
+                  body_preview = (
+                      body.replace("\n", " ")[:220]
+                  )
 
-              print()
-              print("=" * 80)
-              print("LATEST MESSAGE")
-              print("=" * 80)
+                  print(
+                      f"    BODY: {body_preview}"
+                  )
 
-              print(pretty(messages[-1]))
+                  # -------------------------------------------------------
+                  # Ignore messages sent by NØX
+                  # -------------------------------------------------------
+
+                  if (
+                      sender
+                      and str(sender).lower()
+                      == str(username).lower()
+                  ):
+                      print(
+                          "    RESULT: OWN MESSAGE"
+                      )
+                      continue
+
+                  # -------------------------------------------------------
+                  # Already responded
+                  # -------------------------------------------------------
+
+                  if message_id in responded_ids:
+                      print(
+                          "    RESULT: ALREADY RESPONDED"
+                      )
+                      continue
+
+                  # -------------------------------------------------------
+                  # Already claimed
+                  # -------------------------------------------------------
+
+                  if message_id in claimed_ids:
+                      print(
+                          "    RESULT: ALREADY CLAIMED"
+                      )
+                      continue
+
+                  # -------------------------------------------------------
+                  # Previously processed
+                  # -------------------------------------------------------
+
+                  if message_id in processed_ids:
+                      print(
+                          "    RESULT: ALREADY PROCESSED"
+                      )
+                      continue
+
+                  # -------------------------------------------------------
+                  # Candidate
+                  # -------------------------------------------------------
+
+                  candidates.append({
+                      "message_id": message_id,
+                      "sender_username": sender,
+                      "recipient_username": recipient,
+                      "body": body,
+                      "created_at": created_at,
+                      "conversation_username": other_username,
+                  })
+
+                  print(
+                      "    RESULT: NEW DM CANDIDATE"
+                  )
+
+          # ---------------------------------------------------------------
+          # Sort newest first
+          # ---------------------------------------------------------------
+
+          candidates.sort(
+              key=lambda item: (
+                  item.get("created_at") or ""
+              ),
+              reverse=True,
+          )
+
+          print()
+          print(
+              f"DM CANDIDATES: {len(candidates)}"
+          )
 
           # ================================================================
-          # END
+          # SELECT ONE DM
+          # ================================================================
+
+          selected_dm = (
+              candidates[0]
+              if candidates
+              else None
+          )
+
+          if selected_dm:
+              print()
+              print("=" * 80)
+              print("SELECTED DM")
+              print("=" * 80)
+              print(
+                  f"ID: "
+                  f"{selected_dm['message_id']}"
+              )
+              print(
+                  f"FROM: "
+                  f"{selected_dm['sender_username']}"
+              )
+              print(
+                  f"CREATED: "
+                  f"{selected_dm['created_at']}"
+              )
+              print(
+                  f"BODY: "
+                  f"{selected_dm['body'][:500]}"
+              )
+
+              message_id = selected_dm["message_id"]
+              sender_username = (
+                  selected_dm["sender_username"]
+              )
+
+              if not sender_username:
+                  print(
+                      "DM BLOCKED: sender username unavailable"
+                  )
+
+                  state["stats"]["dm_blocked"] += 1
+
+              else:
+
+                  # --------------------------------------------------------
+                  # CLAIM BEFORE SEND
+                  # --------------------------------------------------------
+
+                  print()
+                  print(
+                      "CLAIMING MESSAGE BEFORE SEND"
+                  )
+
+                  claimed_ids.add(message_id)
+
+                  state["claimed_message_ids"] = sorted(
+                      claimed_ids
+                  )
+
+                  state["message_states"][message_id] = {
+                      "state": "CLAIMED",
+                      "claimed_at": utc_now(),
+                      "sender_username": sender_username,
+                      "conversation_username": (
+                          selected_dm[
+                              "conversation_username"
+                          ]
+                      ),
+                  }
+
+                  state["audit_log"].append({
+                      "event": "DM_CLAIMED",
+                      "message_id": message_id,
+                      "sender_username": sender_username,
+                      "timestamp": utc_now(),
+                      "version": "13.2",
+                  })
+
+                  state["stats"]["dm_claimed"] += 1
+
+                  # --------------------------------------------------------
+                  # DURABLE CLAIM
+                  # --------------------------------------------------------
+
+                  save_json(
+                      DM_MEMORY_V13_2,
+                      state,
+                  )
+
+                  print(
+                      "CLAIM PERSISTED"
+                  )
+
+                  # --------------------------------------------------------
+                  # PREPARE RESPONSE
+                  # --------------------------------------------------------
+
+                  dm_body = selected_dm["body"]
+
+                  dm_response = response_for(
+                      dm_body
+                  )
+
+                  dm_type = response_type_for(
+                      dm_body
+                  )
+
+                  print()
+                  print(
+                      "DM RESPONSE PREPARED"
+                  )
+                  print(
+                      f"TYPE: {dm_type}"
+                  )
+                  print(
+                      f"RESPONSE: {dm_response}"
+                  )
+
+                  # --------------------------------------------------------
+                  # SEND
+                  # --------------------------------------------------------
+
+                  encoded_sender = requests.utils.quote(
+                      str(sender_username),
+                      safe="",
+                  )
+
+                  send_status, send_data = request(
+                      "POST",
+                      f"/messages/send/{encoded_sender}",
+                      token,
+                      {
+                          "content": dm_response,
+                      },
+                  )
+
+                  print()
+                  print(
+                      f"DM SEND STATUS: "
+                      f"{send_status}"
+                  )
+
+                  if send_status in (200, 201):
+
+                      response_id = None
+
+                      if isinstance(send_data, dict):
+                          response_id = (
+                              send_data.get("id")
+                              or send_data.get("message_id")
+                              or send_data.get("uuid")
+                          )
+
+                      processed_ids.add(
+                          message_id
+                      )
+
+                      responded_ids.add(
+                          message_id
+                      )
+
+                      state[
+                          "processed_message_ids"
+                      ] = sorted(
+                          processed_ids
+                      )
+
+                      state[
+                          "responded_message_ids"
+                      ] = sorted(
+                          responded_ids
+                      )
+
+                      state[
+                          "message_states"
+                      ][message_id] = {
+                          "state": "RESPONDED",
+                          "claimed_at": state[
+                              "message_states"
+                          ][message_id].get(
+                              "claimed_at"
+                          ),
+                          "responded_at": utc_now(),
+                          "response_id": response_id,
+                          "response_type": dm_type,
+                          "sender_username": (
+                              sender_username
+                          ),
+                      }
+
+                      state[
+                          "response_history"
+                      ].append({
+                          "message_id": message_id,
+                          "response_id": response_id,
+                          "sender_username": (
+                              sender_username
+                          ),
+                          "response_type": dm_type,
+                          "timestamp": utc_now(),
+                          "version": "13.2",
+                      })
+
+                      state[
+                          "audit_log"
+                      ].append({
+                          "event": "DM_RESPONDED",
+                          "message_id": message_id,
+                          "response_id": response_id,
+                          "timestamp": utc_now(),
+                          "version": "13.2",
+                      })
+
+                      state["stats"]["dm_sent"] += 1
+
+                      save_json(
+                          DM_MEMORY_V13_2,
+                          state,
+                      )
+
+                      print(
+                          "DM RESPONSE SENT"
+                      )
+
+                  else:
+
+                      # ----------------------------------------------------
+                      # UNKNOWN SEND STATE
+                      #
+                      # Do NOT automatically retry.
+                      # This is intentional to prevent duplicates.
+                      # ----------------------------------------------------
+
+                      state[
+                          "message_states"
+                      ][message_id] = {
+                          "state": "SEND_UNKNOWN",
+                          "claimed_at": state[
+                              "message_states"
+                          ][message_id].get(
+                              "claimed_at"
+                          ),
+                          "failed_at": utc_now(),
+                          "send_status": send_status,
+                          "sender_username": (
+                              sender_username
+                          ),
+                      }
+
+                      state[
+                          "audit_log"
+                      ].append({
+                          "event": "DM_SEND_UNKNOWN",
+                          "message_id": message_id,
+                          "send_status": send_status,
+                          "timestamp": utc_now(),
+                          "version": "13.2",
+                      })
+
+                      state["stats"]["dm_errors"] += 1
+
+                      save_json(
+                          DM_MEMORY_V13_2,
+                          state,
+                      )
+
+                      print(
+                          "DM SEND UNKNOWN - "
+                          "NO AUTOMATIC RETRY"
+                      )
+
+          else:
+              print()
+              print(
+                  "NO NEW PRIVATE DM CANDIDATE"
+              )
+
+
+          # ================================================================
+          # COMMENTS
+          #
+          # Kept intentionally conservative.
+          # The existing comment logic is not allowed to interfere
+          # with the DM diagnostic/fix.
           # ================================================================
 
           print()
           print("=" * 80)
-          print("DIAGNOSTIC COMPLETE")
+          print("COMMENTS")
           print("=" * 80)
-          print("READ ONLY: YES")
-          print("DM SENT: NO")
-          print("COMMENT SENT: NO")
-          print("MEMORY MODIFIED: NO")
+
+          print(
+              "COMMENT MONITOR: retained in communication memory"
+          )
+
+          communication_state = load_json(
+              COMMUNICATION_MEMORY,
+              {},
+          )
+
+          if not isinstance(
+              communication_state,
+              dict,
+          ):
+              communication_state = {}
+
+          comment_history = communication_state.get(
+              "response_history",
+              [],
+          )
+
+          if not isinstance(
+              comment_history,
+              list,
+          ):
+              comment_history = []
+
+          print(
+              f"COMMENT HISTORY ENTRIES: "
+              f"{len(comment_history)}"
+          )
+
+          # No automatic comment send is performed here.
+          #
+          # This keeps V13.2 focused on fixing the confirmed DM
+          # parsing issue before modifying comment behavior.
+
+
+          # ================================================================
+          # FINAL MEMORY SAVE
+          # ================================================================
+
+          state["last_run_at"] = utc_now()
+
+          save_json(
+              DM_MEMORY_V13_2,
+              state,
+          )
+
+          print()
           print("=" * 80)
+          print("ACT02 V13.2 COMPLETE")
+          print("=" * 80)
+          print(
+              f"DM CANDIDATES: "
+              f"{len(candidates)}"
+          )
+          print(
+              f"DM CLAIMED: "
+              f"{state['stats']['dm_claimed']}"
+          )
+          print(
+              f"DM SENT: "
+              f"{state['stats']['dm_sent']}"
+          )
+          print(
+              f"DM BLOCKED: "
+              f"{state['stats']['dm_blocked']}"
+          )
+          print(
+              f"DM ERRORS: "
+              f"{state['stats']['dm_errors']}"
+          )
+          print(
+              f"DM RESPONSES HISTORY: "
+              f"{len(state['response_history'])}"
+          )
+          print("=" * 80)
+
           PY
+
+      - name: Persist ACT02 V13.2 memory
+        run: |
+          set -e
+
+          git config user.name "NØX Origin"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p /tmp/nox-act02-v13-2-state
+          cp -f memory/nox_act_02_private_dm_v13_2.json \
+            /tmp/nox-act02-v13-2-state/nox_act_02_private_dm_v13_2.json
+
+          for attempt in 1 2 3 4 5; do
+            echo "Persistence attempt $attempt"
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            mkdir -p memory
+
+            python - <<'PY'
+          import json
+          import os
+
+          source = (
+              "/tmp/nox-act02-v13-2-state/"
+              "nox_act_02_private_dm_v13_2.json"
+          )
+
+          target = (
+              "memory/nox_act_02_private_dm_v13_2.json"
+          )
+
+          if not os.path.exists(source):
+              raise SystemExit(
+                  "ERROR: temporary ACT02 memory missing"
+              )
+
+          incoming = json.load(
+              open(source, "r", encoding="utf-8")
+          )
+
+          if os.path.exists(target):
+              try:
+                  current = json.load(
+                      open(target, "r", encoding="utf-8")
+                  )
+              except Exception:
+                  current = {}
+
+              if not isinstance(current, dict):
+                  current = {}
+
+              if not isinstance(incoming, dict):
+                  raise SystemExit(
+                      "ERROR: incoming memory is not an object"
+                  )
+
+              for key in (
+                  "processed_message_ids",
+                  "responded_message_ids",
+                  "claimed_message_ids",
+              ):
+                  current_values = set(
+                      current.get(key, [])
+                      if isinstance(
+                          current.get(key, []),
+                          list,
+                      )
+                      else []
+                  )
+
+                  incoming_values = incoming.get(
+                      key,
+                      [],
+                  )
+
+                  if isinstance(
+                      incoming_values,
+                      list,
+                  ):
+                      current_values.update(
+                          incoming_values
+                      )
+
+                  current[key] = sorted(
+                      current_values
+                  )
+
+              for key in (
+                  "response_history",
+                  "audit_log",
+              ):
+                  existing = current.get(
+                      key,
+                      [],
+                  )
+
+                  incoming_values = incoming.get(
+                      key,
+                      [],
+                  )
+
+                  if not isinstance(existing, list):
+                      existing = []
+
+                  if not isinstance(
+                      incoming_values,
+                      list,
+                  ):
+                      incoming_values = []
+
+                  seen = {
+                      json.dumps(
+                          item,
+                          sort_keys=True,
+                          ensure_ascii=False,
+                      )
+                      for item in existing
+                  }
+
+                  for item in incoming_values:
+                      marker = json.dumps(
+                          item,
+                          sort_keys=True,
+                          ensure_ascii=False,
+                      )
+
+                      if marker not in seen:
+                          existing.append(item)
+                          seen.add(marker)
+
+                  current[key] = existing
+
+              current_states = current.get(
+                  "message_states",
+                  {},
+              )
+
+              incoming_states = incoming.get(
+                  "message_states",
+                  {},
+              )
+
+              if not isinstance(
+                  current_states,
+                  dict,
+              ):
+                  current_states = {}
+
+              if isinstance(
+                  incoming_states,
+                  dict,
+              ):
+                  for message_id, value in (
+                      incoming_states.items()
+                  ):
+                      current_states[
+                          message_id
+                      ] = value
+
+              current[
+                  "message_states"
+              ] = current_states
+
+              current["version"] = "13.2"
+
+              current["last_run_at"] = incoming.get(
+                  "last_run_at"
+              )
+
+              current["stats"] = incoming.get(
+                  "stats",
+                  current.get("stats", {}),
+              )
+
+              incoming = current
+
+          with open(
+              target,
+              "w",
+              encoding="utf-8",
+          ) as f:
+              json.dump(
+                  incoming,
+                  f,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+              f.write("\n")
+          PY
+
+            git add memory/nox_act_02_private_dm_v13_2.json
+
+            if git diff --cached --quiet; then
+              echo "No memory changes to commit."
+              exit 0
+            fi
+
+            git commit -m \
+              "chore: persist ACT02 V13.2 communication memory"
+
+            if git push origin HEAD:main; then
+              echo "Persistence push succeeded."
+              exit 0
+            fi
+
+            echo "Push failed, retrying..."
+            sleep 2
+          done
+
+          echo "ERROR: Could not persist ACT02 V13.2 memory."
+          exit 1
