@@ -1,4 +1,4 @@
-name: "NØX ACT39 V4 - Confidence Calibration"
+name: "NØX ACT39 V5 - Confidence Calibration"
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ACT39 V4
+      - name: Run ACT39 V5
         run: |
           python - <<'PY'
           import json
@@ -45,6 +45,10 @@ jobs:
           MEMORY = ROOT / "memory"
           MEMORY.mkdir(parents=True, exist_ok=True)
 
+          # ============================================================
+          # Generic helpers
+          # ============================================================
+
           def load_json(path):
               try:
                   with open(path, "r", encoding="utf-8") as f:
@@ -52,11 +56,10 @@ jobs:
               except Exception:
                   return None
 
-          def first_number(*values):
-              for value in values:
-                  if isinstance(value, (int, float)) and not isinstance(value, bool):
-                      return float(value)
-              return None
+          def write_json(path, data):
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(data, f, indent=2, ensure_ascii=False)
+                  f.write("\n")
 
           def first_value(*values):
               for value in values:
@@ -64,16 +67,26 @@ jobs:
                       return value
               return None
 
+          def numeric(value):
+              if isinstance(value, bool):
+                  return None
+
+              if isinstance(value, (int, float)):
+                  return float(value)
+
+              if isinstance(value, str):
+                  try:
+                      return float(value.strip().replace("%", ""))
+                  except Exception:
+                      return None
+
+              return None
+
           def clamp(value, low, high):
               return max(low, min(high, value))
 
-          def write_json(path, data):
-              with open(path, "w", encoding="utf-8") as f:
-                  json.dump(data, f, indent=2, ensure_ascii=False)
-                  f.write("\n")
-
           # ============================================================
-          # Locate ACT source files robustly
+          # Robust ACT source discovery
           # ============================================================
 
           def find_act_file(act_number, preferred_names=None):
@@ -83,31 +96,49 @@ jobs:
                   path = MEMORY / name
                   if path.exists():
                       data = load_json(path)
-                      if isinstance(data, dict) and data.get("act") == act_number:
+                      if (
+                          isinstance(data, dict)
+                          and str(data.get("act", "")).upper()
+                          == act_number.upper()
+                      ):
                           return path, data
 
-              candidates = sorted(
-                  MEMORY.glob(f"*act_{act_number.lower().replace('act', '')}*.json")
+              number = act_number.lower().replace("act", "")
+
+              candidates = list(
+                  MEMORY.glob(f"*act_{number}*.json")
               )
 
-              # Also support files where the ACT number is represented
-              # without the underscore convention.
-              if not candidates:
-                  candidates = sorted(
-                      MEMORY.glob(f"*{act_number.lower()}*.json")
-                  )
+              candidates += list(
+                  MEMORY.glob(f"*act{number}*.json")
+              )
+
+              candidates += list(
+                  MEMORY.glob(f"*{act_number.lower()}*.json")
+              )
 
               matches = []
 
+              seen = set()
+
               for path in candidates:
+                  if path in seen:
+                      continue
+
+                  seen.add(path)
+
                   data = load_json(path)
-                  if isinstance(data, dict) and data.get("act") == act_number:
+
+                  if (
+                      isinstance(data, dict)
+                      and str(data.get("act", "")).upper()
+                      == act_number.upper()
+                  ):
                       matches.append((path, data))
 
               if not matches:
                   return None, {}
 
-              # Prefer the most recently modified valid source.
               matches.sort(
                   key=lambda item: item[0].stat().st_mtime,
                   reverse=True
@@ -139,14 +170,14 @@ jobs:
           act38_path, act38 = find_act_file(
               "ACT38",
               [
-                  "nox_act_38_evidence_fusion_contradiction_handling.json",
                   "nox_act_38_evidence_fusion.json",
+                  "nox_act_38_evidence_fusion_contradiction_handling.json",
                   "nox_act_38.json"
               ]
           )
 
           print("========================================")
-          print("NØX ACT39 V4 - SOURCE DISCOVERY")
+          print("NØX ACT39 V5 - SOURCE DISCOVERY")
           print("========================================")
           print(f"ACT28 source: {act28_path}")
           print(f"ACT30 source: {act30_path}")
@@ -167,7 +198,149 @@ jobs:
               act38 = {}
 
           # ============================================================
-          # ACT28 - prediction recovery
+          # Confidence extraction
+          #
+          # ACT28 has already produced valid confidence values.
+          # The downstream contract must preserve them.
+          #
+          # V5 searches recursively and distinguishes:
+          # - missing confidence
+          # - explicit zero
+          # - decimal probability 0.00-1.00
+          # - percentage 1-100
+          #
+          # A zero is valid only when no stronger non-zero confidence
+          # candidate exists for the same prediction.
+          # ============================================================
+
+          CONFIDENCE_KEYS = {
+              "confidence",
+              "prediction_confidence",
+              "predicted_confidence",
+              "confidence_score",
+              "confidence_percent",
+              "confidence_percentage",
+              "probability",
+              "predicted_probability",
+              "prediction_probability"
+          }
+
+          def normalize_confidence(value):
+              n = numeric(value)
+
+              if n is None:
+                  return None
+
+              # Decimal probability:
+              # 0.76 -> 76.0
+              if 0.0 < n <= 1.0:
+                  return n * 100.0
+
+              # Percentage:
+              # 76 -> 76.0
+              if 0.0 <= n <= 100.0:
+                  return n
+
+              return None
+
+          def confidence_candidates(obj, path="root"):
+              found = []
+
+              if isinstance(obj, dict):
+
+                  for key, value in obj.items():
+
+                      key_lower = str(key).strip().lower()
+
+                      if key_lower in CONFIDENCE_KEYS:
+                          normalized = normalize_confidence(value)
+
+                          if normalized is not None:
+                              found.append({
+                                  "path": f"{path}.{key}",
+                                  "raw": value,
+                                  "normalized": normalized
+                              })
+
+                      if isinstance(value, (dict, list)):
+                          found.extend(
+                              confidence_candidates(
+                                  value,
+                                  f"{path}.{key}"
+                              )
+                          )
+
+              elif isinstance(obj, list):
+
+                  for index, value in enumerate(obj):
+
+                      if isinstance(value, (dict, list)):
+                          found.extend(
+                              confidence_candidates(
+                                  value,
+                                  f"{path}[{index}]"
+                              )
+                          )
+
+              return found
+
+          def select_confidence(prediction):
+
+              candidates = confidence_candidates(prediction)
+
+              if not candidates:
+                  return None, None, []
+
+              # Prefer non-zero values over zero placeholders.
+              non_zero = [
+                  item
+                  for item in candidates
+                  if item["normalized"] > 0
+              ]
+
+              if non_zero:
+                  # Prefer canonical confidence field names.
+                  priority = {
+                      "confidence": 0,
+                      "predicted_confidence": 1,
+                      "prediction_confidence": 2,
+                      "confidence_score": 3,
+                      "confidence_percent": 4,
+                      "confidence_percentage": 5,
+                      "probability": 6,
+                      "predicted_probability": 7,
+                      "prediction_probability": 8
+                  }
+
+                  def candidate_priority(item):
+                      last_key = item["path"].split(".")[-1]
+                      return (
+                          priority.get(last_key, 50),
+                          -item["normalized"]
+                      )
+
+                  selected = sorted(
+                      non_zero,
+                      key=candidate_priority
+                  )[0]
+
+                  return (
+                      selected["normalized"],
+                      selected["path"],
+                      candidates
+                  )
+
+              # Explicit zero is valid if it is the only available value.
+              selected = candidates[0]
+
+              return (
+                  0.0,
+                  selected["path"],
+                  candidates
+              )
+
+          # ============================================================
+          # Locate predictions
           # ============================================================
 
           raw_predictions = act28.get("predictions", [])
@@ -175,9 +348,27 @@ jobs:
           if not isinstance(raw_predictions, list):
               raw_predictions = []
 
+          # Some historical structures may store predictions in another
+          # container. Only use it if the canonical list is absent.
+          if not raw_predictions:
+
+              for fallback_key in [
+                  "prediction_records",
+                  "predictions_generated",
+                  "prediction_list"
+              ]:
+                  candidate = act28.get(fallback_key)
+
+                  if isinstance(candidate, list):
+                      raw_predictions = candidate
+                      break
+
           prediction_records = []
 
-          for index, prediction in enumerate(raw_predictions, start=1):
+          for index, prediction in enumerate(
+              raw_predictions,
+              start=1
+          ):
 
               if not isinstance(prediction, dict):
                   continue
@@ -202,14 +393,18 @@ jobs:
                   prediction.get("consequence")
               )
 
-              confidence = first_number(
-                  prediction.get("confidence"),
-                  prediction.get("prediction_confidence"),
-                  prediction.get("confidence_score")
+              confidence, confidence_source, confidence_candidates_found = (
+                  select_confidence(prediction)
               )
 
               if confidence is None:
                   confidence = 0.0
+                  confidence_source = "missing_confidence"
+              else:
+                  confidence = round(
+                      clamp(confidence, 0.0, 100.0),
+                      2
+                  )
 
               outcome = first_value(
                   prediction.get("outcome"),
@@ -227,17 +422,34 @@ jobs:
               accuracy = None
 
               if scored:
+
                   if isinstance(outcome, bool):
-                      accuracy = 1.0 if outcome else 0.0
-                  elif isinstance(outcome, (int, float)):
-                      accuracy = clamp(float(outcome), 0.0, 1.0)
+                      accuracy = (
+                          1.0
+                          if outcome
+                          else 0.0
+                      )
+
+                  elif numeric(outcome) is not None:
+                      accuracy = clamp(
+                          numeric(outcome),
+                          0.0,
+                          1.0
+                      )
 
               prediction_records.append({
                   "prediction_id": prediction_id,
                   "hypothesis": hypothesis,
                   "predicted_consequence": predicted_consequence,
-                  "confidence": round(float(confidence), 2),
-                  "confidence_source": "predicted_confidence",
+                  "confidence": confidence,
+                  "confidence_source": (
+                      confidence_source
+                      if confidence_source
+                      else "predicted_confidence"
+                  ),
+                  "confidence_candidates_found": len(
+                      confidence_candidates_found
+                  ),
                   "outcome": outcome,
                   "outcome_source": outcome_source,
                   "scored": scored,
@@ -245,31 +457,46 @@ jobs:
               })
 
           # ============================================================
-          # ACT31 - outcomes
+          # ACT31 outcomes
           # ============================================================
 
           act31_metrics = act31.get("metrics", {})
+
           if not isinstance(act31_metrics, dict):
               act31_metrics = {}
 
-          observed_outcomes = first_number(
+          observed_outcomes = first_value(
               act31.get("observed_outcome_count"),
               act31.get("observed_outcomes"),
               act31_metrics.get("observed_outcomes"),
               0
           )
 
-          comparable_outcomes = first_number(
+          comparable_outcomes = first_value(
               act31.get("comparable_outcomes"),
               act31_metrics.get("comparable_outcomes"),
               0
           )
 
-          evidence_quality = first_number(
+          observed_outcomes = numeric(observed_outcomes)
+          comparable_outcomes = numeric(comparable_outcomes)
+
+          if observed_outcomes is None:
+              observed_outcomes = 0.0
+
+          if comparable_outcomes is None:
+              comparable_outcomes = 0.0
+
+          evidence_quality = first_value(
               act31.get("evidence_quality"),
               act31_metrics.get("evidence_quality"),
               60.0
           )
+
+          evidence_quality = numeric(evidence_quality)
+
+          if evidence_quality is None:
+              evidence_quality = 60.0
 
           evaluation_status = first_value(
               act31.get("evaluation_status"),
@@ -277,8 +504,9 @@ jobs:
               "inconclusive"
           )
 
-          # Zero outcomes is valid measured information.
+          # Zero outcomes means predictions remain unscored.
           if observed_outcomes == 0:
+
               for record in prediction_records:
                   record["outcome"] = None
                   record["outcome_source"] = None
@@ -294,14 +522,34 @@ jobs:
           accuracies = [
               record["accuracy"]
               for record in prediction_records
-              if record["scored"] and record["accuracy"] is not None
+              if record["scored"]
+              and record["accuracy"] is not None
           ]
 
           confidences = [
               record["confidence"]
               for record in prediction_records
-              if isinstance(record["confidence"], (int, float))
+              if isinstance(
+                  record["confidence"],
+                  (int, float)
+              )
           ]
+
+          # ============================================================
+          # Confidence diagnostics
+          # ============================================================
+
+          confidence_nonzero_count = sum(
+              1
+              for record in prediction_records
+              if record["confidence"] > 0
+          )
+
+          confidence_missing_count = sum(
+              1
+              for record in prediction_records
+              if record["confidence_source"] == "missing_confidence"
+          )
 
           mean_predicted_confidence = (
               sum(confidences) / len(confidences)
@@ -310,17 +558,23 @@ jobs:
           )
 
           empirical_accuracy = (
-              sum(accuracies) / len(accuracies) * 100.0
+              sum(accuracies)
+              / len(accuracies)
+              * 100.0
               if accuracies
               else None
           )
 
           correct_predictions = sum(
-              1 for value in accuracies if value >= 0.5
+              1
+              for value in accuracies
+              if value >= 0.5
           )
 
           incorrect_predictions = sum(
-              1 for value in accuracies if value < 0.5
+              1
+              for value in accuracies
+              if value < 0.5
           )
 
           # ============================================================
@@ -354,6 +608,7 @@ jobs:
               ]
 
               if not bucket:
+
                   calibration_buckets.append({
                       "confidence_range": label,
                       "predictions": 0,
@@ -363,27 +618,39 @@ jobs:
                       "calibration_error": None,
                       "status": "no_predictions"
                   })
+
                   continue
 
               mean_confidence = (
-                  sum(record["confidence"] for record in bucket)
+                  sum(
+                      record["confidence"]
+                      for record in bucket
+                  )
                   / len(bucket)
               )
 
               if not scored_bucket:
+
                   calibration_buckets.append({
                       "confidence_range": label,
                       "predictions": len(bucket),
                       "observed_outcomes": 0,
-                      "mean_confidence": round(mean_confidence, 2),
+                      "mean_confidence": round(
+                          mean_confidence,
+                          2
+                      ),
                       "observed_accuracy": None,
                       "calibration_error": None,
                       "status": "awaiting_outcomes"
                   })
+
                   continue
 
               accuracy = (
-                  sum(record["accuracy"] for record in scored_bucket)
+                  sum(
+                      record["accuracy"]
+                      for record in scored_bucket
+                  )
                   / len(scored_bucket)
                   * 100.0
               )
@@ -391,88 +658,29 @@ jobs:
               calibration_buckets.append({
                   "confidence_range": label,
                   "predictions": len(bucket),
-                  "observed_outcomes": len(scored_bucket),
-                  "mean_confidence": round(mean_confidence, 2),
-                  "observed_accuracy": round(accuracy, 2),
+                  "observed_outcomes": len(
+                      scored_bucket
+                  ),
+                  "mean_confidence": round(
+                      mean_confidence,
+                      2
+                  ),
+                  "observed_accuracy": round(
+                      accuracy,
+                      2
+                  ),
                   "calibration_error": round(
-                      abs(mean_confidence - accuracy),
+                      abs(
+                          mean_confidence
+                          - accuracy
+                      ),
                       2
                   ),
                   "status": "measured"
               })
 
           # ============================================================
-          # ACT30
-          # ============================================================
-
-          act30_metrics = act30.get("metrics", {})
-          if not isinstance(act30_metrics, dict):
-              act30_metrics = {}
-
-          decision_confidence = first_number(
-              act30.get("decision_confidence"),
-              act30_metrics.get("decision_confidence"),
-              82.0
-          )
-
-          # ============================================================
-          # ACT38 V3 CANONICAL DATA CONTRACT
-          # ============================================================
-
-          act38_canonical = act38.get("canonical_metrics", {})
-          if not isinstance(act38_canonical, dict):
-              act38_canonical = {}
-
-          act38_metrics = act38.get("metrics", {})
-          if not isinstance(act38_metrics, dict):
-              act38_metrics = {}
-
-          # IMPORTANT:
-          # The actual ACT38 V3 source is selected dynamically above.
-          # Canonical fields are read before any fallback.
-
-          act38_fusion_confidence = first_number(
-              act38_canonical.get("fusion_confidence"),
-              act38.get("fusion_confidence"),
-              act38_metrics.get("fusion_confidence")
-          )
-
-          act38_decision_ceiling = first_number(
-              act38_canonical.get("decision_confidence_ceiling"),
-              act38.get("decision_confidence_ceiling"),
-              act38_metrics.get("decision_confidence_ceiling")
-          )
-
-          # No fallback is considered a valid ACT38 source.
-          act38_contract_valid = (
-              act38_path is not None
-              and act38_fusion_confidence is not None
-              and act38_decision_ceiling is not None
-          )
-
-          if act38_fusion_confidence is None:
-              fusion_source = "missing"
-          else:
-              fusion_source = "ACT38_V3_canonical"
-
-          if act38_decision_ceiling is None:
-              ceiling_source = "missing"
-          else:
-              ceiling_source = "ACT38_V3_canonical"
-
-          print("========================================")
-          print("ACT38 CONTRACT")
-          print("========================================")
-          print(f"ACT38 file found: {act38_path is not None}")
-          print(f"ACT38 contract valid: {act38_contract_valid}")
-          print(f"Fusion confidence: {act38_fusion_confidence}")
-          print(f"Decision ceiling: {act38_decision_ceiling}")
-          print(f"Fusion source: {fusion_source}")
-          print(f"Ceiling source: {ceiling_source}")
-          print("----------------------------------------")
-
-          # ============================================================
-          # Calibration
+          # Calibration model
           # ============================================================
 
           calibration_factor = 1.0
@@ -497,7 +705,9 @@ jobs:
                           confidence_values[i]
                           - accuracies[i]
                       )
-                      for i in range(len(accuracies))
+                      for i in range(
+                          len(accuracies)
+                      )
                   )
                   / len(accuracies)
               )
@@ -508,15 +718,23 @@ jobs:
                           confidence_values[i]
                           - accuracies[i]
                       ) ** 2
-                      for i in range(len(accuracies))
+                      for i in range(
+                          len(accuracies)
+                      )
                   )
                   / len(accuracies)
               )
 
-              observed_accuracy_fraction = empirical_accuracy / 100.0
-              mean_confidence_fraction = mean_predicted_confidence / 100.0
+              observed_accuracy_fraction = (
+                  empirical_accuracy / 100.0
+              )
+
+              mean_confidence_fraction = (
+                  mean_predicted_confidence / 100.0
+              )
 
               if mean_confidence_fraction > 0:
+
                   calibration_factor = (
                       observed_accuracy_fraction
                       / mean_confidence_fraction
@@ -529,22 +747,30 @@ jobs:
               )
 
               if evaluated_predictions >= 5:
+
                   calibration_status = "empirical"
                   calibration_empirical = True
                   calibration_usable = True
+
                   calibration_confidence = clamp(
-                      40.0 + evaluated_predictions * 5.0,
+                      40.0
+                      + evaluated_predictions * 5.0,
                       40.0,
                       90.0
                   )
+
               else:
-                  calibration_status = "insufficient_outcomes"
+
+                  calibration_status = (
+                      "insufficient_outcomes"
+                  )
+
                   calibration_empirical = True
                   calibration_usable = False
                   calibration_confidence = 25.0
 
           # ============================================================
-          # Over / under confidence
+          # Overconfidence / underconfidence
           # ============================================================
 
           overconfidence_cases = []
@@ -555,29 +781,54 @@ jobs:
               if not record["scored"]:
                   continue
 
-              confidence_fraction = record["confidence"] / 100.0
-              gap = confidence_fraction - record["accuracy"]
+              confidence_fraction = (
+                  record["confidence"]
+                  / 100.0
+              )
+
+              gap = (
+                  confidence_fraction
+                  - record["accuracy"]
+              )
 
               if gap >= 0.20:
+
                   overconfidence_cases.append({
-                      "prediction_id": record["prediction_id"],
-                      "confidence": record["confidence"],
+                      "prediction_id": record[
+                          "prediction_id"
+                      ],
+                      "confidence": record[
+                          "confidence"
+                      ],
                       "accuracy": round(
-                          record["accuracy"] * 100.0,
+                          record["accuracy"]
+                          * 100.0,
                           2
                       ),
-                      "gap": round(gap * 100.0, 2)
+                      "gap": round(
+                          gap * 100.0,
+                          2
+                      )
                   })
 
               elif gap <= -0.20:
+
                   underconfidence_cases.append({
-                      "prediction_id": record["prediction_id"],
-                      "confidence": record["confidence"],
+                      "prediction_id": record[
+                          "prediction_id"
+                      ],
+                      "confidence": record[
+                          "confidence"
+                      ],
                       "accuracy": round(
-                          record["accuracy"] * 100.0,
+                          record["accuracy"]
+                          * 100.0,
                           2
                       ),
-                      "gap": round(abs(gap) * 100.0, 2)
+                      "gap": round(
+                          abs(gap) * 100.0,
+                          2
+                      )
                   })
 
           overconfidence_status = (
@@ -601,19 +852,116 @@ jobs:
           )
 
           # ============================================================
+          # ACT30
+          # ============================================================
+
+          act30_metrics = act30.get("metrics", {})
+
+          if not isinstance(act30_metrics, dict):
+              act30_metrics = {}
+
+          decision_confidence = first_value(
+              act30.get("decision_confidence"),
+              act30_metrics.get(
+                  "decision_confidence"
+              ),
+              82.0
+          )
+
+          decision_confidence = numeric(
+              decision_confidence
+          )
+
+          if decision_confidence is None:
+              decision_confidence = 82.0
+
+          # ============================================================
+          # ACT38 V3 canonical contract
+          # ============================================================
+
+          act38_canonical = act38.get(
+              "canonical_metrics",
+              {}
+          )
+
+          if not isinstance(
+              act38_canonical,
+              dict
+          ):
+              act38_canonical = {}
+
+          act38_metrics = act38.get(
+              "metrics",
+              {}
+          )
+
+          if not isinstance(
+              act38_metrics,
+              dict
+          ):
+              act38_metrics = {}
+
+          act38_fusion_confidence = first_value(
+              act38_canonical.get(
+                  "fusion_confidence"
+              ),
+              act38.get(
+                  "fusion_confidence"
+              ),
+              act38_metrics.get(
+                  "fusion_confidence"
+              )
+          )
+
+          act38_decision_ceiling = first_value(
+              act38_canonical.get(
+                  "decision_confidence_ceiling"
+              ),
+              act38.get(
+                  "decision_confidence_ceiling"
+              ),
+              act38_metrics.get(
+                  "decision_confidence_ceiling"
+              )
+          )
+
+          act38_fusion_confidence = numeric(
+              act38_fusion_confidence
+          )
+
+          act38_decision_ceiling = numeric(
+              act38_decision_ceiling
+          )
+
+          act38_contract_valid = (
+              act38_path is not None
+              and act38_fusion_confidence is not None
+              and act38_decision_ceiling is not None
+          )
+
+          if not act38_contract_valid:
+
+              raise SystemExit(
+                  "ACT38 V3 canonical contract could not "
+                  "be loaded. Refusing to use fallback values."
+              )
+
+          previous_ceiling = (
+              act38_decision_ceiling
+          )
+
+          fusion_for_policy = (
+              act38_fusion_confidence
+          )
+
+          # ============================================================
           # Decision ceiling
           # ============================================================
 
-          if not act38_contract_valid:
-              raise SystemExit(
-                  "ACT38 V3 canonical contract could not be loaded. "
-                  "Refusing to use fallback values."
-              )
+          calibrated_ceiling = (
+              previous_ceiling
+          )
 
-          previous_ceiling = float(act38_decision_ceiling)
-          fusion_for_policy = float(act38_fusion_confidence)
-
-          calibrated_ceiling = previous_ceiling
           ceiling_increase_allowed = False
 
           if (
@@ -624,32 +972,55 @@ jobs:
               and evidence_quality >= 75
               and fusion_for_policy >= 50
           ):
+
               calibrated_ceiling = min(
                   100.0,
-                  previous_ceiling * calibration_factor
+                  previous_ceiling
+                  * calibration_factor
               )
 
               ceiling_increase_allowed = (
-                  calibrated_ceiling > previous_ceiling
+                  calibrated_ceiling
+                  > previous_ceiling
               )
 
-          if calibrated_ceiling < previous_ceiling:
-              calibrated_ceiling = previous_ceiling
+          if (
+              calibrated_ceiling
+              < previous_ceiling
+          ):
+              calibrated_ceiling = (
+                  previous_ceiling
+              )
 
           # ============================================================
           # Source completeness
           # ============================================================
 
           source_states = {
-              "ACT28_predictions": len(prediction_records) > 0,
-              "ACT30_decision_confidence": decision_confidence is not None,
-              "ACT31_outcomes": act31_path is not None,
-              "ACT31_comparable_outcomes": comparable_outcomes is not None,
-              "ACT38_fusion_confidence": (
-                  act38_fusion_confidence is not None
+              "ACT28_predictions": (
+                  len(prediction_records) > 0
               ),
+
+              "ACT30_decision_confidence": (
+                  decision_confidence is not None
+              ),
+
+              "ACT31_outcomes": (
+                  act31_path is not None
+              ),
+
+              "ACT31_comparable_outcomes": (
+                  comparable_outcomes is not None
+              ),
+
+              "ACT38_fusion_confidence": (
+                  act38_fusion_confidence
+                  is not None
+              ),
+
               "ACT38_decision_ceiling": (
-                  act38_decision_ceiling is not None
+                  act38_decision_ceiling
+                  is not None
               )
           }
 
@@ -669,22 +1040,26 @@ jobs:
 
           result = {
               "act": "ACT39",
-              "version": "V4",
+              "version": "V5",
               "name": "Confidence Calibration",
-              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "timestamp": datetime.now(
+                  timezone.utc
+              ).isoformat(),
 
               "gemini_used": False,
               "project_cost_eur": 0,
 
               "purpose": (
-                  "Determine whether NØX confidence tracks observed accuracy "
-                  "and calibrate confidence only when repeated real outcomes "
-                  "justify an adjustment."
+                  "Determine whether NØX confidence tracks "
+                  "observed accuracy and calibrate confidence "
+                  "only when repeated real outcomes justify "
+                  "an adjustment."
               ),
 
               "principle": (
-                  "Confidence is a prediction about reliability; only repeated "
-                  "observed outcomes can determine whether that confidence is calibrated."
+                  "Confidence is a prediction about reliability; "
+                  "only repeated observed outcomes can determine "
+                  "whether that confidence is calibrated."
               ),
 
               "source_acts": [
@@ -695,10 +1070,26 @@ jobs:
               ],
 
               "source_files": {
-                  "ACT28": str(act28_path) if act28_path else None,
-                  "ACT30": str(act30_path) if act30_path else None,
-                  "ACT31": str(act31_path) if act31_path else None,
-                  "ACT38": str(act38_path) if act38_path else None
+                  "ACT28": (
+                      str(act28_path)
+                      if act28_path
+                      else None
+                  ),
+                  "ACT30": (
+                      str(act30_path)
+                      if act30_path
+                      else None
+                  ),
+                  "ACT31": (
+                      str(act31_path)
+                      if act31_path
+                      else None
+                  ),
+                  "ACT38": (
+                      str(act38_path)
+                      if act38_path
+                      else None
+                  )
               },
 
               "source_states": source_states,
@@ -709,7 +1100,9 @@ jobs:
               ),
 
               "act38_contract": {
-                  "contract_version": "ACT38_V3_canonical_metrics",
+                  "contract_version": (
+                      "ACT38_V3_canonical_metrics"
+                  ),
                   "valid": act38_contract_valid,
                   "fusion_confidence": round(
                       fusion_for_policy,
@@ -719,7 +1112,29 @@ jobs:
                       previous_ceiling,
                       2
                   ),
-                  "source": "ACT38_V3_canonical"
+                  "source": (
+                      "ACT38_V3_canonical"
+                  )
+              },
+
+              "confidence_recovery": {
+                  "method": (
+                      "recursive_multi_field_search"
+                  ),
+                  "prediction_count": len(
+                      prediction_records
+                  ),
+                  "nonzero_confidence_count": (
+                      confidence_nonzero_count
+                  ),
+                  "missing_confidence_count": (
+                      confidence_missing_count
+                  ),
+                  "normalization": (
+                      "decimal_probability_to_percentage"
+                  ),
+                  "zero_is_valid": True,
+                  "missing_is_not_zero": True
               },
 
               "calibration_model": {
@@ -753,18 +1168,21 @@ jobs:
                   ),
                   "status": calibration_status,
                   "empirical": calibration_empirical,
-                  "usable_for_autonomous_decision": calibration_usable,
+                  "usable_for_autonomous_decision": (
+                      calibration_usable
+                  ),
                   "confidence": round(
                       calibration_confidence,
                       2
                   ),
                   "reason": (
                       "No empirical correction is justified yet; "
-                      "1.0 is a neutral baseline, not evidence of "
-                      "good calibration."
+                      "1.0 is a neutral baseline, not evidence "
+                      "of good calibration."
                       if evaluated_predictions == 0
                       else
-                      "Calibration derived from observed prediction outcomes."
+                      "Calibration derived from observed "
+                      "prediction outcomes."
                   )
               },
 
@@ -772,60 +1190,92 @@ jobs:
                   "prediction_records": len(
                       prediction_records
                   ),
+
                   "confidence_records": len(
                       prediction_records
                   ),
-                  "evaluated_predictions": evaluated_predictions,
-                  "observed_outcomes": float(
-                      observed_outcomes
+
+                  "confidence_nonzero_count": (
+                      confidence_nonzero_count
                   ),
-                  "comparable_outcomes": float(
-                      comparable_outcomes
+
+                  "confidence_missing_count": (
+                      confidence_missing_count
                   ),
-                  "correct_predictions": correct_predictions,
-                  "incorrect_predictions": incorrect_predictions,
+
+                  "evaluated_predictions": (
+                      evaluated_predictions
+                  ),
+
+                  "observed_outcomes": (
+                      float(observed_outcomes)
+                  ),
+
+                  "comparable_outcomes": (
+                      float(comparable_outcomes)
+                  ),
+
+                  "correct_predictions": (
+                      correct_predictions
+                  ),
+
+                  "incorrect_predictions": (
+                      incorrect_predictions
+                  ),
+
                   "mean_predicted_confidence": (
                       round(
                           mean_predicted_confidence,
                           2
                       )
-                      if mean_predicted_confidence is not None
+                      if mean_predicted_confidence
+                      is not None
                       else None
                   ),
+
                   "empirical_accuracy": (
                       round(
                           empirical_accuracy,
                           2
                       )
-                      if empirical_accuracy is not None
+                      if empirical_accuracy
+                      is not None
                       else None
                   ),
+
                   "calibration_error": (
                       round(
                           calibration_error * 100.0,
                           4
                       )
-                      if calibration_error is not None
+                      if calibration_error
+                      is not None
                       else None
                   ),
+
                   "brier_score": (
                       round(
                           brier_score,
                           6
                       )
-                      if brier_score is not None
+                      if brier_score
+                      is not None
                       else None
                   ),
+
                   "overconfidence_cases": len(
                       overconfidence_cases
                   ),
+
                   "underconfidence_cases": len(
                       underconfidence_cases
                   ),
+
                   "calibration_factor": round(
                       calibration_factor,
                       4
                   ),
+
                   "calibration_confidence": round(
                       calibration_confidence,
                       2
@@ -837,15 +1287,21 @@ jobs:
                       decision_confidence,
                       2
                   ),
+
                   "ACT31_evidence_quality": round(
                       evidence_quality,
                       2
                   ),
-                  "ACT31_evaluation_status": evaluation_status,
+
+                  "ACT31_evaluation_status": (
+                      evaluation_status
+                  ),
+
                   "ACT38_fusion_confidence": round(
                       fusion_for_policy,
                       2
                   ),
+
                   "ACT38_decision_confidence_ceiling": round(
                       previous_ceiling,
                       2
@@ -858,15 +1314,20 @@ jobs:
                       if ceiling_increase_allowed
                       else "ACT38_V3_canonical"
                   ),
+
                   "previous_ceiling": round(
                       previous_ceiling,
                       2
                   ),
+
                   "calibrated_ceiling": round(
                       calibrated_ceiling,
                       2
                   ),
-                  "may_increase": ceiling_increase_allowed
+
+                  "may_increase": (
+                      ceiling_increase_allowed
+                  )
               },
 
               "decision_policy": [
@@ -882,7 +1343,10 @@ jobs:
                   "Keep calibration separate from external truth validation.",
                   "Preserve conservative decision ceilings when calibration is unavailable.",
                   "Read ACT38 V3 canonical metrics before any fallback.",
-                  "Never silently replace missing upstream evidence with fabricated values."
+                  "Never silently replace missing upstream evidence with fabricated values.",
+                  "Preserve non-zero ACT28 confidence values across downstream cognitive layers.",
+                  "Normalize decimal probabilities and percentage confidence without changing their meaning.",
+                  "A real zero confidence must remain zero; missing confidence must remain distinguishable from zero."
               ],
 
               "repair_queue": [
@@ -890,24 +1354,28 @@ jobs:
                       "priority": "high",
                       "issue": "prediction_outcomes",
                       "action": (
-                          "Collect actual outcomes for ACT28 predictions "
-                          "in a canonical structured field."
+                          "Collect actual outcomes for ACT28 "
+                          "predictions in a canonical structured field."
                       )
                   },
+
                   {
                       "priority": "high",
                       "issue": "real_world_calibration",
                       "action": (
-                          "Generate repeated comparable prediction-outcome "
-                          "observations before changing the calibration factor."
+                          "Generate repeated comparable "
+                          "prediction-outcome observations "
+                          "before changing the calibration factor."
                       )
                   },
+
                   {
                       "priority": "medium",
                       "issue": "confidence_data_contract",
                       "action": (
-                          "Preserve prediction confidence fields unchanged "
-                          "from ACT28 through downstream cognitive layers."
+                          "Preserve prediction confidence fields "
+                          "unchanged from ACT28 through downstream "
+                          "cognitive layers."
                       )
                   }
               ],
@@ -918,7 +1386,8 @@ jobs:
                   "A neutral calibration factor is preferable to an unsupported penalty.",
                   "Reliable confidence calibration requires repeated prediction-outcome comparisons.",
                   "ACT38 V3 canonical metrics must remain available to downstream cognitive layers.",
-                  "Data-contract reliability remains part of NØX's cognitive capability."
+                  "Data-contract reliability remains part of NØX's cognitive capability.",
+                  "Confidence representation must preserve the distinction between missing, zero, decimal probability and percentage."
               ],
 
               "autonomy_rule": {
@@ -928,9 +1397,11 @@ jobs:
                   "payment_permission": False,
                   "spending_permission": False,
                   "gemini_permission": False,
+
                   "rule": (
-                      "ACT39 may measure and calibrate confidence, "
-                      "but cannot grant execution or financial authority."
+                      "ACT39 may measure and calibrate "
+                      "confidence, but cannot grant execution "
+                      "or financial authority."
                   )
               },
 
@@ -939,13 +1410,17 @@ jobs:
               ),
 
               "next_cognitive_step": (
-                  "ACT40 should use calibrated confidence, evidence quality "
-                  "and expected value to improve action selection without "
-                  "converting uncertainty into false certainty."
+                  "ACT40 should use calibrated confidence, "
+                  "evidence quality and expected value to improve "
+                  "action selection without converting uncertainty "
+                  "into false certainty."
               )
           }
 
-          # Stable aliases for downstream ACTs.
+          # ============================================================
+          # Stable downstream aliases
+          # ============================================================
+
           result["fusion_confidence"] = round(
               fusion_for_policy,
               2
@@ -956,7 +1431,9 @@ jobs:
               2
           )
 
-          result["calibrated_decision_confidence_ceiling"] = round(
+          result[
+              "calibrated_decision_confidence_ceiling"
+          ] = round(
               calibrated_ceiling,
               2
           )
@@ -974,7 +1451,9 @@ jobs:
               4
           )
 
-          result["calibration_status"] = calibration_status
+          result["calibration_status"] = (
+              calibration_status
+          )
 
           # ============================================================
           # Strict validation
@@ -987,6 +1466,14 @@ jobs:
 
               "confidence_records_10": (
                   len(prediction_records) == 10
+              ),
+
+              "confidence_recovered": (
+                  confidence_nonzero_count == 10
+              ),
+
+              "confidence_not_silently_zeroed": (
+                  confidence_missing_count == 0
               ),
 
               "act38_file_discovered": (
@@ -1017,11 +1504,13 @@ jobs:
               "neutral_calibration_without_outcomes": (
                   evaluated_predictions == 0
                   and calibration_factor == 1.0
-                  and calibration_status == "baseline_only"
+                  and calibration_status
+                  == "baseline_only"
               ),
 
               "decision_ceiling_preserved": (
-                  calibrated_ceiling >= previous_ceiling
+                  calibrated_ceiling
+                  >= previous_ceiling
               ),
 
               "gemini_false": (
@@ -1045,46 +1534,111 @@ jobs:
               result
           )
 
+          # ============================================================
+          # Console output
+          # ============================================================
+
           print("========================================")
-          print("NØX ACT39 V4 - CONFIDENCE CALIBRATION")
+          print("NØX ACT39 V5 - CONFIDENCE CALIBRATION")
           print("========================================")
-          print(f"Prediction records: {len(prediction_records)}")
-          print(f"Confidence records: {len(prediction_records)}")
-          print(f"Observed outcomes: {observed_outcomes}")
-          print(f"Comparable outcomes: {comparable_outcomes}")
+          print(f"ACT28 source: {act28_path}")
           print(f"ACT38 source: {act38_path}")
-          print(f"ACT38 fusion confidence: {fusion_for_policy}")
-          print(f"ACT38 decision ceiling: {previous_ceiling}")
-          print(f"Source completeness: {source_completeness:.2f}%")
-          print(f"Calibration factor: {calibration_factor}")
-          print(f"Calibration status: {calibration_status}")
-          print(f"Calibration usable: {calibration_usable}")
-          print(f"Decision ceiling: {calibrated_ceiling}")
+          print("----------------------------------------")
+          print(
+              f"Prediction records: "
+              f"{len(prediction_records)}"
+          )
+          print(
+              f"Confidence records: "
+              f"{len(prediction_records)}"
+          )
+          print(
+              f"Non-zero confidence values: "
+              f"{confidence_nonzero_count}"
+          )
+          print(
+              f"Missing confidence values: "
+              f"{confidence_missing_count}"
+          )
+          print(
+              f"Mean predicted confidence: "
+              f"{mean_predicted_confidence}"
+          )
+          print(
+              f"Observed outcomes: "
+              f"{observed_outcomes}"
+          )
+          print(
+              f"Comparable outcomes: "
+              f"{comparable_outcomes}"
+          )
+          print("----------------------------------------")
+          print(
+              f"ACT38 fusion confidence: "
+              f"{fusion_for_policy}"
+          )
+          print(
+              f"ACT38 decision ceiling: "
+              f"{previous_ceiling}"
+          )
+          print(
+              f"Source completeness: "
+              f"{source_completeness:.2f}%"
+          )
+          print("----------------------------------------")
+          print(
+              f"Calibration factor: "
+              f"{calibration_factor}"
+          )
+          print(
+              f"Calibration status: "
+              f"{calibration_status}"
+          )
+          print(
+              f"Calibration usable: "
+              f"{calibration_usable}"
+          )
+          print(
+              f"Decision ceiling: "
+              f"{calibrated_ceiling}"
+          )
+          print("----------------------------------------")
           print("Gemini used: false")
           print("Project cost: 0 EUR")
           print("----------------------------------------")
 
           failed = [
               name
-              for name, passed in validation.items()
+              for name, passed
+              in validation.items()
               if not passed
           ]
 
           if failed:
+
               print("VALIDATION FAILED:")
+
               for item in failed:
                   print(f" - {item}")
+
               raise SystemExit(1)
 
           print("VALIDATION PASSED")
-          print(f"Memory written: {output_path}")
+          print(
+              f"Memory written: {output_path}"
+          )
 
           # ============================================================
           # Commit / push
           # ============================================================
 
           subprocess.run(
-              ["git", "config", "user.name", "NØX"],
+              [
+                  "git",
+                  "config",
+                  "user.name",
+                  "NØX"
+              ],
               check=True
           )
 
@@ -1099,7 +1653,11 @@ jobs:
           )
 
           subprocess.run(
-              ["git", "add", str(output_path)],
+              [
+                  "git",
+                  "add",
+                  str(output_path)
+              ],
               check=True
           )
 
@@ -1108,7 +1666,7 @@ jobs:
                   "git",
                   "commit",
                   "-m",
-                  "ACT39 V4 confidence calibration"
+                  "ACT39 V5 confidence calibration"
               ],
               text=True,
               capture_output=True
@@ -1123,13 +1681,23 @@ jobs:
           for attempt in range(3):
 
               try:
+
                   subprocess.run(
-                      ["git", "fetch", "origin", "main"],
+                      [
+                          "git",
+                          "fetch",
+                          "origin",
+                          "main"
+                      ],
                       check=True
                   )
 
                   subprocess.run(
-                      ["git", "rebase", "origin/main"],
+                      [
+                          "git",
+                          "rebase",
+                          "origin/main"
+                      ],
                       check=True
                   )
 
@@ -1149,21 +1717,28 @@ jobs:
               except subprocess.CalledProcessError as exc:
 
                   print(
-                      f"Push/rebase attempt {attempt + 1} failed: {exc}"
+                      f"Push/rebase attempt "
+                      f"{attempt + 1} failed: {exc}"
                   )
 
                   if attempt < 2:
+
                       subprocess.run(
-                          ["git", "rebase", "--abort"],
+                          [
+                              "git",
+                              "rebase",
+                              "--abort"
+                          ],
                           check=False
                       )
 
           if not pushed:
+
               raise SystemExit(
-                  "Unable to push ACT39 V4 after 3 attempts."
+                  "Unable to push ACT39 V5 after 3 attempts."
               )
 
           print(
-              "ACT39 V4 committed and pushed successfully."
+              "ACT39 V5 committed and pushed successfully."
           )
           PY
