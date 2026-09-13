@@ -1,0 +1,882 @@
+name: NØX ACT55 - Autonomous Self-Calibration Core
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act55-self-calibration
+  cancel-in-progress: false
+
+jobs:
+  self-calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PYTHON_VERSION: "3.11"
+      MEMORY_DIR: memory
+      PREDICTION_FILE: memory/nox_act_53_empirical_prediction.json
+      EXPERIMENT_FILE: memory/nox_act_54_experiment_validation.json
+      CALIBRATION_FILE: memory/nox_act_55_self_calibration.json
+      KNOWLEDGE_FILE: memory/nox_knowledge_core.json
+      DECISION_FILE: memory/nox_act_19_v2_decision_engine.json
+      LEARNING_FILE: memory/nox_act_20_learning_loop.json
+      GEMINI_USED: "false"
+      PROJECT_COST_EUR: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run ACT55
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          MEMORY_DIR = ROOT / os.environ["MEMORY_DIR"]
+
+          PREDICTION_FILE = ROOT / os.environ["PREDICTION_FILE"]
+          EXPERIMENT_FILE = ROOT / os.environ["EXPERIMENT_FILE"]
+          CALIBRATION_FILE = ROOT / os.environ["CALIBRATION_FILE"]
+          KNOWLEDGE_FILE = ROOT / os.environ["KNOWLEDGE_FILE"]
+          DECISION_FILE = ROOT / os.environ["DECISION_FILE"]
+          LEARNING_FILE = ROOT / os.environ["LEARNING_FILE"]
+
+          NOW = datetime.now(timezone.utc).isoformat()
+
+          print("=" * 70)
+          print("NØX ACT55 - AUTONOMOUS SELF-CALIBRATION CORE")
+          print("=" * 70)
+          print("timestamp:", NOW)
+          print("gemini_used:", False)
+          print("project_cost_eur:", 0)
+          print("external_ai:", False)
+          print()
+
+          def load_json(path):
+              if not path.exists():
+                  return None
+
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+                  return value
+              except Exception as exc:
+                  print(f"WARNING: cannot read {path}: {exc}")
+                  return None
+
+          def save_json(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+          def as_list(value):
+              if isinstance(value, list):
+                  return value
+
+              if isinstance(value, dict):
+                  for key in (
+                      "predictions",
+                      "experiments",
+                      "results",
+                      "observations",
+                      "items",
+                      "entries",
+                      "actions",
+                      "records",
+                      "data"
+                  ):
+                      candidate = value.get(key)
+                      if isinstance(candidate, list):
+                          return candidate
+
+              return []
+
+          def clamp(value, low=0.0, high=1.0):
+              return max(low, min(high, value))
+
+          def number(value, default=None):
+              if value is None:
+                  return default
+
+              try:
+                  return float(value)
+              except Exception:
+                  return default
+
+          def normalize_text(value):
+              if value is None:
+                  return ""
+
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(value).strip().lower()
+              )
+
+          def identifier(item):
+              if not isinstance(item, dict):
+                  return None
+
+              for key in (
+                  "prediction_id",
+                  "experiment_id",
+                  "id",
+                  "prediction",
+                  "key"
+              ):
+                  value = item.get(key)
+                  if value:
+                      return str(value)
+
+              return None
+
+          def extract_prediction_confidence(item):
+              if not isinstance(item, dict):
+                  return None
+
+              candidates = (
+                  item.get("confidence"),
+                  item.get("predicted_confidence"),
+                  item.get("confidence_score"),
+                  item.get("probability"),
+                  item.get("prediction_confidence")
+              )
+
+              for value in candidates:
+                  n = number(value)
+                  if n is not None:
+                      if n > 1:
+                          n = n / 100.0
+                      return clamp(n)
+
+              return None
+
+          def extract_outcome(item):
+              if not isinstance(item, dict):
+                  return None
+
+              for key in (
+                  "outcome",
+                  "result",
+                  "validation",
+                  "status",
+                  "classification",
+                  "evidence_status"
+              ):
+                  value = item.get(key)
+
+                  if isinstance(value, str):
+                      text = normalize_text(value)
+
+                      if any(
+                          x in text
+                          for x in (
+                              "confirm",
+                              "success",
+                              "validated",
+                              "true",
+                              "supported",
+                              "observed"
+                          )
+                      ):
+                          return "CONFIRMED"
+
+                      if any(
+                          x in text
+                          for x in (
+                              "refut",
+                              "false",
+                              "failed",
+                              "contradicted",
+                              "rejected"
+                          )
+                      ):
+                          return "REFUTED"
+
+                      if any(
+                          x in text
+                          for x in (
+                              "inconclusive",
+                              "uncertain",
+                              "pending",
+                              "unknown",
+                              "waiting"
+                          )
+                      ):
+                          return "INCONCLUSIVE"
+
+                      if any(
+                          x in text
+                          for x in (
+                              "unobservable",
+                              "no evidence",
+                              "not observable"
+                          )
+                      ):
+                          return "UNOBSERVABLE"
+
+              return None
+
+          def evidence_strength(item):
+              if not isinstance(item, dict):
+                  return 0.0
+
+              direct = number(
+                  item.get("evidence_strength"),
+                  item.get("evidence_quality")
+              )
+
+              if direct is not None:
+                  if direct > 1:
+                      direct /= 100.0
+                  return clamp(direct)
+
+              evidence = (
+                  item.get("evidence")
+                  or item.get("evidence_items")
+                  or item.get("evidence_count")
+                  or item.get("sources")
+              )
+
+              if isinstance(evidence, list):
+                  return clamp(min(1.0, len(evidence) / 3.0))
+
+              count = number(evidence)
+
+              if count is not None:
+                  return clamp(min(1.0, count / 3.0))
+
+              return 0.0
+
+          print("Loading ACT53 prediction memory...")
+          predictions_raw = load_json(PREDICTION_FILE)
+
+          print("Loading ACT54 validation memory...")
+          experiments_raw = load_json(EXPERIMENT_FILE)
+
+          print("Loading knowledge core...")
+          knowledge_raw = load_json(KNOWLEDGE_FILE)
+
+          print("Loading decision engine memory...")
+          decision_raw = load_json(DECISION_FILE)
+
+          print("Loading learning-loop memory...")
+          learning_raw = load_json(LEARNING_FILE)
+
+          predictions = as_list(predictions_raw)
+          experiments = as_list(experiments_raw)
+
+          print("Predictions found:", len(predictions))
+          print("Experiment/validation records:", len(experiments))
+
+          # ------------------------------------------------------------
+          # 1. Build a unified evidence index.
+          # ------------------------------------------------------------
+
+          evidence_index = {}
+
+          for record in experiments:
+              rid = identifier(record)
+
+              if rid:
+                  evidence_index[rid] = record
+
+              if isinstance(record, dict):
+                  linked = (
+                      record.get("prediction_id")
+                      or record.get("source_prediction_id")
+                      or record.get("prediction")
+                  )
+
+                  if linked:
+                      evidence_index[str(linked)] = record
+
+          # Also allow ACT53 records themselves to contain outcome data.
+          for prediction in predictions:
+              pid = identifier(prediction)
+
+              if not pid:
+                  continue
+
+              if pid not in evidence_index:
+                  outcome = extract_outcome(prediction)
+
+                  if outcome:
+                      evidence_index[pid] = prediction
+
+          # ------------------------------------------------------------
+          # 2. Validate every prediction without inventing outcomes.
+          # ------------------------------------------------------------
+
+          evaluations = []
+
+          for prediction in predictions:
+              if not isinstance(prediction, dict):
+                  continue
+
+              pid = identifier(prediction)
+
+              if not pid:
+                  continue
+
+              confidence = extract_prediction_confidence(prediction)
+              evidence = evidence_index.get(pid)
+
+              if evidence is None:
+                  evaluations.append({
+                      "prediction_id": pid,
+                      "status": "PENDING",
+                      "confidence": confidence,
+                      "evidence_strength": 0.0,
+                      "calibration_error": None,
+                      "reason": "No observable validation evidence yet."
+                  })
+                  continue
+
+              outcome = extract_outcome(evidence)
+              strength = evidence_strength(evidence)
+
+              if outcome not in (
+                  "CONFIRMED",
+                  "REFUTED",
+                  "INCONCLUSIVE",
+                  "UNOBSERVABLE"
+              ):
+                  evaluations.append({
+                      "prediction_id": pid,
+                      "status": "PENDING",
+                      "confidence": confidence,
+                      "evidence_strength": strength,
+                      "calibration_error": None,
+                      "reason": "Evidence exists but outcome cannot be classified safely."
+                  })
+                  continue
+
+              actual = None
+
+              if outcome == "CONFIRMED":
+                  actual = 1.0
+              elif outcome == "REFUTED":
+                  actual = 0.0
+
+              calibration_error = None
+
+              if (
+                  confidence is not None
+                  and actual is not None
+                  and strength >= 0.5
+              ):
+                  calibration_error = round(
+                      abs(confidence - actual),
+                      4
+                  )
+
+              evaluations.append({
+                  "prediction_id": pid,
+                  "status": outcome,
+                  "confidence": confidence,
+                  "evidence_strength": round(strength, 4),
+                  "calibration_error": calibration_error,
+                  "reason": (
+                      "Outcome supported by observable evidence."
+                      if outcome == "CONFIRMED"
+                      else
+                      "Outcome contradicted by observable evidence."
+                      if outcome == "REFUTED"
+                      else
+                      "Evidence exists but cannot establish a reliable outcome."
+                  )
+              })
+
+          # ------------------------------------------------------------
+          # 3. Measure calibration.
+          # ------------------------------------------------------------
+
+          resolved = [
+              x for x in evaluations
+              if x["status"] in ("CONFIRMED", "REFUTED")
+              and x["calibration_error"] is not None
+          ]
+
+          confirmed = sum(
+              1 for x in resolved
+              if x["status"] == "CONFIRMED"
+          )
+
+          refuted = sum(
+              1 for x in resolved
+              if x["status"] == "REFUTED"
+          )
+
+          inconclusive = sum(
+              1 for x in evaluations
+              if x["status"] == "INCONCLUSIVE"
+          )
+
+          unobservable = sum(
+              1 for x in evaluations
+              if x["status"] == "UNOBSERVABLE"
+          )
+
+          pending = sum(
+              1 for x in evaluations
+              if x["status"] == "PENDING"
+          )
+
+          if resolved:
+              mean_error = sum(
+                  x["calibration_error"]
+                  for x in resolved
+              ) / len(resolved)
+
+              calibration_score = clamp(
+                  1.0 - mean_error
+              )
+
+              empirical_accuracy = (
+                  confirmed / len(resolved)
+              )
+          else:
+              mean_error = None
+              calibration_score = None
+              empirical_accuracy = None
+
+          # ------------------------------------------------------------
+          # 4. Detect systematic confidence problems.
+          # ------------------------------------------------------------
+
+          high_confidence_failures = [
+              x for x in resolved
+              if (
+                  x["status"] == "REFUTED"
+                  and x["confidence"] is not None
+                  and x["confidence"] >= 0.80
+              )
+          ]
+
+          low_confidence_successes = [
+              x for x in resolved
+              if (
+                  x["status"] == "CONFIRMED"
+                  and x["confidence"] is not None
+                  and x["confidence"] <= 0.40
+              )
+          ]
+
+          overconfidence_rate = (
+              len(high_confidence_failures) / len(resolved)
+              if resolved else None
+          )
+
+          underconfidence_rate = (
+              len(low_confidence_successes) / len(resolved)
+              if resolved else None
+          )
+
+          # ------------------------------------------------------------
+          # 5. Derive one coherent self-calibration policy.
+          # ------------------------------------------------------------
+
+          adjustments = []
+
+          if (
+              overconfidence_rate is not None
+              and overconfidence_rate >= 0.25
+          ):
+              adjustments.append({
+                  "type": "REDUCE_CONFIDENCE",
+                  "target": "high_confidence_predictions",
+                  "magnitude": "moderate",
+                  "reason": "High-confidence predictions are being refuted too often."
+              })
+
+          if (
+              underconfidence_rate is not None
+              and underconfidence_rate >= 0.25
+          ):
+              adjustments.append({
+                  "type": "INCREASE_CONFIDENCE",
+                  "target": "well_supported_low_confidence_predictions",
+                  "magnitude": "moderate",
+                  "reason": "Some low-confidence predictions are repeatedly confirmed."
+              })
+
+          if (
+              inconclusive + unobservable > 0
+              and len(evaluations) > 0
+          ):
+              weak_observability_rate = (
+                  (inconclusive + unobservable)
+                  / len(evaluations)
+              )
+
+              if weak_observability_rate >= 0.50:
+                  adjustments.append({
+                      "type": "IMPROVE_OBSERVABILITY",
+                      "target": "future_predictions",
+                      "magnitude": "high",
+                      "reason": "Too many predictions cannot currently be empirically resolved."
+                  })
+
+          if not resolved and evaluations:
+              adjustments.append({
+                  "type": "DEFER_CONFIDENCE_UPDATE",
+                  "target": "all_pending_predictions",
+                  "magnitude": "none",
+                  "reason": "No prediction has sufficient empirical evidence for calibration."
+              })
+
+          if not evaluations:
+              adjustments.append({
+                  "type": "WAIT_FOR_DATA",
+                  "target": "prediction_system",
+                  "magnitude": "none",
+                  "reason": "No prediction record is available for calibration."
+              })
+
+          # ------------------------------------------------------------
+          # 6. Determine the new operational calibration state.
+          # ------------------------------------------------------------
+
+          if not evaluations:
+              calibration_state = "NO_DATA"
+
+          elif not resolved:
+              calibration_state = "WAITING_FOR_EVIDENCE"
+
+          elif calibration_score >= 0.85:
+              calibration_state = "WELL_CALIBRATED"
+
+          elif calibration_score >= 0.65:
+              calibration_state = "PARTIALLY_CALIBRATED"
+
+          else:
+              calibration_state = "POORLY_CALIBRATED"
+
+          # ------------------------------------------------------------
+          # 7. Extract historical calibration state.
+          # ------------------------------------------------------------
+
+          previous = load_json(CALIBRATION_FILE)
+
+          previous_score = None
+          previous_state = None
+
+          if isinstance(previous, dict):
+              previous_score = number(
+                  previous.get("calibration_score")
+              )
+              previous_state = previous.get("calibration_state")
+
+          score_delta = None
+
+          if (
+              previous_score is not None
+              and calibration_score is not None
+          ):
+              score_delta = round(
+                  calibration_score - previous_score,
+                  4
+              )
+
+          # ------------------------------------------------------------
+          # 8. Produce actionable self-knowledge.
+          # ------------------------------------------------------------
+
+          self_knowledge = {
+              "what_nox_now_knows": [
+                  "Prediction quality must be evaluated against observable outcomes.",
+                  "Confidence is not evidence.",
+                  "Unresolved predictions must remain unresolved.",
+                  "Prediction errors can be converted into calibration signals.",
+                  "Repeated prediction outcomes can modify future decision confidence."
+              ],
+              "current_limitation": (
+                  "Insufficient empirical evidence."
+                  if not resolved
+                  else
+                  "Calibration sample is still limited."
+                  if len(resolved) < 5
+                  else
+                  "No major calibration limitation detected."
+              )
+          }
+
+          # ------------------------------------------------------------
+          # 9. Persist the complete calibration model.
+          # ------------------------------------------------------------
+
+          output = {
+              "act": "ACT55",
+              "version": "V1",
+              "name": "Autonomous Self-Calibration Core",
+              "timestamp": NOW,
+
+              "gemini_used": False,
+              "external_ai_used": False,
+              "project_cost_eur": 0,
+
+              "purpose": (
+                  "Transform empirical prediction outcomes into "
+                  "persistent calibration of NØX confidence and decision policy."
+              ),
+
+              "inputs": {
+                  "prediction_file": str(PREDICTION_FILE),
+                  "experiment_file": str(EXPERIMENT_FILE),
+                  "knowledge_file_present": KNOWLEDGE_FILE.exists(),
+                  "decision_file_present": DECISION_FILE.exists(),
+                  "learning_file_present": LEARNING_FILE.exists()
+              },
+
+              "dataset": {
+                  "predictions": len(predictions),
+                  "evaluations": len(evaluations),
+                  "resolved": len(resolved),
+                  "confirmed": confirmed,
+                  "refuted": refuted,
+                  "inconclusive": inconclusive,
+                  "unobservable": unobservable,
+                  "pending": pending
+              },
+
+              "calibration": {
+                  "state": calibration_state,
+                  "calibration_score": (
+                      round(calibration_score, 4)
+                      if calibration_score is not None
+                      else None
+                  ),
+                  "empirical_accuracy": (
+                      round(empirical_accuracy, 4)
+                      if empirical_accuracy is not None
+                      else None
+                  ),
+                  "mean_calibration_error": (
+                      round(mean_error, 4)
+                      if mean_error is not None
+                      else None
+                  ),
+                  "previous_score": previous_score,
+                  "score_delta": score_delta
+              },
+
+              "systematic_signals": {
+                  "high_confidence_failures": len(high_confidence_failures),
+                  "low_confidence_successes": len(low_confidence_successes),
+                  "overconfidence_rate": (
+                      round(overconfidence_rate, 4)
+                      if overconfidence_rate is not None
+                      else None
+                  ),
+                  "underconfidence_rate": (
+                      round(underconfidence_rate, 4)
+                      if underconfidence_rate is not None
+                      else None
+                  )
+              },
+
+              "adjustments": adjustments,
+
+              "self_knowledge": self_knowledge,
+
+              "evaluations": evaluations,
+
+              "policy": {
+                  "never_convert_pending_to_success": True,
+                  "never_invent_outcome": True,
+                  "require_observable_evidence": True,
+                  "preserve_inconclusive_state": True,
+                  "allow_future_confidence_adjustment": True,
+                  "allow_strategy_adjustment": True
+              },
+
+              "status": (
+                  "CALIBRATION_UPDATED"
+                  if resolved
+                  else "WAITING_FOR_EMPIRICAL_EVIDENCE"
+              )
+          }
+
+          save_json(CALIBRATION_FILE, output)
+
+          print()
+          print("=" * 70)
+          print("ACT55 CALIBRATION RESULT")
+          print("=" * 70)
+          print("State:", calibration_state)
+          print("Predictions:", len(predictions))
+          print("Resolved:", len(resolved))
+          print("Confirmed:", confirmed)
+          print("Refuted:", refuted)
+          print("Inconclusive:", inconclusive)
+          print("Unobservable:", unobservable)
+          print("Pending:", pending)
+
+          if calibration_score is None:
+              print("Calibration score: NOT_AVAILABLE")
+          else:
+              print(
+                  "Calibration score:",
+                  round(calibration_score, 4)
+              )
+
+          if empirical_accuracy is None:
+              print("Empirical accuracy: NOT_AVAILABLE")
+          else:
+              print(
+                  "Empirical accuracy:",
+                  round(empirical_accuracy, 4)
+              )
+
+          print()
+          print("Strategy adjustments:")
+
+          if adjustments:
+              for adjustment in adjustments:
+                  print(
+                      "-",
+                      adjustment["type"],
+                      "|",
+                      adjustment["target"],
+                      "|",
+                      adjustment["reason"]
+                  )
+          else:
+              print("- none")
+
+          print()
+          print("Self-knowledge updated:", CALIBRATION_FILE)
+          print("Gemini:", False)
+          print("External AI:", False)
+          print("Cost EUR:", 0)
+          print()
+          print("ACT55 completed.")
+          PY
+
+      - name: Validate ACT55 output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("memory/nox_act_55_self_calibration.json")
+
+          if not path.exists():
+              raise SystemExit("ACT55 output memory was not created.")
+
+          data = json.loads(
+              path.read_text(encoding="utf-8")
+          )
+
+          required = [
+              "act",
+              "version",
+              "calibration",
+              "evaluations",
+              "adjustments",
+              "status"
+          ]
+
+          missing = [
+              key for key in required
+              if key not in data
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "ACT55 output missing fields: "
+                  + ", ".join(missing)
+              )
+
+          if data.get("act") != "ACT55":
+              raise SystemExit("Invalid ACT55 identifier.")
+
+          if data.get("gemini_used") is not False:
+              raise SystemExit("Gemini must remain disabled.")
+
+          if data.get("project_cost_eur") != 0:
+              raise SystemExit("Project cost must remain 0 EUR.")
+
+          print("ACT55 output validation: PASS")
+          print("status:", data["status"])
+          print(
+              "calibration_state:",
+              data["calibration"].get("state")
+          )
+          PY
+
+      - name: Commit ACT55 memory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_55_self_calibration.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT55 memory changes."
+            exit 0
+          fi
+
+          git commit -m "ACT55: autonomous self-calibration core"
+
+      - name: Sync and push ACT55
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! git log -1 --pretty=%B | grep -q "ACT55: autonomous self-calibration core"; then
+            echo "No ACT55 commit created."
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt}/3"
+
+            git fetch origin main
+
+            if ! git rebase origin/main; then
+              echo "Rebase conflict."
+              git rebase --abort || true
+              exit 1
+            fi
+
+            if git push origin HEAD:main; then
+              echo "ACT55 pushed successfully."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "ACT55 push failed after 3 attempts."
+          exit 1
