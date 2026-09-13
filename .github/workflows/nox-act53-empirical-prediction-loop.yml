@@ -29,12 +29,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ACT53 - Empirical Prediction Loop
+      - name: Run ACT53 - Empirical Prediction Loop V2
         shell: bash
         run: |
           python - <<'PY'
           import json
           import hashlib
+          import subprocess
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -43,7 +44,6 @@ jobs:
 
           ACT50_FILE = MEMORY_DIR / "nox_act_50_cognitive_decision_loop.json"
           ACT52_FILE = MEMORY_DIR / "nox_act_52_prediction_outcome_evidence.json"
-
           ACT53_JSON = MEMORY_DIR / "nox_act_53_empirical_prediction_loop.json"
           ACT53_MD = MEMORY_DIR / "nox_act_53_empirical_prediction_loop.md"
 
@@ -51,7 +51,7 @@ jobs:
           timestamp = now.isoformat()
 
           print("=" * 72)
-          print("NØX ACT53 V1 - EMPIRICAL PREDICTION LOOP")
+          print("NØX ACT53 V2 - EMPIRICAL PREDICTION LOOP")
           print("=" * 72)
 
           def load_json(path):
@@ -64,8 +64,86 @@ jobs:
                   print(f"[WARN] Could not read {path}: {exc}")
                   return None
 
+          def parse_timestamp(value):
+              if not isinstance(value, str):
+                  return None
+              try:
+                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(timezone.utc)
+              except Exception:
+                  return None
+
+          def load_previous_act53_records():
+              """
+              Recover earlier ACT53 records from git history.
+
+              V1 could overwrite a still-pending prediction with a new
+              created_at timestamp. V2 therefore searches git history for
+              the previous persistent prediction instead of trusting only
+              the current working-tree file.
+              """
+              records = []
+
+              try:
+                  result = subprocess.run(
+                      [
+                          "git",
+                          "log",
+                          "--format=%H",
+                          "--all",
+                          "--",
+                          str(ACT53_JSON),
+                      ],
+                      capture_output=True,
+                      text=True,
+                      check=True,
+                  )
+
+                  commits = [
+                      line.strip()
+                      for line in result.stdout.splitlines()
+                      if line.strip()
+                  ]
+
+                  seen = set()
+
+                  for commit in commits:
+                      try:
+                          content = subprocess.run(
+                              [
+                                  "git",
+                                  "show",
+                                  f"{commit}:{ACT53_JSON}",
+                              ],
+                              capture_output=True,
+                              text=True,
+                              check=True,
+                          ).stdout
+
+                          parsed = json.loads(content)
+
+                          prediction = parsed.get("prediction")
+
+                          if isinstance(prediction, dict):
+                              prediction_id = prediction.get("prediction_id")
+
+                              if prediction_id and prediction_id not in seen:
+                                  records.append(parsed)
+                                  seen.add(prediction_id)
+
+                      except Exception:
+                          continue
+
+              except Exception as exc:
+                  print(f"[WARN] Could not inspect ACT53 git history: {exc}")
+
+              return records
+
           act50 = load_json(ACT50_FILE)
           act52 = load_json(ACT52_FILE)
+          current_act53 = load_json(ACT53_JSON)
 
           if act50 is None:
               raise RuntimeError(
@@ -88,119 +166,181 @@ jobs:
           decision_status = decision.get("status")
           decision_supported = decision.get("supported")
           decision_action = decision.get("selected_action")
-
           can_advance = uncertainty_gate.get("can_advance")
 
           selected_action_id = perception_state.get("selected_action_id")
           selected_action = perception_state.get("selected_action")
 
+          act50_timestamp_raw = act50.get("timestamp_utc")
+          act50_timestamp = parse_timestamp(act50_timestamp_raw)
+
           print()
           print("CURRENT COGNITIVE STATE")
           print("-" * 72)
-          print(f"ACT50 decision status:       {decision_status!r}")
-          print(f"ACT50 decision supported:    {decision_supported!r}")
-          print(f"ACT50 decision action:       {decision_action!r}")
-          print(f"ACT49 can advance:           {can_advance!r}")
-          print(f"Selected action id:          {selected_action_id!r}")
-          print(f"Selected action:             {selected_action!r}")
+          print(f"ACT50 timestamp:            {act50_timestamp_raw!r}")
+          print(f"ACT50 decision status:      {decision_status!r}")
+          print(f"ACT50 decision supported:   {decision_supported!r}")
+          print(f"ACT50 decision action:      {decision_action!r}")
+          print(f"ACT49 can advance:          {can_advance!r}")
+          print(f"Selected action id:         {selected_action_id!r}")
+          print(f"Selected action:            {selected_action!r}")
 
           # ---------------------------------------------------------------
-          # ACT53 PRINCIPLE
+          # Recover an existing pending prediction first.
           #
-          # ACT53 never invents an outcome.
-          # ACT53 only creates a prediction when an observable future
-          # condition can be stated from existing NØX state.
+          # This is the key V2 change.
           #
-          # The first bootstrap prediction is deliberately conservative:
-          # if ACT50 remains blocked by ACT49 uncertainty, the next
-          # cognitive decision cycle cannot legitimately advance.
-          #
-          # This is not presented as a certainty. It is recorded as a
-          # testable prediction with explicit evidence and a verification
-          # condition.
+          # ACT53 must NOT create a new prediction when an earlier
+          # prediction is still pending. A prediction is an experiment
+          # with a lifecycle, not a disposable hourly record.
+          # ---------------------------------------------------------------
+
+          history_records = load_previous_act53_records()
+
+          candidate_records = []
+
+          if isinstance(current_act53, dict):
+              candidate_records.append(current_act53)
+
+          candidate_records.extend(history_records)
+
+          pending_prediction = None
+          pending_source_record = None
+
+          for record in candidate_records:
+              prediction = record.get("prediction")
+
+              if not isinstance(prediction, dict):
+                  continue
+
+              if prediction.get("status") != "PENDING":
+                  continue
+
+              prediction_id = prediction.get("prediction_id")
+
+              if not prediction_id:
+                  continue
+
+              created_at = parse_timestamp(prediction.get("created_at_utc"))
+
+              if created_at is None:
+                  continue
+
+              if (
+                  pending_prediction is None
+                  or created_at < parse_timestamp(
+                      pending_prediction.get("created_at_utc")
+                  )
+              ):
+                  pending_prediction = prediction.copy()
+                  pending_source_record = record
+
+          # ---------------------------------------------------------------
+          # Build the stable bootstrap prediction only when there is no
+          # existing pending experiment.
           # ---------------------------------------------------------------
 
           prediction = None
-          prediction_status = "INSUFFICIENT_EVIDENCE_TO_PREDICT"
+          prediction_status = "NO_PREDICTION"
 
-          if (
-              decision_status == "NO_DEFENSIBLE_DECISION"
-              and decision_supported is False
-              and can_advance is False
-          ):
-              prediction_text = (
-                  "At the next cognitive decision evaluation, NØX will "
-                  "remain blocked from advancing unless new empirical "
-                  "evidence changes the current uncertainty state."
-              )
+          if pending_prediction is not None:
+              prediction = pending_prediction
+              prediction_status = "PENDING"
 
-              verification_condition = (
-                  "Compare the next ACT50 decision and ACT49 uncertainty "
-                  "gate with the current state. The prediction is confirmed "
-                  "only if the next evaluation still has no defensible "
-                  "decision and ACT49 does not allow advancement; it is "
-                  "refuted if sufficient new evidence causes the cognitive "
-                  "gate to advance."
-              )
+              print()
+              print("EXISTING PENDING PREDICTION")
+              print("-" * 72)
+              print(f"prediction id:              {prediction.get('prediction_id')}")
+              print(f"created at:                 {prediction.get('created_at_utc')}")
+              print("[OK] Existing experiment preserved.")
+          else:
+              if (
+                  decision_status == "NO_DEFENSIBLE_DECISION"
+                  and decision_supported is False
+                  and can_advance is False
+              ):
+                  prediction_text = (
+                      "At the next cognitive decision evaluation, NØX will "
+                      "remain blocked from advancing unless new empirical "
+                      "evidence changes the current uncertainty state."
+                  )
 
-              evidence_basis = [
-                  "ACT50 currently reports NO_DEFENSIBLE_DECISION.",
-                  "ACT50 currently reports supported=False.",
-                  "ACT49 currently reports can_advance=False.",
-                  "ACT50 explicitly states that the current uncertainty "
-                  "does not justify advancing.",
-              ]
+                  verification_condition = (
+                      "Compare the next ACT50 decision and ACT49 uncertainty "
+                      "gate with the current state. The prediction is confirmed "
+                      "only if the next evaluation still has no defensible "
+                      "decision and ACT49 does not allow advancement; it is "
+                      "refuted if sufficient new evidence causes the cognitive "
+                      "gate to advance."
+                  )
 
-              # Stable fingerprint prevents creating a new identical
-              # prediction on every hourly workflow execution.
-              fingerprint_source = json.dumps(
-                  {
-                      "prediction": prediction_text,
-                      "basis": evidence_basis,
-                      "state": {
-                          "decision_status": decision_status,
-                          "decision_supported": decision_supported,
-                          "can_advance": can_advance,
+                  evidence_basis = [
+                      "ACT50 currently reports NO_DEFENSIBLE_DECISION.",
+                      "ACT50 currently reports supported=False.",
+                      "ACT49 currently reports can_advance=False.",
+                      "ACT50 explicitly states that the current uncertainty "
+                      "does not justify advancing.",
+                  ]
+
+                  fingerprint_source = json.dumps(
+                      {
+                          "prediction": prediction_text,
+                          "basis": evidence_basis,
+                          "state": {
+                              "decision_status": decision_status,
+                              "decision_supported": decision_supported,
+                              "can_advance": can_advance,
+                          },
                       },
-                  },
-                  sort_keys=True,
-                  ensure_ascii=False,
-              )
+                      sort_keys=True,
+                      ensure_ascii=False,
+                  )
 
-              prediction_id = (
-                  "P53-"
-                  + hashlib.sha256(
-                      fingerprint_source.encode("utf-8")
-                  ).hexdigest()[:12]
-              )
+                  prediction_id = (
+                      "P53-"
+                      + hashlib.sha256(
+                          fingerprint_source.encode("utf-8")
+                      ).hexdigest()[:12]
+                  )
 
-              prediction = {
-                  "prediction_id": prediction_id,
-                  "created_at_utc": timestamp,
-                  "prediction": prediction_text,
-                  "confidence": 0.80,
-                  "confidence_basis": (
-                      "The prediction follows directly from the current "
-                      "explicit uncertainty gate, but remains falsifiable "
-                      "because new empirical evidence may change the state."
-                  ),
-                  "evidence_basis": evidence_basis,
-                  "verification_condition": verification_condition,
-                  "expected_evaluation": {
-                      "decision_status": "NO_DEFENSIBLE_DECISION",
-                      "decision_supported": False,
-                      "can_advance": False,
-                  },
-                  "status": "PENDING",
-              }
+                  prediction = {
+                      "prediction_id": prediction_id,
+                      "created_at_utc": timestamp,
+                      "prediction": prediction_text,
+                      "confidence": 0.80,
+                      "confidence_basis": (
+                          "The prediction follows directly from the current "
+                          "explicit uncertainty gate, but remains falsifiable "
+                          "because new empirical evidence may change the state."
+                      ),
+                      "evidence_basis": evidence_basis,
+                      "verification_condition": verification_condition,
+                      "expected_evaluation": {
+                          "decision_status": "NO_DEFENSIBLE_DECISION",
+                          "decision_supported": False,
+                          "can_advance": False,
+                      },
+                      "status": "PENDING",
+                  }
 
-              prediction_status = "PREDICTION_CREATED"
+                  prediction_status = "PREDICTION_CREATED"
+
+                  print()
+                  print("NEW PREDICTION CREATED")
+                  print("-" * 72)
+                  print(f"prediction id:              {prediction_id}")
 
           # ---------------------------------------------------------------
-          # Search ACT52 for already observed prediction/outcome evidence.
-          # ACT53 does not manufacture outcomes.
+          # V2 VERIFICATION
+          #
+          # If a prediction existed before the current ACT50 evaluation,
+          # ACT53 compares the real ACT50 result against the prediction.
+          #
+          # The observation must be strictly later than prediction creation.
+          # No simulated or inferred timestamp is accepted.
           # ---------------------------------------------------------------
 
+          evaluated_predictions = []
           observed_pairs = []
 
           if isinstance(act52, dict):
@@ -212,82 +352,166 @@ jobs:
                       if isinstance(pair, dict):
                           observed_pairs.append(pair)
 
-          evaluated_predictions = []
+          if prediction is not None and pending_prediction is not None:
+              prediction_created_at = parse_timestamp(
+                  prediction.get("created_at_utc")
+              )
 
-          if prediction is not None:
-              for pair in observed_pairs:
-                  prediction_id = pair.get("prediction_id")
+              if prediction_created_at is not None and act50_timestamp is not None:
+                  observation_is_new = act50_timestamp > prediction_created_at
 
-                  if prediction_id != prediction.get("prediction_id"):
-                      continue
+                  print()
+                  print("PREDICTION VERIFICATION")
+                  print("-" * 72)
+                  print(
+                      f"prediction created:        "
+                      f"{prediction_created_at.isoformat()}"
+                  )
+                  print(
+                      f"ACT50 observed:             "
+                      f"{act50_timestamp.isoformat()}"
+                  )
+                  print(f"new observation:            {observation_is_new}")
 
-                  outcome = pair.get("outcome")
+                  if observation_is_new:
+                      expected = prediction.get("expected_evaluation") or {}
 
-                  if not isinstance(outcome, dict):
-                      continue
+                      expected_status = expected.get("decision_status")
+                      expected_supported = expected.get("decision_supported")
+                      expected_can_advance = expected.get("can_advance")
 
-                  actual_status = outcome.get("status")
+                      status_matches = (
+                          decision_status == expected_status
+                      )
 
-                  if actual_status in {
-                      "CONFIRMED",
-                      "CORRECT",
-                      "REFUTED",
-                      "INCORRECT",
-                      "PARTIALLY_CONFIRMED",
-                      "UNRESOLVED",
-                  }:
-                      if actual_status in {"CONFIRMED", "CORRECT"}:
+                      supported_matches = (
+                          decision_supported == expected_supported
+                      )
+
+                      gate_matches = (
+                          can_advance == expected_can_advance
+                      )
+
+                      if status_matches and supported_matches and gate_matches:
                           result = "CONFIRMED"
-                      elif actual_status in {"REFUTED", "INCORRECT"}:
+                          lesson = (
+                              "The real subsequent ACT50 evaluation matched "
+                              "the predicted cognitive state. This confirms "
+                              "the prediction for this experiment only; it "
+                              "does not establish a general rule."
+                          )
+                      elif (
+                          decision_status != expected_status
+                          or decision_supported != expected_supported
+                          or can_advance != expected_can_advance
+                      ):
                           result = "REFUTED"
-                      elif actual_status == "PARTIALLY_CONFIRMED":
-                          result = "PARTIALLY_CONFIRMED"
+                          lesson = (
+                              "The real subsequent ACT50 evaluation differed "
+                              "from the predicted cognitive state. The "
+                              "prediction was therefore empirically refuted "
+                              "for this experiment."
+                          )
                       else:
                           result = "UNRESOLVED"
+                          lesson = (
+                              "The subsequent observation did not provide "
+                              "enough information for a defensible binary "
+                              "evaluation."
+                          )
+
+                      outcome = {
+                          "prediction_id": prediction.get("prediction_id"),
+                          "observed_at_utc": act50_timestamp.isoformat(),
+                          "source_act": "ACT50",
+                          "source_timestamp_utc": act50_timestamp.isoformat(),
+                          "observed_state": {
+                              "decision_status": decision_status,
+                              "decision_supported": decision_supported,
+                              "can_advance": can_advance,
+                          },
+                          "expected_state": {
+                              "decision_status": expected_status,
+                              "decision_supported": expected_supported,
+                              "can_advance": expected_can_advance,
+                          },
+                          "status": result,
+                          "real_observation": True,
+                          "invented": False,
+                          "simulated": False,
+                      }
 
                       prediction["status"] = result
                       prediction["observed_outcome"] = outcome
 
-                      confidence = prediction.get("confidence", 0.0)
+                      evaluated_predictions.append(
+                          {
+                              "prediction_id": prediction.get("prediction_id"),
+                              "result": result,
+                              "outcome": outcome,
+                              "calibration": {
+                                  "confidence_before_result": prediction.get(
+                                      "confidence"
+                                  ),
+                                  "outcome_supported_prediction": (
+                                      True
+                                      if result == "CONFIRMED"
+                                      else False
+                                      if result == "REFUTED"
+                                      else None
+                                  ),
+                              },
+                          }
+                      )
 
-                      if result == "CONFIRMED":
-                          calibration = {
-                              "confidence_before_result": confidence,
-                              "outcome_supported_prediction": True,
-                              "calibration_note": (
-                                  "The predicted state was observed."
-                              ),
-                          }
-                      elif result == "REFUTED":
-                          calibration = {
-                              "confidence_before_result": confidence,
-                              "outcome_supported_prediction": False,
-                              "calibration_note": (
-                                  "The predicted state was not observed."
-                              ),
-                          }
-                      else:
-                          calibration = {
-                              "confidence_before_result": confidence,
-                              "outcome_supported_prediction": None,
-                              "calibration_note": (
-                                  "The observed result does not permit "
-                                  "a binary calibration."
-                              ),
-                          }
+                      prediction_status = result
 
-                      evaluated_predictions.append({
-                          "prediction_id": prediction["prediction_id"],
-                          "result": result,
-                          "calibration": calibration,
-                      })
+                      print(f"[RESULT] Prediction: {result}")
+                      print("[RESULT] Real ACT50 observation recorded.")
+
+                  else:
+                      print(
+                          "[INFO] Current ACT50 is not newer than the "
+                          "prediction. Waiting for a future observation."
+                      )
 
           # ---------------------------------------------------------------
-          # Learning signal
+          # If the prediction was evaluated, expose the real outcome as an
+          # explicit evidence pair for ACT54 and future cognitive cycles.
           # ---------------------------------------------------------------
 
-          if prediction is None:
+          if evaluated_predictions:
+              learning_status = evaluated_predictions[-1]["result"]
+
+              learning = {
+                  "status": learning_status,
+                  "lesson": (
+                      evaluated_predictions[-1]["outcome"]["status"]
+                      == "CONFIRMED"
+                      and
+                      "The real observed outcome confirmed the prediction "
+                      "for this experiment."
+                      or
+                      "The real observed outcome did not confirm the "
+                      "prediction for this experiment."
+                  ),
+                  "empirical_evidence": evaluated_predictions[-1]["outcome"],
+              }
+
+          elif prediction is not None:
+              learning_status = "PENDING"
+
+              learning = {
+                  "status": "WAITING_FOR_OUTCOME",
+                  "lesson": (
+                      "The prediction remains pending because no newer "
+                      "real observation has yet been evaluated."
+                  ),
+              }
+
+          else:
               learning_status = "NO_PREDICTION"
+
               learning = {
                   "status": "WAITING_FOR_SUFFICIENT_EVIDENCE",
                   "lesson": (
@@ -296,62 +520,19 @@ jobs:
                   ),
               }
 
-          elif evaluated_predictions:
-              result = evaluated_predictions[-1]["result"]
-
-              if result == "CONFIRMED":
-                  learning_status = "CONFIRMED"
-                  lesson = (
-                      "The observed result matched the predicted state. "
-                      "The evidence supports the current reasoning pattern, "
-                      "without proving that it will generalize."
-                  )
-              elif result == "REFUTED":
-                  learning_status = "REFUTED"
-                  lesson = (
-                      "The observed result contradicted the prediction. "
-                      "The reasoning and confidence used for this prediction "
-                      "must be treated as an empirical error."
-                  )
-              elif result == "PARTIALLY_CONFIRMED":
-                  learning_status = "PARTIALLY_CONFIRMED"
-                  lesson = (
-                      "The observed result only partially matched the "
-                      "prediction. The prediction should not be treated "
-                      "as fully validated."
-                  )
-              else:
-                  learning_status = "UNRESOLVED"
-                  lesson = (
-                      "The available observation does not establish whether "
-                      "the prediction was correct."
-                  )
-
-              learning = {
-                  "status": learning_status,
-                  "lesson": lesson,
-              }
-
-          else:
-              learning_status = "PENDING"
-              learning = {
-                  "status": "WAITING_FOR_OUTCOME",
-                  "lesson": (
-                      "The prediction is testable but its verification "
-                      "condition has not yet produced a real outcome."
-                  ),
-              }
+          # ---------------------------------------------------------------
+          # Persistent record
+          # ---------------------------------------------------------------
 
           record = {
               "act": "ACT53",
-              "version": "V1",
+              "version": "V2",
               "title": "Empirical Prediction Loop",
               "question": (
                   "Je formule une prédiction vérifiable, j'observe ce qui "
                   "se passe réellement, puis j'apprends de l'écart."
               ),
               "timestamp_utc": timestamp,
-
               "status": prediction_status,
               "prediction": prediction,
 
@@ -359,6 +540,12 @@ jobs:
                   "real_outcome_required": True,
                   "invented_outcome": False,
                   "simulated_outcome": False,
+                  "observation_source": "ACT50",
+                  "observation_timestamp_utc": (
+                      act50_timestamp.isoformat()
+                      if act50_timestamp is not None
+                      else None
+                  ),
                   "observed_pairs": len(observed_pairs),
                   "evaluated_predictions": evaluated_predictions,
               },
@@ -366,6 +553,7 @@ jobs:
               "learning": learning,
 
               "source_state": {
+                  "act50_timestamp_utc": act50_timestamp_raw,
                   "act50_decision_status": decision_status,
                   "act50_decision_supported": decision_supported,
                   "act50_selected_action": decision_action,
@@ -389,13 +577,13 @@ jobs:
               },
 
               "next_step": (
-                  "Wait for the verification condition to become "
-                  "observable, then compare prediction with the real result."
-                  if prediction is not None and not evaluated_predictions
-                  else
-                  "Continue empirical observation and use confirmed or "
-                  "refuted outcomes as learning evidence."
+                  "Pass the real experimental outcome to ACT54 for "
+                  "empirical learning."
                   if evaluated_predictions
+                  else
+                  "Wait for a newer ACT50 evaluation before evaluating "
+                  "the pending prediction."
+                  if prediction is not None
                   else
                   "Continue collecting sufficiently grounded evidence "
                   "before creating a prediction."
@@ -405,7 +593,7 @@ jobs:
           with ACT53_JSON.open("w", encoding="utf-8") as f:
               json.dump(record, f, ensure_ascii=False, indent=2)
 
-          md = f"""# NØX ACT53 V1 — Empirical Prediction Loop
+          md = f"""# NØX ACT53 V2 — Empirical Prediction Loop
 
           ## Question
 
@@ -415,26 +603,38 @@ jobs:
 
           **{prediction_status}**
 
-          ## Current prediction
+          ## Prediction
 
-          {json.dumps(prediction, ensure_ascii=False, indent=2) if prediction else "No sufficiently grounded prediction created."}
+          {json.dumps(prediction, ensure_ascii=False, indent=2) if prediction else "No sufficiently grounded prediction exists."}
 
           ## Verification
 
           - Real outcome required: **True**
           - Invented outcome: **False**
           - Simulated outcome: **False**
-          - Existing evidence pairs: **{len(observed_pairs)}**
-          - Evaluated predictions: **{len(evaluated_predictions)}**
+          - Observation source: **ACT50**
+          - ACT50 timestamp: **{act50_timestamp_raw}**
+          - Evidence pairs already present in ACT52: **{len(observed_pairs)}**
+          - Evaluated predictions in this run: **{len(evaluated_predictions)}**
 
           ## Learning
 
           {json.dumps(learning, ensure_ascii=False, indent=2)}
 
+          ## V2 principle
+
+          ACT53 does not recreate a pending prediction.
+
+          A pending prediction remains an active experiment until a newer
+          real observation is available.
+
+          ACT53 compares the prediction with the subsequent ACT50 state and
+          records a real outcome.
+
           ## Safety
 
-          ACT53 does not invent outcomes.
-
+          No invented outcome.
+          No simulated outcome.
           No Gemini.
           No external AI.
           No external API.
@@ -455,20 +655,20 @@ jobs:
 
           print()
           print("=" * 72)
-          print("ACT53 RESULT")
+          print("ACT53 V2 RESULT")
           print("=" * 72)
           print(f"status:                  {prediction_status}")
           print(
               "prediction id:           "
               f"{prediction.get('prediction_id') if prediction else None}"
           )
-          print(f"existing evidence pairs: {len(observed_pairs)}")
+          print(f"observed ACT52 pairs:    {len(observed_pairs)}")
           print(f"evaluated predictions:   {len(evaluated_predictions)}")
           print(f"learning status:         {learning_status}")
           print()
           print(record["next_step"])
           print()
-          print("[OK] ACT53 memory written.")
+          print("[OK] ACT53 V2 memory written.")
           PY
 
       - name: Commit and push ACT53 memory
@@ -484,5 +684,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "feat: add ACT53 empirical prediction loop"
+          git commit -m "feat: upgrade ACT53 empirical prediction loop to V2"
           git push origin HEAD:main
