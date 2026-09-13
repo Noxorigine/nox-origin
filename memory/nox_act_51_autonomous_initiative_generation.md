@@ -1,9 +1,33 @@
 # NØX ACT51 — Autonomous Initiative Generation
 
-**Status:** WAITING_FOR_SUPPORTED_DECISION
+## Status
 
-No initiative was generated because ACT50 did not provide a defensible decision.
+**WAITING_FOR_SUPPORTED_DECISION**
 
-**Decision state:** `None`
+## ACT50 decision
 
-**Reason:** ACT50 did not provide a DECISION_SUPPORTED state. ACT51 must not invent an initiative.
+- Status: `NO_DEFENSIBLE_DECISION`
+- Supported: `False`
+- Selected action: `None`
+
+## ACT49 uncertainty gate
+
+- Can advance: `False`
+
+## Reason
+
+ACT50 decision.supported is not true. NØX does not have a defensible decision.
+
+ACT51 does not invent an initiative when ACT50 has not
+produced a defensible decision.
+
+## Safety
+
+- Decision overridden: `false`
+- Uncertainty overridden: `false`
+- Initiative invented: `false`
+- Colony created: `false`
+- External API: `false`
+- Gemini: `false`
+- Payment: `false`
+- Spending: `false`
