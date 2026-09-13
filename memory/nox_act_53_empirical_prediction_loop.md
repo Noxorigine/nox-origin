@@ -1,4 +1,4 @@
-# NØX ACT53 V1 — Empirical Prediction Loop
+# NØX ACT53 V2 — Empirical Prediction Loop
 
 ## Question
 
@@ -6,9 +6,9 @@
 
 ## Status
 
-**PREDICTION_CREATED**
+**PENDING**
 
-## Current prediction
+## Prediction
 
 {
   "prediction_id": "P53-a2aa15cd52c6",
@@ -36,20 +36,32 @@
 - Real outcome required: **True**
 - Invented outcome: **False**
 - Simulated outcome: **False**
-- Existing evidence pairs: **0**
-- Evaluated predictions: **0**
+- Observation source: **ACT50**
+- ACT50 timestamp: **2026-09-13T10:38:16.689623+00:00**
+- Evidence pairs already present in ACT52: **0**
+- Evaluated predictions in this run: **0**
 
 ## Learning
 
 {
   "status": "WAITING_FOR_OUTCOME",
-  "lesson": "The prediction is testable but its verification condition has not yet produced a real outcome."
+  "lesson": "The prediction remains pending because no newer real observation has yet been evaluated."
 }
+
+## V2 principle
+
+ACT53 does not recreate a pending prediction.
+
+A pending prediction remains an active experiment until a newer
+real observation is available.
+
+ACT53 compares the prediction with the subsequent ACT50 state and
+records a real outcome.
 
 ## Safety
 
-ACT53 does not invent outcomes.
-
+No invented outcome.
+No simulated outcome.
 No Gemini.
 No external AI.
 No external API.
@@ -61,6 +73,6 @@ No initiative execution.
 
 ## Next step
 
-Wait for the verification condition to become observable, then compare prediction with the real result.
+Wait for a newer ACT50 evaluation before evaluating the pending prediction.
 
-Generated: `2026-09-13T10:42:58.186571+00:00`
+Generated: `2026-09-13T10:44:07.537878+00:00`
