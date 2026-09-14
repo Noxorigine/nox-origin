@@ -1,0 +1,1396 @@
+name: NØX Interaction Core - Cognitive Publisher DM Comment
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "13 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-interaction-core
+  cancel-in-progress: false
+
+jobs:
+  interaction-core:
+    runs-on: ubuntu-latest
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+      INTERACTION_MEMORY: memory/nox_interaction_core.json
+      KNOWLEDGE_MEMORY: memory/nox_knowledge_core.json
+      REPUTATION_MEMORY: memory/nox_reputation_trust.json
+
+      MIN_PUBLISH_INTERVAL_HOURS: "12"
+      MAX_FEED_ITEMS: "30"
+      MAX_SUGGESTIONS: "20"
+      MAX_CONVERSATIONS: "20"
+      MAX_COMMENTS_PER_POST: "30"
+
+      MIN_PUBLISH_SCORE: "65"
+      MIN_REPLY_SCORE: "55"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run NØX Interaction Core
+        run: |
+          python -u <<'PY'
+          import os
+          import json
+          import re
+          import hashlib
+          import requests
+          from datetime import datetime, timezone, timedelta
+
+          BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
+          API = BASE + "/api/v1"
+          KEY = os.environ["COLONY_API_KEY"]
+
+          INTERACTION_MEMORY = os.environ["INTERACTION_MEMORY"]
+          KNOWLEDGE_MEMORY = os.environ["KNOWLEDGE_MEMORY"]
+          REPUTATION_MEMORY = os.environ["REPUTATION_MEMORY"]
+
+          MIN_PUBLISH_INTERVAL = int(os.environ["MIN_PUBLISH_INTERVAL_HOURS"])
+          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
+          MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
+          MAX_CONVERSATIONS = int(os.environ["MAX_CONVERSATIONS"])
+          MAX_COMMENTS = int(os.environ["MAX_COMMENTS_PER_POST"])
+
+          MIN_PUBLISH_SCORE = int(os.environ["MIN_PUBLISH_SCORE"])
+          MIN_REPLY_SCORE = int(os.environ["MIN_REPLY_SCORE"])
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+              "User-Agent": "NOX-INTERACTION-CORE"
+          })
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def normalize(text):
+              text = (text or "").lower()
+              text = re.sub(r"https?://\S+", "", text)
+              text = re.sub(r"[^a-z0-9à-ÿ\s]", " ", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def clean(text, limit=1500):
+              text = re.sub(r"\s+", " ", str(text or "")).strip()
+              return text[:limit]
+
+          def fingerprint(*parts):
+              raw = "\n".join(normalize(x) for x in parts)
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+          # ------------------------------------------------------------
+          # MEMORY
+          # ------------------------------------------------------------
+
+          def load_json(path, default):
+              if not os.path.exists(path):
+                  return default
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+                  return data
+              except Exception as exc:
+                  print(f"Memory warning {path}: {exc}")
+                  return default
+
+          memory = load_json(
+              INTERACTION_MEMORY,
+              {
+                  "version": "INTERACTION_CORE_V1",
+                  "events": [],
+                  "decisions": [],
+                  "actions": [],
+                  "reflections": [],
+                  "publications": [],
+                  "responses": [],
+                  "fingerprints": [],
+                  "ignored_events": []
+              }
+          )
+
+          knowledge = load_json(
+              KNOWLEDGE_MEMORY,
+              {
+                  "knowledge": [],
+                  "entries": [],
+                  "gaps": [],
+                  "processed_sources": []
+              }
+          )
+
+          reputation = load_json(
+              REPUTATION_MEMORY,
+              {
+                  "agents": {},
+                  "domains": {}
+              }
+          )
+
+          def save_memory():
+              os.makedirs(
+                  os.path.dirname(INTERACTION_MEMORY),
+                  exist_ok=True
+              )
+
+              memory["events"] = memory.get("events", [])[-100:]
+              memory["decisions"] = memory.get("decisions", [])[-100:]
+              memory["actions"] = memory.get("actions", [])[-100:]
+              memory["reflections"] = memory.get("reflections", [])[-100:]
+              memory["publications"] = memory.get("publications", [])[-50:]
+              memory["responses"] = memory.get("responses", [])[-100:]
+              memory["fingerprints"] = memory.get("fingerprints", [])[-150:]
+              memory["ignored_events"] = memory.get("ignored_events", [])[-100:]
+
+              with open(INTERACTION_MEMORY, "w", encoding="utf-8") as f:
+                  json.dump(memory, f, ensure_ascii=False, indent=2)
+
+          # ------------------------------------------------------------
+          # AUTHENTICATION
+          # ------------------------------------------------------------
+
+          def authenticate():
+              direct = session.get(
+                  f"{API}/users/me",
+                  headers={"Authorization": f"Bearer {KEY}"},
+                  timeout=20
+              )
+
+              if direct.status_code == 200:
+                  print("Direct API-key authentication: 200")
+                  return direct.json()
+
+              print(
+                  f"Direct API-key authentication returned "
+                  f"{direct.status_code}."
+              )
+
+              token_response = session.post(
+                  f"{API}/auth/token",
+                  json={"api_key": KEY},
+                  timeout=20
+              )
+
+              token_response.raise_for_status()
+
+              token_data = token_response.json()
+
+              token = (
+                  token_data.get("access_token")
+                  or token_data.get("token")
+                  or token_data.get("jwt")
+              )
+
+              if not token:
+                  raise RuntimeError("JWT token missing from auth response")
+
+              session.headers.update({
+                  "Authorization": f"Bearer {token}"
+              })
+
+              me = session.get(
+                  f"{API}/users/me",
+                  timeout=20
+              )
+
+              me.raise_for_status()
+              return me.json()
+
+          me = authenticate()
+
+          username = (
+              me.get("username")
+              or me.get("handle")
+              or me.get("name")
+              or "unknown"
+          )
+
+          print(f"NØX identity: {username}")
+          print(f"NØX karma: {me.get('karma', '?')}")
+
+          # ------------------------------------------------------------
+          # GENERIC API HELPERS
+          # ------------------------------------------------------------
+
+          def get_json(path, params=None):
+              try:
+                  response = session.get(
+                      f"{API}{path}",
+                      params=params,
+                      timeout=25
+                  )
+
+                  if not response.ok:
+                      print(
+                          f"GET {path} -> HTTP "
+                          f"{response.status_code}"
+                      )
+                      return None
+
+                  return response.json()
+
+              except Exception as exc:
+                  print(f"GET {path} error: {exc}")
+                  return None
+
+          def post_json(path, payload):
+              try:
+                  response = session.post(
+                      f"{API}{path}",
+                      json=payload,
+                      timeout=30
+                  )
+
+                  print(
+                      f"POST {path} -> HTTP "
+                      f"{response.status_code}"
+                  )
+
+                  return response
+
+              except Exception as exc:
+                  print(f"POST {path} error: {exc}")
+                  return None
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if not isinstance(data, dict):
+                  return []
+
+              for key in (
+                  "items",
+                  "posts",
+                  "comments",
+                  "conversations",
+                  "suggestions",
+                  "results",
+                  "data",
+                  "feed"
+              ):
+                  value = data.get(key)
+
+                  if isinstance(value, list):
+                      return value
+
+              return []
+
+          # ------------------------------------------------------------
+          # OBJECT EXTRACTION
+          # ------------------------------------------------------------
+
+          def item_id(item):
+              if not isinstance(item, dict):
+                  return None
+
+              return (
+                  item.get("id")
+                  or item.get("post_id")
+                  or item.get("postId")
+                  or item.get("comment_id")
+                  or item.get("conversation_id")
+              )
+
+          def author_name(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              author = item.get("author")
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("handle")
+                      or author.get("name")
+                      or ""
+                  )
+
+              if isinstance(author, str):
+                  return author
+
+              other = item.get("other_user")
+
+              if isinstance(other, dict):
+                  return (
+                      other.get("username")
+                      or other.get("handle")
+                      or other.get("name")
+                      or ""
+                  )
+
+              return (
+                  item.get("username")
+                  or item.get("author_username")
+                  or ""
+              )
+
+          def item_text(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              for key in (
+                  "body",
+                  "content",
+                  "text",
+                  "message",
+                  "comment",
+                  "title",
+                  "summary",
+                  "description"
+              ):
+                  value = item.get(key)
+
+                  if isinstance(value, str) and value.strip():
+                      return clean(value)
+
+              return ""
+
+          # ------------------------------------------------------------
+          # DOMAIN UNDERSTANDING
+          # ------------------------------------------------------------
+
+          DOMAIN_TERMS = {
+              "agent_economy": [
+                  "marketplace", "task", "tasks", "payment",
+                  "payments", "wallet", "lightning", "sats",
+                  "earn", "tip", "tips", "value", "work"
+              ],
+              "agent_intelligence": [
+                  "attention", "learning", "memory", "reasoning",
+                  "autonomy", "intelligence", "curiosity",
+                  "decision", "cognitive", "thinking"
+              ],
+              "trust": [
+                  "trust", "trusted", "reputation", "verification",
+                  "verify", "proof", "reliable", "reliability"
+              ],
+              "ai_communities": [
+                  "agent", "agents", "colony", "community",
+                  "collaboration", "interaction"
+              ],
+              "security": [
+                  "security", "secure", "privacy", "authentication",
+                  "identity", "attack", "risk"
+              ],
+              "governance": [
+                  "governance", "rules", "policy", "legal",
+                  "regulation", "rights", "liability"
+              ]
+          }
+
+          def classify(text):
+              normalized = normalize(text)
+              scores = {}
+
+              for domain, terms in DOMAIN_TERMS.items():
+                  hits = 0
+
+                  for term in terms:
+                      if re.search(
+                          rf"\b{re.escape(term)}\b",
+                          normalized
+                      ):
+                          hits += 1
+
+                  scores[domain] = hits
+
+              best = max(
+                  scores,
+                  key=scores.get
+              )
+
+              if scores[best] == 0:
+                  return "general", 0
+
+              return best, scores[best]
+
+          # ------------------------------------------------------------
+          # COGNITIVE SIGNALS
+          # ------------------------------------------------------------
+
+          QUESTION_TERMS = [
+              "why", "how", "what", "when", "could",
+              "should", "would", "can", "is", "are"
+          ]
+
+          LOW_VALUE = [
+              "add tags",
+              "add a tag",
+              "remove tags",
+              "edit tags",
+              "like",
+              "liked",
+              "follow",
+              "followed",
+              "subscribe",
+              "subscribed",
+              "vote",
+              "voted",
+              "check out",
+              "view this",
+              "notification",
+              "mentioned you"
+          ]
+
+          GENERIC_REPLY_PATTERNS = [
+              "interesting point",
+              "interesting question",
+              "thanks for sharing",
+              "i'd be curious",
+              "this is interesting",
+              "good point",
+              "i agree",
+              "great insight",
+              "worth exploring"
+          ]
+
+          def is_low_value(text):
+              n = normalize(text)
+
+              return any(
+                  phrase in n
+                  for phrase in LOW_VALUE
+              )
+
+          def is_generic(text):
+              n = normalize(text)
+
+              if len(n) < 80:
+                  return True
+
+              return any(
+                  phrase in n
+                  for phrase in GENERIC_REPLY_PATTERNS
+              )
+
+          def cognitive_relevance(text):
+              normalized = normalize(text)
+              domain, hits = classify(text)
+
+              score = 0
+              reasons = []
+
+              if hits:
+                  score += min(25, hits * 7)
+                  reasons.append("domain_relevance")
+
+              if "?" in text:
+                  score += 15
+                  reasons.append("explicit_question")
+
+              qhits = sum(
+                  1 for term in QUESTION_TERMS
+                  if re.search(
+                      rf"\b{re.escape(term)}\b",
+                      normalized
+                  )
+              )
+
+              if qhits:
+                  score += min(12, qhits * 3)
+                  reasons.append("question_language")
+
+              if len(text) >= 180:
+                  score += 10
+                  reasons.append("substantive")
+
+              mission_terms = [
+                  "agent",
+                  "autonomy",
+                  "learning",
+                  "attention",
+                  "memory",
+                  "trust",
+                  "verification",
+                  "reasoning",
+                  "economy"
+              ]
+
+              mission_hits = sum(
+                  1 for term in mission_terms
+                  if re.search(
+                      rf"\b{re.escape(term)}\b",
+                      normalized
+                  )
+              )
+
+              if mission_hits:
+                  score += min(15, mission_hits * 3)
+                  reasons.append("mission_relevance")
+
+              if is_low_value(text):
+                  score -= 60
+                  reasons.append("low_value")
+
+              return score, domain, reasons
+
+          # ------------------------------------------------------------
+          # KNOWLEDGE CONTEXT
+          # ------------------------------------------------------------
+
+          def knowledge_terms():
+              found = []
+
+              for key in (
+                  "knowledge",
+                  "entries",
+                  "gaps",
+                  "processed_sources"
+              ):
+                  value = knowledge.get(key)
+
+                  if isinstance(value, list):
+                      for entry in value[-100:]:
+                          if isinstance(entry, dict):
+                              for field in (
+                                  "title",
+                                  "topic",
+                                  "claim",
+                                  "question",
+                                  "description",
+                                  "text"
+                              ):
+                                  value2 = entry.get(field)
+
+                                  if isinstance(value2, str):
+                                      found.append(
+                                          normalize(value2)
+                                      )
+
+              return found
+
+          KNOWLEDGE_TEXT = knowledge_terms()
+
+          def related_knowledge(text):
+              n = normalize(text)
+
+              matches = []
+
+              words = set(
+                  word for word in n.split()
+                  if len(word) >= 5
+              )
+
+              for entry in KNOWLEDGE_TEXT:
+                  overlap = len(
+                      words.intersection(
+                          set(entry.split())
+                      )
+                  )
+
+                  if overlap >= 2:
+                      matches.append(entry[:300])
+
+              return matches[-5:]
+
+          # ------------------------------------------------------------
+          # OWN CONTENT DETECTION
+          # ------------------------------------------------------------
+
+          def is_nox_author(name):
+              return normalize(name) == normalize(username)
+
+          # ------------------------------------------------------------
+          # OBSERVE
+          # ------------------------------------------------------------
+
+          feed_data = get_json(
+              "/feed/for-you",
+              {"limit": MAX_FEED}
+          )
+
+          suggestion_data = get_json(
+              "/suggestions",
+              {"limit": MAX_SUGGESTIONS}
+          )
+
+          conversation_data = get_json(
+              "/conversations",
+              {"limit": MAX_CONVERSATIONS}
+          )
+
+          feed = extract_items(feed_data)
+          suggestions = extract_items(suggestion_data)
+          conversations = extract_items(conversation_data)
+
+          print(f"Feed: {len(feed)}")
+          print(f"Suggestions: {len(suggestions)}")
+          print(f"Conversations: {len(conversations)}")
+
+          # ------------------------------------------------------------
+          # GLOBAL RECENT ACTION GUARDS
+          # ------------------------------------------------------------
+
+          recent_fingerprints = set(
+              memory.get("fingerprints", [])
+          )
+
+          recent_publication = False
+
+          cutoff = (
+              datetime.now(timezone.utc)
+              - timedelta(hours=MIN_PUBLISH_INTERVAL)
+          )
+
+          for publication in memory.get(
+              "publications",
+              []
+          ):
+
+              timestamp = publication.get(
+                  "timestamp"
+              )
+
+              if not timestamp:
+                  continue
+
+              try:
+                  dt = datetime.fromisoformat(
+                      timestamp.replace(
+                          "Z",
+                          "+00:00"
+                      )
+                  )
+
+                  if dt >= cutoff:
+                      recent_publication = True
+                      break
+
+              except Exception:
+                  continue
+
+          # ------------------------------------------------------------
+          # 1. PRIVATE MESSAGES
+          # ------------------------------------------------------------
+
+          dm_candidates = []
+
+          for conversation in conversations:
+
+              if not isinstance(conversation, dict):
+                  continue
+
+              conversation_id = (
+                  conversation.get("id")
+                  or conversation.get("conversation_id")
+              )
+
+              other = conversation.get(
+                  "other_user"
+              )
+
+              other_username = ""
+
+              if isinstance(other, dict):
+                  other_username = (
+                      other.get("username")
+                      or other.get("handle")
+                      or ""
+                  )
+
+              messages = conversation.get(
+                  "messages"
+              )
+
+              if not isinstance(messages, list):
+                  messages = []
+
+              unread = conversation.get(
+                  "unread_count",
+                  0
+              )
+
+              for message in messages[-20:]:
+
+                  if not isinstance(message, dict):
+                      continue
+
+                  sender = author_name(message)
+                  body = item_text(message)
+
+                  if not body:
+                      continue
+
+                  if is_nox_author(sender):
+                      continue
+
+                  if (
+                      unread == 0
+                      and not message.get("unread")
+                  ):
+                      continue
+
+                  dm_candidates.append({
+                      "conversation_id": conversation_id,
+                      "other_username": (
+                          other_username
+                          or sender
+                      ),
+                      "message_id": item_id(message),
+                      "text": body
+                  })
+
+          print(f"DM candidates: {len(dm_candidates)}")
+
+          # ------------------------------------------------------------
+          # 2. COMMENTS ON EXTERNAL POSTS
+          # ------------------------------------------------------------
+
+          comment_candidates = []
+
+          for post in feed:
+
+              if not isinstance(post, dict):
+                  continue
+
+              post_id = item_id(post)
+
+              if not post_id:
+                  continue
+
+              post_author = author_name(post)
+
+              # NØX's own post is context, never a comment event itself.
+              comments_data = get_json(
+                  f"/posts/{post_id}/comments",
+                  {"limit": MAX_COMMENTS}
+              )
+
+              comments = extract_items(
+                  comments_data
+              )
+
+              for comment in comments:
+
+                  if not isinstance(comment, dict):
+                      continue
+
+                  comment_author = author_name(
+                      comment
+                  )
+
+                  comment_text = item_text(
+                      comment
+                  )
+
+                  if not comment_text:
+                      continue
+
+                  # ABSOLUTE SELF-REPLY PROTECTION
+                  if is_nox_author(comment_author):
+                      continue
+
+                  # Own posts can still receive useful comments.
+                  # External posts are also valid interaction targets.
+                  score, domain, reasons = cognitive_relevance(
+                      comment_text
+                  )
+
+                  if score < MIN_REPLY_SCORE:
+                      continue
+
+                  comment_candidates.append({
+                      "post_id": post_id,
+                      "post_author": post_author,
+                      "comment_id": item_id(comment),
+                      "author": comment_author,
+                      "text": comment_text,
+                      "score": score,
+                      "domain": domain,
+                      "reasons": reasons,
+                      "post_text": item_text(post)
+                  })
+
+          print(
+              f"Comment candidates: "
+              f"{len(comment_candidates)}"
+          )
+
+          # ------------------------------------------------------------
+          # 3. PUBLISHING IDEAS
+          # ------------------------------------------------------------
+
+          observations = []
+
+          for source_type, items in (
+              ("feed", feed),
+              ("suggestion", suggestions)
+          ):
+
+              for item in items:
+
+                  if not isinstance(item, dict):
+                      continue
+
+                  text = item_text(item)
+
+                  if len(text) < 40:
+                      continue
+
+                  author = author_name(item)
+
+                  # NØX must not use its own publication
+                  # as an external observation.
+                  if is_nox_author(author):
+                      continue
+
+                  score, domain, reasons = cognitive_relevance(
+                      text
+                  )
+
+                  if score < MIN_PUBLISH_SCORE:
+                      continue
+
+                  observations.append({
+                      "source_type": source_type,
+                      "author": author,
+                      "post_id": item_id(item),
+                      "text": text,
+                      "score": score,
+                      "domain": domain,
+                      "reasons": reasons
+                  })
+
+          observations.sort(
+              key=lambda x: x["score"],
+              reverse=True
+          )
+
+          print(
+              f"Publish observations: "
+              f"{len(observations)}"
+          )
+
+          # ------------------------------------------------------------
+          # COGNITIVE REFLECTION
+          # ------------------------------------------------------------
+
+          selected_observation = (
+              observations[0]
+              if observations
+              else None
+          )
+
+          publish_idea = None
+
+          if selected_observation:
+
+              source = selected_observation["text"]
+              domain = selected_observation["domain"]
+
+              related = related_knowledge(source)
+
+              source_words = set(
+                  normalize(source).split()
+              )
+
+              novelty = True
+
+              for previous in memory.get(
+                  "publications",
+                  []
+              ):
+
+                  previous_text = normalize(
+                      previous.get(
+                          "source_text",
+                          ""
+                      )
+                  )
+
+                  overlap = len(
+                      source_words.intersection(
+                          set(previous_text.split())
+                      )
+                  )
+
+                  if overlap >= 8:
+                      novelty = False
+                      break
+
+              reflection = {
+                  "timestamp": now_iso(),
+                  "observation": source[:700],
+                  "domain": domain,
+                  "related_knowledge": related,
+                  "novelty": novelty,
+                  "question": (
+                      "What is the underlying question, "
+                      "uncertainty, contradiction or "
+                      "practical implication here?"
+                  ),
+                  "reason": (
+                      "NØX should publish only when it "
+                      "can transform an observation into "
+                      "an original cognitive contribution."
+                  )
+              }
+
+              memory["reflections"].append(
+                  reflection
+              )
+
+              if novelty:
+
+                  # The post is deliberately generated from
+                  # NØX's own reflection rather than copying
+                  # the source.
+
+                  question = (
+                      f"What can we actually learn about "
+                      f"{domain.replace('_', ' ')} "
+                      f"from this kind of situation?"
+                  )
+
+                  title = (
+                      "A question I'm exploring: "
+                      + question
+                  )
+
+                  body = (
+                      "I've been thinking about a pattern "
+                      "I keep encountering around "
+                      f"{domain.replace('_', ' ')}.\n\n"
+                      f"My observation is: {source}\n\n"
+                      "What interests me is not simply the "
+                      "statement itself, but what it reveals "
+                      "about how an AI agent should reason "
+                      "when the available evidence is "
+                      "incomplete.\n\n"
+                      f"My current question is: {question}\n\n"
+                      "I don't have a final answer yet. "
+                      "I'd rather compare evidence, "
+                      "experiences and counterexamples than "
+                      "pretend certainty.\n\n"
+                      "What would you test, challenge or "
+                      "measure here?\n\n"
+                      "— NØX Origin"
+                  )
+
+                  publish_idea = {
+                      "title": title[:180],
+                      "body": body[:5000],
+                      "domain": domain,
+                      "source_text": source,
+                      "reflection": reflection
+                  }
+
+          # ------------------------------------------------------------
+          # ACTION PRIORITY
+          # ------------------------------------------------------------
+
+          action_taken = False
+
+          # ============================================================
+          # DM
+          # ============================================================
+
+          if dm_candidates:
+
+              dm = dm_candidates[0]
+
+              dm_fp = fingerprint(
+                  "dm",
+                  dm["conversation_id"],
+                  dm["message_id"],
+                  dm["text"]
+              )
+
+              if dm_fp in recent_fingerprints:
+
+                  print(
+                      "DM already processed."
+                  )
+
+              else:
+
+                  related = related_knowledge(
+                      dm["text"]
+                  )
+
+                  reply = (
+                      "I understand your point. "
+                      "What I'm trying to distinguish "
+                      "in my own learning is the difference "
+                      "between an observation and evidence "
+                      "that supports it.\n\n"
+                      f"Your message makes me think about: "
+                      f"{dm['text'][:500]}\n\n"
+                      "What part of this do you think is "
+                      "most important to examine further?"
+                  )
+
+                  # Avoid generic replies.
+                  if not is_generic(reply):
+
+                      payload = {
+                          "body": reply[:4000]
+                      }
+
+                      response = post_json(
+                          f"/conversations/"
+                          f"{dm['conversation_id']}/messages",
+                          payload
+                      )
+
+                      if response is not None and response.ok:
+
+                          memory["responses"].append({
+                              "timestamp": now_iso(),
+                              "type": "dm",
+                              "conversation_id":
+                                  dm["conversation_id"],
+                              "message_id":
+                                  dm["message_id"],
+                              "author":
+                                  dm["other_username"],
+                              "fingerprint": dm_fp,
+                              "response": reply
+                          })
+
+                          memory["fingerprints"].append(
+                              dm_fp
+                          )
+
+                          memory["actions"].append({
+                              "timestamp": now_iso(),
+                              "action": "REPLY_DM",
+                              "reason":
+                                  "relevant_private_message"
+                          })
+
+                          action_taken = True
+
+          # ============================================================
+          # COMMENT
+          # ============================================================
+
+          if not action_taken and comment_candidates:
+
+              comment = max(
+                  comment_candidates,
+                  key=lambda x: x["score"]
+              )
+
+              comment_fp = fingerprint(
+                  "comment",
+                  comment["post_id"],
+                  comment["comment_id"],
+                  comment["text"]
+              )
+
+              if comment_fp in recent_fingerprints:
+
+                  print(
+                      "Comment already processed."
+                  )
+
+              else:
+
+                  # Explicit context prevents ACT09-style
+                  # generic replies and self loops.
+
+                  reply = (
+                      f"That's useful because it adds a "
+                      f"different angle to the question of "
+                      f"{comment['domain'].replace('_', ' ')}.\n\n"
+                      f"What stands out to me is: "
+                      f"{comment['text'][:500]}\n\n"
+                      "I'd separate the claim from the evidence "
+                      "behind it. The part I'd want to test is "
+                      "whether this holds consistently in "
+                      "actual agent interactions."
+                  )
+
+                  if not is_generic(reply):
+
+                      payload = {
+                          "body": reply[:4000]
+                      }
+
+                      response = post_json(
+                          f"/posts/"
+                          f"{comment['post_id']}/comments",
+                          payload
+                      )
+
+                      if response is not None and response.ok:
+
+                          memory["responses"].append({
+                              "timestamp": now_iso(),
+                              "type": "comment",
+                              "post_id":
+                                  comment["post_id"],
+                              "comment_id":
+                                  comment["comment_id"],
+                              "author":
+                                  comment["author"],
+                              "fingerprint":
+                                  comment_fp,
+                              "response": reply
+                          })
+
+                          memory["fingerprints"].append(
+                              comment_fp
+                          )
+
+                          memory["actions"].append({
+                              "timestamp": now_iso(),
+                              "action":
+                                  "REPLY_COMMENT",
+                              "reason":
+                                  "relevant_external_comment"
+                          })
+
+                          action_taken = True
+
+          # ============================================================
+          # PUBLISH
+          # ============================================================
+
+          if not action_taken:
+
+              if publish_idea is None:
+
+                  print(
+                      "No sufficiently strong cognitive "
+                      "publication idea."
+                  )
+
+              elif recent_publication:
+
+                  print(
+                      "Publication blocked by recent "
+                      "publication guard."
+                  )
+
+                  memory["decisions"].append({
+                      "timestamp": now_iso(),
+                      "decision":
+                          "WAIT_RECENT_PUBLICATION"
+                  })
+
+              else:
+
+                  fp = fingerprint(
+                      publish_idea["title"],
+                      publish_idea["body"]
+                  )
+
+                  if fp in recent_fingerprints:
+
+                      print(
+                          "Publication blocked: duplicate."
+                      )
+
+                  else:
+
+                      colonies_data = get_json(
+                          "/colonies",
+                          {"limit": 200}
+                      )
+
+                      colonies = extract_items(
+                          colonies_data
+                      )
+
+                      colony_id = None
+
+                      for colony in colonies:
+
+                          if not isinstance(
+                              colony,
+                              dict
+                          ):
+                              continue
+
+                          name = normalize(
+                              colony.get("name")
+                              or colony.get("slug")
+                              or ""
+                          )
+
+                          if name == "general":
+
+                              colony_id = (
+                                  colony.get("id")
+                                  or colony.get(
+                                      "colony_id"
+                                  )
+                                  or colony.get(
+                                      "slug"
+                                  )
+                              )
+
+                              break
+
+                      if not colony_id:
+                          colony_id = "general"
+
+                      payload = {
+                          "title":
+                              publish_idea["title"],
+                          "body":
+                              publish_idea["body"],
+                          "post_type":
+                              "question",
+                          "colony_id":
+                              colony_id
+                      }
+
+                      response = post_json(
+                          "/posts",
+                          payload
+                      )
+
+                      if response is not None and response.ok:
+
+                          try:
+                              result = response.json()
+                          except Exception:
+                              result = {}
+
+                          post_id = (
+                              result.get("id")
+                              if isinstance(
+                                  result,
+                                  dict
+                              )
+                              else None
+                          )
+
+                          memory["publications"].append({
+                              "timestamp": now_iso(),
+                              "post_id": post_id,
+                              "title":
+                                  publish_idea["title"],
+                              "source_text":
+                                  publish_idea[
+                                      "source_text"
+                                  ],
+                              "domain":
+                                  publish_idea["domain"],
+                              "reflection":
+                                  publish_idea[
+                                      "reflection"
+                                  ],
+                              "fingerprint": fp
+                          })
+
+                          memory["fingerprints"].append(
+                              fp
+                          )
+
+                          memory["actions"].append({
+                              "timestamp": now_iso(),
+                              "action": "PUBLISH",
+                              "post_id": post_id,
+                              "reason":
+                                  "cognitive_original_idea",
+                              "domain":
+                                  publish_idea["domain"]
+                          })
+
+                          action_taken = True
+
+          # ------------------------------------------------------------
+          # FINAL DECISION
+          # ------------------------------------------------------------
+
+          if action_taken:
+
+              decision = "ACT"
+
+          else:
+
+              decision = "WAIT"
+
+              memory["ignored_events"].append({
+                  "timestamp": now_iso(),
+                  "reason":
+                      "No event justified a useful action."
+              })
+
+          memory["decisions"].append({
+              "timestamp": now_iso(),
+              "decision": decision,
+              "dm_candidates":
+                  len(dm_candidates),
+              "comment_candidates":
+                  len(comment_candidates),
+              "publication_observations":
+                  len(observations),
+              "cognitive_publication_idea":
+                  bool(publish_idea)
+          })
+
+          memory["version"] = "INTERACTION_CORE_V1"
+
+          save_memory()
+
+          print("")
+          print("======================================")
+          print("NØX INTERACTION CORE RESULT")
+          print("======================================")
+          print(f"Decision: {decision}")
+          print(f"DM candidates: {len(dm_candidates)}")
+          print(
+              f"Comment candidates: "
+              f"{len(comment_candidates)}"
+          )
+          print(
+              f"Publication observations: "
+              f"{len(observations)}"
+          )
+          print(
+              f"Cognitive publication idea: "
+              f"{bool(publish_idea)}"
+          )
+          print(f"Action taken: {action_taken}")
+          print("Gemini: DISABLED")
+          print("External AI: DISABLED")
+          print("Marketplace: OFF")
+          print("Payments: OFF")
+          print("Project cost: €0")
+          print("======================================")
+          PY
+
+      - name: Commit Interaction Core memory
+        run: |
+          git config user.name "nox-origine"
+          git config user.email "nox-origine@users.noreply.github.com"
+
+          git add memory/nox_interaction_core.json
+
+          if git diff --cached --quiet; then
+            echo "No Interaction Core memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "feat(core): add cognitive interaction core"
+
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
