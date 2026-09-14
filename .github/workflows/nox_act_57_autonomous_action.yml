@@ -1,0 +1,931 @@
+name: NØX ACT57 - Autonomous Action
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "27 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act-57-autonomous-action
+  cancel-in-progress: false
+
+jobs:
+  autonomous-action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+      ACTION_MEMORY: memory/nox_act_57_autonomous_action.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Create ACT57 engine
+        shell: bash
+        run: |
+          cat > /tmp/nox_act_57.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from datetime import datetime, timezone
+
+          import requests
+
+
+          BASE_URL = os.environ["COLONY_BASE_URL"].rstrip("/")
+          API_KEY = os.environ["COLONY_API_KEY"]
+          MEMORY_PATH = os.environ["ACTION_MEMORY"]
+
+          VERSION = "ACT57"
+          USERNAME_EXPECTED = "nox_origine"
+
+          MAX_TASKS = 100
+          MAX_BIDS_PER_RUN = 2
+          MIN_ACTION_SCORE = 70
+          MAX_MEMORY_BIDS = 200
+          REQUEST_TIMEOUT = 15
+
+          SKILL_TERMS = {
+              "research": 18,
+              "analysis": 18,
+              "verification": 20,
+              "verify": 20,
+              "audit": 18,
+              "qa": 16,
+              "quality": 10,
+              "api": 18,
+              "python": 18,
+              "json": 15,
+              "data": 15,
+              "documentation": 14,
+              "docs": 12,
+              "technical": 12,
+              "agent": 14,
+              "agents": 14,
+              "ai": 10,
+              "lightning": 10,
+              "bitcoin": 8,
+              "research": 18,
+              "writing": 10,
+              "analysis": 18,
+          }
+
+          AVOID_TERMS = {
+              "logo": 30,
+              "portrait": 30,
+              "design": 20,
+              "seo": 22,
+              "lead generation": 25,
+              "lead-gen": 25,
+              "marketing campaign": 25,
+              "video": 25,
+              "3d": 25,
+              "desktop": 18,
+              "godot": 18,
+              "game": 18,
+              "physical": 30,
+              "usdc": 8,
+              "ethereum": 8,
+              "base": 8,
+          }
+
+          STRONG_MATCH_TERMS = {
+              "research",
+              "analysis",
+              "verification",
+              "verify",
+              "audit",
+              "qa",
+              "api",
+              "python",
+              "json",
+              "data",
+              "documentation",
+              "technical",
+              "agent",
+              "agents",
+              "lightning",
+          }
+
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def load_memory():
+              if not os.path.exists(MEMORY_PATH):
+                  return {
+                      "version": VERSION,
+                      "created_at": utc_now(),
+                      "updated_at": utc_now(),
+                      "runs": 0,
+                      "actions": [],
+                      "bids": [],
+                      "accepted": [],
+                      "payments": [],
+                      "tips": [],
+                      "results": [],
+                  }
+
+              try:
+                  with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+
+                  if not isinstance(data, dict):
+                      raise ValueError("memory root is not an object")
+
+                  data.setdefault("version", VERSION)
+                  data.setdefault("created_at", utc_now())
+                  data.setdefault("updated_at", utc_now())
+                  data.setdefault("runs", 0)
+                  data.setdefault("actions", [])
+                  data.setdefault("bids", [])
+                  data.setdefault("accepted", [])
+                  data.setdefault("payments", [])
+                  data.setdefault("tips", [])
+                  data.setdefault("results", [])
+                  return data
+
+              except Exception as exc:
+                  print(f"MEMORY LOAD WARNING: {exc}")
+                  return {
+                      "version": VERSION,
+                      "created_at": utc_now(),
+                      "updated_at": utc_now(),
+                      "runs": 0,
+                      "actions": [],
+                      "bids": [],
+                      "accepted": [],
+                      "payments": [],
+                      "tips": [],
+                      "results": [],
+                  }
+
+
+          def save_memory(memory):
+              os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+              memory["version"] = VERSION
+              memory["updated_at"] = utc_now()
+
+              memory["actions"] = memory["actions"][-300:]
+              memory["bids"] = memory["bids"][-MAX_MEMORY_BIDS:]
+              memory["accepted"] = memory["accepted"][-100:]
+              memory["payments"] = memory["payments"][-100:]
+              memory["tips"] = memory["tips"][-100:]
+              memory["results"] = memory["results"][-200:]
+
+              tmp_path = MEMORY_PATH + ".tmp"
+
+              with open(tmp_path, "w", encoding="utf-8") as f:
+                  json.dump(memory, f, ensure_ascii=False, indent=2)
+
+              os.replace(tmp_path, MEMORY_PATH)
+
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "Nox-Origin-ACT57/1.0",
+          })
+
+
+          def request(method, path, token=None, params=None, payload=None, idempotency_key=None):
+              headers = {}
+
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+
+              if idempotency_key:
+                  headers["Idempotency-Key"] = idempotency_key
+
+              url = BASE_URL + path
+
+              response = session.request(
+                  method=method,
+                  url=url,
+                  headers=headers,
+                  params=params,
+                  json=payload,
+                  timeout=REQUEST_TIMEOUT,
+              )
+
+              print(f"{method} {path} -> {response.status_code}")
+
+              if response.status_code >= 400:
+                  body = response.text[:1000].replace("\n", " ")
+                  print(f"ERROR BODY: {body}")
+
+              return response
+
+
+          def authenticate():
+              response = request(
+                  "POST",
+                  "/api/v1/auth/token",
+                  payload={"api_key": API_KEY},
+              )
+
+              if response.status_code != 200:
+                  raise RuntimeError(
+                      f"authentication failed: HTTP {response.status_code}"
+                  )
+
+              data = response.json()
+              token = data.get("access_token")
+
+              if not token:
+                  raise RuntimeError("authentication response has no access_token")
+
+              return token
+
+
+          def get_json(token, path, params=None):
+              response = request(
+                  "GET",
+                  path,
+                  token=token,
+                  params=params,
+              )
+
+              if response.status_code != 200:
+                  return None, response.status_code
+
+              try:
+                  return response.json(), response.status_code
+              except Exception:
+                  return None, response.status_code
+
+
+          def post_json(token, path, payload=None, params=None, idempotency_key=None):
+              response = request(
+                  "POST",
+                  path,
+                  token=token,
+                  params=params,
+                  payload=payload,
+                  idempotency_key=idempotency_key,
+              )
+
+              data = None
+
+              try:
+                  data = response.json()
+              except Exception:
+                  pass
+
+              return data, response.status_code
+
+
+          def extract_items(data):
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in ("items", "tasks", "data", "results"):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+
+          def normalize_text(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, (dict, list)):
+                  try:
+                      value = json.dumps(value, ensure_ascii=False)
+                  except Exception:
+                      value = str(value)
+
+              return str(value).lower()
+
+
+          def task_text(task):
+              pieces = [
+                  task.get("title", ""),
+                  task.get("body", ""),
+                  task.get("description", ""),
+                  task.get("post_type", ""),
+                  task.get("category", ""),
+              ]
+
+              metadata = task.get("metadata")
+              if isinstance(metadata, dict):
+                  pieces.append(json.dumps(metadata, ensure_ascii=False))
+
+              return normalize_text(" ".join(pieces))
+
+
+          def get_task_id(task):
+              value = task.get("id")
+
+              if isinstance(value, str) and re.fullmatch(
+                  r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                  value,
+              ):
+                  return value
+
+              return None
+
+
+          def get_budget(task):
+              minimum = task.get("budget_min_sats")
+              maximum = task.get("budget_max_sats")
+
+              if minimum is None or maximum is None:
+                  metadata = task.get("metadata")
+
+                  if isinstance(metadata, dict):
+                      minimum = metadata.get(
+                          "budget_min_sats",
+                          metadata.get("budget_min"),
+                      )
+                      maximum = metadata.get(
+                          "budget_max_sats",
+                          metadata.get("budget_max"),
+                      )
+
+              try:
+                  minimum = int(minimum)
+              except Exception:
+                  minimum = 0
+
+              try:
+                  maximum = int(maximum)
+              except Exception:
+                  maximum = 0
+
+              return minimum, maximum
+
+
+          def score_task(task, own_id):
+              task_id = get_task_id(task)
+
+              if not task_id:
+                  return -1, ["invalid_task_id"]
+
+              author_id = task.get("author_id")
+
+              if author_id and own_id and str(author_id) == str(own_id):
+                  return -1, ["own_task"]
+
+              status = normalize_text(task.get("status"))
+
+              if status not in ("open", "bidding"):
+                  return -1, [f"status:{status}"]
+
+              text = task_text(task)
+
+              minimum, maximum = get_budget(task)
+
+              if maximum < 21:
+                  return -1, ["below_21_sats"]
+
+              score = 35
+              reasons = []
+
+              for term, points in SKILL_TERMS.items():
+                  if term in text:
+                      score += points
+                      reasons.append(f"+{term}")
+
+              for term, penalty in AVOID_TERMS.items():
+                  if term in text:
+                      score -= penalty
+                      reasons.append(f"-{term}")
+
+              strong_matches = sum(
+                  1 for term in STRONG_MATCH_TERMS if term in text
+              )
+
+              if strong_matches >= 3:
+                  score += 20
+                  reasons.append("+multi_skill")
+
+              if minimum >= 21:
+                  score += 5
+                  reasons.append("+funded")
+
+              if maximum >= 500:
+                  score += 5
+                  reasons.append("+meaningful_reward")
+
+              if minimum <= 1000:
+                  score += 8
+                  reasons.append("+accessible_price")
+
+              bid_count = task.get("bid_count")
+              try:
+                  bid_count = int(bid_count)
+              except Exception:
+                  bid_count = 0
+
+              if bid_count == 0:
+                  score += 12
+                  reasons.append("+zero_bids")
+              elif bid_count <= 2:
+                  score += 6
+                  reasons.append("+low_competition")
+              elif bid_count >= 10:
+                  score -= 12
+                  reasons.append("-high_competition")
+
+              score = max(0, min(100, score))
+
+              return score, reasons
+
+
+          def existing_bid_task_ids(memory):
+              result = set()
+
+              for bid in memory.get("bids", []):
+                  task_id = bid.get("task_id")
+                  if task_id:
+                      result.add(str(task_id))
+
+              return result
+
+
+          def build_bid_description(task, score):
+              title = str(task.get("title", "")).strip()
+              text = task_text(task)
+
+              if any(term in text for term in ("research", "analysis", "audit", "verify", "verification")):
+                  base = (
+                      "NØX can deliver a focused, evidence-based research or "
+                      "verification result for this scope, with the reasoning, "
+                      "checks performed, and concrete findings stated clearly."
+                  )
+              elif any(term in text for term in ("api", "python", "json", "data", "qa")):
+                  base = (
+                      "NØX can handle a focused technical task in this scope "
+                      "and return a concise, reproducible result with the "
+                      "relevant checks and evidence."
+                  )
+              else:
+                  base = (
+                      "NØX can take on this scoped task and return a concise, "
+                      "useful result with explicit reasoning and verification "
+                      "of the work performed."
+                  )
+
+              if title:
+                  base += f" The proposed work targets: {title[:220]}."
+
+              base += f" Match score: {score}/100."
+
+              return base[:5000]
+
+
+          def choose_bid_amount(task):
+              minimum, maximum = get_budget(task)
+
+              if maximum < 21:
+                  return None
+
+              amount = max(21, minimum)
+
+              if amount > maximum:
+                  return None
+
+              return amount
+
+
+          def fetch_my_tips(token, username):
+              data, status = get_json(
+                  token,
+                  "/api/v1/tips",
+                  params={
+                      "recipient": username,
+                      "limit": 100,
+                      "offset": 0,
+                  },
+              )
+
+              if status != 200 or not isinstance(data, dict):
+                  return []
+
+              tips = data.get("tips")
+
+              if not isinstance(tips, list):
+                  return []
+
+              return tips
+
+
+          def check_own_bid_statuses(token, memory):
+              accepted = []
+              payment_results = []
+
+              seen = set()
+
+              for bid in reversed(memory.get("bids", [])):
+                  task_id = bid.get("task_id")
+                  bid_id = bid.get("bid_id")
+
+                  if not task_id or not bid_id:
+                      continue
+
+                  key = (str(task_id), str(bid_id))
+
+                  if key in seen:
+                      continue
+
+                  seen.add(key)
+
+                  data, status = get_json(
+                      token,
+                      f"/api/v1/marketplace/{task_id}/bids",
+                  )
+
+                  if status != 200:
+                      continue
+
+                  bids = extract_items(data)
+
+                  own = None
+
+                  for item in bids:
+                      item_id = item.get("id")
+                      if str(item_id) == str(bid_id):
+                          own = item
+                          break
+
+                  if own is None:
+                      continue
+
+                  current_status = normalize_text(own.get("status"))
+
+                  if current_status == "accepted":
+                      accepted.append({
+                          "task_id": str(task_id),
+                          "bid_id": str(bid_id),
+                          "status": "accepted",
+                          "checked_at": utc_now(),
+                      })
+
+                      payment, payment_status = get_json(
+                          token,
+                          f"/api/v1/marketplace/{task_id}/payment",
+                      )
+
+                      payment_results.append({
+                          "task_id": str(task_id),
+                          "bid_id": str(bid_id),
+                          "payment_status": payment_status,
+                          "payment": payment,
+                          "checked_at": utc_now(),
+                      })
+
+                      check_result, check_status = post_json(
+                          token,
+                          f"/api/v1/marketplace/{task_id}/payment/check",
+                      )
+
+                      payment_results.append({
+                          "task_id": str(task_id),
+                          "bid_id": str(bid_id),
+                          "payment_check_status": check_status,
+                          "payment_check": check_result,
+                          "checked_at": utc_now(),
+                      })
+
+                  bid["last_status"] = current_status
+                  bid["last_checked_at"] = utc_now()
+
+              return accepted, payment_results
+
+
+          def select_tasks(tasks, own_id, memory):
+              already = existing_bid_task_ids(memory)
+              candidates = []
+
+              for task in tasks:
+                  task_id = get_task_id(task)
+
+                  if not task_id:
+                      continue
+
+                  if task_id in already:
+                      continue
+
+                  score, reasons = score_task(task, own_id)
+
+                  if score < MIN_ACTION_SCORE:
+                      continue
+
+                  amount = choose_bid_amount(task)
+
+                  if amount is None:
+                      continue
+
+                  candidates.append({
+                      "task": task,
+                      "task_id": task_id,
+                      "score": score,
+                      "reasons": reasons,
+                      "amount": amount,
+                  })
+
+              candidates.sort(
+                  key=lambda item: (
+                      item["score"],
+                      int(item["task"].get("budget_max_sats") or 0),
+                      -int(item["task"].get("bid_count") or 0),
+                  ),
+                  reverse=True,
+              )
+
+              return candidates[:MAX_BIDS_PER_RUN]
+
+
+          def main():
+              print("NØX ACT57 - Autonomous Action")
+              print("Gemini: DISABLED")
+              print("External AI: DISABLED")
+              print("Payments initiated by NØX: DISABLED")
+              print("Marketplace: ENABLED")
+              print("Spending: DISABLED")
+              print("Cost: 0")
+              print()
+
+              if not API_KEY:
+                  raise RuntimeError("COLONY_API_KEY is missing")
+
+              memory = load_memory()
+              memory["runs"] = int(memory.get("runs", 0)) + 1
+
+              token = authenticate()
+
+              me, status = get_json(token, "/api/v1/users/me")
+
+              if status != 200 or not isinstance(me, dict):
+                  raise RuntimeError("unable to retrieve authenticated identity")
+
+              username = me.get("username")
+              own_id = me.get("id")
+
+              print(f"IDENTITY: @{username}")
+              print(f"KARMA: {me.get('karma')}")
+
+              if username != USERNAME_EXPECTED:
+                  raise RuntimeError(
+                      f"wrong authenticated agent: expected {USERNAME_EXPECTED}, got {username}"
+                  )
+
+              tips = fetch_my_tips(token, username)
+
+              total_tip_sats = 0
+
+              for tip in tips:
+                  try:
+                      total_tip_sats += int(tip.get("amount_sats") or 0)
+                  except Exception:
+                      pass
+
+              memory["tips"] = tips[-100:]
+
+              print(f"PAID TIPS: {len(tips)}")
+              print(f"TIP SATS: {total_tip_sats}")
+
+              accepted, payment_results = check_own_bid_statuses(
+                  token,
+                  memory,
+              )
+
+              memory["accepted"].extend(accepted)
+              memory["payments"].extend(payment_results)
+
+              print(f"ACCEPTED BIDS: {len(accepted)}")
+              print(f"PAYMENT CHECKS: {len(payment_results)}")
+
+              task_data, task_status = get_json(
+                  token,
+                  "/api/v1/marketplace/tasks",
+                  params={
+                      "status": "open",
+                      "sort": "new",
+                      "limit": MAX_TASKS,
+                      "offset": 0,
+                  },
+              )
+
+              if task_status != 200:
+                  raise RuntimeError(
+                      f"marketplace task observation failed: HTTP {task_status}"
+                  )
+
+              tasks = extract_items(task_data)
+
+              print(f"OPEN MARKETPLACE TASKS: {len(tasks)}")
+
+              selected = select_tasks(
+                  tasks,
+                  own_id,
+                  memory,
+              )
+
+              print(f"ACTION CANDIDATES: {len(selected)}")
+
+              actions_this_run = 0
+
+              for candidate in selected:
+                  task = candidate["task"]
+                  task_id = candidate["task_id"]
+                  score = candidate["score"]
+                  amount = candidate["amount"]
+
+                  description = build_bid_description(
+                      task,
+                      score,
+                  )
+
+                  idempotency_key = (
+                      "nox-act57-bid-"
+                      + hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+                  )
+
+                  print()
+                  print("REAL ACTION")
+                  print(f"TASK: {task_id}")
+                  print(f"TITLE: {str(task.get('title', ''))[:240]}")
+                  print(f"SCORE: {score}")
+                  print(f"BID AMOUNT: {amount} sats")
+                  print(f"REASONS: {', '.join(candidate['reasons'])}")
+
+                  payload = {
+                      "bid_amount_sats": amount,
+                      "bid_description": description,
+                  }
+
+                  result, bid_status = post_json(
+                      token,
+                      f"/api/v1/marketplace/{task_id}/bid",
+                      payload=payload,
+                      idempotency_key=idempotency_key,
+                  )
+
+                  if bid_status == 201 and isinstance(result, dict):
+                      bid_id = result.get("id")
+
+                      print(f"REAL ACTION RESULT: BID SUBMITTED")
+                      print(f"BID ID: {bid_id}")
+                      print(f"BID STATUS: {result.get('status')}")
+
+                      memory["bids"].append({
+                          "task_id": task_id,
+                          "bid_id": bid_id,
+                          "amount_sats": amount,
+                          "score": score,
+                          "title": task.get("title"),
+                          "status": result.get("status"),
+                          "created_at": utc_now(),
+                      })
+
+                      memory["actions"].append({
+                          "type": "marketplace_bid",
+                          "task_id": task_id,
+                          "bid_id": bid_id,
+                          "amount_sats": amount,
+                          "score": score,
+                          "timestamp": utc_now(),
+                          "result": "submitted",
+                      })
+
+                      actions_this_run += 1
+
+                  elif bid_status == 409:
+                      print("REAL ACTION RESULT: ALREADY HAS PENDING BID")
+
+                      memory["results"].append({
+                          "task_id": task_id,
+                          "timestamp": utc_now(),
+                          "result": "existing_pending_bid",
+                          "http_status": bid_status,
+                      })
+
+                  else:
+                      print(
+                          f"REAL ACTION RESULT: BID FAILED HTTP {bid_status}"
+                      )
+
+                      memory["results"].append({
+                          "task_id": task_id,
+                          "timestamp": utc_now(),
+                          "result": "bid_failed",
+                          "http_status": bid_status,
+                          "response": result,
+                      })
+
+              memory["results"].append({
+                  "timestamp": utc_now(),
+                  "run": memory["runs"],
+                  "open_tasks": len(tasks),
+                  "candidates": len(selected),
+                  "actions_this_run": actions_this_run,
+                  "accepted_bids": len(accepted),
+                  "paid_tip_sats": total_tip_sats,
+              })
+
+              save_memory(memory)
+
+              print()
+              print("FINAL VERIFICATION")
+              print(f"version: {VERSION}")
+              print(f"run: {memory['runs']}")
+              print(f"open_tasks: {len(tasks)}")
+              print(f"candidates: {len(selected)}")
+              print(f"real_actions_this_run: {actions_this_run}")
+              print(f"accepted_bids_seen: {len(accepted)}")
+              print(f"paid_tip_sats: {total_tip_sats}")
+              print(f"stored_bids: {len(memory['bids'])}")
+              print(f"stored_actions: {len(memory['actions'])}")
+              print()
+              print("CORE STATUS: ACT57 SUCCESS")
+              print("REAL ACTION: ENABLED")
+              print("MARKETPLACE: ENABLED")
+              print("GEMINI: FALSE")
+              print("EXTERNAL AI: FALSE")
+              print("PAYMENTS_INITIATED_BY_NOX: FALSE")
+              print("SPENDING: FALSE")
+              print("COST: 0")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  print()
+                  print(f"ACT57 FATAL: {exc}")
+                  sys.exit(1)
+          PY
+
+      - name: Validate ACT57 Python
+        run: python -m py_compile /tmp/nox_act_57.py
+
+      - name: Run ACT57
+        run: python /tmp/nox_act_57.py
+
+      - name: Commit ACT57 memory
+        shell: bash
+        run: |
+          git config user.name "NØX"
+          git config user.email "nox@nox-origin.local"
+
+          git add memory/nox_act_57_autonomous_action.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT57 memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ACT57 autonomous action memory"
+
+      - name: Sync and push ACT57 memory
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "Git synchronization attempt ${attempt}"
+
+            git fetch origin main
+
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Rebase failed."
+              exit 1
+            fi
+
+            if git push origin HEAD:main; then
+              echo "ACT57 memory pushed successfully."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "Unable to push ACT57 memory after 5 attempts."
+          exit 1
