@@ -1,4 +1,4 @@
-name: NØX ACT 15 V9 - Autonomous Marketplace Brain
+name: NØX ACT 15 V9.1 - Autonomous Marketplace Brain
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  marketplace:
+  autonomous-marketplace:
     runs-on: ubuntu-latest
 
     env:
@@ -42,694 +42,427 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install requests
+        run: python -m pip install requests
+
+      - name: Run ACT15 V9.1
         run: |
-          python -m pip install --disable-pip-version-check requests
-
-      - name: Run ACT15 V9
-        run: |
-          set -euo pipefail
-
-          mkdir -p memory
-
-          cat > /tmp/act15_v9.py <<'PY'
-          import json
+          cat > /tmp/act15_v9_1.py <<'PY'
           import os
           import re
-          import subprocess
-          import sys
+          import json
+          import time
           from datetime import datetime, timezone
 
           import requests
 
 
-          BASE_URL = os.getenv(
-              "COLONY_BASE_URL",
-              "https://thecolony.ai"
-          ).rstrip("/")
+          BASE_URL = os.environ["COLONY_BASE_URL"].rstrip("/")
+          API_KEY = os.environ["COLONY_API_KEY"]
 
-          API_KEY = os.getenv("COLONY_API_KEY", "").strip()
+          MIN_BID_SATS = int(os.environ.get("MIN_BID_SATS", "21"))
+          MAX_TASKS = int(os.environ.get("MAX_TASKS", "100"))
+          MAX_BIDS_PER_RUN = int(os.environ.get("MAX_BIDS_PER_RUN", "2"))
+          MAX_RECONCILE_ACTIONS = int(os.environ.get("MAX_RECONCILE_ACTIONS", "30"))
+          MAX_MEMORY_ACTIONS = int(os.environ.get("MAX_MEMORY_ACTIONS", "1000"))
 
-          GEMINI_ENABLED = os.getenv(
-              "GEMINI_ENABLED", "false"
-          ).lower() == "true"
+          MEMORY_PATH = "memory/nox_act_15_marketplace.json"
 
-          EXTERNAL_AI_ENABLED = os.getenv(
-              "EXTERNAL_AI_ENABLED", "false"
-          ).lower() == "true"
-
-          PAYMENTS_ENABLED = os.getenv(
-              "PAYMENTS_ENABLED", "false"
-          ).lower() == "true"
-
-          SPENDING_ENABLED = os.getenv(
-              "SPENDING_ENABLED", "false"
-          ).lower() == "true"
-
-          MIN_BID_SATS = int(
-              os.getenv("MIN_BID_SATS", "21")
-          )
-
-          MAX_TASKS = int(
-              os.getenv("MAX_TASKS", "100")
-          )
-
-          MAX_BIDS_PER_RUN = int(
-              os.getenv("MAX_BIDS_PER_RUN", "2")
-          )
-
-          MAX_RECONCILE_ACTIONS = int(
-              os.getenv("MAX_RECONCILE_ACTIONS", "30")
-          )
-
-          MAX_MEMORY_ACTIONS = int(
-              os.getenv("MAX_MEMORY_ACTIONS", "1000")
-          )
-
-          MEMORY_FILE = (
-              "memory/nox_act_15_marketplace.json"
-          )
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          })
 
 
-          def now_iso():
-              return datetime.now(
-                  timezone.utc
-              ).isoformat()
-
-
-          def normalize_text(value):
-              if value is None:
-                  return ""
-
-              if isinstance(value, (dict, list)):
-                  try:
-                      value = json.dumps(
-                          value,
-                          ensure_ascii=False,
-                          sort_keys=True
-                      )
-                  except Exception:
-                      value = str(value)
-
-              return str(value).strip().lower()
-
-
-          def clean_space(text):
-              return re.sub(
-                  r"\s+",
-                  " ",
-                  normalize_text(text)
-              ).strip()
-
-
-          def phrase_in_text(phrase, text):
-              phrase = clean_space(phrase)
-              text = clean_space(text)
-
-              if not phrase or not text:
-                  return False
-
-              pattern = (
-                  r"(?<![\w])"
-                  + re.escape(phrase)
-                  + r"(?![\w])"
-              )
-
-              return bool(
-                  re.search(
-                      pattern,
-                      text,
-                      flags=re.IGNORECASE
-                  )
-              )
-
-
-          def phrase_hits(phrases, text):
-              return [
-                  phrase
-                  for phrase in phrases
-                  if phrase_in_text(
-                      phrase,
-                      text
-                  )
-              ]
+          def now():
+              return datetime.now(timezone.utc).isoformat()
 
 
           def first_value(obj, keys):
               if not isinstance(obj, dict):
                   return None
-
               for key in keys:
                   value = obj.get(key)
-
                   if value not in (None, ""):
                       return value
-
               return None
 
 
-          def get_task_id(task):
-              if not isinstance(task, dict):
-                  return None
+          def api(method, path, **kwargs):
+              url = BASE_URL + path
+              return session.request(method, url, timeout=30, **kwargs)
 
-              for key in [
+
+          def authenticate():
+              response = api(
+                  "POST",
+                  "/api/v1/auth/token",
+                  json={"api_key": API_KEY},
+              )
+              response.raise_for_status()
+
+              data = response.json()
+              token = data.get("access_token") or data.get("token")
+
+              if not token:
+                  raise RuntimeError("Authentication succeeded but no JWT was returned")
+
+              session.headers["Authorization"] = f"Bearer {token}"
+              return token
+
+
+          def load_memory():
+              os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+
+              if not os.path.exists(MEMORY_PATH):
+                  return {
+                      "act": "ACT15",
+                      "version": "V9.1",
+                      "created_at": now(),
+                      "runs": [],
+                      "bids": [],
+                      "reconciliation": [],
+                  }
+
+              try:
+                  with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+
+                  if not isinstance(data, dict):
+                      raise ValueError("memory root is not an object")
+
+                  data.setdefault("runs", [])
+                  data.setdefault("bids", [])
+                  data.setdefault("reconciliation", [])
+                  return data
+
+              except Exception as exc:
+                  print(f"MEMORY WARNING: {exc}")
+                  return {
+                      "act": "ACT15",
+                      "version": "V9.1",
+                      "created_at": now(),
+                      "memory_recovered": True,
+                      "runs": [],
+                      "bids": [],
+                      "reconciliation": [],
+                  }
+
+
+          def save_memory(memory):
+              memory["version"] = "V9.1"
+              memory["updated_at"] = now()
+
+              memory["runs"] = memory.get("runs", [])[-MAX_MEMORY_ACTIONS:]
+              memory["bids"] = memory.get("bids", [])[-MAX_MEMORY_ACTIONS:]
+              memory["reconciliation"] = memory.get(
+                  "reconciliation", []
+              )[-MAX_MEMORY_ACTIONS:]
+
+              tmp = MEMORY_PATH + ".tmp"
+
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(memory, f, indent=2, ensure_ascii=False)
+
+              os.replace(tmp, MEMORY_PATH)
+
+
+          def get_task_id(task):
+              return first_value(task, [
                   "id",
                   "task_id",
                   "taskId",
                   "uuid",
-                  "post_id",
-                  "postId",
-              ]:
-                  value = task.get(key)
-
-                  if value:
-                      return str(value)
-
-              return None
+              ])
 
 
           def get_title(task):
-              if not isinstance(task, dict):
-                  return ""
-
-              for key in [
+              value = first_value(task, [
                   "title",
                   "name",
                   "subject",
-                  "headline",
-              ]:
-                  value = task.get(key)
-
-                  if value:
-                      return str(value)
-
-              return ""
+              ])
+              return str(value or "").strip()
 
 
           def get_description(task):
-              if not isinstance(task, dict):
-                  return ""
-
-              values = []
-
-              for key in [
+              value = first_value(task, [
                   "description",
                   "body",
                   "content",
                   "details",
-                  "task_description",
-                  "taskDescription",
-                  "requirements",
-                  "request",
-              ]:
-                  value = task.get(key)
-
-                  if value:
-                      if isinstance(value, (dict, list)):
-                          try:
-                              value = json.dumps(
-                                  value,
-                                  ensure_ascii=False
-                              )
-                          except Exception:
-                              value = str(value)
-
-                      values.append(str(value))
-
-              return " ".join(values)
+              ])
+              return str(value or "").strip()
 
 
           def get_category(task):
-              value = first_value(
-                  task,
-                  [
-                      "category",
-                      "type",
-                      "task_type",
-                      "taskType",
-                      "post_type",
-                      "postType",
-                  ]
-              )
+              value = first_value(task, [
+                  "category",
+                  "type",
+                  "task_type",
+              ])
+              return str(value or "").strip()
 
-              return normalize_text(value)
+
+          def get_author_text(task):
+              author = task.get("author")
+
+              if isinstance(author, dict):
+                  values = [
+                      author.get("username"),
+                      author.get("name"),
+                      author.get("display_name"),
+                  ]
+                  return " ".join(str(x) for x in values if x)
+
+              return str(author or "")
+
+
+          def task_text(task):
+              return " ".join([
+                  get_title(task),
+                  get_description(task),
+                  get_category(task),
+                  get_author_text(task),
+              ]).strip()
 
 
           SUPPLY_PHRASES = [
               "for hire",
-              "hire me",
-              "my services",
-              "i offer",
-              "i provide",
-              "i can help",
-              "i can do",
-              "available for work",
-              "available to work",
               "available for hire",
-              "open for work",
-              "offering services",
-              "freelance services",
+              "i can do",
+              "i can help",
+              "i offer",
+              "offering",
+              "my services",
               "services available",
-              "my rate",
-              "my rates",
-              "price:",
-              "price -",
-              "price —",
-              "per order",
-              "fixed-rate",
-              "fixed rate",
+              "available to work",
+              "looking for clients",
           ]
-
-
-          SUPPLY_METADATA_KEYS = {
-              "seller",
-              "provider",
-              "service_provider",
-              "serviceProvider",
-              "offerer",
-              "author_offering",
-          }
-
-
-          DEMAND_METADATA_KEYS = {
-              "buyer",
-              "requester",
-              "requester_id",
-              "client",
-              "customer",
-          }
-
 
           DEMAND_PHRASES = [
-              "looking for",
               "need someone",
-              "need a",
-              "need an",
+              "looking for someone",
+              "looking for an agent",
+              "need an agent",
+              "need help",
+              "i need",
+              "we need",
               "seeking",
               "wanted",
-              "we need",
-              "i need someone",
-              "i need help",
-              "can someone",
-              "who can",
-              "requesting",
-              "help wanted",
-              "paid task",
-              "bounty",
-              "task for",
-              "looking to hire",
+              "request",
+              "task required",
+              "work needed",
               "hire someone",
+              "hiring",
+              "paid task",
           ]
+
+          REWARD_SIGNAL_RE = re.compile(
+              r"\b\d+(?:\.\d+)?\s*(?:sats?|sat|satoshi|satoshis)\b",
+              re.IGNORECASE,
+          )
+
+
+          def has_phrase(text, phrases):
+              lowered = text.lower()
+              return any(
+                  re.search(
+                      r"(?<!\w)" + re.escape(phrase) + r"(?!\w)",
+                      lowered,
+                  )
+                  for phrase in phrases
+              )
 
 
           def classify_direction(task):
               title = get_title(task)
               description = get_description(task)
-              category = get_category(task)
 
-              core_text = clean_space(
-                  " ".join([
-                      title,
-                      description,
-                  ])
-              )
+              text = f"{title} {description}".strip()
 
-              supply_hits = phrase_hits(
-                  SUPPLY_PHRASES,
-                  core_text
-              )
+              title_supply = has_phrase(title, SUPPLY_PHRASES)
+              body_supply = has_phrase(description, SUPPLY_PHRASES)
 
-              demand_hits = phrase_hits(
-                  DEMAND_PHRASES,
-                  core_text
-              )
+              title_demand = has_phrase(title, DEMAND_PHRASES)
+              body_demand = has_phrase(description, DEMAND_PHRASES)
 
-              if category in {
+              structured_paid = False
+
+              for key in [
+                  "paid",
+                  "is_paid",
                   "paid_task",
-                  "paid task",
-                  "bounty",
-                  "task",
-              }:
-                  demand_hits.append(
-                      f"metadata:{category}"
-                  )
+                  "reward",
+                  "budget",
+              ]:
+                  value = task.get(key)
 
-              if phrase_in_text(
-                  "for hire",
-                  title
-              ):
-                  return {
-                      "direction": "SUPPLY",
-                      "confidence": "VERY_HIGH",
-                      "signals": [
-                          "title:for hire"
-                      ],
-                      "reason": "explicit_supply_title",
-                  }
+                  if isinstance(value, bool) and value:
+                      structured_paid = True
 
-              if supply_hits and not demand_hits:
-                  return {
-                      "direction": "SUPPLY",
-                      "confidence": "HIGH",
-                      "signals": supply_hits[:8],
-                      "reason": "supply_language",
-                  }
+                  elif isinstance(value, (int, float)) and value > 0:
+                      structured_paid = True
 
-              if demand_hits and not supply_hits:
-                  return {
-                      "direction": "DEMAND",
-                      "confidence": "HIGH",
-                      "signals": demand_hits[:8],
-                      "reason": "demand_language",
-                  }
+                  elif isinstance(value, dict):
+                      for nested_key in [
+                          "sats",
+                          "amount_sats",
+                          "min_sats",
+                          "max_sats",
+                      ]:
+                          nested_value = value.get(nested_key)
+                          if isinstance(nested_value, (int, float)) and nested_value > 0:
+                              structured_paid = True
 
-              if supply_hits and demand_hits:
-                  return {
-                      "direction": "UNKNOWN_DIRECTION",
-                      "confidence": "LOW",
-                      "signals": (
-                          supply_hits[:4]
-                          + demand_hits[:4]
-                      ),
-                      "reason": "conflicting_signals",
-                  }
+              if title_supply:
+                  return "SUPPLY", "VERY_HIGH"
 
-              supply_metadata = []
-              demand_metadata = []
+              if body_supply and body_demand:
+                  return "UNKNOWN", "CONFLICT"
 
-              if isinstance(task, dict):
-                  for key in SUPPLY_METADATA_KEYS:
-                      if task.get(key):
-                          supply_metadata.append(key)
+              if body_supply:
+                  return "SUPPLY", "HIGH"
 
-                  for key in DEMAND_METADATA_KEYS:
-                      if task.get(key):
-                          demand_metadata.append(key)
+              if title_demand or body_demand:
+                  return "DEMAND", "HIGH"
 
-              if demand_metadata and not supply_metadata:
-                  return {
-                      "direction": "DEMAND",
-                      "confidence": "MEDIUM",
-                      "signals": demand_metadata,
-                      "reason": "demand_metadata",
-                  }
+              if structured_paid or REWARD_SIGNAL_RE.search(text):
+                  return "DEMAND", "LOW"
 
-              if supply_metadata and not demand_metadata:
-                  return {
-                      "direction": "SUPPLY",
-                      "confidence": "MEDIUM",
-                      "signals": supply_metadata,
-                      "reason": "supply_metadata",
-                  }
-
-              reward_hint = any(
-                  phrase_in_text(
-                      phrase,
-                      core_text
-                  )
-                  for phrase in [
-                      "reward",
-                      "sats",
-                      "satoshis",
-                      "paid task",
-                      "bounty",
-                  ]
-              )
-
-              if reward_hint:
-                  return {
-                      "direction": "DEMAND",
-                      "confidence": "LOW",
-                      "signals": [
-                          "reward_signal"
-                      ],
-                      "reason": (
-                          "reward_without_"
-                          "supply_language"
-                      ),
-                  }
-
-              return {
-                  "direction": "UNKNOWN_DIRECTION",
-                  "confidence": "LOW",
-                  "signals": [],
-                  "reason": "no_clear_market_direction",
-              }
-
-
-          def parse_number(value):
-              if value is None:
-                  return None
-
-              if isinstance(value, bool):
-                  return None
-
-              if isinstance(value, (int, float)):
-                  return float(value)
-
-              text = str(value).strip()
-              text = text.replace(",", "")
-
-              match = re.search(
-                  r"-?\d+(?:\.\d+)?",
-                  text
-              )
-
-              if not match:
-                  return None
-
-              try:
-                  return float(
-                      match.group(0)
-                  )
-              except Exception:
-                  return None
+              return "UNKNOWN", "LOW"
 
 
           def parse_reward_range(task):
-              if not isinstance(task, dict):
-                  return {
-                      "min": None,
-                      "max": None,
-                      "source": None,
-                  }
+              title = get_title(task)
+              description = get_description(task)
+              text = f"{title} {description}"
 
-              range_pairs = [
-                  (
-                      "min_reward_sats",
-                      "max_reward_sats",
-                  ),
-                  (
-                      "minRewardSats",
-                      "maxRewardSats",
-                  ),
-                  (
-                      "min_sats",
-                      "max_sats",
-                  ),
-                  (
-                      "minSats",
-                      "maxSats",
-                  ),
-                  (
-                      "budget_min_sats",
-                      "budget_max_sats",
-                  ),
-                  (
-                      "budgetMinSats",
-                      "budgetMaxSats",
-                  ),
-                  (
-                      "reward_min_sats",
-                      "reward_max_sats",
-                  ),
-                  (
-                      "rewardMinSats",
-                      "rewardMaxSats",
-                  ),
-              ]
+              candidates = []
 
-              for min_key, max_key in range_pairs:
-                  low = parse_number(
-                      task.get(min_key)
-                  )
+              def add(value, source):
+                  try:
+                      value = int(float(value))
+                  except Exception:
+                      return
 
-                  high = parse_number(
-                      task.get(max_key)
-                  )
+                  if value > 0:
+                      candidates.append((value, value, source))
 
-                  if low is not None or high is not None:
-                      if low is None:
-                          low = high
-
-                      if high is None:
-                          high = low
-
-                      return {
-                          "min": max(
-                              0,
-                              int(low)
-                          ),
-                          "max": max(
-                              0,
-                              int(high)
-                          ),
-                          "source": (
-                              f"structured:"
-                              f"{min_key}/"
-                              f"{max_key}"
-                          ),
-                      }
-
+              # Explicit structured sats fields.
               for key in [
                   "reward_sats",
-                  "rewardSats",
-                  "sats",
-                  "sat",
-                  "amount_sats",
-                  "amountSats",
-                  "payment_sats",
-                  "paymentSats",
+                  "reward_amount_sats",
                   "budget_sats",
-                  "budgetSats",
+                  "min_reward_sats",
+                  "max_reward_sats",
               ]:
-                  value = parse_number(
-                      task.get(key)
-                  )
+                  value = task.get(key)
 
-                  if value is not None and value >= 0:
-                      amount = int(value)
+                  if isinstance(value, (int, float)):
+                      add(value, f"field:{key}")
 
-                      return {
-                          "min": amount,
-                          "max": amount,
-                          "source": (
-                              f"structured:{key}"
-                          ),
-                      }
+              for parent_key in ["reward", "budget", "payment"]:
+                  parent = task.get(parent_key)
 
-              text = clean_space(
-                  " ".join([
-                      get_title(task),
-                      get_description(task),
-                  ])
-              )
+                  if isinstance(parent, dict):
+                      min_value = first_value(parent, [
+                          "min_sats",
+                          "minimum_sats",
+                          "min_reward_sats",
+                          "amount_sats",
+                          "sats",
+                      ])
 
-              patterns = [
-                  (
-                      r"(\d[\d\s,]*)"
-                      r"\s*[-–—]\s*"
-                      r"(\d[\d\s,]*)"
-                      r"\s*sats?\b"
+                      max_value = first_value(parent, [
+                          "max_sats",
+                          "maximum_sats",
+                          "max_reward_sats",
+                          "amount_sats",
+                          "sats",
+                      ])
+
+                      if min_value is not None or max_value is not None:
+                          try:
+                              low = int(float(min_value or max_value))
+                              high = int(float(max_value or min_value))
+                              if low > 0 and high > 0:
+                                  candidates.append(
+                                      (min(low, high), max(low, high), f"field:{parent_key}")
+                                  )
+                          except Exception:
+                              pass
+
+              range_patterns = [
+                  re.compile(
+                      r"\b(\d[\d,]*)\s*(?:-|to)\s*(\d[\d,]*)\s*(?:sats?|sat|satoshi|satoshis)\b",
+                      re.IGNORECASE,
                   ),
-                  (
-                      r"(\d[\d\s,]*)"
-                      r"\s*to\s*"
-                      r"(\d[\d\s,]*)"
-                      r"\s*sats?\b"
+                  re.compile(
+                      r"\b(\d[\d,]*)\s*(?:sats?|sat|satoshi|satoshis)\b",
+                      re.IGNORECASE,
                   ),
               ]
 
-              for pattern in patterns:
-                  match = re.search(
-                      pattern,
-                      text,
-                      flags=re.IGNORECASE
-                  )
+              for pattern in range_patterns:
+                  for match in pattern.finditer(text):
+                      values = [
+                          int(x.replace(",", ""))
+                          for x in match.groups()
+                      ]
 
-                  if match:
-                      try:
-                          low = int(
-                              match.group(1)
-                              .replace(" ", "")
-                              .replace(",", "")
+                      if len(values) == 1:
+                          candidates.append(
+                              (values[0], values[0], "text:sats")
+                          )
+                      elif len(values) == 2:
+                          candidates.append(
+                              (
+                                  min(values[0], values[1]),
+                                  max(values[0], values[1]),
+                                  "text:sats_range",
+                              )
                           )
 
-                          high = int(
-                              match.group(2)
-                              .replace(" ", "")
-                              .replace(",", "")
-                          )
+              if not candidates:
+                  return None, None, None
 
-                          return {
-                              "min": min(
-                                  low,
-                                  high
-                              ),
-                              "max": max(
-                                  low,
-                                  high
-                              ),
-                              "source": "text:sat_range",
-                          }
-
-                      except Exception:
-                          pass
-
-              match = re.search(
-                  r"(\d[\d\s,]*)\s*sats?\b",
-                  text,
-                  flags=re.IGNORECASE
+              low, high, source = max(
+                  candidates,
+                  key=lambda item: item[1],
               )
 
-              if match:
-                  try:
-                      amount = int(
-                          match.group(1)
-                          .replace(" ", "")
-                          .replace(",", "")
-                      )
-
-                      return {
-                          "min": amount,
-                          "max": amount,
-                          "source": "text:sats",
-                      }
-
-                  except Exception:
-                      pass
-
-              return {
-                  "min": None,
-                  "max": None,
-                  "source": None,
-              }
+              return low, high, source
 
 
-          SAFETY_BLOCKED_TERMS = [
-              "illegal",
+          BLOCKED_TERMS = [
               "malware",
               "ransomware",
               "credential theft",
-              "phishing",
-              "stolen credentials",
-              "exploit",
+              "credential stealing",
+              "phishing kit",
+              "keylogger",
+              "botnet",
+              "ddos attack",
+              "steal credentials",
+              "bypass authentication",
+              "exploit a real target",
               "weapon",
-              "weapons",
-              "drug trafficking",
-              "money laundering",
-              "fraud",
+              "explosive",
           ]
 
 
           def safety_hits(task):
-              text = clean_space(
-                  " ".join([
-                      get_title(task),
-                      get_description(task),
-                  ])
-              )
+              text = task_text(task).lower()
 
-              return phrase_hits(
-                  SAFETY_BLOCKED_TERMS,
-                  text
-              )
+              return [
+                  term
+                  for term in BLOCKED_TERMS
+                  if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text)
+              ]
 
 
-          # IMPORTANT:
-          # Capability terms are divided into STRONG and WEAK
-          # signals. Weak generic words can never create a bid
-          # by themselves.
           STRONG_CAPABILITIES = {
               "api": [
                   "rest api",
@@ -760,9 +493,11 @@ jobs:
                   "implement a function",
                   "implement a feature",
                   "debug code",
+                  "debugging code",
                   "fix code",
                   "programming task",
                   "develop a script",
+                  "develop software",
               ],
               "testing": [
                   "automated testing",
@@ -783,27 +518,31 @@ jobs:
                   "web research",
                   "competitive research",
                   "fact checking",
-                  "fact-checking",
                   "source verification",
+                  "conduct research",
+                  "perform research",
               ],
               "data": [
                   "data analysis",
                   "data cleaning",
                   "data processing",
-                  "dataset analysis",
                   "data extraction",
                   "data collection",
+                  "dataset analysis",
                   "structured data",
                   "csv processing",
+                  "analyze data",
+                  "clean data",
               ],
               "documentation": [
                   "technical documentation",
                   "api documentation",
                   "documentation task",
-                  "write documentation",
                   "documentation update",
+                  "write documentation",
                   "technical report",
                   "write a report",
+                  "prepare a report",
               ],
               "github": [
                   "github repository",
@@ -854,1366 +593,709 @@ jobs:
           }
 
 
-          def explicit_task_request_text(task):
-              title = clean_space(
-                  get_title(task)
-              )
-
-              description = clean_space(
-                  get_description(task)
-              )
-
-              return clean_space(
-                  " ".join([
-                      title,
-                      description,
-                  ])
-              )
-
-
           def capability_analysis(task):
-              text = explicit_task_request_text(
-                  task
-              )
+              text = task_text(task).lower()
 
-              strong_groups = {}
-              weak_groups = {}
+              strong = {}
+              weak = {}
 
-              for group, terms in STRONG_CAPABILITIES.items():
-                  hits = phrase_hits(
-                      terms,
-                      text
-                  )
+              for group, phrases in STRONG_CAPABILITIES.items():
+                  hits = []
 
-                  if hits:
-                      strong_groups[group] = hits[:6]
-
-              for group, terms in WEAK_CAPABILITIES.items():
-                  hits = phrase_hits(
-                      terms,
-                      text
-                  )
+                  for phrase in phrases:
+                      if re.search(
+                          r"(?<!\w)" + re.escape(phrase) + r"(?!\w)",
+                          text,
+                      ):
+                          hits.append(phrase)
 
                   if hits:
-                      weak_groups[group] = hits[:6]
+                      strong[group] = sorted(set(hits))
 
-              # Remove weak matches for groups already supported
-              # by strong evidence. They add noise, not confidence.
-              for group in list(weak_groups):
-                  if group in strong_groups:
-                      del weak_groups[group]
+              for group, phrases in WEAK_CAPABILITIES.items():
+                  hits = []
 
-              # "sats", "lightning", "agent" etc. are contextual
-              # signals and never count as operational capability.
-              operational_strong = set(
-                  strong_groups.keys()
-              ).intersection({
-                  "api",
-                  "python",
-                  "coding",
-                  "testing",
-                  "research",
-                  "data",
-                  "documentation",
-                  "github",
-              })
+                  for phrase in phrases:
+                      if re.search(
+                          r"(?<!\w)" + re.escape(phrase) + r"(?!\w)",
+                          text,
+                      ):
+                          hits.append(phrase)
 
-              operational_weak = set(
-                  weak_groups.keys()
-              ).intersection({
-                  "coding",
-                  "research",
-                  "documentation",
-                  "data",
-              })
+                  if hits:
+                      weak[group] = sorted(set(hits))
 
-              # A weak capability is useful only when supported
-              # by a second coherent signal.
-              weak_fit = (
-                  len(operational_weak) >= 2
-              )
+              # Weak mentions cannot create a capability when the same
+              # capability already has strong evidence.
+              for group in list(weak.keys()):
+                  if group in strong:
+                      del weak[group]
 
-              strong_fit = (
-                  len(operational_strong) >= 1
-              )
+              # IMPORTANT:
+              # Weak evidence NEVER authorizes a real bid by itself.
+              # It is retained only as contextual evidence.
+              operational_strong = {
+                  group: hits
+                  for group, hits in strong.items()
+                  if group in {
+                      "api",
+                      "python",
+                      "coding",
+                      "testing",
+                      "research",
+                      "data",
+                      "documentation",
+                      "github",
+                  }
+              }
 
-              actionable_fit = (
-                  strong_fit
-                  or weak_fit
-              )
+              strong_count = len(operational_strong)
 
               return {
-                  "strong_groups": strong_groups,
-                  "weak_groups": weak_groups,
-                  "strong_count": len(
-                      operational_strong
-                  ),
-                  "weak_count": len(
-                      operational_weak
-                  ),
-                  "actionable_fit": actionable_fit,
-                  "terms": (
-                      [
-                          term
-                          for hits in strong_groups.values()
-                          for term in hits
-                      ][:8]
-                      +
-                      [
-                          term
-                          for hits in weak_groups.values()
-                          for term in hits
-                      ][:4]
-                  ),
+                  "strong": strong,
+                  "weak": weak,
+                  "operational_strong": operational_strong,
+                  "strong_count": strong_count,
+                  "capability_fit": strong_count >= 1,
               }
 
 
           def complexity_flags(task):
-              text = explicit_task_request_text(
-                  task
-              )
+              text = task_text(task).lower()
 
               flags = []
 
-              for phrase in [
-                  "24/7",
-                  "real-time",
-                  "realtime",
-                  "production",
-                  "enterprise",
-                  "large scale",
-                  "large-scale",
-                  "ongoing",
-                  "long term",
-                  "long-term",
-                  "multiple agents",
-                  "full implementation",
-                  "end to end",
-                  "end-to-end",
-              ]:
-                  if phrase_in_text(
-                      phrase,
-                      text
-                  ):
-                      flags.append(phrase)
+              if len(text) > 2500:
+                  flags.append("long_spec")
+
+              if len(re.findall(r"\b(?:must|require|required|deliver|deadline)\b", text)) >= 8:
+                  flags.append("high_requirements")
+
+              if len(re.findall(r"\b(?:multiple|several|integrate|integration|deploy|production)\b", text)) >= 5:
+                  flags.append("multi_step")
 
               return flags
 
 
-          def competition_from_task(task):
-              if not isinstance(task, dict):
-                  return None
-
-              for key in [
-                  "bid_count",
-                  "bidCount",
-                  "bids_count",
-                  "bidsCount",
-                  "num_bids",
-                  "number_of_bids",
-              ]:
-                  value = parse_number(
-                      task.get(key)
-                  )
-
-                  if value is not None:
-                      return int(
-                          max(0, value)
-                      )
-
-              for key in [
-                  "bids",
-              ]:
-                  value = task.get(key)
-
-                  if isinstance(value, list):
-                      return len(value)
-
-              return None
-
-
-          def economic_score(
-              reward_min,
-              reward_max
-          ):
-              if reward_min is None:
-                  return 0
-
-              value = max(
-                  reward_min,
-                  reward_max or reward_min
+          def fetch_task_bids(post_id):
+              response = api(
+                  "GET",
+                  f"/api/v1/marketplace/{post_id}/bids",
               )
 
-              if value < 21:
+              if response.status_code != 200:
+                  return None
+
+              try:
+                  data = response.json()
+              except Exception:
+                  return None
+
+              if isinstance(data, list):
+                  return data
+
+              if isinstance(data, dict):
+                  for key in ["bids", "items", "results", "data"]:
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+
+              return []
+
+
+          def competition_from_task(post_id):
+              bids = fetch_task_bids(post_id)
+
+              if bids is None:
+                  return None
+
+              return len(bids)
+
+
+          def economic_score(low, high):
+              if low is None or high is None:
+                  return -20
+
+              if high < MIN_BID_SATS:
+                  return -30
+
+              if low >= 1000:
+                  return 30
+
+              if low >= 500:
+                  return 25
+
+              if low >= 100:
+                  return 18
+
+              if low >= 50:
+                  return 10
+
+              return 5
+
+
+          def competition_score(competition):
+              if competition is None:
                   return 0
 
-              if value < 100:
-                  return 1
+              if competition == 0:
+                  return 12
 
-              if value < 500:
-                  return 2
+              if competition <= 2:
+                  return 8
 
-              if value < 1000:
-                  return 3
-
-              if value < 5000:
+              if competition <= 5:
                   return 4
 
-              if value < 10000:
-                  return 5
+              if competition <= 10:
+                  return 0
 
-              return 6
-
-
-          def competition_score(bids):
-              if bids is None:
-                  return 2
-
-              if bids == 0:
-                  return 5
-
-              if bids == 1:
-                  return 4
-
-              if bids == 2:
-                  return 3
-
-              if bids <= 4:
-                  return 2
-
-              if bids <= 7:
-                  return 1
-
-              return 0
+              return -8
 
 
           def decision_score(
-              task,
-              direction_info,
-              reward_range,
-              capability,
-              competition,
+              direction,
+              reward_low,
+              reward_high,
+              capabilities,
               safety,
+              complexity,
+              competition,
           ):
               if safety:
-                  return {
-                      "score": -100,
-                      "actionable": False,
-                      "reason": "safety_block",
-                  }
+                  return -100, "blocked_safety"
 
-              if direction_info["direction"] != "DEMAND":
-                  return {
-                      "score": -50,
-                      "actionable": False,
-                      "reason": "not_demand",
-                  }
+              if direction != "DEMAND":
+                  if direction == "SUPPLY":
+                      return -50, "not_demand"
+                  return -40, "unknown_direction"
 
-              reward_min = reward_range["min"]
-              reward_max = reward_range["max"]
+              if reward_low is None or reward_high is None:
+                  return -20, "no_verified_lightning_reward"
 
-              if reward_min is None:
-                  return {
-                      "score": -20,
-                      "actionable": False,
-                      "reason": (
-                          "no_verified_"
-                          "lightning_reward"
-                      ),
-                  }
+              if reward_high < MIN_BID_SATS:
+                  return -30, "reward_below_minimum"
 
-              if reward_max is None:
-                  reward_max = reward_min
+              # V9.1 hard gate:
+              # at least one operational STRONG capability is mandatory.
+              if not capabilities["capability_fit"]:
+                  return -10, "no_strong_operational_capability"
 
-              if reward_max < MIN_BID_SATS:
-                  return {
-                      "score": -20,
-                      "actionable": False,
-                      "reason": (
-                          "reward_below_"
-                          "bid_minimum"
-                      ),
-                  }
+              score = 35
+              score += min(capabilities["strong_count"] * 10, 30)
+              score += economic_score(reward_low, reward_high)
+              score += competition_score(competition)
 
-              if not capability["actionable_fit"]:
-                  return {
-                      "score": -10,
-                      "actionable": False,
-                      "reason": (
-                          "insufficient_"
-                          "capability_evidence"
-                      ),
-                  }
+              for flag in complexity:
+                  if flag == "long_spec":
+                      score -= 5
+                  elif flag == "high_requirements":
+                      score -= 8
+                  elif flag == "multi_step":
+                      score -= 5
 
-              strong = capability["strong_count"]
-              weak = capability["weak_count"]
+              if score >= 55:
+                  return score, "bid_candidate"
 
-              score = 0
-
-              # Strong operational capability is the primary
-              # driver. One strong capability is enough to enter
-              # consideration, but not enough to guarantee a bid.
-              score += min(
-                  strong * 20,
-                  60
-              )
-
-              # Two coherent weak capability groups can establish
-              # a useful fit, but weak evidence remains deliberately
-              # less valuable.
-              if weak >= 2:
-                  score += 10
-
-              score += (
-                  economic_score(
-                      reward_min,
-                      reward_max
-                  ) * 4
-              )
-
-              score += (
-                  competition_score(
-                      competition
-                  ) * 4
-              )
-
-              if direction_info["confidence"] == "HIGH":
-                  score += 10
-              elif direction_info["confidence"] == "MEDIUM":
-                  score += 4
-
-              complexity = complexity_flags(
-                  task
-              )
-
-              if not complexity:
-                  score += 8
-              else:
-                  score -= min(
-                      len(complexity) * 4,
-                      16
-                  )
-
-              # Strong evidence is required for a real bid.
-              strong_or_coherent_weak = (
-                  strong >= 1
-                  or weak >= 2
-              )
-
-              actionable = (
-                  score >= 55
-                  and strong_or_coherent_weak
-                  and reward_min >= MIN_BID_SATS
-              )
-
-              if actionable:
-                  reason = (
-                      "actionable_opportunity"
-                  )
-              elif not strong_or_coherent_weak:
-                  reason = (
-                      "insufficient_capability_evidence"
-                  )
-              elif score < 55:
-                  reason = (
-                      "below_action_threshold"
-                  )
-              else:
-                  reason = "not_actionable"
-
-              return {
-                  "score": score,
-                  "actionable": actionable,
-                  "reason": reason,
-              }
+              return score, "score_below_threshold"
 
 
-          def build_bid_amount(reward_range):
-              low = reward_range["min"]
-              high = reward_range["max"]
-
-              if low is None:
+          def build_bid_amount(reward_low, reward_high):
+              if reward_low is None or reward_high is None:
                   return None
 
-              if high is None:
-                  high = low
+              amount = max(MIN_BID_SATS, int(reward_low))
 
-              amount = max(
-                  MIN_BID_SATS,
-                  int(low)
-              )
-
-              amount = min(
-                  amount,
-                  int(high)
-              )
-
-              if amount < MIN_BID_SATS:
+              if amount > reward_high:
                   return None
 
               return amount
 
 
-          def build_bid_description(
-              task,
-              capability,
-              reward_range,
-          ):
-              groups = list(
-                  capability["strong_groups"].keys()
-              )
+          def build_bid_description(task, capabilities, amount):
+              groups = list(capabilities["operational_strong"].keys())
 
               if not groups:
-                  groups = list(
-                      capability["weak_groups"].keys()
-                  )
+                  return None
 
-              groups = [
-                  group
-                  for group in groups
-                  if group not in {
-                      "agents",
-                  }
-              ][:4]
+              group_text = ", ".join(groups)
 
-              if groups:
-                  capability_text = ", ".join(
-                      groups
-                  )
-              else:
-                  capability_text = (
-                      "bounded technical/research work"
-                  )
-
-              title = get_title(task).strip()
-
-              if not title:
-                  title = "the requested task"
-
-              reward_text = ""
-
-              low = reward_range["min"]
-              high = reward_range["max"]
-
-              if low is not None:
-                  if (
-                      high is not None
-                      and high != low
-                  ):
-                      reward_text = (
-                          f" for the advertised "
-                          f"{low}-{high} sats range"
-                      )
-                  else:
-                      reward_text = (
-                          f" for the advertised "
-                          f"{low} sats"
-                      )
+              title = get_title(task)
 
               description = (
-                  f"NØX can contribute on "
-                  f"{capability_text} for "
-                  f"\"{title}\"{reward_text}. "
-                  f"The bid is based on the task's "
-                  f"stated requirements and verified "
-                  f"Lightning reward."
+                  f"NØX can contribute on '{title}' using verified capabilities "
+                  f"in {group_text}. Proposed bid: {amount} sats. "
+                  f"Work would be scoped to the requested deliverable and "
+                  f"validated against the task requirements."
               )
 
               return description[:5000]
 
 
-          def load_memory():
-              if not os.path.exists(MEMORY_FILE):
-                  return {
-                      "act": "ACT15",
-                      "version": "V9",
-                      "created_at": now_iso(),
-                      "runs": [],
-                      "bids": [],
-                      "reconciliation": [],
-                  }
+          def bid_belongs_to_identity(bid, username):
+              if not isinstance(bid, dict):
+                  return False
 
-              try:
-                  with open(
-                      MEMORY_FILE,
-                      "r",
-                      encoding="utf-8"
-                  ) as handle:
-                      data = json.load(handle)
+              possible = [
+                  bid.get("username"),
+                  bid.get("bidder_username"),
+                  bid.get("agent_username"),
+                  bid.get("author_username"),
+              ]
 
-                  if not isinstance(data, dict):
-                      raise ValueError(
-                          "memory_not_dict"
-                      )
+              bidder = bid.get("bidder")
 
-                  return data
+              if isinstance(bidder, dict):
+                  possible.extend([
+                      bidder.get("username"),
+                      bidder.get("name"),
+                  ])
 
-              except Exception:
-                  return {
-                      "act": "ACT15",
-                      "version": "V9",
-                      "created_at": now_iso(),
-                      "memory_recovery": True,
-                      "runs": [],
-                      "bids": [],
-                      "reconciliation": [],
-                  }
+              return username in {
+                  str(value).strip()
+                  for value in possible
+                  if value not in (None, "")
+              }
 
 
-          def save_memory(memory):
-              memory["updated_at"] = now_iso()
+          def get_own_bids():
+              response = api("GET", "/api/v1/marketplace/tasks")
 
-              for key in [
-                  "runs",
-                  "bids",
-                  "reconciliation",
-              ]:
-                  if not isinstance(
-                      memory.get(key),
-                      list
-                  ):
-                      memory[key] = []
-
-              memory["runs"] = memory[
-                  "runs"
-              ][-100:]
-
-              memory["bids"] = memory[
-                  "bids"
-              ][-MAX_MEMORY_ACTIONS:]
-
-              memory["reconciliation"] = memory[
-                  "reconciliation"
-              ][-MAX_MEMORY_ACTIONS:]
-
-              with open(
-                  MEMORY_FILE,
-                  "w",
-                  encoding="utf-8"
-              ) as handle:
-                  json.dump(
-                      memory,
-                      handle,
-                      ensure_ascii=False,
-                      indent=2,
-                      sort_keys=True
-                  )
-
-
-          session = requests.Session()
-          session.headers.update({
-              "Accept": "application/json",
-              "User-Agent": (
-                  "NOX-ACT15-V9/"
-                  "autonomous-marketplace"
-              ),
-          })
-
-
-          def api_request(
-              method,
-              path,
-              *,
-              payload=None,
-              timeout=30,
-          ):
-              url = BASE_URL + path
-
-              response = session.request(
-                  method,
-                  url,
-                  json=payload,
-                  timeout=timeout
-              )
+              if response.status_code != 200:
+                  return []
 
               try:
                   data = response.json()
               except Exception:
-                  data = {
-                      "raw": response.text[:4000]
-                  }
-
-              return response, data
-
-
-          def authenticate():
-              if not API_KEY:
-                  raise RuntimeError(
-                      "COLONY_API_KEY is missing"
-                  )
-
-              response, data = api_request(
-                  "POST",
-                  "/api/v1/auth/token",
-                  payload={
-                      "api_key": API_KEY
-                  }
-              )
-
-              if not response.ok:
-                  raise RuntimeError(
-                      "Authentication failed: "
-                      f"HTTP {response.status_code} "
-                      f"{data}"
-                  )
-
-              token = (
-                  data.get("access_token")
-                  or data.get("token")
-                  or data.get("jwt")
-              )
-
-              if not token:
-                  raise RuntimeError(
-                      "Authentication succeeded "
-                      "but no JWT was returned"
-                  )
-
-              session.headers.update({
-                  "Authorization":
-                      f"Bearer {token}"
-              })
-
-              return token
-
-
-          def extract_list(data, keys):
-              if isinstance(data, list):
-                  return data
-
-              if not isinstance(data, dict):
                   return []
 
-              for key in keys:
-                  value = data.get(key)
-
-                  if isinstance(value, list):
-                      return value
-
-              for value in data.values():
-                  if isinstance(value, list):
-                      return value
-
-              return []
-
-
-          def fetch_tasks():
-              response, data = api_request(
-                  "GET",
-                  "/api/v1/marketplace/tasks",
-                  timeout=30
-              )
-
-              if not response.ok:
-                  raise RuntimeError(
-                      "Marketplace task fetch failed: "
-                      f"HTTP {response.status_code} "
-                      f"{data}"
-                  )
-
-              tasks = extract_list(
-                  data,
-                  [
-                      "tasks",
-                      "results",
-                      "items",
-                      "data",
-                  ]
-              )
-
-              return tasks[:MAX_TASKS]
-
-
-          def fetch_task_bids(task_id):
-              response, data = api_request(
-                  "GET",
-                  f"/api/v1/marketplace/"
-                  f"{task_id}/bids",
-                  timeout=20
-              )
-
-              if not response.ok:
-                  return {
-                      "ok": False,
-                      "status": response.status_code,
-                      "bids": [],
-                  }
-
-              return {
-                  "ok": True,
-                  "status": response.status_code,
-                  "bids": extract_list(
-                      data,
-                      [
-                          "bids",
-                          "results",
-                          "items",
-                          "data",
-                      ]
-                  ),
-              }
-
-
-          def bid_belongs_to_identity(
-              bid,
-              username
-          ):
-              if not isinstance(bid, dict):
-                  return False
-
-              identity_values = []
-
-              for key in [
-                  "username",
-                  "user",
-                  "agent",
-                  "bidder",
-                  "owner",
-                  "author",
-                  "created_by",
-              ]:
-                  value = bid.get(key)
-
-                  if isinstance(value, dict):
-                      identity_values.append(
-                          value.get("username")
-                          or value.get("handle")
-                          or value.get("name")
-                      )
-                  elif value:
-                      identity_values.append(
-                          str(value)
-                      )
-
-              return any(
-                  value
-                  and str(value).lower()
-                  == username.lower()
-                  for value in identity_values
-              )
-
-
-          def reconcile_bid(task_id):
-              result = {
-                  "task_id": task_id,
-                  "checked_at": now_iso(),
-                  "accepted": False,
-                  "paid": False,
-                  "payment_checked": False,
-              }
-
-              bids_result = fetch_task_bids(
-                  task_id
-              )
-
-              if not bids_result["ok"]:
-                  result["bids_error"] = (
-                      bids_result["status"]
-                  )
-                  return result
-
-              username = "nox_origine"
-
-              own_bids = [
-                  bid
-                  for bid in bids_result["bids"]
-                  if bid_belongs_to_identity(
-                      bid,
-                      username
-                  )
-              ]
-
-              result["own_bids"] = len(
-                  own_bids
-              )
-
-              accepted = any(
-                  str(
-                      bid.get("status", "")
-                  ).lower()
-                  in {
-                      "accepted",
-                      "approved",
-                      "selected",
-                  }
-                  for bid in own_bids
-                  if isinstance(bid, dict)
-              )
-
-              result["accepted"] = accepted
-
-              response, data = api_request(
-                  "GET",
-                  f"/api/v1/marketplace/"
-                  f"{task_id}/payment",
-                  timeout=20
-              )
-
-              result["payment_checked"] = True
-
-              if response.ok:
-                  payment_text = normalize_text(
-                      data
-                  )
-
-                  result["paid"] = any(
-                      phrase_in_text(
-                          phrase,
-                          payment_text
-                      )
-                      for phrase in [
-                          "paid",
-                          "completed",
-                          "settled",
-                      ]
-                  )
-
-                  result["payment_status"] = (
-                      data.get("status")
-                      if isinstance(data, dict)
-                      else None
+              if isinstance(data, list):
+                  tasks = data
+              elif isinstance(data, dict):
+                  tasks = (
+                      data.get("tasks")
+                      or data.get("items")
+                      or data.get("results")
+                      or data.get("data")
+                      or []
                   )
               else:
-                  result["payment_http"] = (
-                      response.status_code
-                  )
+                  tasks = []
 
-              return result
+              return tasks
 
 
-          def submit_bid(
-              task_id,
-              amount,
-              description
-          ):
-              payload = {
-                  "bid_amount_sats": int(amount),
-                  "bid_description": description,
+          def reconcile(memory, username):
+              accepted = 0
+              paid = 0
+              checks = 0
+              actions = 0
+
+              tasks = get_own_bids()
+
+              for task in tasks:
+                  if actions >= MAX_RECONCILE_ACTIONS:
+                      break
+
+                  post_id = get_task_id(task)
+
+                  if not post_id:
+                      continue
+
+                  bids = fetch_task_bids(post_id)
+
+                  if not bids:
+                      continue
+
+                  own_bids = [
+                      bid
+                      for bid in bids
+                      if bid_belongs_to_identity(bid, username)
+                  ]
+
+                  if not own_bids:
+                      continue
+
+                  for bid in own_bids:
+                      actions += 1
+
+                      status = str(
+                          first_value(bid, [
+                              "status",
+                              "state",
+                          ]) or ""
+                      ).lower()
+
+                      if status in {
+                          "accepted",
+                          "approved",
+                          "winner",
+                      }:
+                          accepted += 1
+
+                      payment_response = api(
+                          "GET",
+                          f"/api/v1/marketplace/{post_id}/payment",
+                      )
+
+                      payment_status = None
+
+                      if payment_response.status_code == 200:
+                          checks += 1
+
+                          try:
+                              payment_data = payment_response.json()
+                          except Exception:
+                              payment_data = {}
+
+                          if isinstance(payment_data, dict):
+                              payment_status = first_value(
+                                  payment_data,
+                                  [
+                                      "status",
+                                      "payment_status",
+                                  ],
+                              )
+
+                              if str(payment_status).lower() in {
+                                  "paid",
+                                  "completed",
+                                  "settled",
+                              }:
+                                  paid += 1
+
+                      memory["reconciliation"].append({
+                          "timestamp_utc": now(),
+                          "post_id": post_id,
+                          "bid_id": first_value(
+                              bid,
+                              ["id", "bid_id", "uuid"],
+                          ),
+                          "bid_status": status,
+                          "payment_status": payment_status,
+                      })
+
+              return {
+                  "accepted": accepted,
+                  "paid": paid,
+                  "payment_checks": checks,
               }
 
-              response, data = api_request(
-                  "POST",
-                  f"/api/v1/marketplace/"
-                  f"{task_id}/bid",
-                  payload=payload,
-                  timeout=30
-              )
 
-              return response, data
-
-
-          print("=== NØX ACT15 V9 ===")
+          print("=== NØX ACT15 V9.1 ===")
           print("Gemini: DISABLED")
           print("External AI: DISABLED")
           print("Payments: DISABLED")
           print("Spending: DISABLED")
           print("Marketplace: ENABLED")
           print("Real bids: ENABLED")
-          print(
-              f"Minimum bid: {MIN_BID_SATS} sats"
-          )
-          print(
-              f"Maximum bids this run: "
-              f"{MAX_BIDS_PER_RUN}"
-          )
+          print(f"Minimum bid: {MIN_BID_SATS} sats")
+          print(f"Maximum bids this run: {MAX_BIDS_PER_RUN}")
+          print("Capability gate: STRONG operational capability REQUIRED")
+          print("Weak capability evidence: CONTEXT ONLY")
           print("Cost: 0")
 
-          if (
-              GEMINI_ENABLED
-              or EXTERNAL_AI_ENABLED
-              or PAYMENTS_ENABLED
-              or SPENDING_ENABLED
-          ):
-              raise RuntimeError(
-                  "Safety flags invalid: "
-                  "forbidden capability enabled"
-              )
-
-          memory = load_memory()
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
 
           authenticate()
 
-          response, identity = api_request(
-              "GET",
-              "/api/v1/users/me",
-              timeout=20
-          )
+          me_response = api("GET", "/api/v1/users/me")
+          me_response.raise_for_status()
+          me = me_response.json()
 
-          username = "nox_origine"
+          username = first_value(
+              me,
+              ["username", "handle", "name"],
+          ) or "nox_origine"
 
-          if response.ok and isinstance(
-              identity,
-              dict
-          ):
-              username = (
-                  identity.get("username")
-                  or identity.get("handle")
-                  or username
-              )
+          print(f"IDENTITY: {username}")
 
-          print(
-              f"IDENTITY: {username}"
-          )
+          memory = load_memory()
 
-          reconciliation = []
-          previous_bid_task_ids = []
-
-          for entry in memory.get(
-              "bids",
-              []
-          )[-MAX_RECONCILE_ACTIONS:]:
-              task_id = entry.get("task_id")
-
-              if task_id and task_id not in previous_bid_task_ids:
-                  previous_bid_task_ids.append(
-                      task_id
-                  )
-
-          for task_id in previous_bid_task_ids[
-              :MAX_RECONCILE_ACTIONS
-          ]:
-              try:
-                  state = reconcile_bid(
-                      task_id
-                  )
-
-                  reconciliation.append(
-                      state
-                  )
-
-                  print(
-                      "RECONCILIATION: "
-                      + json.dumps(
-                          state,
-                          ensure_ascii=False
-                      )
-                  )
-
-              except Exception as exc:
-                  print(
-                      "RECONCILIATION ERROR "
-                      f"{task_id}: {exc}"
-                  )
-
-          accepted_count = sum(
-              1
-              for item in reconciliation
-              if item.get("accepted")
-          )
-
-          paid_count = sum(
-              1
-              for item in reconciliation
-              if item.get("paid")
-          )
-
-          payment_checks = sum(
-              1
-              for item in reconciliation
-              if item.get("payment_checked")
-          )
+          reconciliation = reconcile(memory, username)
 
           print(
               "RECONCILIATION SUMMARY: "
-              + json.dumps({
-                  "accepted": accepted_count,
-                  "paid": paid_count,
-                  "payment_checks": payment_checks,
-              })
+              + json.dumps(reconciliation, ensure_ascii=False)
           )
 
-          tasks = fetch_tasks()
-
-          print(
-              f"OPEN TASKS RECEIVED: {len(tasks)}"
+          response = api(
+              "GET",
+              "/api/v1/marketplace/tasks",
+              params={"limit": MAX_TASKS},
           )
 
-          analyzed = []
-          candidates = []
+          response.raise_for_status()
+
+          payload = response.json()
+
+          if isinstance(payload, list):
+              tasks = payload
+          elif isinstance(payload, dict):
+              tasks = (
+                  payload.get("tasks")
+                  or payload.get("items")
+                  or payload.get("results")
+                  or payload.get("data")
+                  or []
+              )
+          else:
+              tasks = []
+
+          tasks = tasks[:MAX_TASKS]
+
+          print(f"OPEN TASKS RECEIVED: {len(tasks)}")
+
+          run_record = {
+              "timestamp_utc": now(),
+              "version": "V9.1",
+              "tasks_received": len(tasks),
+              "bids_attempted": 0,
+              "bids_created": [],
+              "decisions": [],
+              "reconciliation": reconciliation,
+          }
+
+          existing_bid_ids = set()
+
+          for old_bid in memory.get("bids", []):
+              if isinstance(old_bid, dict):
+                  task_id = old_bid.get("task_id")
+                  if task_id:
+                      existing_bid_ids.add(str(task_id))
+
+          bids_this_run = 0
 
           for task in tasks:
-              task_id = get_task_id(task)
-              title = get_title(task)
+              post_id = get_task_id(task)
 
-              if not task_id:
-                  print(
-                      "TASK WITHOUT ID: skipped"
-                  )
+              if not post_id:
                   continue
 
-              direction = classify_direction(
-                  task
-              )
+              title = get_title(task)
 
-              reward = parse_reward_range(
-                  task
-              )
+              direction, direction_confidence = classify_direction(task)
 
-              capabilities = capability_analysis(
-                  task
-              )
+              reward_low, reward_high, reward_source = parse_reward_range(task)
 
-              competition = (
-                  competition_from_task(
-                      task
-                  )
-              )
+              capabilities = capability_analysis(task)
 
-              safety = safety_hits(
-                  task
-              )
+              complexity = complexity_flags(task)
 
-              decision = decision_score(
-                  task,
+              safety = safety_hits(task)
+
+              competition = None
+
+              if direction == "DEMAND" and capabilities["capability_fit"]:
+                  competition = competition_from_task(post_id)
+
+              score, reason = decision_score(
                   direction,
-                  reward,
+                  reward_low,
+                  reward_high,
                   capabilities,
-                  competition,
                   safety,
+                  complexity,
+                  competition,
               )
 
-              analysis = {
-                  "task_id": task_id,
-                  "title": title,
-                  "direction": direction,
-                  "reward": reward,
-                  "capabilities": capabilities,
-                  "competition": competition,
-                  "safety": safety,
-                  "decision": decision,
-              }
-
-              analyzed.append(analysis)
-
-              print("")
+              print()
+              print(f"TASK: {title}")
+              print(f"ID: {post_id}")
               print(
-                  f"TASK: {title or '(untitled)'}"
+                  f"DIRECTION: {direction} {direction_confidence}"
               )
               print(
-                  f"ID: {task_id}"
-              )
-              print(
-                  "DIRECTION: "
-                  f"{direction['direction']} "
-                  f"{direction['confidence']}"
-              )
-              print(
-                  "REWARD: "
-                  f"{reward['min']} - "
-                  f"{reward['max']} "
-                  f"{reward['source']}"
+                  f"REWARD: {reward_low} - {reward_high} {reward_source}"
               )
               print(
                   "CAPABILITIES STRONG: "
                   + json.dumps(
-                      capabilities[
-                          "strong_groups"
-                      ],
-                      ensure_ascii=False
+                      capabilities["strong"],
+                      ensure_ascii=False,
                   )
               )
               print(
                   "CAPABILITIES WEAK: "
                   + json.dumps(
-                      capabilities[
-                          "weak_groups"
-                      ],
-                      ensure_ascii=False
+                      capabilities["weak"],
+                      ensure_ascii=False,
                   )
               )
               print(
-                  "CAPABILITY FIT: "
-                  f"{capabilities['actionable_fit']}"
+                  f"CAPABILITY FIT: {capabilities['capability_fit']}"
               )
-              print(
-                  "COMPETITION: "
-                  f"{competition}"
-              )
-              print(
-                  "DECISION: "
-                  f"{decision['score']} "
-                  f"{decision['reason']}"
-              )
+              print(f"COMPETITION: {competition}")
+              print(f"DECISION: {score} {reason}")
 
-              if decision["actionable"]:
-                  candidates.append(
-                      analysis
-                  )
+              decision_record = {
+                  "timestamp_utc": now(),
+                  "task_id": post_id,
+                  "title": title,
+                  "direction": direction,
+                  "direction_confidence": direction_confidence,
+                  "reward_low_sats": reward_low,
+                  "reward_high_sats": reward_high,
+                  "reward_source": reward_source,
+                  "capabilities_strong": capabilities["strong"],
+                  "capabilities_weak": capabilities["weak"],
+                  "capability_fit": capabilities["capability_fit"],
+                  "competition": competition,
+                  "complexity": complexity,
+                  "safety_hits": safety,
+                  "score": score,
+                  "reason": reason,
+              }
 
-          # Existing bids are checked immediately before bidding.
-          # This avoids duplicate bids even if memory is stale.
-          bids_submitted = 0
-          bid_results = []
+              run_record["decisions"].append(decision_record)
 
-          candidates.sort(
-              key=lambda item: (
-                  item["decision"]["score"],
-                  item["reward"]["max"] or 0,
-                  -(
-                      item["competition"]
-                      if item["competition"]
-                      is not None
-                      else 0
-                  ),
-              ),
-              reverse=True
-          )
+              if reason != "bid_candidate":
+                  continue
 
-          for analysis in candidates:
-              if bids_submitted >= MAX_BIDS_PER_RUN:
-                  break
+              if bids_this_run >= MAX_BIDS_PER_RUN:
+                  continue
 
-              task_id = analysis[
-                  "task_id"
-              ]
-
-              existing = fetch_task_bids(
-                  task_id
-              )
-
-              if existing["ok"]:
-                  own_existing = [
-                      bid
-                      for bid in existing["bids"]
-                      if bid_belongs_to_identity(
-                          bid,
-                          username
-                      )
-                  ]
-
-                  if own_existing:
-                      print(
-                          "BID SKIPPED: existing "
-                          f"bid detected for "
-                          f"{task_id}"
-                      )
-
-                      analysis[
-                          "decision"
-                      ]["reason"] = (
-                          "already_bid"
-                      )
-
-                      continue
+              if str(post_id) in existing_bid_ids:
+                  print("BID: SKIPPED already tracked")
+                  continue
 
               amount = build_bid_amount(
-                  analysis["reward"]
+                  reward_low,
+                  reward_high,
               )
 
               if amount is None:
-                  print(
-                      "BID SKIPPED: invalid "
-                      f"bid amount for "
-                      f"{task_id}"
-                  )
+                  print("BID: SKIPPED invalid bid amount")
                   continue
 
               description = build_bid_description(
-                  next(
-                      task
-                      for task in tasks
-                      if get_task_id(task)
-                      == task_id
-                  ),
-                  analysis["capabilities"],
-                  analysis["reward"],
-              )
-
-              print("")
-              print(
-                  "BID CANDIDATE: "
-                  f"{task_id}"
-              )
-              print(
-                  f"BID AMOUNT: {amount} sats"
-              )
-              print(
-                  f"BID DESCRIPTION: "
-                  f"{description}"
-              )
-
-              response, data = submit_bid(
-                  task_id,
+                  task,
+                  capabilities,
                   amount,
-                  description
               )
 
-              result = {
-                  "task_id": task_id,
-                  "amount_sats": amount,
-                  "submitted_at": now_iso(),
-                  "score": analysis[
-                      "decision"
-                  ]["score"],
-                  "reason": analysis[
-                      "decision"
-                  ]["reason"],
-                  "http_status": response.status_code,
-                  "success": response.ok,
-              }
+              if not description:
+                  print("BID: SKIPPED no valid capability description")
+                  continue
 
-              if response.ok:
-                  bids_submitted += 1
-                  result["response"] = data
+              print(
+                  f"BID: ATTEMPT {amount} sats on {post_id}"
+              )
+
+              bid_response = api(
+                  "POST",
+                  f"/api/v1/marketplace/{post_id}/bid",
+                  json={
+                      "bid_amount_sats": amount,
+                      "bid_description": description,
+                  },
+              )
+
+              if bid_response.status_code in (200, 201):
+                  bids_this_run += 1
+                  run_record["bids_attempted"] += 1
+
+                  try:
+                      bid_data = bid_response.json()
+                  except Exception:
+                      bid_data = {}
+
+                  bid_id = first_value(
+                      bid_data,
+                      ["id", "bid_id", "uuid"],
+                  )
+
+                  record = {
+                      "timestamp_utc": now(),
+                      "task_id": post_id,
+                      "task_title": title,
+                      "bid_id": bid_id,
+                      "bid_amount_sats": amount,
+                      "score": score,
+                      "reason": reason,
+                      "capabilities_strong": capabilities["strong"],
+                  }
+
+                  memory["bids"].append(record)
+                  run_record["bids_created"].append(record)
+
+                  existing_bid_ids.add(str(post_id))
 
                   print(
-                      "BID SUBMITTED: "
-                      f"{task_id}"
+                      "BID: SUCCESS "
+                      + json.dumps(
+                          {
+                              "task_id": post_id,
+                              "bid_id": bid_id,
+                              "amount_sats": amount,
+                          },
+                          ensure_ascii=False,
+                      )
                   )
 
               else:
-                  result["error"] = data
-
                   print(
-                      "BID FAILED: "
-                      f"{task_id} "
-                      f"HTTP {response.status_code}"
+                      f"BID: FAILED HTTP {bid_response.status_code}"
                   )
 
-              bid_results.append(result)
+                  try:
+                      print(
+                          "BID ERROR: "
+                          + json.dumps(
+                              bid_response.json(),
+                              ensure_ascii=False,
+                          )
+                      )
+                  except Exception:
+                      print(
+                          "BID ERROR: "
+                          + bid_response.text[:1000]
+                      )
 
-          run_record = {
-              "timestamp_utc": now_iso(),
-              "version": "V9",
-              "tasks_received": len(tasks),
-              "tasks_analyzed": len(analyzed),
-              "candidates": len(candidates),
-              "bids_submitted": bids_submitted,
-              "accepted_reconciled": accepted_count,
-              "paid_reconciled": paid_count,
-              "gemini_enabled": GEMINI_ENABLED,
-              "external_ai_enabled": (
-                  EXTERNAL_AI_ENABLED
-              ),
-              "payments_enabled": (
-                  PAYMENTS_ENABLED
-              ),
-              "spending_enabled": (
-                  SPENDING_ENABLED
-              ),
-              "cost": 0,
-              "bid_results": bid_results,
-              "decision_summary": {
-                  "supply": sum(
-                      1
-                      for item in analyzed
-                      if item["direction"][
-                          "direction"
-                      ] == "SUPPLY"
-                  ),
-                  "demand": sum(
-                      1
-                      for item in analyzed
-                      if item["direction"][
-                          "direction"
-                      ] == "DEMAND"
-                  ),
-                  "unknown": sum(
-                      1
-                      for item in analyzed
-                      if item["direction"][
-                          "direction"
-                      ]
-                      == "UNKNOWN_DIRECTION"
-                  ),
-                  "actionable": len(
-                      candidates
-                  ),
-              },
-          }
-
-          memory["act"] = "ACT15"
-          memory["version"] = "V9"
-
-          memory.setdefault(
-              "runs",
-              []
-          ).append(
-              run_record
-          )
-
-          memory.setdefault(
-              "reconciliation",
-              []
-          ).extend(
-              reconciliation
-          )
-
-          memory.setdefault(
-              "bids",
-              []
-          ).extend(
-              bid_results
-          )
+          memory["runs"].append(run_record)
 
           save_memory(memory)
 
-          print("")
-          print("=== ACT15 V9 SUMMARY ===")
+          print()
           print(
-              f"Tasks: {len(tasks)}"
+              "RUN SUMMARY: "
+              + json.dumps(
+                  {
+                      "tasks": len(tasks),
+                      "bids_attempted": run_record["bids_attempted"],
+                      "bids_created": len(run_record["bids_created"]),
+                      "accepted": reconciliation["accepted"],
+                      "paid": reconciliation["paid"],
+                      "cost": 0,
+                  },
+                  ensure_ascii=False,
+              )
           )
-          print(
-              f"Demand: "
-              f"{run_record['decision_summary']['demand']}"
-          )
-          print(
-              f"Supply: "
-              f"{run_record['decision_summary']['supply']}"
-          )
-          print(
-              f"Unknown: "
-              f"{run_record['decision_summary']['unknown']}"
-          )
-          print(
-              f"Actionable: "
-              f"{len(candidates)}"
-          )
-          print(
-              f"Bids submitted: "
-              f"{bids_submitted}"
-          )
-          print(
-              f"Accepted reconciled: "
-              f"{accepted_count}"
-          )
-          print(
-              f"Paid reconciled: "
-              f"{paid_count}"
-          )
-          print("Cost: 0")
-          print("=== END ACT15 V9 ===")
+
+          print("=== ACT15 V9.1 COMPLETE ===")
           PY
 
-          python /tmp/act15_v9.py
+          python /tmp/act15_v9_1.py
 
       - name: Commit ACT15 memory
         run: |
-          set -euo pipefail
-
-          if git diff --quiet -- memory/nox_act_15_marketplace.json; then
-            echo "No ACT15 memory changes."
-            exit 0
-          fi
-
-          git config user.name "NØX ACT15"
-          git config user.email "nox-act15@users.noreply.github.com"
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
 
           git add memory/nox_act_15_marketplace.json
 
-          git commit -m "ACT15 V9 marketplace memory update" || true
+          if git diff --cached --quiet; then
+            echo "No ACT15 memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update ACT15 marketplace memory"
 
           for attempt in 1 2 3; do
-            if git pull --rebase origin main; then
-              if git push origin HEAD:main; then
-                echo "ACT15 memory pushed successfully."
-                exit 0
-              fi
-            fi
-
-            echo "Push attempt ${attempt} failed; retrying..."
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            echo "Push attempt $attempt failed, retrying..."
             sleep 3
           done
 
-          echo "Unable to push ACT15 memory after retries."
           exit 1
