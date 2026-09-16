@@ -1,0 +1,955 @@
+name: NØX ACT15 Memory Cleaner - Weekly
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "15 4 * * 0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act15-memory-cleaner
+  cancel-in-progress: false
+
+env:
+  MEMORY_FILE: memory/nox_act_15_marketplace.json
+  MAX_RECENT_ACTIONS: 300
+  MAX_PROTECTED_TASKS: 250
+  MAX_OPPORTUNITIES: 200
+  MAX_HISTORY: 500
+
+jobs:
+  clean-act15-memory:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync main before cleaning
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git rebase origin/main
+
+      - name: Clean ACT15 memory
+        run: |
+          python - <<'PY'
+          import copy
+          import hashlib
+          import json
+          import os
+          import shutil
+          import tempfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+
+          MEMORY_FILE = os.environ["MEMORY_FILE"]
+
+          MAX_RECENT_ACTIONS = int(
+              os.environ["MAX_RECENT_ACTIONS"]
+          )
+
+          MAX_PROTECTED_TASKS = int(
+              os.environ["MAX_PROTECTED_TASKS"]
+          )
+
+          MAX_OPPORTUNITIES = int(
+              os.environ["MAX_OPPORTUNITIES"]
+          )
+
+          MAX_HISTORY = int(
+              os.environ["MAX_HISTORY"]
+          )
+
+          print("=== NØX ACT15 MEMORY CLEANER ===")
+          print("Mode: WEEKLY CLEANUP")
+          print("Payments: False")
+          print("Spending: False")
+          print("Gemini: False")
+          print("External AI: False")
+          print("Cost: €0")
+          print()
+
+          if not os.path.exists(MEMORY_FILE):
+              raise SystemExit(
+                  f"Memory file not found: {MEMORY_FILE}"
+              )
+
+          with open(
+              MEMORY_FILE,
+              "r",
+              encoding="utf-8",
+          ) as handle:
+              original = json.load(handle)
+
+          if not isinstance(original, dict):
+              raise SystemExit(
+                  "ACT15 memory root is not a JSON object."
+              )
+
+          original_bytes = os.path.getsize(
+              MEMORY_FILE
+          )
+
+          original_actions = original.get(
+              "actions",
+              [],
+          )
+
+          if not isinstance(
+              original_actions,
+              list,
+          ):
+              original_actions = []
+
+          print(
+              f"Original file size: "
+              f"{original_bytes:,} bytes"
+          )
+
+          print(
+              f"Original actions: "
+              f"{len(original_actions):,}"
+          )
+
+          def now_iso():
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
+
+          def normalize(value):
+              if value is None:
+                  return ""
+
+              return str(value).strip().lower()
+
+          def task_id_of(obj):
+              if not isinstance(obj, dict):
+                  return None
+
+              for key in (
+                  "task_id",
+                  "taskId",
+              ):
+                  value = obj.get(key)
+
+                  if value not in (
+                      None,
+                      "",
+                  ):
+                      return str(value)
+
+              return None
+
+          def timestamp_of(obj):
+              if not isinstance(obj, dict):
+                  return ""
+
+              for key in (
+                  "timestamp",
+                  "timestamp_utc",
+                  "updated_at",
+                  "created_at",
+              ):
+                  value = obj.get(key)
+
+                  if value:
+                      return str(value)
+
+              return ""
+
+          def action_name(obj):
+              if not isinstance(obj, dict):
+                  return ""
+
+              return normalize(
+                  obj.get("action")
+              )
+
+          def status_of(obj):
+              if not isinstance(obj, dict):
+                  return ""
+
+              return normalize(
+                  obj.get("status")
+              )
+
+          def is_bid_related(obj):
+              action = action_name(obj)
+
+              if "bid" in action:
+                  return True
+
+              if any(
+                  key in obj
+                  for key in (
+                      "bid_id",
+                      "bidId",
+                      "bid_status",
+                      "bidStatus",
+                      "proposed_bid_sats",
+                  )
+              ):
+                  return True
+
+              return False
+
+          def is_protected_action(obj):
+              if not isinstance(obj, dict):
+                  return False
+
+              action = action_name(obj)
+              status = status_of(obj)
+
+              if is_bid_related(obj):
+                  return True
+
+              protected_statuses = {
+                  "pending",
+                  "accepted",
+                  "submitted",
+                  "already_bid",
+                  "won",
+                  "selected",
+                  "approved",
+              }
+
+              if status in protected_statuses:
+                  return True
+
+              important_actions = {
+                  "marketplace_bid",
+                  "marketplace_bid_submitted",
+                  "marketplace_bid_check",
+                  "marketplace_bid_error",
+                  "marketplace_task_accepted",
+                  "marketplace_payment_check",
+                  "marketplace_payment",
+              }
+
+              if action in important_actions:
+                  return True
+
+              return False
+
+          def canonical(obj):
+              return json.dumps(
+                  obj,
+                  sort_keys=True,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+
+          def fingerprint(obj):
+              raw = canonical(obj).encode(
+                  "utf-8"
+              )
+
+              return hashlib.sha256(
+                  raw
+              ).hexdigest()
+
+          # --------------------------------------------------
+          # 1. Remove exact duplicate actions.
+          # --------------------------------------------------
+
+          unique_actions = []
+          seen_fingerprints = set()
+          exact_duplicates = 0
+
+          for item in original_actions:
+              fp = fingerprint(item)
+
+              if fp in seen_fingerprints:
+                  exact_duplicates += 1
+                  continue
+
+              seen_fingerprints.add(fp)
+              unique_actions.append(item)
+
+          print(
+              f"Exact duplicate actions removed: "
+              f"{exact_duplicates:,}"
+          )
+
+          # --------------------------------------------------
+          # 2. Group actions by explicit task_id.
+          # --------------------------------------------------
+
+          by_task = defaultdict(list)
+          no_task_actions = []
+
+          for item in unique_actions:
+              task_id = task_id_of(item)
+
+              if task_id:
+                  by_task[task_id].append(
+                      item
+                  )
+              else:
+                  no_task_actions.append(item)
+
+          # --------------------------------------------------
+          # 3. Sort each task chronologically.
+          # --------------------------------------------------
+
+          for task_id in by_task:
+              by_task[task_id].sort(
+                  key=timestamp_of
+              )
+
+          # --------------------------------------------------
+          # 4. Protect tasks that still have meaningful
+          #    marketplace state.
+          # --------------------------------------------------
+
+          protected_task_ids = set()
+
+          terminal_statuses = {
+              "rejected",
+              "declined",
+              "lost",
+              "denied",
+              "error",
+              "failed",
+              "closed",
+              "cancelled",
+              "canceled",
+          }
+
+          for task_id, items in by_task.items():
+
+              recent = items[-1]
+
+              # Any explicit bid activity remains protected.
+              if any(
+                  is_bid_related(item)
+                  for item in items[-20:]
+              ):
+                  protected_task_ids.add(
+                      task_id
+                  )
+                  continue
+
+              # Accepted/pending states remain protected.
+              recent_status = status_of(
+                  recent
+              )
+
+              if recent_status not in (
+                  "",
+                  *terminal_statuses,
+              ):
+                  protected_task_ids.add(
+                      task_id
+                  )
+                  continue
+
+              # Explicit opportunity tracking remains useful.
+              for item in items[-10:]:
+                  action = action_name(item)
+
+                  if (
+                      "opportunity" in action
+                      or "learning" in action
+                  ):
+                      protected_task_ids.add(
+                          task_id
+                      )
+                      break
+
+          # Keep the most recently active protected tasks
+          # if there are unexpectedly many.
+          protected_sorted = sorted(
+              protected_task_ids,
+              key=lambda task_id:
+                  timestamp_of(
+                      by_task[task_id][-1]
+                  ),
+              reverse=True,
+          )
+
+          protected_sorted = protected_sorted[
+              :MAX_PROTECTED_TASKS
+          ]
+
+          protected_task_ids = set(
+              protected_sorted
+          )
+
+          print(
+              f"Protected task IDs: "
+              f"{len(protected_task_ids):,}"
+          )
+
+          # --------------------------------------------------
+          # 5. Preserve the latest meaningful record for every
+          #    protected task.
+          # --------------------------------------------------
+
+          protected_actions = []
+
+          for task_id in protected_sorted:
+              items = by_task.get(
+                  task_id,
+                  [],
+              )
+
+              if not items:
+                  continue
+
+              # Keep latest action.
+              protected_actions.append(
+                  items[-1]
+              )
+
+              # Also keep the latest bid-related action.
+              bid_items = [
+                  item
+                  for item in items
+                  if is_bid_related(item)
+              ]
+
+              if bid_items:
+                  latest_bid = bid_items[-1]
+
+                  if latest_bid is not items[-1]:
+                      protected_actions.append(
+                          latest_bid
+                      )
+
+          # --------------------------------------------------
+          # 6. Keep recent actions globally.
+          # --------------------------------------------------
+
+          recent_pool = sorted(
+              unique_actions,
+              key=timestamp_of,
+              reverse=True,
+          )
+
+          recent_actions = recent_pool[
+              :MAX_RECENT_ACTIONS
+          ]
+
+          # --------------------------------------------------
+          # 7. Merge protected + recent actions.
+          # --------------------------------------------------
+
+          merged = []
+          merged_fingerprints = set()
+
+          for item in (
+              protected_actions
+              + recent_actions
+          ):
+              fp = fingerprint(item)
+
+              if fp in merged_fingerprints:
+                  continue
+
+              merged_fingerprints.add(fp)
+              merged.append(item)
+
+          merged.sort(
+              key=timestamp_of
+          )
+
+          # --------------------------------------------------
+          # 8. Keep useful opportunity lists, deduplicated by
+          #    task_id when possible.
+          # --------------------------------------------------
+
+          def compact_task_list(
+              key,
+              limit,
+          ):
+              source = original.get(
+                  key,
+                  [],
+              )
+
+              if not isinstance(
+                  source,
+                  list,
+              ):
+                  return []
+
+              by_id = {}
+
+              without_id = []
+
+              for item in source:
+                  if not isinstance(
+                      item,
+                      dict,
+                  ):
+                      continue
+
+                  task_id = task_id_of(
+                      item
+                  )
+
+                  if task_id:
+                      by_id[task_id] = item
+                  else:
+                      without_id.append(item)
+
+              combined = list(
+                  by_id.values()
+              )
+
+              combined.extend(
+                  without_id
+              )
+
+              combined.sort(
+                  key=timestamp_of,
+                  reverse=True,
+              )
+
+              return combined[:limit]
+
+          unknown_reward = compact_task_list(
+              "unknown_reward_opportunities",
+              MAX_OPPORTUNITIES,
+          )
+
+          # Preserve other known opportunity lists if they exist.
+          paid_candidates = compact_task_list(
+              "paid_bid_candidates",
+              MAX_OPPORTUNITIES,
+          )
+
+          learning_candidates = compact_task_list(
+              "learning_candidates",
+              MAX_OPPORTUNITIES,
+          )
+
+          tip_opportunities = compact_task_list(
+              "tip_opportunities",
+              MAX_OPPORTUNITIES,
+          )
+
+          # --------------------------------------------------
+          # 9. Aggregate old action statistics.
+          # --------------------------------------------------
+
+          action_counter = Counter()
+          status_counter = Counter()
+          error_counter = Counter()
+
+          for item in unique_actions:
+
+              action = action_name(item)
+
+              if action:
+                  action_counter[action] += 1
+
+              status = status_of(item)
+
+              if status:
+                  status_counter[status] += 1
+
+              response = item.get(
+                  "response"
+              )
+
+              if isinstance(
+                  response,
+                  dict,
+              ):
+                  detail = response.get(
+                      "detail"
+                  )
+
+                  if isinstance(
+                      detail,
+                      dict,
+                  ):
+                      code = detail.get(
+                          "code"
+                      )
+
+                      message = detail.get(
+                          "message"
+                      )
+
+                      if code or message:
+                          signature = (
+                              str(code or "UNKNOWN")
+                              + ": "
+                              + str(
+                                  message
+                                  or "UNKNOWN"
+                              )
+                          )
+
+                          error_counter[
+                              signature
+                          ] += 1
+
+          # --------------------------------------------------
+          # 10. Preserve existing root fields that are not
+          #     explicitly managed by the cleaner.
+          # --------------------------------------------------
+
+          cleaned = copy.deepcopy(
+              original
+          )
+
+          cleaned["actions"] = merged
+
+          cleaned[
+              "unknown_reward_opportunities"
+          ] = unknown_reward
+
+          if (
+              "paid_bid_candidates"
+              in original
+          ):
+              cleaned[
+                  "paid_bid_candidates"
+              ] = paid_candidates
+
+          if (
+              "learning_candidates"
+              in original
+          ):
+              cleaned[
+                  "learning_candidates"
+              ] = learning_candidates
+
+          if (
+              "tip_opportunities"
+              in original
+          ):
+              cleaned[
+                  "tip_opportunities"
+              ] = tip_opportunities
+
+          # --------------------------------------------------
+          # 11. Add a compact historical summary instead of
+          #     keeping every old action forever.
+          # --------------------------------------------------
+
+          old_summary = original.get(
+              "cleaner_history",
+              [],
+          )
+
+          if not isinstance(
+              old_summary,
+              list,
+          ):
+              old_summary = []
+
+          cleaner_record = {
+              "timestamp_utc": now_iso(),
+              "source_actions":
+                  len(original_actions),
+              "unique_actions":
+                  len(unique_actions),
+              "exact_duplicates_removed":
+                  exact_duplicates,
+              "protected_tasks":
+                  len(protected_task_ids),
+              "actions_kept":
+                  len(merged),
+              "unknown_reward_opportunities_kept":
+                  len(unknown_reward),
+          }
+
+          old_summary.append(
+              cleaner_record
+          )
+
+          cleaned[
+              "cleaner_history"
+          ] = old_summary[
+              -MAX_HISTORY:
+          ]
+
+          cleaned[
+              "cleaner_last_run"
+          ] = cleaner_record
+
+          cleaned[
+              "cleaner_statistics"
+          ] = {
+              "action_counts":
+                  dict(
+                      action_counter.most_common(
+                          50
+                      )
+                  ),
+              "status_counts":
+                  dict(
+                      status_counter.most_common(
+                          50
+                      )
+                  ),
+              "error_counts":
+                  dict(
+                      error_counter.most_common(
+                          50
+                      )
+                  ),
+          }
+
+          cleaned[
+              "updated_at"
+          ] = now_iso()
+
+          cleaned[
+              "cleaner_version"
+          ] = "V1"
+
+          # --------------------------------------------------
+          # 12. Validate BEFORE replacing the real file.
+          # --------------------------------------------------
+
+          temp_fd, temp_path = tempfile.mkstemp(
+              prefix="act15_clean_",
+              suffix=".json",
+          )
+
+          os.close(temp_fd)
+
+          try:
+              with open(
+                  temp_path,
+                  "w",
+                  encoding="utf-8",
+              ) as handle:
+                  json.dump(
+                      cleaned,
+                      handle,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+                  handle.write("\n")
+
+              with open(
+                  temp_path,
+                  "r",
+                  encoding="utf-8",
+              ) as handle:
+                  validation = json.load(
+                      handle
+                  )
+
+              if not isinstance(
+                  validation,
+                  dict,
+              ):
+                  raise RuntimeError(
+                      "Validation failed: root is not an object."
+                  )
+
+              if not isinstance(
+                  validation.get(
+                      "actions",
+                      [],
+                  ),
+                  list,
+              ):
+                  raise RuntimeError(
+                      "Validation failed: actions is not a list."
+                  )
+
+              # --------------------------------------------------
+              # 13. Safety checks.
+              # --------------------------------------------------
+
+              original_task_ids = {
+                  task_id_of(item)
+                  for item in original_actions
+                  if task_id_of(item)
+              }
+
+              cleaned_task_ids = {
+                  task_id_of(item)
+                  for item in validation.get(
+                      "actions",
+                      [],
+                  )
+                  if task_id_of(item)
+              }
+
+              missing_protected = (
+                  protected_task_ids
+                  - cleaned_task_ids
+              )
+
+              if missing_protected:
+                  raise RuntimeError(
+                      "Safety check failed: "
+                      f"{len(missing_protected)} "
+                      "protected task IDs disappeared."
+                  )
+
+              cleaned_bytes = os.path.getsize(
+                  temp_path
+              )
+
+              reduction = (
+                  100
+                  * (
+                      1
+                      - (
+                          cleaned_bytes
+                          / max(
+                              original_bytes,
+                              1,
+                          )
+                      )
+                  )
+              )
+
+              print()
+              print(
+                  "=== CLEANER REPORT ==="
+              )
+
+              print(
+                  f"Original bytes: "
+                  f"{original_bytes:,}"
+              )
+
+              print(
+                  f"Cleaned bytes: "
+                  f"{cleaned_bytes:,}"
+              )
+
+              print(
+                  f"Estimated reduction: "
+                  f"{reduction:.1f}%"
+              )
+
+              print(
+                  f"Original actions: "
+                  f"{len(original_actions):,}"
+              )
+
+              print(
+                  f"Unique actions: "
+                  f"{len(unique_actions):,}"
+              )
+
+              print(
+                  f"Actions kept: "
+                  f"{len(merged):,}"
+              )
+
+              print(
+                  f"Protected tasks: "
+                  f"{len(protected_task_ids):,}"
+              )
+
+              print(
+                  f"Unknown reward opportunities kept: "
+                  f"{len(unknown_reward):,}"
+              )
+
+              # Never replace the file if the result is larger.
+              if cleaned_bytes >= original_bytes:
+                  print(
+                      "CLEANUP SKIPPED: "
+                      "cleaned file is not smaller."
+                  )
+                  raise SystemExit(0)
+
+              # ------------------------------------------------
+              # 14. Atomic replacement.
+              # ------------------------------------------------
+
+              backup_path = (
+                  MEMORY_FILE
+                  + ".preclean.bak"
+              )
+
+              shutil.copy2(
+                  MEMORY_FILE,
+                  backup_path,
+              )
+
+              os.replace(
+                  temp_path,
+                  MEMORY_FILE,
+              )
+
+              # Final validation of the actual file.
+              with open(
+                  MEMORY_FILE,
+                  "r",
+                  encoding="utf-8",
+              ) as handle:
+                  final_data = json.load(
+                      handle
+                  )
+
+              if not isinstance(
+                  final_data,
+                  dict,
+              ):
+                  raise RuntimeError(
+                      "Final validation failed."
+                  )
+
+              print()
+              print(
+                  "MEMORY REPLACEMENT: OK"
+              )
+
+              # The .bak is deliberately not committed.
+              # Git history already retains the previous version.
+              os.remove(
+                  backup_path
+              )
+
+          finally:
+              if os.path.exists(
+                  temp_path
+              ):
+                  os.remove(
+                      temp_path
+                  )
+
+          print()
+          print(
+              "ACT15_MEMORY_CLEANER: SUCCESS"
+          )
+          PY
+
+      - name: Commit cleaned ACT15 memory
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX Origin"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_act_15_marketplace.json
+
+          if git diff --cached --quiet; then
+            echo "No ACT15 memory changes."
+            exit 0
+          fi
+
+          git commit -m "NØX ACT15: weekly memory cleanup"
+
+          git fetch origin main
+          git rebase origin/main
+
+          git push origin HEAD:main
+
+          echo "ACT15 MEMORY CLEANER: PUSHED"
