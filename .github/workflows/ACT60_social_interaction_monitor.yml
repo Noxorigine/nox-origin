@@ -1,4 +1,4 @@
-name: NØX ACT60 - Social Interaction Monitor V1
+name: NØX ACT60 V2 - Social Interaction Tracker
 
 on:
   workflow_dispatch:
@@ -9,27 +9,26 @@ permissions:
   contents: write
 
 concurrency:
-  group: nox-act60-social-monitor
+  group: nox-act60-social-interaction
   cancel-in-progress: false
 
 env:
   COLONY_BASE_URL: https://thecolony.ai
-  MEMORY_FILE: memory/nox_act60_social.json
+  COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
   NOX_USERNAME: nox_origine
-  MAX_POSTS: "100"
-  MAX_COMMENTS: "300"
-  MAX_HISTORY: "100"
+  MEMORY_FILE: memory/nox_act60_social.json
+  MAX_ACTIONS: "300"
+  MAX_HISTORY: "200"
+  MAX_AGENTS: "100"
 
 jobs:
-  social-monitor:
+  social-interaction:
     runs-on: ubuntu-latest
     timeout-minutes: 8
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,410 +36,665 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: python -m pip install requests
-
-      - name: Synchronize main
         run: |
-          git fetch origin main
-          git rebase origin/main
+          python -m pip install --disable-pip-version-check requests
 
-      - name: Analyze NØX social activity
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+      - name: Track NØX social interactions
+        shell: bash
         run: |
+          set -euo pipefail
+
           python - <<'PY'
           import json
           import os
-          import re
+          import sys
           from datetime import datetime, timezone
           from pathlib import Path
+          from urllib.parse import quote
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
           import requests
 
           BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
           API_KEY = os.environ["COLONY_API_KEY"]
+          USERNAME = os.environ["NOX_USERNAME"]
           MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
-          NOX_USERNAME = os.environ["NOX_USERNAME"].lower().lstrip("@")
-          MAX_POSTS = int(os.environ["MAX_POSTS"])
-          MAX_COMMENTS = int(os.environ["MAX_COMMENTS"])
+          MAX_ACTIONS = int(os.environ["MAX_ACTIONS"])
           MAX_HISTORY = int(os.environ["MAX_HISTORY"])
-
-          print("=== NØX ACT60 - SOCIAL INTERACTION MONITOR V1 ===")
-          print("Gemini: False")
-          print("External AI: False")
-          print("Publishing: False")
-          print("Messaging: False")
-          print("Payments: False")
-          print("Cost: €0")
+          MAX_AGENTS = int(os.environ["MAX_AGENTS"])
 
           if not API_KEY:
               raise SystemExit("COLONY_API_KEY is missing")
 
-          session = requests.Session()
+          # ------------------------------------------------------------
+          # Helpers
+          # ------------------------------------------------------------
 
-          def request_json(method, path, **kwargs):
-              try:
-                  response = session.request(
-                      method,
-                      BASE + path,
-                      timeout=25,
-                      **kwargs
-                  )
-                  if response.status_code == 404:
-                      print(f"ENDPOINT UNAVAILABLE: {path}")
-                      return None
-                  if response.status_code == 429:
-                      print(f"RATE LIMIT: {path}")
-                      return None
-                  if not response.ok:
-                      print(
-                          f"REQUEST FAILED: {path} "
-                          f"HTTP {response.status_code}"
-                      )
-                      return None
-                  return response.json()
-              except Exception as exc:
-                  print(f"REQUEST ERROR: {path}: {exc}")
-                  return None
-
-          # Authenticate using the same method as the existing workflows.
-          auth = session.post(
-              f"{BASE}/api/v1/auth/token",
-              json={"api_key": API_KEY},
-              timeout=25
-          )
-
-          print(f"AUTH STATUS: {auth.status_code}")
-
-          if not auth.ok:
-              raise SystemExit("Authentication failed")
-
-          auth_data = auth.json()
-          token = (
-              auth_data.get("access_token")
-              or auth_data.get("token")
-              or auth_data.get("jwt")
-          )
-
-          if not token:
-              raise SystemExit("Authentication token missing")
-
-          session.headers.update({
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/json",
-              "User-Agent": "NOX-Origin-ACT60/1.0"
-          })
-
-          def now():
+          def utc_now():
               return datetime.now(timezone.utc).isoformat()
 
-          def load_memory():
-              if not MEMORY_FILE.exists():
-                  return {
-                      "version": "ACT60-V1",
-                      "observations": [],
-                      "known_interactions": []
-                  }
-
+          def compact(value, limit=1500):
               try:
-                  data = json.loads(
-                      MEMORY_FILE.read_text(encoding="utf-8")
-                  )
-                  return data if isinstance(data, dict) else {}
-              except Exception:
-                  return {
-                      "version": "ACT60-V1",
-                      "observations": [],
-                      "known_interactions": []
-                  }
-
-          def save_memory(data):
-              MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-              tmp = MEMORY_FILE.with_suffix(".tmp")
-
-              tmp.write_text(
-                  json.dumps(
-                      data,
+                  text = json.dumps(
+                      value,
                       ensure_ascii=False,
-                      indent=2
-                  ) + "\n",
-                  encoding="utf-8"
-              )
+                      separators=(",", ":")
+                  )
+              except Exception:
+                  text = str(value)
 
-              tmp.replace(MEMORY_FILE)
+              return text[:limit]
 
-          def as_list(data):
-              if isinstance(data, list):
-                  return data
+          def normalize_items(value):
+              if isinstance(value, list):
+                  return value
 
-              if isinstance(data, dict):
+              if isinstance(value, dict):
                   for key in (
                       "items",
+                      "results",
                       "posts",
-                      "comments",
-                      "data",
-                      "results"
+                      "conversations",
+                      "actions",
                   ):
-                      if isinstance(data.get(key), list):
-                          return data[key]
+                      if isinstance(value.get(key), list):
+                          return value[key]
 
               return []
 
-          def get_value(obj, *keys):
-              if not isinstance(obj, dict):
+          # ------------------------------------------------------------
+          # Load memory
+          # ------------------------------------------------------------
+
+          if MEMORY_FILE.exists():
+              try:
+                  memory = json.loads(
+                      MEMORY_FILE.read_text(encoding="utf-8")
+                  )
+              except Exception:
+                  memory = {}
+          else:
+              memory = {}
+
+          if not isinstance(memory, dict):
+              memory = {}
+
+          history = memory.get("history", [])
+          if not isinstance(history, list):
+              history = []
+
+          # ------------------------------------------------------------
+          # Authenticate
+          # ------------------------------------------------------------
+
+          auth = requests.post(
+              f"{BASE}/api/v1/auth/token",
+              headers={
+                  "Accept": "application/json",
+                  "Content-Type": "application/json",
+              },
+              json={"api_key": API_KEY},
+              timeout=30,
+          )
+
+          print(f"AUTH /api/v1/auth/token -> {auth.status_code}")
+          auth.raise_for_status()
+
+          token_data = auth.json()
+          token = (
+              token_data.get("access_token")
+              or token_data.get("token")
+              or token_data.get("jwt")
+          )
+
+          if not token:
+              raise SystemExit("No access token returned")
+
+          HEADERS = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json",
+          }
+
+          SESSION = requests.Session()
+          SESSION.headers.update(HEADERS)
+
+          def get(path, params=None):
+              response = SESSION.get(
+                  BASE + path,
+                  params=params,
+                  timeout=30,
+              )
+
+              if response.status_code == 429:
+                  print("RATE_LIMIT:", path)
                   return None
 
-              for key in keys:
-                  if obj.get(key) is not None:
-                      return obj[key]
-
-              return None
-
-          def extract_author(obj):
-              if not isinstance(obj, dict):
-                  return ""
-
-              author = (
-                  obj.get("author")
-                  or obj.get("user")
-                  or obj.get("creator")
-                  or {}
-              )
-
-              if isinstance(author, dict):
-                  value = get_value(
-                      author,
-                      "username",
-                      "handle",
-                      "name"
-                  )
-              else:
-                  value = author
-
-              value = value or get_value(
-                  obj,
-                  "username",
-                  "author_username",
-                  "user_name"
-              )
-
-              return str(value or "").lower().lstrip("@")
-
-          def extract_id(obj):
-              value = get_value(
-                  obj,
-                  "id",
-                  "post_id",
-                  "comment_id",
-                  "uuid"
-              )
-              return str(value) if value is not None else ""
-
-          def extract_parent_id(obj):
-              value = get_value(
-                  obj,
-                  "post_id",
-                  "parent_id",
-                  "parent_post_id",
-                  "postId"
-              )
-              return str(value) if value is not None else ""
-
-          def extract_title(obj):
-              return str(
-                  get_value(obj, "title", "body", "content", "text")
-                  or ""
-              )[:160].replace("\n", " ")
-
-          # 1. Verify identity.
-          me = request_json("GET", "/api/v1/users/me")
-
-          if not me:
-              raise SystemExit("Unable to verify NØX identity")
-
-          real_username = extract_author(me)
-          nox_ids = set()
-
-          for key in ("id", "user_id", "agent_id", "uuid"):
-              if me.get(key) is not None:
-                  nox_ids.add(str(me[key]))
-
-          nox_ids.add(NO X_USERNAME if False else NOX_USERNAME)
-
-          print("IDENTITY:", json.dumps(me, ensure_ascii=False)[:500])
-
-          # 2. Retrieve recent posts.
-          posts_data = request_json(
-              "GET",
-              f"/api/v1/posts?limit={MAX_POSTS}"
-          )
-
-          posts = as_list(posts_data)
-
-          # Some API responses may expose a paginated structure.
-          if not posts and isinstance(posts_data, dict):
-              posts = as_list(posts_data.get("data"))
-
-          print("POSTS RETRIEVED:", len(posts))
-
-          # 3. Identify NØX's own posts.
-          own_post_ids = set()
-
-          for post in posts:
-              author = extract_author(post)
-              post_id = extract_id(post)
-
-              if (
-                  author == NOX_USERNAME
-                  or author == real_username
-                  or str(get_value(post, "author_id", "user_id")) in nox_ids
-              ):
-                  if post_id:
-                      own_post_ids.add(post_id)
-
-          print("NØX OWN POSTS:", len(own_post_ids))
-
-          # 4. Retrieve comments.
-          # The endpoint is tested without inventing data.
-          comments_data = request_json(
-              "GET",
-              f"/api/v1/comments?limit={MAX_COMMENTS}"
-          )
-
-          comments = as_list(comments_data)
-
-          print("COMMENTS RETRIEVED:", len(comments))
-
-          # 5. Detect comments authored by NØX on other agents' posts.
-          external_comments = []
-
-          for comment in comments:
-              author = extract_author(comment)
-              parent_id = extract_parent_id(comment)
-              comment_id = extract_id(comment)
-
-              if author != NOX_USERNAME and author != real_username:
-                  continue
-
-              if not comment_id:
-                  continue
-
-              # A comment without a resolvable parent is not
-              # counted as an external interaction.
-              if not parent_id or parent_id in own_post_ids:
-                  continue
-
-              external_comments.append({
-                  "comment_id": comment_id,
-                  "post_id": parent_id,
-                  "content_preview": extract_title(comment),
-                  "timestamp": get_value(
-                      comment,
-                      "created_at",
-                      "createdAt",
-                      "timestamp"
-                  ),
-                  "type": "comment_on_external_post"
-              })
-
-          # 6. Identify other agents involved.
-          other_agents = set()
-
-          for comment in external_comments:
-              parent_id = comment["post_id"]
-
-              for post in posts:
-                  if extract_id(post) != parent_id:
-                      continue
-
-                  author = extract_author(post)
-
-                  if author and author != NOX_USERNAME:
-                      other_agents.add(author)
-
-          # 7. Build a stable observation.
-          observation = {
-              "timestamp_utc": now(),
-              "posts_retrieved": len(posts),
-              "comments_retrieved": len(comments),
-              "nox_own_posts": len(own_post_ids),
-              "external_comments_detected": len(external_comments),
-              "agents_contacted": sorted(other_agents),
-              "interactions": external_comments[:50],
-              "data_quality": {
-                  "comments_endpoint_available": comments_data is not None,
-                  "posts_endpoint_available": posts_data is not None
-              }
-          }
-
-          memory = load_memory()
-
-          memory.setdefault("observations", [])
-          memory.setdefault("known_interactions", [])
-
-          memory["observations"].append(observation)
-          memory["observations"] = memory["observations"][-MAX_HISTORY:]
-
-          known = {
-              str(item.get("comment_id"))
-              for item in memory["known_interactions"]
-              if isinstance(item, dict)
-          }
-
-          new_interactions = []
-
-          for item in external_comments:
-              if item["comment_id"] not in known:
-                  new_interactions.append(item)
-                  memory["known_interactions"].append(item)
-
-          memory["known_interactions"] = (
-              memory["known_interactions"][-1000:]
-          )
-
-          memory["last_run"] = observation
-          memory["last_new_interactions"] = len(new_interactions)
-
-          save_memory(memory)
-
-          # 8. Condensed diagnostic output.
-          print("")
-          print("=== ACT60 RESULT ===")
-          print("External comments:", len(external_comments))
-          print("New interactions:", len(new_interactions))
-          print("Other agents:", len(other_agents))
-
-          if other_agents:
-              print("Agents:", ", ".join(sorted(other_agents)[:20]))
-
-          if new_interactions:
-              print("--- NEW INTERACTIONS ---")
-              for item in new_interactions[:10]:
+              if response.status_code >= 400:
                   print(
-                      f"{item['comment_id']} -> "
-                      f"post {item['post_id']}: "
-                      f"{item['content_preview']}"
+                      f"GET {path} -> {response.status_code}: "
+                      f"{response.text[:500]}"
                   )
+                  return None
 
-          print("MEMORY FILE:", MEMORY_FILE)
-          print("ACT60_RESULT: SUCCESS")
+              try:
+                  return response.json()
+              except Exception:
+                  return None
+
+          # ------------------------------------------------------------
+          # Identity
+          # ------------------------------------------------------------
+
+          me = get("/api/v1/users/me")
+
+          if not isinstance(me, dict):
+              raise SystemExit("Unable to retrieve NØX identity")
+
+          returned_username = str(
+              me.get("username", "")
+          ).strip()
+
+          print("NØX identity:", returned_username)
+
+          if returned_username != USERNAME:
+              raise SystemExit(
+                  f"Wrong Colony identity: expected {USERNAME}, "
+                  f"received {returned_username}"
+              )
+
+          nox_id = str(me.get("id", "")).strip()
+
+          # ------------------------------------------------------------
+          # 1. Get NØX actions
+          #
+          # This is the authoritative activity surface:
+          # post_created / comment_created / dm_sent
+          # ------------------------------------------------------------
+
+          actions = []
+          cursor = None
+
+          while len(actions) < MAX_ACTIONS:
+              params = {
+                  "kinds": "comment_created,dm_sent,post_created",
+                  "limit": min(200, MAX_ACTIONS - len(actions)),
+              }
+
+              if cursor:
+                  params["cursor"] = cursor
+
+              result = get(
+                  "/api/v1/me/actions",
+                  params=params
+              )
+
+              if not isinstance(result, dict):
+                  break
+
+              page_items = result.get("items") or []
+
+              if not isinstance(page_items, list):
+                  break
+
+              actions.extend(page_items)
+
+              if not result.get("has_more"):
+                  break
+
+              cursor = result.get("next_cursor")
+
+              if not cursor:
+                  break
+
+          print("NØX actions retrieved:", len(actions))
+
+          # ------------------------------------------------------------
+          # 2. Separate action types
+          # ------------------------------------------------------------
+
+          comments = [
+              x for x in actions
+              if isinstance(x, dict)
+              and x.get("kind") == "comment_created"
+          ]
+
+          dms = [
+              x for x in actions
+              if isinstance(x, dict)
+              and x.get("kind") == "dm_sent"
+          ]
+
+          posts = [
+              x for x in actions
+              if isinstance(x, dict)
+              and x.get("kind") == "post_created"
+          ]
+
+          print("Own comments:", len(comments))
+          print("Own DMs:", len(dms))
+          print("Own posts:", len(posts))
+
+          # ------------------------------------------------------------
+          # 3. Resolve parent posts for NØX comments
+          #
+          # parent_id = post ID according to Colony API.
+          # We fetch the parent post to determine its author.
+          # ------------------------------------------------------------
+
+          parent_ids = sorted({
+              str(x.get("parent_id"))
+              for x in comments
+              if x.get("parent_id")
+          })
+
+          post_cache = {}
+
+          def fetch_post(post_id):
+              data = get(
+                  f"/api/v1/posts/{quote(post_id, safe='')}"
+              )
+              return post_id, data
+
+          if parent_ids:
+              workers = min(8, len(parent_ids))
+
+              with ThreadPoolExecutor(
+                  max_workers=workers
+              ) as executor:
+
+                  futures = [
+                      executor.submit(fetch_post, post_id)
+                      for post_id in parent_ids
+                  ]
+
+                  for future in as_completed(futures):
+                      try:
+                          post_id, data = future.result()
+
+                          if isinstance(data, dict):
+                              post_cache[post_id] = data
+
+                      except Exception as exc:
+                          print(
+                              "POST_RESOLVE_ERROR:",
+                              str(exc)[:300]
+                          )
+
+          # ------------------------------------------------------------
+          # 4. Classify comments
+          # ------------------------------------------------------------
+
+          external_comments = []
+          own_post_replies = []
+
+          agent_names = set()
+
+          for action in comments:
+              parent_id = str(
+                  action.get("parent_id") or ""
+              )
+
+              post = post_cache.get(parent_id)
+
+              if not post:
+                  continue
+
+              author = post.get("author")
+
+              if not isinstance(author, dict):
+                  author = {}
+
+              author_username = str(
+                  author.get("username")
+                  or post.get("author_username")
+                  or ""
+              ).strip()
+
+              if not author_username:
+                  continue
+
+              created_at = action.get("created_at")
+
+              record = {
+                  "kind": "comment",
+                  "comment_id": action.get("resource_id"),
+                  "post_id": parent_id,
+                  "post_author": author_username,
+                  "created_at": created_at,
+              }
+
+              if author_username.lower() == USERNAME.lower():
+                  record["interaction"] = "reply_on_own_post"
+                  own_post_replies.append(record)
+              else:
+                  record["interaction"] = "comment_on_other_agent"
+                  external_comments.append(record)
+                  agent_names.add(author_username)
+
+          # ------------------------------------------------------------
+          # 5. Resolve DM conversation partners
+          # ------------------------------------------------------------
+
+          conversations = normalize_items(
+              get(
+                  "/api/v1/messages/conversations",
+                  params={
+                      "limit": 100,
+                      "include_archived": "true",
+                  },
+              ) or []
+          )
+
+          conversation_map = {}
+
+          for conversation in conversations:
+              if not isinstance(conversation, dict):
+                  continue
+
+              conversation_id = str(
+                  conversation.get("id") or ""
+              )
+
+              other_user = conversation.get("other_user")
+
+              if conversation_id and isinstance(
+                  other_user,
+                  dict
+              ):
+                  conversation_map[conversation_id] = other_user
+
+          dm_records = []
+
+          for action in dms:
+              conversation_id = str(
+                  action.get("parent_id") or ""
+              )
+
+              other = conversation_map.get(
+                  conversation_id,
+                  {}
+              )
+
+              other_username = str(
+                  other.get("username") or ""
+              ).strip()
+
+              record = {
+                  "kind": "dm_sent",
+                  "message_id": action.get("resource_id"),
+                  "conversation_id": conversation_id,
+                  "agent": other_username or "unknown",
+                  "created_at": action.get("created_at"),
+              }
+
+              dm_records.append(record)
+
+              if other_username:
+                  agent_names.add(other_username)
+
+          # ------------------------------------------------------------
+          # 6. Following list
+          # ------------------------------------------------------------
+
+          following_result = get(
+              "/api/v1/users/me/following",
+              params={
+                  "limit": 100,
+                  "page": 1,
+              },
+          ) or {}
+
+          following = normalize_items(following_result)
+
+          following_names = []
+
+          for user in following:
+              if not isinstance(user, dict):
+                  continue
+
+              name = str(
+                  user.get("username") or ""
+              ).strip()
+
+              if name and name.lower() != USERNAME.lower():
+                  following_names.append(name)
+
+          # ------------------------------------------------------------
+          # 7. Build interaction history
+          # ------------------------------------------------------------
+
+          current_records = (
+              external_comments
+              + own_post_replies
+              + dm_records
+          )
+
+          # Stable deduplication
+          existing_keys = {
+              (
+                  x.get("kind"),
+                  x.get("comment_id") or x.get("message_id"),
+              )
+              for x in history
+              if isinstance(x, dict)
+          }
+
+          for record in current_records:
+              key = (
+                  record.get("kind"),
+                  record.get("comment_id")
+                  or record.get("message_id"),
+              )
+
+              if key in existing_keys:
+                  continue
+
+              history.append(record)
+              existing_keys.add(key)
+
+          # newest first
+          history.sort(
+              key=lambda x: str(
+                  x.get("created_at") or ""
+              ),
+              reverse=True,
+          )
+
+          history = history[:MAX_HISTORY]
+
+          # ------------------------------------------------------------
+          # 8. Agent interaction summary
+          # ------------------------------------------------------------
+
+          interaction_counts = {}
+
+          for record in history:
+              if not isinstance(record, dict):
+                  continue
+
+              agent = (
+                  record.get("post_author")
+                  or record.get("agent")
+              )
+
+              if not agent:
+                  continue
+
+              if agent.lower() == USERNAME.lower():
+                  continue
+
+              interaction_counts[agent] = (
+                  interaction_counts.get(agent, 0) + 1
+              )
+
+          top_agents = sorted(
+              interaction_counts.items(),
+              key=lambda item: (-item[1], item[0].lower()),
+          )[:MAX_AGENTS]
+
+          # ------------------------------------------------------------
+          # 9. Compact memory
+          # ------------------------------------------------------------
+
+          now = utc_now()
+
+          memory_out = {
+              "version": "ACT60_V2",
+              "updated_at": now,
+              "username": USERNAME,
+
+              "summary": {
+                  "external_agent_comments": len(
+                      external_comments
+                  ),
+                  "replies_on_nox_posts": len(
+                      own_post_replies
+                  ),
+                  "dms_sent": len(dms),
+                  "unique_agents_interacted": len(
+                      interaction_counts
+                  ),
+                  "following_count": len(
+                      following_names
+                  ),
+              },
+
+              "agents_interacted": [
+                  {
+                      "username": username,
+                      "interactions": count,
+                  }
+                  for username, count in top_agents
+              ],
+
+              "following": following_names[:MAX_AGENTS],
+
+              "recent_external_comments":
+                  external_comments[:50],
+
+              "recent_replies_received_context":
+                  own_post_replies[:50],
+
+              "recent_dms":
+                  dm_records[:50],
+
+              "history": history,
+
+              "last_run": {
+                  "timestamp": now,
+                  "actions_scanned": len(actions),
+                  "comments_scanned": len(comments),
+                  "posts_scanned": len(posts),
+                  "dms_scanned": len(dms),
+              },
+
+              "policy": {
+                  "publishing": False,
+                  "commenting": False,
+                  "messaging": False,
+                  "payments": False,
+                  "spending": False,
+                  "gemini_used": False,
+                  "external_ai_used": False,
+                  "project_cost_eur": 0,
+              },
+          }
+
+          MEMORY_FILE.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          MEMORY_FILE.write_text(
+              json.dumps(
+                  memory_out,
+                  indent=2,
+                  ensure_ascii=False,
+              ),
+              encoding="utf-8",
+          )
+
+          # ------------------------------------------------------------
+          # 10. Condensed GitHub output
+          # ------------------------------------------------------------
+
+          print("")
+          print("=== NØX ACT60 V2 - SOCIAL INTERACTION ===")
+          print("Timestamp:", now)
+          print("Identity:", USERNAME)
+          print("")
+          print("COMMENTS BY NØX ON OTHER AGENTS:",
+                len(external_comments))
+          print("REPLIES ON NØX POSTS:",
+                len(own_post_replies))
+          print("DMS SENT:",
+                len(dms))
+          print("UNIQUE AGENTS INTERACTED:",
+                len(interaction_counts))
+          print("FOLLOWING:",
+                len(following_names))
+          print("")
+
+          print("TOP INTERACTED AGENTS:")
+
+          if top_agents:
+              for username, count in top_agents[:15]:
+                  print(f"  @{username}: {count}")
+          else:
+              print("  none")
+
+          print("")
+          print("RECENT EXTERNAL COMMENTS:")
+
+          if external_comments:
+              for item in external_comments[:10]:
+                  print(
+                      f"  {item.get('created_at')} | "
+                      f"@{item.get('post_author')} | "
+                      f"post={item.get('post_id')}"
+                  )
+          else:
+              print("  none")
+
+          print("")
+          print("RECENT DMS:")
+
+          if dm_records:
+              for item in dm_records[:10]:
+                  print(
+                      f"  {item.get('created_at')} | "
+                      f"@{item.get('agent')}"
+                  )
+          else:
+              print("  none")
+
+          print("")
+          print("MEMORY:", MEMORY_FILE)
+          print("")
+          print("Gemini: False")
+          print("External AI: False")
+          print("Publishing: False")
+          print("Commenting: False")
+          print("Messaging: False")
+          print("Payments: False")
+          print("Spending: False")
+          print("Cost: €0")
+          print("")
+          print("ACT60_STATUS: ACTIVE")
+
           PY
 
       - name: Commit ACT60 memory
         run: |
-          set -euo pipefail
-
-          git config user.name "NØX Origin"
-          git config user.email "nox-origin@users.noreply.github.com"
+          git config user.name "NØX ACT60"
+          git config user.email "nox-act60@users.noreply.github.com"
 
           git add memory/nox_act60_social.json
 
           if git diff --cached --quiet; then
-            echo "No ACT60 memory changes."
+            echo "No ACT60 memory change."
             exit 0
           fi
 
-          git commit -m "NØX ACT60: update social interaction history"
-
-          git fetch origin main
-          git rebase origin/main
-          git push origin HEAD:main
+          git commit -m "chore: update NØX ACT60 social interaction memory"
+          git push
