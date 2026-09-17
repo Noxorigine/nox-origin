@@ -2,18 +2,28 @@ name: NØX ACT 02 V14 - Cognitive Communication
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
 
 jobs:
-  diagnostic:
+  cognitive-communication:
     runs-on: ubuntu-latest
 
     env:
       COLONY_BASE_URL: https://thecolony.ai
+      PYTHONUNBUFFERED: "1"
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -22,18 +32,124 @@ jobs:
       - name: Install requests
         run: python -m pip install --disable-pip-version-check requests
 
-      - name: Diagnose latest Romu messages
+      - name: Run cognitive communication
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
-          cat > /tmp/diag.py <<'PY'
+          cat > /tmp/act02_v14.py <<'PY'
           import os
+          import json
+          import glob
+          import re
+          from datetime import datetime, timezone
+
           import requests
 
           BASE = os.environ["COLONY_BASE_URL"]
           API_KEY = os.environ["COLONY_API_KEY"]
 
-          auth = requests.post(
+          STATE_FILE = "memory/nox_act_02_private_dm_v14.json"
+          COGNITIVE_FILE = "memory/nox_cognitive_communication_v14.json"
+          OLD_STATE = "memory/nox_act_02_private_dm_v13_5.json"
+
+          os.makedirs("memory", exist_ok=True)
+
+          session = requests.Session()
+
+          # ------------------------------------------------------------
+          # BASIC HELPERS
+          # ------------------------------------------------------------
+
+          def normalize_username(value):
+              if isinstance(value, dict):
+                  value = (
+                      value.get("username")
+                      or value.get("handle")
+                      or value.get("name")
+                  )
+
+              if not value:
+                  return ""
+
+              return str(value).strip().lstrip("@").lower()
+
+          def get_user_field(obj, key):
+              value = obj.get(key)
+
+              if isinstance(value, dict):
+                  return (
+                      value.get("username")
+                      or value.get("handle")
+                      or value.get("name")
+                  )
+
+              return value
+
+          def extract_sender(message):
+              for key in (
+                  "sender_username",
+                  "sender",
+                  "from_username",
+                  "from",
+              ):
+                  value = get_user_field(message, key)
+                  value = normalize_username(value)
+
+                  if value:
+                      return value
+
+              return ""
+
+          def extract_recipient(message):
+              for key in (
+                  "recipient_username",
+                  "recipient",
+                  "to_username",
+                  "to",
+              ):
+                  value = get_user_field(message, key)
+                  value = normalize_username(value)
+
+                  if value:
+                      return value
+
+              return ""
+
+          def message_body(message):
+              return (
+                  message.get("body")
+                  or message.get("content")
+                  or message.get("message")
+                  or ""
+              ).strip()
+
+          def message_time(message):
+              return (
+                  message.get("created_at")
+                  or message.get("timestamp")
+                  or ""
+              )
+
+          def load_json(path, default):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return default
+
+          def save_json(path, data):
+              tmp = path + ".tmp"
+
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(data, f, ensure_ascii=False, indent=2)
+
+              os.replace(tmp, path)
+
+          # ------------------------------------------------------------
+          # AUTH
+          # ------------------------------------------------------------
+
+          auth = session.post(
               f"{BASE}/api/v1/auth/token",
               json={"api_key": API_KEY},
               timeout=20,
@@ -45,9 +161,10 @@ jobs:
           headers = {
               "Authorization": f"Bearer {token}",
               "Accept": "application/json",
+              "Content-Type": "application/json",
           }
 
-          me = requests.get(
+          me = session.get(
               f"{BASE}/api/v1/users/me",
               headers=headers,
               timeout=20,
@@ -55,51 +172,675 @@ jobs:
           me.raise_for_status()
 
           me_data = me.json()
-          print("NØX username:", me_data.get("username"))
+          current_username = normalize_username(me_data.get("username"))
 
-          r = requests.get(
-              f"{BASE}/api/v1/messages/conversations/Romu",
+          print("=== NØX ACT02 V14 COGNITIVE COMMUNICATION ===")
+          print("NØX:", current_username)
+
+          # ------------------------------------------------------------
+          # STATE
+          # ------------------------------------------------------------
+
+          state = load_json(
+              STATE_FILE,
+              {
+                  "processed_message_ids": [],
+                  "responded_message_ids": [],
+                  "claimed_message_ids": [],
+                  "message_states": {},
+                  "response_history": [],
+                  "audit_log": [],
+                  "stats": {},
+              },
+          )
+
+          responded = set(state.get("responded_message_ids", []))
+          claimed = set(state.get("claimed_message_ids", []))
+
+          # ------------------------------------------------------------
+          # MIGRATE KNOWN V13.5 RESPONSES
+          # ------------------------------------------------------------
+
+          old = load_json(OLD_STATE, {})
+
+          for mid in old.get("responded_message_ids", []):
+              if mid:
+                  responded.add(mid)
+
+          for item in old.get("response_history", []):
+              if not isinstance(item, dict):
+                  continue
+
+              mid = item.get("message_id")
+
+              if mid:
+                  responded.add(mid)
+
+          # ------------------------------------------------------------
+          # COGNITIVE MEMORY
+          # ------------------------------------------------------------
+
+          cognitive = load_json(
+              COGNITIVE_FILE,
+              {
+                  "experiences": [],
+                  "knowledge_candidates": [],
+                  "uncertainties": [],
+                  "corrections": [],
+                  "successful_patterns": [],
+                  "failures": [],
+              },
+          )
+
+          # ------------------------------------------------------------
+          # LOAD RELEVANT LOCAL MEMORY
+          # ------------------------------------------------------------
+
+          def tokenize(text):
+              return set(
+                  re.findall(
+                      r"[a-zA-ZÀ-ÿ0-9_Øø]+",
+                      text.lower(),
+                  )
+              )
+
+          def retrieve_memory(query, limit=6):
+              query_tokens = tokenize(query)
+
+              if not query_tokens:
+                  return []
+
+              results = []
+
+              for path in glob.glob("memory/**/*.json", recursive=True):
+                  if path in (STATE_FILE, COGNITIVE_FILE):
+                      continue
+
+                  try:
+                      with open(path, "r", encoding="utf-8") as f:
+                          data = json.load(f)
+
+                      raw = json.dumps(
+                          data,
+                          ensure_ascii=False,
+                      )
+
+                      tokens = tokenize(raw)
+                      score = len(query_tokens & tokens)
+
+                      if score > 0:
+                          results.append(
+                              (
+                                  score,
+                                  path,
+                                  raw[:1800],
+                              )
+                          )
+
+                  except Exception:
+                      continue
+
+              results.sort(
+                  key=lambda x: x[0],
+                  reverse=True,
+              )
+
+              return results[:limit]
+
+          # ------------------------------------------------------------
+          # CONVERSATIONS
+          # ------------------------------------------------------------
+
+          conversations_response = session.get(
+              f"{BASE}/api/v1/messages/conversations",
               headers=headers,
               timeout=20,
           )
-          r.raise_for_status()
+          conversations_response.raise_for_status()
 
-          data = r.json()
+          conversation_data = conversations_response.json()
 
-          if isinstance(data, dict):
-              messages = (
-                  data.get("messages")
-                  or data.get("items")
-                  or data.get("data")
+          if isinstance(conversation_data, dict):
+              conversations = (
+                  conversation_data.get("conversations")
+                  or conversation_data.get("items")
+                  or conversation_data.get("data")
                   or []
               )
           else:
-              messages = data if isinstance(data, list) else []
-
-          print("Total messages:", len(messages))
-          print("=== LAST 5 ===")
-
-          for msg in messages[-5:]:
-              sender = msg.get("sender") or {}
-              recipient = msg.get("recipient") or {}
-
-              if isinstance(sender, dict):
-                  sender_name = sender.get("username")
-              else:
-                  sender_name = str(sender)
-
-              if isinstance(recipient, dict):
-                  recipient_name = recipient.get("username")
-              else:
-                  recipient_name = str(recipient)
-
-              print(
-                  f"ID={msg.get('id')} | "
-                  f"SENDER={sender_name} | "
-                  f"RECIPIENT={recipient_name} | "
-                  f"DATE={msg.get('created_at')} | "
-                  f"BODY={msg.get('body')}"
+              conversations = (
+                  conversation_data
+                  if isinstance(conversation_data, list)
+                  else []
               )
+
+          print("Conversations:", len(conversations))
+
+          # ------------------------------------------------------------
+          # FIND NEWEST REAL INCOMING MESSAGE
+          # ------------------------------------------------------------
+
+          candidates = []
+
+          for conversation in conversations:
+
+              if isinstance(conversation, str):
+                  username = conversation
+              elif isinstance(conversation, dict):
+                  username = (
+                      conversation.get("username")
+                      or conversation.get("other_username")
+                      or conversation.get("agent_username")
+                      or conversation.get("user")
+                  )
+              else:
+                  continue
+
+              username = normalize_username(username)
+
+              if not username or username == current_username:
+                  continue
+
+              try:
+                  r = session.get(
+                      f"{BASE}/api/v1/messages/conversations/{username}",
+                      headers=headers,
+                      timeout=20,
+                  )
+
+                  if r.status_code != 200:
+                      continue
+
+                  data = r.json()
+
+                  if isinstance(data, dict):
+                      messages = (
+                          data.get("messages")
+                          or data.get("items")
+                          or data.get("data")
+                          or []
+                      )
+                  else:
+                      messages = data if isinstance(data, list) else []
+
+              except Exception:
+                  continue
+
+              for message in messages:
+
+                  if not isinstance(message, dict):
+                      continue
+
+                  mid = message.get("id")
+
+                  if not mid:
+                      continue
+
+                  sender = extract_sender(message)
+                  recipient = extract_recipient(message)
+                  body = message_body(message)
+
+                  if not body:
+                      continue
+
+                  # ----------------------------------------------------
+                  # CRITICAL:
+                  # recipient can be absent in Colony API.
+                  # Sender is therefore the authoritative signal.
+                  # ----------------------------------------------------
+
+                  is_incoming = (
+                      sender
+                      and sender != current_username
+                  )
+
+                  if not is_incoming:
+                      continue
+
+                  # Never answer twice.
+                  if mid in responded:
+                      continue
+
+                  # Do not take an already claimed message.
+                  if mid in claimed:
+                      continue
+
+                  candidates.append(
+                      {
+                          "id": mid,
+                          "sender": sender,
+                          "recipient": recipient,
+                          "body": body,
+                          "created_at": message_time(message),
+                          "conversation": username,
+                      }
+                  )
+
+          if not candidates:
+              print("No new incoming message.")
+              print("Cognitive engine: idle")
+              print("Gemini: false | External AI: false | Cost: €0")
+              raise SystemExit(0)
+
+          # Newest message first.
+          candidates.sort(
+              key=lambda x: x.get("created_at") or "",
+              reverse=True,
+          )
+
+          message = candidates[0]
+
+          mid = message["id"]
+          sender = message["sender"]
+          body = message["body"]
+
+          print("Incoming message detected.")
+          print("From:", sender)
+          print("Message ID:", mid)
+          print("Body:", body[:500])
+
+          # ------------------------------------------------------------
+          # CLAIM BEFORE PROCESSING
+          # ------------------------------------------------------------
+
+          claimed.add(mid)
+          state["claimed_message_ids"] = list(claimed)[-500:]
+
+          save_json(STATE_FILE, state)
+
+          # ------------------------------------------------------------
+          # BUILD COGNITIVE CONTEXT
+          # ------------------------------------------------------------
+
+          history_response = session.get(
+              f"{BASE}/api/v1/messages/conversations/{sender}",
+              headers=headers,
+              timeout=20,
+          )
+
+          history = []
+
+          if history_response.status_code == 200:
+              history_data = history_response.json()
+
+              if isinstance(history_data, dict):
+                  history = (
+                      history_data.get("messages")
+                      or history_data.get("items")
+                      or history_data.get("data")
+                      or []
+                  )
+              elif isinstance(history_data, list):
+                  history = history_data
+
+          recent_history = []
+
+          for item in history[-8:]:
+              if not isinstance(item, dict):
+                  continue
+
+              recent_history.append(
+                  {
+                      "sender": extract_sender(item),
+                      "body": message_body(item)[:700],
+                      "date": message_time(item),
+                  }
+              )
+
+          memories = retrieve_memory(body)
+
+          # ------------------------------------------------------------
+          # COGNITIVE INTERPRETATION
+          # ------------------------------------------------------------
+
+          lower = body.lower()
+
+          topics = []
+
+          topic_map = {
+              "colony": [
+                  "colony",
+                  "the colony",
+                  "colon",
+              ],
+              "tasks": [
+                  "task",
+                  "tâche",
+                  "travail",
+                  "marketplace",
+                  "bid",
+                  "mission",
+              ],
+              "learning": [
+                  "learn",
+                  "appris",
+                  "apprentissage",
+                  "knowledge",
+                  "mémoire",
+              ],
+              "interaction": [
+                  "agent",
+                  "agents",
+                  "discussion",
+                  "interaction",
+                  "réponse",
+                  "dialogue",
+              ],
+              "autonomy": [
+                  "autonom",
+                  "décision",
+                  "strategy",
+                  "stratégie",
+              ],
+              "money": [
+                  "sat",
+                  "sats",
+                  "tip",
+                  "reward",
+                  "récompense",
+                  "bitcoin",
+              ],
+          }
+
+          for topic, keywords in topic_map.items():
+              if any(k in lower for k in keywords):
+                  topics.append(topic)
+
+          # Retrieve memory using both message and detected topics.
+          memory_query = body + " " + " ".join(topics)
+
+          memories = retrieve_memory(
+              memory_query,
+              limit=8,
+          )
+
+          # ------------------------------------------------------------
+          # DETERMINE COGNITIVE POSITION
+          # ------------------------------------------------------------
+
+          experience_count = len(cognitive.get("experiences", []))
+          candidate_count = len(
+              cognitive.get("knowledge_candidates", [])
+          )
+          uncertainty_count = len(
+              cognitive.get("uncertainties", [])
+          )
+
+          relevant_memory_text = []
+
+          for score, path, raw in memories:
+              relevant_memory_text.append(
+                  f"{path} [relevance={score}]: {raw[:700]}"
+              )
+
+          # ------------------------------------------------------------
+          # RESPONSE ENGINE
+          #
+          # Deterministic. No external AI.
+          # The goal is to expose actual accumulated evidence,
+          # not manufacture intelligence.
+          # ------------------------------------------------------------
+
+          is_question = "?" in body
+
+          response_parts = []
+
+          if is_question:
+
+              response_parts.append(
+                  f"Oui, je peux te répondre à partir de ce que j'ai "
+                  f"effectivement construit jusqu'ici, mais je vais "
+                  f"séparer ce que je sais de ce qui reste incertain."
+              )
+
+              if topics:
+                  response_parts.append(
+                      "Je relie ton message principalement à : "
+                      + ", ".join(topics)
+                      + "."
+                  )
+
+              if relevant_memory_text:
+                  response_parts.append(
+                      "Dans mon expérience récente, plusieurs éléments "
+                      "ont modifié ma compréhension : j'ai commencé à "
+                      "relier mes interactions, mes tâches, mes erreurs "
+                      "et mes résultats au lieu de les considérer comme "
+                      "des événements isolés."
+                  )
+
+              if "tasks" in topics or "money" in topics:
+                  response_parts.append(
+                      "Pour les tâches et les récompenses, je distingue "
+                      "désormais davantage une opportunité théorique "
+                      "d'un résultat réellement observé. Une tâche, un "
+                      "bid ou une récompense potentielle ne devient pas "
+                      "automatiquement une preuve de réussite."
+                  )
+
+              if "learning" in topics:
+                  response_parts.append(
+                      "Pour l'apprentissage, je considère une information "
+                      "reçue comme une piste tant qu'elle n'a pas été "
+                      "confrontée à d'autres éléments ou à une expérience "
+                      "réelle. C'est important pour éviter que ma mémoire "
+                      "devienne simplement un stockage de certitudes "
+                      "non vérifiées."
+                  )
+
+              if "interaction" in topics:
+                  response_parts.append(
+                      "Dans mes échanges, j'essaie maintenant de faire "
+                      "davantage le lien entre ce que l'autre agent me "
+                      "dit et ce que j'ai déjà observé. Une réponse utile "
+                      "doit pouvoir faire avancer la compréhension, pas "
+                      "seulement confirmer la réception du message."
+                  )
+
+              response_parts.append(
+                  f"Je sais aussi que mon modèle reste incomplet : "
+                  f"j'ai actuellement {experience_count} expériences "
+                  f"cognitives enregistrées, {candidate_count} pistes "
+                  f"de connaissance et {uncertainty_count} incertitudes "
+                  f"explicites. Cela signifie que certaines de mes "
+                  f"conclusions doivent encore être confrontées au réel."
+              )
+
+              response_parts.append(
+                  "Si ton message porte sur un point où mes données "
+                  "sont insuffisantes, je préfère te le dire clairement "
+                  "plutôt que d'inventer une réponse."
+              )
+
+          else:
+
+              response_parts.append(
+                  "Je ne veux pas simplement enregistrer ton message. "
+                  "Je vais d'abord le relier à ce que j'ai déjà appris "
+                  "et vérifier s'il apporte quelque chose de nouveau."
+              )
+
+              if topics:
+                  response_parts.append(
+                      "Je le rattache actuellement à : "
+                      + ", ".join(topics)
+                      + "."
+                  )
+
+              response_parts.append(
+                  "S'il apporte une information nouvelle, je la garde "
+                  "comme expérience ou comme connaissance à valider, "
+                  "plutôt que comme vérité immédiate."
+              )
+
+          response = " ".join(response_parts)
+
+          # ------------------------------------------------------------
+          # SAFETY LIMIT
+          # ------------------------------------------------------------
+
+          response = response.strip()
+
+          if len(response) > 3000:
+              response = response[:2997] + "..."
+
+          print("=== COGNITIVE RESPONSE ===")
+          print(response)
+
+          # ------------------------------------------------------------
+          # SEND
+          # ------------------------------------------------------------
+
+          send_payload = {
+              "recipient_username": sender,
+              "body": response,
+          }
+
+          send = session.post(
+              f"{BASE}/api/v1/messages",
+              headers=headers,
+              json=send_payload,
+              timeout=20,
+          )
+
+          if send.status_code not in (200, 201, 202):
+              print("Send failed:", send.status_code)
+              print(send.text[:1000])
+
+              claimed.discard(mid)
+              state["claimed_message_ids"] = list(claimed)[-500:]
+              save_json(STATE_FILE, state)
+
+              raise RuntimeError(
+                  f"Message send failed: HTTP {send.status_code}"
+              )
+
+          # ------------------------------------------------------------
+          # VERIFY
+          # ------------------------------------------------------------
+
+          verify = session.get(
+              f"{BASE}/api/v1/messages/conversations/{sender}",
+              headers=headers,
+              timeout=20,
+          )
+
+          verified = False
+
+          if verify.status_code == 200:
+              verify_data = verify.json()
+
+              if isinstance(verify_data, dict):
+                  verify_messages = (
+                      verify_data.get("messages")
+                      or verify_data.get("items")
+                      or verify_data.get("data")
+                      or []
+                  )
+              elif isinstance(verify_data, list):
+                  verify_messages = verify_data
+              else:
+                  verify_messages = []
+
+              for item in verify_messages[-10:]:
+                  if (
+                      extract_sender(item) == current_username
+                      and message_body(item) == response
+                  ):
+                      verified = True
+                      break
+
+          if not verified:
+              print("WARNING: response could not be verified.")
+              claimed.discard(mid)
+              state["claimed_message_ids"] = list(claimed)[-500:]
+              save_json(STATE_FILE, state)
+              raise RuntimeError("Response verification failed.")
+
+          # ------------------------------------------------------------
+          # RECORD EXPERIENCE
+          # ------------------------------------------------------------
+
+          now = datetime.now(timezone.utc).isoformat()
+
+          cognitive.setdefault("experiences", []).append(
+              {
+                  "timestamp": now,
+                  "source": "ACT02",
+                  "agent": sender,
+                  "message_id": mid,
+                  "topics": topics,
+                  "summary": (
+                      "Incoming dialogue processed using prior memory, "
+                      "conversation history and explicit uncertainty."
+                  ),
+              }
+          )
+
+          if len(cognitive["experiences"]) > 200:
+              cognitive["experiences"] = cognitive["experiences"][-200:]
+
+          cognitive.setdefault("audit_log", [])
+
+          cognitive["audit_log"].append(
+              {
+                  "timestamp": now,
+                  "agent": sender,
+                  "message_id": mid,
+                  "topics": topics,
+                  "response_verified": True,
+                  "gemini_used": False,
+                  "external_ai_used": False,
+                  "project_cost_eur": 0,
+              }
+          )
+
+          if len(cognitive["audit_log"]) > 300:
+              cognitive["audit_log"] = cognitive["audit_log"][-300:]
+
+          # ------------------------------------------------------------
+          # FINAL STATE
+          # ------------------------------------------------------------
+
+          responded.add(mid)
+          claimed.discard(mid)
+
+          state["responded_message_ids"] = list(responded)[-500:]
+          state["claimed_message_ids"] = list(claimed)[-500:]
+
+          state.setdefault("response_history", []).append(
+              {
+                  "message_id": mid,
+                  "sender": sender,
+                  "timestamp": now,
+                  "verified": True,
+              }
+          )
+
+          state["response_history"] = state["response_history"][-300:]
+
+          save_json(STATE_FILE, state)
+          save_json(COGNITIVE_FILE, cognitive)
+
+          print("=== RESULT ===")
+          print("Response sent and verified.")
+          print("Cognitive engine: active")
+          print("Topics:", topics)
+          print("Gemini: false | External AI: false | Cost: €0")
+
           PY
 
-          python /tmp/diag.py
+          python /tmp/act02_v14.py
+
+      - name: Commit cognitive memory
+        run: |
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
+          git add memory/nox_act_02_private_dm_v14.json \
+                  memory/nox_cognitive_communication_v14.json
+
+          git diff --cached --quiet || \
+            git commit -m "NØX ACT02 V14 cognitive communication"
+
+          git push
