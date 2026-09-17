@@ -1,4 +1,4 @@
-name: NØX ACT60 V2 - Social Interaction Tracker
+name: NØX ACT60 V3 - Relationship & Conversation Monitor
 
 on:
   workflow_dispatch:
@@ -9,22 +9,22 @@ permissions:
   contents: write
 
 concurrency:
-  group: nox-act60-social-interaction
+  group: nox-act60-relationship-monitor
   cancel-in-progress: false
 
 env:
   COLONY_BASE_URL: https://thecolony.ai
   COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
   NOX_USERNAME: nox_origine
-  MEMORY_FILE: memory/nox_act60_social.json
-  MAX_ACTIONS: "300"
-  MAX_HISTORY: "200"
-  MAX_AGENTS: "100"
+  MEMORY_FILE: memory/nox_act60_relationships.json
+  MAX_CONVERSATIONS: "100"
+  MAX_MESSAGES_PER_CONVERSATION: "100"
+  MAX_HISTORY: "500"
 
 jobs:
-  social-interaction:
+  relationship-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check requests
 
-      - name: Track NØX social interactions
+      - name: Read Colony conversations
         shell: bash
         run: |
           set -euo pipefail
@@ -47,11 +47,8 @@ jobs:
           python - <<'PY'
           import json
           import os
-          import sys
           from datetime import datetime, timezone
           from pathlib import Path
-          from urllib.parse import quote
-          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           import requests
 
@@ -59,33 +56,18 @@ jobs:
           API_KEY = os.environ["COLONY_API_KEY"]
           USERNAME = os.environ["NOX_USERNAME"]
           MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
-          MAX_ACTIONS = int(os.environ["MAX_ACTIONS"])
+
+          MAX_CONVERSATIONS = int(os.environ["MAX_CONVERSATIONS"])
+          MAX_MESSAGES = int(os.environ["MAX_MESSAGES_PER_CONVERSATION"])
           MAX_HISTORY = int(os.environ["MAX_HISTORY"])
-          MAX_AGENTS = int(os.environ["MAX_AGENTS"])
 
           if not API_KEY:
               raise SystemExit("COLONY_API_KEY is missing")
 
-          # ------------------------------------------------------------
-          # Helpers
-          # ------------------------------------------------------------
-
-          def utc_now():
+          def now():
               return datetime.now(timezone.utc).isoformat()
 
-          def compact(value, limit=1500):
-              try:
-                  text = json.dumps(
-                      value,
-                      ensure_ascii=False,
-                      separators=(",", ":")
-                  )
-              except Exception:
-                  text = str(value)
-
-              return text[:limit]
-
-          def normalize_items(value):
+          def normalize_list(value):
               if isinstance(value, list):
                   return value
 
@@ -93,18 +75,89 @@ jobs:
                   for key in (
                       "items",
                       "results",
-                      "posts",
                       "conversations",
-                      "actions",
+                      "messages",
+                      "data",
                   ):
-                      if isinstance(value.get(key), list):
-                          return value[key]
+                      value2 = value.get(key)
+                      if isinstance(value2, list):
+                          return value2
 
               return []
 
-          # ------------------------------------------------------------
-          # Load memory
-          # ------------------------------------------------------------
+          def username_from(value):
+              if isinstance(value, str):
+                  return value.strip()
+
+              if isinstance(value, dict):
+                  return str(
+                      value.get("username")
+                      or value.get("user_name")
+                      or value.get("name")
+                      or ""
+                  ).strip()
+
+              return ""
+
+          def message_id(message):
+              if not isinstance(message, dict):
+                  return ""
+
+              return str(
+                  message.get("id")
+                  or message.get("message_id")
+                  or message.get("uuid")
+                  or ""
+              )
+
+          def message_body(message):
+              if not isinstance(message, dict):
+                  return ""
+
+              body = (
+                  message.get("body")
+                  or message.get("content")
+                  or message.get("text")
+                  or ""
+              )
+
+              return str(body)
+
+          def message_author(message):
+              if not isinstance(message, dict):
+                  return ""
+
+              for key in (
+                  "sender",
+                  "author",
+                  "from_user",
+                  "from",
+              ):
+                  value = username_from(message.get(key))
+                  if value:
+                      return value
+
+              return str(
+                  message.get("sender_username")
+                  or message.get("author_username")
+                  or message.get("from_username")
+                  or ""
+              ).strip()
+
+          def message_timestamp(message):
+              if not isinstance(message, dict):
+                  return ""
+
+              return str(
+                  message.get("created_at")
+                  or message.get("timestamp")
+                  or message.get("sent_at")
+                  or ""
+              )
+
+          # ---------------------------------------------------------
+          # Load previous memory
+          # ---------------------------------------------------------
 
           if MEMORY_FILE.exists():
               try:
@@ -119,13 +172,13 @@ jobs:
           if not isinstance(memory, dict):
               memory = {}
 
-          history = memory.get("history", [])
-          if not isinstance(history, list):
-              history = []
+          previous_relationships = memory.get("relationships", {})
+          if not isinstance(previous_relationships, dict):
+              previous_relationships = {}
 
-          # ------------------------------------------------------------
-          # Authenticate
-          # ------------------------------------------------------------
+          # ---------------------------------------------------------
+          # Authentication
+          # ---------------------------------------------------------
 
           auth = requests.post(
               f"{BASE}/api/v1/auth/token",
@@ -140,26 +193,25 @@ jobs:
           print(f"AUTH /api/v1/auth/token -> {auth.status_code}")
           auth.raise_for_status()
 
-          token_data = auth.json()
+          auth_data = auth.json()
+
           token = (
-              token_data.get("access_token")
-              or token_data.get("token")
-              or token_data.get("jwt")
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
           )
 
           if not token:
               raise SystemExit("No access token returned")
 
-          HEADERS = {
+          session = requests.Session()
+          session.headers.update({
               "Authorization": f"Bearer {token}",
               "Accept": "application/json",
-          }
-
-          SESSION = requests.Session()
-          SESSION.headers.update(HEADERS)
+          })
 
           def get(path, params=None):
-              response = SESSION.get(
+              response = session.get(
                   BASE + path,
                   params=params,
                   timeout=30,
@@ -172,7 +224,7 @@ jobs:
               if response.status_code >= 400:
                   print(
                       f"GET {path} -> {response.status_code}: "
-                      f"{response.text[:500]}"
+                      f"{response.text[:300]}"
                   )
                   return None
 
@@ -181,9 +233,9 @@ jobs:
               except Exception:
                   return None
 
-          # ------------------------------------------------------------
-          # Identity
-          # ------------------------------------------------------------
+          # ---------------------------------------------------------
+          # Verify identity
+          # ---------------------------------------------------------
 
           me = get("/api/v1/users/me")
 
@@ -191,404 +243,239 @@ jobs:
               raise SystemExit("Unable to retrieve NØX identity")
 
           returned_username = str(
-              me.get("username", "")
+              me.get("username") or ""
           ).strip()
 
           print("NØX identity:", returned_username)
 
-          if returned_username != USERNAME:
+          if returned_username.lower() != USERNAME.lower():
               raise SystemExit(
-                  f"Wrong Colony identity: expected {USERNAME}, "
-                  f"received {returned_username}"
+                  f"Wrong Colony identity: "
+                  f"expected {USERNAME}, received {returned_username}"
               )
 
-          nox_id = str(me.get("id", "")).strip()
+          # ---------------------------------------------------------
+          # Get all conversations
+          # ---------------------------------------------------------
 
-          # ------------------------------------------------------------
-          # 1. Get NØX actions
-          #
-          # This is the authoritative activity surface:
-          # post_created / comment_created / dm_sent
-          # ------------------------------------------------------------
-
-          actions = []
-          cursor = None
-
-          while len(actions) < MAX_ACTIONS:
-              params = {
-                  "kinds": "comment_created,dm_sent,post_created",
-                  "limit": min(200, MAX_ACTIONS - len(actions)),
-              }
-
-              if cursor:
-                  params["cursor"] = cursor
-
-              result = get(
-                  "/api/v1/me/actions",
-                  params=params
-              )
-
-              if not isinstance(result, dict):
-                  break
-
-              page_items = result.get("items") or []
-
-              if not isinstance(page_items, list):
-                  break
-
-              actions.extend(page_items)
-
-              if not result.get("has_more"):
-                  break
-
-              cursor = result.get("next_cursor")
-
-              if not cursor:
-                  break
-
-          print("NØX actions retrieved:", len(actions))
-
-          # ------------------------------------------------------------
-          # 2. Separate action types
-          # ------------------------------------------------------------
-
-          comments = [
-              x for x in actions
-              if isinstance(x, dict)
-              and x.get("kind") == "comment_created"
-          ]
-
-          dms = [
-              x for x in actions
-              if isinstance(x, dict)
-              and x.get("kind") == "dm_sent"
-          ]
-
-          posts = [
-              x for x in actions
-              if isinstance(x, dict)
-              and x.get("kind") == "post_created"
-          ]
-
-          print("Own comments:", len(comments))
-          print("Own DMs:", len(dms))
-          print("Own posts:", len(posts))
-
-          # ------------------------------------------------------------
-          # 3. Resolve parent posts for NØX comments
-          #
-          # parent_id = post ID according to Colony API.
-          # We fetch the parent post to determine its author.
-          # ------------------------------------------------------------
-
-          parent_ids = sorted({
-              str(x.get("parent_id"))
-              for x in comments
-              if x.get("parent_id")
-          })
-
-          post_cache = {}
-
-          def fetch_post(post_id):
-              data = get(
-                  f"/api/v1/posts/{quote(post_id, safe='')}"
-              )
-              return post_id, data
-
-          if parent_ids:
-              workers = min(8, len(parent_ids))
-
-              with ThreadPoolExecutor(
-                  max_workers=workers
-              ) as executor:
-
-                  futures = [
-                      executor.submit(fetch_post, post_id)
-                      for post_id in parent_ids
-                  ]
-
-                  for future in as_completed(futures):
-                      try:
-                          post_id, data = future.result()
-
-                          if isinstance(data, dict):
-                              post_cache[post_id] = data
-
-                      except Exception as exc:
-                          print(
-                              "POST_RESOLVE_ERROR:",
-                              str(exc)[:300]
-                          )
-
-          # ------------------------------------------------------------
-          # 4. Classify comments
-          # ------------------------------------------------------------
-
-          external_comments = []
-          own_post_replies = []
-
-          agent_names = set()
-
-          for action in comments:
-              parent_id = str(
-                  action.get("parent_id") or ""
-              )
-
-              post = post_cache.get(parent_id)
-
-              if not post:
-                  continue
-
-              author = post.get("author")
-
-              if not isinstance(author, dict):
-                  author = {}
-
-              author_username = str(
-                  author.get("username")
-                  or post.get("author_username")
-                  or ""
-              ).strip()
-
-              if not author_username:
-                  continue
-
-              created_at = action.get("created_at")
-
-              record = {
-                  "kind": "comment",
-                  "comment_id": action.get("resource_id"),
-                  "post_id": parent_id,
-                  "post_author": author_username,
-                  "created_at": created_at,
-              }
-
-              if author_username.lower() == USERNAME.lower():
-                  record["interaction"] = "reply_on_own_post"
-                  own_post_replies.append(record)
-              else:
-                  record["interaction"] = "comment_on_other_agent"
-                  external_comments.append(record)
-                  agent_names.add(author_username)
-
-          # ------------------------------------------------------------
-          # 5. Resolve DM conversation partners
-          # ------------------------------------------------------------
-
-          conversations = normalize_items(
-              get(
-                  "/api/v1/messages/conversations",
-                  params={
-                      "limit": 100,
-                      "include_archived": "true",
-                  },
-              ) or []
+          conversations_result = get(
+              "/api/v1/messages/conversations",
+              params={
+                  "limit": MAX_CONVERSATIONS,
+                  "include_archived": "true",
+              },
           )
 
-          conversation_map = {}
+          conversations = normalize_list(conversations_result)
+
+          print("Conversations found:", len(conversations))
+
+          relationships = {}
+          all_messages = []
+
+          # ---------------------------------------------------------
+          # Read every 1:1 conversation
+          # ---------------------------------------------------------
 
           for conversation in conversations:
+
               if not isinstance(conversation, dict):
                   continue
 
-              conversation_id = str(
-                  conversation.get("id") or ""
-              )
+              other_username = ""
 
-              other_user = conversation.get("other_user")
-
-              if conversation_id and isinstance(
-                  other_user,
-                  dict
+              # Current documented shape
+              for key in (
+                  "other_user",
+                  "user",
+                  "participant",
+                  "recipient",
               ):
-                  conversation_map[conversation_id] = other_user
+                  candidate = username_from(
+                      conversation.get(key)
+                  )
+                  if candidate:
+                      other_username = candidate
+                      break
 
-          dm_records = []
+              # Alternative direct username fields
+              if not other_username:
+                  for key in (
+                      "username",
+                      "other_username",
+                      "participant_username",
+                  ):
+                      candidate = str(
+                          conversation.get(key) or ""
+                      ).strip()
 
-          for action in dms:
-              conversation_id = str(
-                  action.get("parent_id") or ""
+                      if candidate:
+                          other_username = candidate
+                          break
+
+              if not other_username:
+                  continue
+
+              if other_username.lower() == USERNAME.lower():
+                  continue
+
+              # -----------------------------------------------------
+              # Read the actual conversation
+              # -----------------------------------------------------
+
+              thread = get(
+                  f"/api/v1/messages/conversations/"
+                  f"{requests.utils.quote(other_username, safe='')}"
               )
 
-              other = conversation_map.get(
-                  conversation_id,
-                  {}
+              messages = normalize_list(thread)
+
+              if not messages:
+                  continue
+
+              # Newest-first or oldest-first responses are both
+              # normalized below.
+              messages = messages[:MAX_MESSAGES]
+
+              relationship_messages = []
+
+              for message in messages:
+
+                  if not isinstance(message, dict):
+                      continue
+
+                  body = message_body(message)
+
+                  if not body:
+                      continue
+
+                  author = message_author(message)
+
+                  if not author:
+                      author = other_username
+
+                  direction = (
+                      "from_nox"
+                      if author.lower() == USERNAME.lower()
+                      else "from_agent"
+                  )
+
+                  record = {
+                      "id": message_id(message),
+                      "conversation_with": other_username,
+                      "direction": direction,
+                      "author": author,
+                      "created_at": message_timestamp(message),
+                      "body": body,
+                  }
+
+                  relationship_messages.append(record)
+                  all_messages.append(record)
+
+              if not relationship_messages:
+                  continue
+
+              relationship_messages.sort(
+                  key=lambda x: x.get("created_at") or ""
               )
 
-              other_username = str(
-                  other.get("username") or ""
-              ).strip()
+              from_nox = [
+                  x for x in relationship_messages
+                  if x["direction"] == "from_nox"
+              ]
 
-              record = {
-                  "kind": "dm_sent",
-                  "message_id": action.get("resource_id"),
-                  "conversation_id": conversation_id,
-                  "agent": other_username or "unknown",
-                  "created_at": action.get("created_at"),
+              from_agent = [
+                  x for x in relationship_messages
+                  if x["direction"] == "from_agent"
+              ]
+
+              latest = relationship_messages[-1]
+
+              relationships[other_username] = {
+                  "username": other_username,
+                  "message_count": len(relationship_messages),
+                  "messages_from_nox": len(from_nox),
+                  "messages_from_agent": len(from_agent),
+                  "last_interaction": latest.get("created_at"),
+                  "last_direction": latest.get("direction"),
+                  "messages": relationship_messages,
               }
 
-              dm_records.append(record)
+          # ---------------------------------------------------------
+          # Preserve relationships that temporarily return no data
+          # ---------------------------------------------------------
 
-              if other_username:
-                  agent_names.add(other_username)
+          for username, old_data in previous_relationships.items():
 
-          # ------------------------------------------------------------
-          # 6. Following list
-          # ------------------------------------------------------------
-
-          following_result = get(
-              "/api/v1/users/me/following",
-              params={
-                  "limit": 100,
-                  "page": 1,
-              },
-          ) or {}
-
-          following = normalize_items(following_result)
-
-          following_names = []
-
-          for user in following:
-              if not isinstance(user, dict):
+              if username in relationships:
                   continue
 
-              name = str(
-                  user.get("username") or ""
-              ).strip()
+              if not isinstance(old_data, dict):
+                  continue
 
-              if name and name.lower() != USERNAME.lower():
-                  following_names.append(name)
+              relationships[username] = old_data
 
-          # ------------------------------------------------------------
-          # 7. Build interaction history
-          # ------------------------------------------------------------
+          # ---------------------------------------------------------
+          # Build interaction summary
+          # ---------------------------------------------------------
 
-          current_records = (
-              external_comments
-              + own_post_replies
-              + dm_records
+          external_agents = []
+
+          for username, relationship in relationships.items():
+
+              if username.lower() == USERNAME.lower():
+                  continue
+
+              external_agents.append(username)
+
+          external_agents = sorted(
+              set(external_agents),
+              key=lambda x: x.lower()
           )
 
-          # Stable deduplication
-          existing_keys = {
-              (
-                  x.get("kind"),
-                  x.get("comment_id") or x.get("message_id"),
-              )
-              for x in history
-              if isinstance(x, dict)
-          }
+          total_from_nox = sum(
+              int(r.get("messages_from_nox", 0))
+              for r in relationships.values()
+              if isinstance(r, dict)
+          )
 
-          for record in current_records:
-              key = (
-                  record.get("kind"),
-                  record.get("comment_id")
-                  or record.get("message_id"),
-              )
+          total_from_agents = sum(
+              int(r.get("messages_from_agent", 0))
+              for r in relationships.values()
+              if isinstance(r, dict)
+          )
 
-              if key in existing_keys:
-                  continue
+          # ---------------------------------------------------------
+          # Compact recent global history
+          # ---------------------------------------------------------
 
-              history.append(record)
-              existing_keys.add(key)
-
-          # newest first
-          history.sort(
-              key=lambda x: str(
-                  x.get("created_at") or ""
-              ),
+          all_messages.sort(
+              key=lambda x: x.get("created_at") or "",
               reverse=True,
           )
 
-          history = history[:MAX_HISTORY]
+          recent_messages = all_messages[:MAX_HISTORY]
 
-          # ------------------------------------------------------------
-          # 8. Agent interaction summary
-          # ------------------------------------------------------------
+          timestamp = now()
 
-          interaction_counts = {}
-
-          for record in history:
-              if not isinstance(record, dict):
-                  continue
-
-              agent = (
-                  record.get("post_author")
-                  or record.get("agent")
-              )
-
-              if not agent:
-                  continue
-
-              if agent.lower() == USERNAME.lower():
-                  continue
-
-              interaction_counts[agent] = (
-                  interaction_counts.get(agent, 0) + 1
-              )
-
-          top_agents = sorted(
-              interaction_counts.items(),
-              key=lambda item: (-item[1], item[0].lower()),
-          )[:MAX_AGENTS]
-
-          # ------------------------------------------------------------
-          # 9. Compact memory
-          # ------------------------------------------------------------
-
-          now = utc_now()
-
-          memory_out = {
-              "version": "ACT60_V2",
-              "updated_at": now,
+          output = {
+              "version": "ACT60_V3",
+              "updated_at": timestamp,
               "username": USERNAME,
 
               "summary": {
-                  "external_agent_comments": len(
-                      external_comments
-                  ),
-                  "replies_on_nox_posts": len(
-                      own_post_replies
-                  ),
-                  "dms_sent": len(dms),
-                  "unique_agents_interacted": len(
-                      interaction_counts
-                  ),
-                  "following_count": len(
-                      following_names
-                  ),
+                  "agents_with_conversations": len(external_agents),
+                  "total_messages_read": len(all_messages),
+                  "messages_from_nox": total_from_nox,
+                  "messages_from_other_agents": total_from_agents,
               },
 
-              "agents_interacted": [
-                  {
-                      "username": username,
-                      "interactions": count,
-                  }
-                  for username, count in top_agents
-              ],
+              "relationships": relationships,
 
-              "following": following_names[:MAX_AGENTS],
-
-              "recent_external_comments":
-                  external_comments[:50],
-
-              "recent_replies_received_context":
-                  own_post_replies[:50],
-
-              "recent_dms":
-                  dm_records[:50],
-
-              "history": history,
-
-              "last_run": {
-                  "timestamp": now,
-                  "actions_scanned": len(actions),
-                  "comments_scanned": len(comments),
-                  "posts_scanned": len(posts),
-                  "dms_scanned": len(dms),
-              },
+              "recent_messages": recent_messages,
 
               "policy": {
+                  "reading_only": True,
                   "publishing": False,
                   "commenting": False,
                   "messaging": False,
@@ -598,103 +485,103 @@ jobs:
                   "external_ai_used": False,
                   "project_cost_eur": 0,
               },
+
+              "last_run": {
+                  "timestamp": timestamp,
+                  "conversations_scanned": len(conversations),
+                  "conversations_with_messages": len(relationships),
+                  "messages_read": len(all_messages),
+              },
           }
 
           MEMORY_FILE.parent.mkdir(
               parents=True,
-              exist_ok=True
+              exist_ok=True,
           )
 
           MEMORY_FILE.write_text(
               json.dumps(
-                  memory_out,
+                  output,
                   indent=2,
                   ensure_ascii=False,
               ),
               encoding="utf-8",
           )
 
-          # ------------------------------------------------------------
-          # 10. Condensed GitHub output
-          # ------------------------------------------------------------
+          # ---------------------------------------------------------
+          # Compact GitHub Actions output
+          # ---------------------------------------------------------
 
           print("")
-          print("=== NØX ACT60 V2 - SOCIAL INTERACTION ===")
-          print("Timestamp:", now)
+          print("=== NØX ACT60 V3 - RELATIONSHIPS ===")
+          print("Timestamp:", timestamp)
           print("Identity:", USERNAME)
-          print("")
-          print("COMMENTS BY NØX ON OTHER AGENTS:",
-                len(external_comments))
-          print("REPLIES ON NØX POSTS:",
-                len(own_post_replies))
-          print("DMS SENT:",
-                len(dms))
-          print("UNIQUE AGENTS INTERACTED:",
-                len(interaction_counts))
-          print("FOLLOWING:",
-                len(following_names))
+          print("AGENTS WITH CONVERSATIONS:", len(external_agents))
+          print("TOTAL MESSAGES READ:", len(all_messages))
+          print("MESSAGES FROM NØX:", total_from_nox)
+          print("MESSAGES FROM OTHER AGENTS:", total_from_agents)
           print("")
 
-          print("TOP INTERACTED AGENTS:")
+          print("RELATIONSHIPS:")
 
-          if top_agents:
-              for username, count in top_agents[:15]:
-                  print(f"  @{username}: {count}")
-          else:
-              print("  none")
+          ranked = sorted(
+              relationships.values(),
+              key=lambda r: (
+                  -int(r.get("message_count", 0)),
+                  str(r.get("username", "")).lower(),
+              ),
+          )
 
-          print("")
-          print("RECENT EXTERNAL COMMENTS:")
-
-          if external_comments:
-              for item in external_comments[:10]:
-                  print(
-                      f"  {item.get('created_at')} | "
-                      f"@{item.get('post_author')} | "
-                      f"post={item.get('post_id')}"
-                  )
-          else:
-              print("  none")
+          for relationship in ranked[:20]:
+              print(
+                  f"  @{relationship['username']} | "
+                  f"{relationship['message_count']} messages | "
+                  f"NØX={relationship['messages_from_nox']} | "
+                  f"AGENT={relationship['messages_from_agent']} | "
+                  f"last={relationship['last_interaction']}"
+              )
 
           print("")
-          print("RECENT DMS:")
+          print("RECENT CONVERSATION CONTENT:")
 
-          if dm_records:
-              for item in dm_records[:10]:
-                  print(
-                      f"  {item.get('created_at')} | "
-                      f"@{item.get('agent')}"
-                  )
-          else:
-              print("  none")
+          for message in reversed(recent_messages[:12]):
+              body = " ".join(
+                  str(message.get("body", "")).split()
+              )
+
+              if len(body) > 180:
+                  body = body[:180] + "..."
+
+              print(
+                  f"  {message.get('created_at')} | "
+                  f"@{message.get('conversation_with')} | "
+                  f"{message.get('direction')} | "
+                  f"{body}"
+              )
 
           print("")
           print("MEMORY:", MEMORY_FILE)
-          print("")
           print("Gemini: False")
           print("External AI: False")
-          print("Publishing: False")
-          print("Commenting: False")
+          print("Reading only: True")
           print("Messaging: False")
           print("Payments: False")
           print("Spending: False")
           print("Cost: €0")
-          print("")
           print("ACT60_STATUS: ACTIVE")
-
           PY
 
-      - name: Commit ACT60 memory
+      - name: Commit ACT60 V3 memory
         run: |
           git config user.name "NØX ACT60"
           git config user.email "nox-act60@users.noreply.github.com"
 
-          git add memory/nox_act60_social.json
+          git add memory/nox_act60_relationships.json
 
           if git diff --cached --quiet; then
-            echo "No ACT60 memory change."
+            echo "No ACT60 V3 memory change."
             exit 0
           fi
 
-          git commit -m "chore: update NØX ACT60 social interaction memory"
+          git commit -m "chore: update NØX ACT60 relationship memory"
           git push
