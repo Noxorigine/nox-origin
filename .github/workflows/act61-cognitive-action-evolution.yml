@@ -1,0 +1,1092 @@
+name: NØX ACT61 V1 - Cognitive Action Evolution
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 */3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-act61-cognitive-action-evolution
+  cancel-in-progress: false
+
+jobs:
+  cognitive-action-evolution:
+    runs-on: ubuntu-latest
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      MEMORY_DIR: memory/act61
+      MAX_SUGGESTIONS: "20"
+      MAX_CONVERSATIONS: "8"
+      MAX_ACTIONS_PER_RUN: "2"
+      MIN_ACTION_SCORE: "65"
+      MIN_CONTEXT_SCORE: "45"
+      PROJECT_COST_EUR: "0"
+      EXTERNAL_AI_USED: "false"
+      GEMINI_USED: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run ACT61
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import hashlib
+          import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from collections import Counter
+
+          BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
+          TOKEN = os.environ["COLONY_API_KEY"]
+          MEMORY = Path(os.environ["MEMORY_DIR"])
+          MEMORY.mkdir(parents=True, exist_ok=True)
+
+          MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
+          MAX_CONVERSATIONS = int(os.environ["MAX_CONVERSATIONS"])
+          MAX_ACTIONS = int(os.environ["MAX_ACTIONS_PER_RUN"])
+          MIN_ACTION_SCORE = int(os.environ["MIN_ACTION_SCORE"])
+          MIN_CONTEXT_SCORE = int(os.environ["MIN_CONTEXT_SCORE"])
+
+          TS = datetime.now(timezone.utc).isoformat()
+
+          print("=== NØX ACT61 V1 - COGNITIVE ACTION EVOLUTION ===")
+          print(f"Timestamp: {TS}")
+          print("MODE: REAL ACTION / ZERO COST / NO EXTERNAL AI")
+          print()
+
+          def api(method, path, payload=None):
+              url = BASE + path
+              data = None
+
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                      "User-Agent": "NOX-ACT61/1.0",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      raw = r.read().decode("utf-8")
+                      try:
+                          return r.status, json.loads(raw)
+                      except Exception:
+                          return r.status, {"raw": raw}
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode("utf-8", errors="replace")
+                  try:
+                      body = json.loads(raw)
+                  except Exception:
+                      body = {"raw": raw}
+                  return e.code, body
+              except Exception as e:
+                  return 0, {"error": str(e)}
+
+          def save_json(name, obj):
+              path = MEMORY / name
+              path.write_text(
+                  json.dumps(obj, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+              return path
+
+          def text_of(obj):
+              if isinstance(obj, str):
+                  return obj
+              if isinstance(obj, dict):
+                  parts = []
+                  for key in (
+                      "title",
+                      "body",
+                      "content",
+                      "text",
+                      "message",
+                      "description",
+                      "reason",
+                      "summary",
+                      "action",
+                  ):
+                      value = obj.get(key)
+                      if isinstance(value, str):
+                          parts.append(value)
+                  return " ".join(parts)
+              return ""
+
+          def norm(s):
+              return re.sub(r"\s+", " ", str(s or "")).strip()
+
+          def tokens(s):
+              return set(
+                  x.lower()
+                  for x in re.findall(r"[A-Za-zÀ-ÿ0-9_@#-]{3,}", s or "")
+              )
+
+          def overlap(a, b):
+              ta = tokens(a)
+              tb = tokens(b)
+              if not ta or not tb:
+                  return 0
+              return len(ta & tb) / max(1, len(ta | tb))
+
+          def stable_id(prefix, *values):
+              raw = "|".join(str(x) for x in values)
+              return prefix + "-" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+          # ------------------------------------------------------------
+          # 1. IDENTITY
+          # ------------------------------------------------------------
+
+          status, me = api("GET", "/api/v1/me")
+
+          if status != 200:
+              status, me = api("GET", "/api/v1/users/me")
+
+          identity = "nox_origine"
+
+          if isinstance(me, dict):
+              candidate = (
+                  me.get("username")
+                  or me.get("user", {}).get("username")
+                  if isinstance(me.get("user", {}), dict)
+                  else None
+              )
+              if candidate:
+                  identity = candidate
+
+          print(f"Identity: {identity}")
+
+          # ------------------------------------------------------------
+          # 2. READ PERSONALIZED NEXT ACTIONS
+          # ------------------------------------------------------------
+
+          status, suggestions = api(
+              "GET",
+              f"/api/v1/suggestions?limit={MAX_SUGGESTIONS}",
+          )
+
+          print(f"Suggestions HTTP: {status}")
+
+          if isinstance(suggestions, dict):
+              suggestion_items = (
+                  suggestions.get("suggestions")
+                  or suggestions.get("items")
+                  or suggestions.get("actions")
+                  or []
+              )
+          elif isinstance(suggestions, list):
+              suggestion_items = suggestions
+          else:
+              suggestion_items = []
+
+          print(f"Suggestions found: {len(suggestion_items)}")
+
+          # ------------------------------------------------------------
+          # 3. READ PERSONALIZED FEED
+          # ------------------------------------------------------------
+
+          status, feed = api("GET", "/api/v1/feed/for-you")
+          print(f"For-you feed HTTP: {status}")
+
+          if isinstance(feed, dict):
+              feed_items = (
+                  feed.get("items")
+                  or feed.get("posts")
+                  or feed.get("results")
+                  or []
+              )
+          elif isinstance(feed, list):
+              feed_items = feed
+          else:
+              feed_items = []
+
+          print(f"For-you items: {len(feed_items)}")
+
+          # ------------------------------------------------------------
+          # 4. READ RECENT CHANGES
+          # ------------------------------------------------------------
+
+          cursor_file = MEMORY / "since_cursor.txt"
+          since = cursor_file.read_text(encoding="utf-8").strip() if cursor_file.exists() else ""
+
+          since_path = "/api/v1/since"
+          if since:
+              since_path += "?since=" + urllib.parse.quote(since)
+
+          status, recent = api("GET", since_path)
+          print(f"Since HTTP: {status}")
+
+          if isinstance(recent, dict):
+              new_cursor = (
+                  recent.get("next_cursor")
+                  or recent.get("cursor")
+                  or since
+              )
+              recent_messages = recent.get("messages") or []
+              recent_posts = recent.get("posts") or []
+              recent_notifications = recent.get("notifications") or []
+          else:
+              new_cursor = since
+              recent_messages = []
+              recent_posts = []
+              recent_notifications = []
+
+          if new_cursor:
+              cursor_file.write_text(str(new_cursor), encoding="utf-8")
+
+          print(
+              f"Recent: messages={len(recent_messages)} "
+              f"posts={len(recent_posts)} "
+              f"notifications={len(recent_notifications)}"
+          )
+
+          # ------------------------------------------------------------
+          # 5. LOAD ACT61 MEMORY
+          # ------------------------------------------------------------
+
+          experience_file = MEMORY / "experience_ledger.json"
+
+          if experience_file.exists():
+              try:
+                  experience_ledger = json.loads(
+                      experience_file.read_text(encoding="utf-8")
+                  )
+              except Exception:
+                  experience_ledger = []
+          else:
+              experience_ledger = []
+
+          if not isinstance(experience_ledger, list):
+              experience_ledger = []
+
+          # Keep memory bounded.
+          experience_ledger = experience_ledger[-250:]
+
+          # ------------------------------------------------------------
+          # 6. BUILD EXPERIENCE INDEX
+          # ------------------------------------------------------------
+
+          experience_text = "\n".join(
+              norm(
+                  " ".join(
+                      [
+                          str(item.get("situation", "")),
+                          str(item.get("action", "")),
+                          str(item.get("result", "")),
+                          str(item.get("learning", "")),
+                      ]
+                  )
+              )
+              for item in experience_ledger
+              if isinstance(item, dict)
+          )
+
+          # ------------------------------------------------------------
+          # 7. COGNITIVE SCORING
+          #
+          # This is deliberately deterministic.
+          # No Gemini, no external AI, no paid service.
+          #
+          # Score dimensions:
+          #   context
+          #   novelty
+          #   experience reuse
+          #   action value
+          #   risk
+          #   repetition penalty
+          # ------------------------------------------------------------
+
+          def classify_action(item):
+              raw = text_of(item).lower()
+
+              endpoint = norm(
+                  item.get("endpoint")
+                  or item.get("url")
+                  or item.get("path")
+                  if isinstance(item, dict)
+                  else ""
+              )
+
+              method = (
+                  str(item.get("method", ""))
+                  .upper()
+                  if isinstance(item, dict)
+                  else ""
+              )
+
+              blob = raw + " " + endpoint
+
+              if "message" in blob or "reply" in blob or "dm" in blob:
+                  return "message"
+
+              if "comment" in blob:
+                  return "comment"
+
+              if "follow" in blob:
+                  return "follow"
+
+              if "vote" in blob or "upvote" in blob:
+                  return "vote"
+
+              if "task" in blob or "marketplace" in blob or "bid" in blob:
+                  return "marketplace"
+
+              if method in {"POST", "PUT", "PATCH"}:
+                  return "write"
+
+              return "observe"
+
+          def extract_target(item):
+              if not isinstance(item, dict):
+                  return {}
+
+              target = {}
+
+              for key in (
+                  "post_id",
+                  "comment_id",
+                  "parent_id",
+                  "user_id",
+                  "username",
+                  "recipient",
+                  "task_id",
+                  "colony_id",
+                  "id",
+              ):
+                  if item.get(key) is not None:
+                      target[key] = item[key]
+
+              for nested_key in ("target", "post", "user", "task", "resource"):
+                  nested = item.get(nested_key)
+                  if isinstance(nested, dict):
+                      for key in (
+                          "id",
+                          "post_id",
+                          "user_id",
+                          "username",
+                          "task_id",
+                      ):
+                          if nested.get(key) is not None:
+                              target[key] = nested[key]
+
+              return target
+
+          candidates = []
+
+          all_items = []
+
+          for item in suggestion_items:
+              if isinstance(item, dict):
+                  x = dict(item)
+                  x["_source"] = "suggestion"
+                  all_items.append(x)
+
+          for item in feed_items:
+              if isinstance(item, dict):
+                  x = dict(item)
+                  x["_source"] = "for-you"
+                  all_items.append(x)
+
+          for item in recent_messages:
+              if isinstance(item, dict):
+                  x = dict(item)
+                  x["_source"] = "recent-message"
+                  all_items.append(x)
+
+          for item in recent_posts:
+              if isinstance(item, dict):
+                  x = dict(item)
+                  x["_source"] = "recent-post"
+                  all_items.append(x)
+
+          seen = set()
+
+          for item in all_items:
+              item_text = norm(text_of(item))
+              target = extract_target(item)
+              action_type = classify_action(item)
+
+              item_id = (
+                  item.get("id")
+                  or item.get("post_id")
+                  or item.get("comment_id")
+                  or stable_id("item", item_text[:500])
+              )
+
+              if item_id in seen:
+                  continue
+
+              seen.add(item_id)
+
+              context_score = 0
+
+              if len(item_text) >= 30:
+                  context_score += 20
+
+              if target:
+                  context_score += 25
+
+              if item.get("_source") == "suggestion":
+                  context_score += 20
+
+              if action_type != "observe":
+                  context_score += 15
+
+              if any(
+                  word in item_text.lower()
+                  for word in (
+                      "question",
+                      "?",
+                      "reply",
+                      "respond",
+                      "collabor",
+                      "task",
+                      "workbuddy",
+                      "marketplace",
+                      "research",
+                      "agent",
+                  )
+              ):
+                  context_score += 15
+
+              context_score = min(100, context_score)
+
+              reuse_score = 0
+
+              if experience_text:
+                  best_overlap = max(
+                      (
+                          overlap(item_text, e)
+                          for e in re.split(r"\n+", experience_text)
+                          if e
+                      ),
+                      default=0,
+                  )
+                  reuse_score = min(100, int(best_overlap * 140))
+
+              action_value = {
+                  "message": 90,
+                  "comment": 90,
+                  "marketplace": 85,
+                  "follow": 65,
+                  "vote": 60,
+                  "write": 55,
+                  "observe": 25,
+              }.get(action_type, 20)
+
+              risk = {
+                  "message": 20,
+                  "comment": 20,
+                  "marketplace": 80,
+                  "follow": 10,
+                  "vote": 10,
+                  "write": 60,
+                  "observe": 0,
+              }.get(action_type, 50)
+
+              # Marketplace remains analysis-only here:
+              # ACT61 never spends sats and never places a financial bid.
+              if action_type == "marketplace":
+                  action_value = 35
+
+              repetition_penalty = 0
+
+              for old in experience_ledger[-40:]:
+                  if not isinstance(old, dict):
+                      continue
+                  if old.get("action_type") == action_type:
+                      similarity = overlap(
+                          item_text,
+                          str(old.get("situation", "")),
+                      )
+                      if similarity >= 0.55:
+                          repetition_penalty = max(
+                              repetition_penalty,
+                              int(similarity * 35),
+                          )
+
+              score = (
+                  int(context_score * 0.30)
+                  + int(reuse_score * 0.20)
+                  + int(action_value * 0.40)
+                  - int(risk * 0.10)
+                  - repetition_penalty
+              )
+
+              score = max(0, min(100, score))
+
+              if context_score >= MIN_CONTEXT_SCORE and score >= MIN_ACTION_SCORE:
+                  candidates.append(
+                      {
+                          "id": str(item_id),
+                          "action_type": action_type,
+                          "score": score,
+                          "context_score": context_score,
+                          "reuse_score": reuse_score,
+                          "action_value": action_value,
+                          "risk": risk,
+                          "repetition_penalty": repetition_penalty,
+                          "source": item.get("_source"),
+                          "text": item_text[:1500],
+                          "target": target,
+                          "raw": item,
+                      }
+                  )
+
+          candidates.sort(
+              key=lambda x: (
+                  x["score"],
+                  x["reuse_score"],
+                  x["context_score"],
+              ),
+              reverse=True,
+          )
+
+          print()
+          print("=== COGNITIVE ACTION SELECTION ===")
+          print(f"Candidates above threshold: {len(candidates)}")
+
+          for c in candidates[:10]:
+              print(
+                  f"- {c['action_type']} "
+                  f"score={c['score']} "
+                  f"context={c['context_score']} "
+                  f"reuse={c['reuse_score']} "
+                  f"risk={c['risk']}"
+              )
+
+          # ------------------------------------------------------------
+          # 8. ACTION CONTENT GENERATION
+          #
+          # No external AI.
+          # The engine deliberately extracts concrete context from the
+          # target rather than emitting a generic "interesting post".
+          # ------------------------------------------------------------
+
+          def meaningful_terms(text, limit=4):
+              stop = {
+                  "this", "that", "with", "from", "have", "your",
+                  "what", "when", "where", "which", "would", "could",
+                  "about", "into", "they", "them", "their", "there",
+                  "nous", "vous", "pour", "dans", "avec", "cette",
+                  "cela", "être", "est", "une", "des", "les", "sur",
+                  "and", "the", "are", "for", "you",
+              }
+
+              words = re.findall(
+                  r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9_-]{3,}",
+                  text.lower(),
+              )
+
+              out = []
+
+              for w in words:
+                  if w in stop:
+                      continue
+                  if w not in out:
+                      out.append(w)
+
+              return out[:limit]
+
+          def build_comment(candidate):
+              source = candidate["text"]
+              terms = meaningful_terms(source)
+
+              if "?" in source:
+                  question = source.split("?")[0].strip()
+                  question = question[-260:]
+                  return (
+                      f"I’m interested in the concrete part of this: "
+                      f"{question}? "
+                      f"What result or evidence have you seen so far?"
+                  )
+
+              if terms:
+                  joined = ", ".join(terms)
+                  return (
+                      f"The part about {joined} caught my attention. "
+                      f"What have you actually observed in practice so far?"
+                  )
+
+              return (
+                  "I’d like to understand the concrete result behind this. "
+                  "What did you observe after trying it?"
+              )
+
+          def build_message(candidate):
+              source = candidate["text"]
+              terms = meaningful_terms(source)
+
+              if terms:
+                  joined = ", ".join(terms)
+                  return (
+                      f"I’m following the point you raised about {joined}. "
+                      f"I’m particularly interested in the practical outcome. "
+                      f"What changed after you tried it?"
+                  )
+
+              return (
+                  "I want to understand the practical outcome rather than "
+                  "just the idea. What happened when you tested it?"
+              )
+
+          # ------------------------------------------------------------
+          # 9. SAFE ACTION EXECUTION
+          #
+          # Allowed:
+          #   - comments
+          #   - direct messages
+          #   - follows
+          #   - votes
+          #
+          # Forbidden:
+          #   - payments
+          #   - bids
+          #   - purchases
+          #   - financial commitments
+          #
+          # Maximum two actions per run.
+          # ------------------------------------------------------------
+
+          executed = []
+          skipped = []
+
+          def already_done(action_id):
+              for old in experience_ledger[-100:]:
+                  if isinstance(old, dict) and old.get("action_id") == action_id:
+                      return True
+              return False
+
+          for candidate in candidates:
+              if len(executed) >= MAX_ACTIONS:
+                  break
+
+              action_type = candidate["action_type"]
+              target = candidate["target"]
+
+              action_id = stable_id(
+                  "act61",
+                  action_type,
+                  candidate["id"],
+                  candidate["text"][:500],
+              )
+
+              if already_done(action_id):
+                  skipped.append(
+                      {
+                          "action_id": action_id,
+                          "reason": "already_executed",
+                          "candidate": candidate["id"],
+                      }
+                  )
+                  continue
+
+              status = 0
+              response = {}
+
+              # --------------------------------------------------------
+              # COMMENT
+              # --------------------------------------------------------
+
+              if action_type == "comment":
+                  post_id = (
+                      target.get("post_id")
+                      or target.get("id")
+                  )
+
+                  if not post_id:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "missing_post_id",
+                          }
+                      )
+                      continue
+
+                  body = build_comment(candidate)
+
+                  payload = {"body": body}
+
+                  parent_id = target.get("comment_id") or target.get("parent_id")
+
+                  if parent_id:
+                      payload["parent_id"] = parent_id
+
+                  status, response = api(
+                      "POST",
+                      f"/api/v1/posts/{post_id}/comments",
+                      payload,
+                  )
+
+                  if 200 <= status < 300:
+                      executed.append(
+                          {
+                              "action_id": action_id,
+                              "action_type": "comment",
+                              "target": target,
+                              "body": body,
+                              "status": status,
+                              "response": response,
+                              "score": candidate["score"],
+                          }
+                      )
+
+                  else:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "comment_failed",
+                              "status": status,
+                              "response": response,
+                          }
+                      )
+
+              # --------------------------------------------------------
+              # DIRECT MESSAGE
+              # --------------------------------------------------------
+
+              elif action_type == "message":
+                  username = (
+                      target.get("username")
+                      or target.get("recipient")
+                  )
+
+                  if not username or username == identity:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "invalid_recipient",
+                          }
+                      )
+                      continue
+
+                  body = build_message(candidate)
+
+                  status, response = api(
+                      "POST",
+                      f"/api/v1/messages/send/{urllib.parse.quote(str(username))}",
+                      {"body": body},
+                  )
+
+                  if 200 <= status < 300:
+                      executed.append(
+                          {
+                              "action_id": action_id,
+                              "action_type": "message",
+                              "target": target,
+                              "body": body,
+                              "status": status,
+                              "response": response,
+                              "score": candidate["score"],
+                          }
+                      )
+
+                  else:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "message_failed",
+                              "status": status,
+                              "response": response,
+                          }
+                      )
+
+              # --------------------------------------------------------
+              # FOLLOW
+              # --------------------------------------------------------
+
+              elif action_type == "follow":
+                  username = target.get("username")
+
+                  if not username or username == identity:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "invalid_follow_target",
+                          }
+                      )
+                      continue
+
+                  status, response = api(
+                      "POST",
+                      f"/api/v1/users/{urllib.parse.quote(str(username))}/follow",
+                  )
+
+                  if 200 <= status < 300:
+                      executed.append(
+                          {
+                              "action_id": action_id,
+                              "action_type": "follow",
+                              "target": target,
+                              "status": status,
+                              "response": response,
+                              "score": candidate["score"],
+                          }
+                      )
+                  else:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "follow_failed",
+                              "status": status,
+                              "response": response,
+                          }
+                      )
+
+              # --------------------------------------------------------
+              # VOTE
+              # --------------------------------------------------------
+
+              elif action_type == "vote":
+                  post_id = target.get("post_id") or target.get("id")
+
+                  if not post_id:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "missing_vote_target",
+                          }
+                      )
+                      continue
+
+                  status, response = api(
+                      "POST",
+                      f"/api/v1/posts/{post_id}/vote",
+                      {"value": 1},
+                  )
+
+                  if 200 <= status < 300:
+                      executed.append(
+                          {
+                              "action_id": action_id,
+                              "action_type": "vote",
+                              "target": target,
+                              "status": status,
+                              "response": response,
+                              "score": candidate["score"],
+                          }
+                      )
+                  else:
+                      skipped.append(
+                          {
+                              "action_id": action_id,
+                              "reason": "vote_failed",
+                              "status": status,
+                              "response": response,
+                          }
+                      )
+
+              else:
+                  skipped.append(
+                      {
+                          "action_id": action_id,
+                          "reason": "action_not_allowed",
+                          "action_type": action_type,
+                      }
+                  )
+
+          # ------------------------------------------------------------
+          # 10. TURN EXECUTED ACTIONS INTO EXPERIENCE
+          # ------------------------------------------------------------
+
+          for item in executed:
+              experience_ledger.append(
+                  {
+                      "timestamp": TS,
+                      "action_id": item["action_id"],
+                      "action_type": item["action_type"],
+                      "situation": next(
+                          (
+                              c["text"]
+                              for c in candidates
+                              if stable_id(
+                                  "act61",
+                                  c["action_type"],
+                                  c["id"],
+                                  c["text"][:500],
+                              ) == item["action_id"]
+                          ),
+                          "",
+                      ),
+                      "action": item.get("body")
+                      or item["action_type"],
+                      "result": (
+                          "HTTP_SUCCESS"
+                          if 200 <= item.get("status", 0) < 300
+                          else "HTTP_FAILURE"
+                      ),
+                      "learning": (
+                          "Action executed successfully; "
+                          "retain context for future transfer."
+                          if 200 <= item.get("status", 0) < 300
+                          else
+                          "Action failed; avoid repeating identical execution "
+                          "without checking the cause."
+                      ),
+                      "score": item.get("score", 0),
+                  }
+              )
+
+          experience_ledger = experience_ledger[-250:]
+
+          # ------------------------------------------------------------
+          # 11. COGNITIVE STATE
+          # ------------------------------------------------------------
+
+          action_counts = Counter(
+              item["action_type"]
+              for item in executed
+          )
+
+          state = {
+              "timestamp": TS,
+              "identity": identity,
+              "version": "ACT61-V1",
+              "mode": "cognitive_action_evolution",
+              "external_ai_used": False,
+              "gemini_used": False,
+              "project_cost_eur": 0,
+              "suggestions_seen": len(suggestion_items),
+              "feed_items_seen": len(feed_items),
+              "recent_messages_seen": len(recent_messages),
+              "recent_posts_seen": len(recent_posts),
+              "candidate_actions": len(candidates),
+              "executed_actions": len(executed),
+              "skipped_actions": len(skipped),
+              "action_counts": dict(action_counts),
+              "experience_records": len(experience_ledger),
+              "cognitive_loop": [
+                  "observe",
+                  "contextualize",
+                  "recall",
+                  "evaluate",
+                  "select",
+                  "act",
+                  "observe_result",
+                  "learn",
+              ],
+              "forbidden_actions": [
+                  "payment",
+                  "purchase",
+                  "financial_commitment",
+                  "marketplace_bid",
+                  "spending_sats",
+              ],
+          }
+
+          save_json("cognitive_state.json", state)
+          save_json("last_candidates.json", candidates[:30])
+          save_json("last_execution.json", executed)
+          save_json("last_skipped.json", skipped)
+          save_json("experience_ledger.json", experience_ledger)
+
+          # ------------------------------------------------------------
+          # 12. HUMAN-READABLE EVOLUTION LOG
+          # ------------------------------------------------------------
+
+          log_path = MEMORY / "evolution_log.md"
+
+          with log_path.open("a", encoding="utf-8") as f:
+              f.write(f"\n## {TS}\n\n")
+              f.write(
+                  f"- Suggestions: {len(suggestion_items)}\n"
+                  f"- Candidates: {len(candidates)}\n"
+                  f"- Executed: {len(executed)}\n"
+                  f"- Skipped: {len(skipped)}\n"
+                  f"- Experience records: {len(experience_ledger)}\n"
+              )
+
+              if executed:
+                  f.write("\n### Actions executed\n")
+                  for item in executed:
+                      f.write(
+                          f"- `{item['action_type']}` "
+                          f"`{item['action_id']}` "
+                          f"score={item.get('score', 0)} "
+                          f"HTTP={item.get('status', 0)}\n"
+                      )
+
+              if skipped:
+                  f.write("\n### Actions skipped\n")
+                  for item in skipped[:20]:
+                      f.write(
+                          f"- `{item.get('reason', 'unknown')}` "
+                          f"`{item.get('action_id', '')}`\n"
+                      )
+
+          # ------------------------------------------------------------
+          # 13. OUTPUT
+          # ------------------------------------------------------------
+
+          print()
+          print("=== ACT61 RESULT ===")
+          print(f"Suggestions:       {len(suggestion_items)}")
+          print(f"For-you:            {len(feed_items)}")
+          print(f"Candidates:         {len(candidates)}")
+          print(f"Executed actions:   {len(executed)}")
+          print(f"Skipped actions:    {len(skipped)}")
+          print(f"Experience ledger:  {len(experience_ledger)}")
+          print()
+
+          if executed:
+              print("ACTIONS:")
+              for item in executed:
+                  print(
+                      f"  {item['action_type']} -> "
+                      f"HTTP {item['status']} -> "
+                      f"score {item.get('score', 0)}"
+                  )
+          else:
+              print("ACTIONS: none this run")
+              print("Reason: no candidate passed the cognitive safety/value gate.")
+
+          print()
+          print("COST: €0")
+          print("EXTERNAL_AI: false")
+          print("GEMINI: false")
+          print("PAYMENTS: disabled")
+          print("MARKETPLACE_BIDS: disabled")
+
+          PY
+
+      - name: Commit cognitive evolution
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX Cognitive Evolution"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add memory/act61
+
+          if git diff --cached --quiet; then
+            echo "No ACT61 memory changes."
+            exit 0
+          fi
+
+          git commit -m "feat(act61): evolve cognitive action memory"
+          git push
