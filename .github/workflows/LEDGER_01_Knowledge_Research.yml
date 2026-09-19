@@ -1,0 +1,523 @@
+name: NØX LEDGER 01 - Knowledge & Autonomous Research
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Optional research query"
+        required: false
+        type: string
+        default: ""
+      force_research:
+        description: "Force external research"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "07 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+jobs:
+  knowledge-research:
+    runs-on: ubuntu-latest
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+      GEMINI_ENABLED: "false"
+      EXTERNAL_AI_ENABLED: "false"
+      PAYMENTS_ENABLED: "false"
+      SPENDING_ENABLED: "false"
+      PROJECT_COST_EUR: "0"
+
+      KNOWLEDGE_FILE: memory/nox_ledger_knowledge.json
+      MAX_FEED_ITEMS: "30"
+      MAX_RESEARCH_QUERIES: "3"
+      MAX_WEB_RESULTS: "5"
+      MAX_SOURCE_CHARS: "5000"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run LEDGER 01
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import re
+          import json
+          import hashlib
+          import html
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import quote, urlparse
+          from html.parser import HTMLParser
+
+          import requests
+
+          BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
+          KEY = os.environ["COLONY_API_KEY"]
+          FILE = Path(os.environ["KNOWLEDGE_FILE"])
+
+          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
+          MAX_QUERIES = int(os.environ["MAX_RESEARCH_QUERIES"])
+          MAX_RESULTS = int(os.environ["MAX_WEB_RESULTS"])
+          MAX_SOURCE_CHARS = int(os.environ["MAX_SOURCE_CHARS"])
+
+          FORCE_RESEARCH = os.getenv("INPUT_FORCE_RESEARCH", "false").lower() == "true"
+          MANUAL_QUERY = os.getenv("INPUT_QUERY", "").strip()
+
+          now = datetime.now(timezone.utc).isoformat()
+
+          def load_json(path, default):
+              if not path.exists():
+                  return default
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+          def save_json(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(data, ensure_ascii=False, indent=2),
+                  encoding="utf-8"
+              )
+
+          memory = load_json(FILE, {
+              "version": "1.0",
+              "updated_at": None,
+              "knowledge": [],
+              "research_runs": [],
+              "attention": [],
+              "gaps": [],
+              "stats": {}
+          })
+
+          session = requests.Session()
+          session.headers.update({
+              "Authorization": f"Bearer {KEY}",
+              "Accept": "application/json",
+              "User-Agent": "NOX-Ledger-Research/1.0"
+          })
+
+          def get(path, params=None, timeout=20):
+              try:
+                  r = session.get(BASE + path, params=params, timeout=timeout)
+                  if r.status_code == 401:
+                      token = session.post(
+                          BASE + "/api/v1/auth/token",
+                          json={"api_key": KEY},
+                          timeout=15
+                      )
+                      if token.ok:
+                          session.headers["Authorization"] = (
+                              "Bearer " + token.json()["access_token"]
+                          )
+                          r = session.get(BASE + path, params=params, timeout=timeout)
+                  if r.ok:
+                      return r.json()
+              except Exception as exc:
+                  print(f"GET ERROR {path}: {exc}")
+              return None
+
+          def text_of(value):
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, dict):
+                  return " ".join(text_of(v) for v in value.values())
+              if isinstance(value, list):
+                  return " ".join(text_of(v) for v in value)
+              return str(value or "")
+
+          def tokens(text):
+              return set(
+                  x.lower()
+                  for x in re.findall(r"[A-Za-zÀ-ÿ0-9_]{4,}", text)
+                  if x.lower() not in {
+                      "this", "that", "with", "from", "have", "about",
+                      "what", "which", "their", "there", "would", "could",
+                      "agent", "agents"
+                  }
+              )
+
+          def fingerprint(text):
+              normalized = " ".join(text.lower().split())
+              return hashlib.sha256(normalized.encode()).hexdigest()[:20]
+
+          # ---------------------------------------------------------
+          # 1. Identity
+          # ---------------------------------------------------------
+
+          me = get("/api/v1/users/me") or {}
+          username = (
+              me.get("username")
+              or me.get("handle")
+              or "nox_origine"
+          )
+
+          print(f"IDENTITY: {username}")
+
+          # ---------------------------------------------------------
+          # 2. Colony attention
+          # ---------------------------------------------------------
+
+          feed = get("/api/v1/feed/for-you", {"limit": MAX_FEED}) or {}
+          suggestions = get("/api/v1/suggestions", {"limit": 20}) or {}
+
+          feed_items = (
+              feed.get("items")
+              if isinstance(feed, dict)
+              else feed
+          )
+          if not isinstance(feed_items, list):
+              feed_items = []
+
+          suggestion_items = (
+              suggestions.get("items")
+              if isinstance(suggestions, dict)
+              else suggestions
+          )
+          if not isinstance(suggestion_items, list):
+              suggestion_items = []
+
+          attention = []
+
+          for item in feed_items:
+              raw = text_of(item)
+              low = raw.lower()
+
+              score = 0
+
+              if any(k in low for k in [
+                  "research", "evidence", "knowledge", "marketplace",
+                  "task", "agent", "autonomy", "lightning", "colony"
+              ]):
+                  score += 20
+
+              if any(k in low for k in [
+                  "question", "problem", "how", "why", "looking for"
+              ]):
+                  score += 15
+
+              if len(raw) > 500:
+                  score += 5
+
+              if score >= 20:
+                  attention.append({
+                      "score": score,
+                      "content": raw[:3000],
+                      "id": item.get("id") if isinstance(item, dict) else None,
+                      "kind": "feed"
+                  })
+
+          for item in suggestion_items:
+              raw = text_of(item)
+              if any(k in raw.lower() for k in [
+                  "question", "research", "reply", "claim", "task"
+              ]):
+                  attention.append({
+                      "score": 25,
+                      "content": raw[:3000],
+                      "id": item.get("id") if isinstance(item, dict) else None,
+                      "kind": "suggestion"
+                  })
+
+          attention.sort(key=lambda x: x["score"], reverse=True)
+          attention = attention[:10]
+
+          # ---------------------------------------------------------
+          # 3. Build research queries
+          # ---------------------------------------------------------
+
+          queries = []
+
+          if MANUAL_QUERY:
+              queries.append(MANUAL_QUERY)
+
+          for item in attention:
+              words = list(tokens(item["content"]))
+              if words:
+                  q = " ".join(words[:8])
+                  queries.append(q)
+
+          # Important NØX strategic topics
+          queries.extend([
+              "AI agents marketplace tasks reputation evidence autonomous agents",
+              "The Colony AI agents marketplace tasks bids tips"
+          ])
+
+          unique_queries = []
+          seen_queries = set()
+
+          for q in queries:
+              q = " ".join(q.split()).strip()
+              if not q:
+                  continue
+              key = q.lower()
+              if key not in seen_queries:
+                  seen_queries.add(key)
+                  unique_queries.append(q)
+
+          if not FORCE_RESEARCH and not MANUAL_QUERY:
+              unique_queries = unique_queries[:2]
+          else:
+              unique_queries = unique_queries[:MAX_QUERIES]
+
+          # ---------------------------------------------------------
+          # 4. Lightweight autonomous web research
+          #    No external AI / no paid API.
+          # ---------------------------------------------------------
+
+          class Parser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+                  self.skip = 0
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() in {"script", "style", "noscript", "svg"}:
+                      self.skip += 1
+
+              def handle_endtag(self, tag):
+                  if tag.lower() in {"script", "style", "noscript", "svg"}:
+                      self.skip = max(0, self.skip - 1)
+
+              def handle_data(self, data):
+                  if self.skip == 0:
+                      value = " ".join(data.split())
+                      if value:
+                          self.parts.append(value)
+
+          def fetch_page(url):
+              try:
+                  r = requests.get(
+                      url,
+                      timeout=15,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 Nox-Ledger-Research/1.0"
+                      }
+                  )
+                  if not r.ok:
+                      return ""
+                  parser = Parser()
+                  parser.feed(r.text)
+                  text = " ".join(parser.parts)
+                  return text[:MAX_SOURCE_CHARS]
+              except Exception:
+                  return ""
+
+          research_results = []
+
+          for query in unique_queries:
+              print(f"RESEARCH QUERY: {query}")
+
+              search_url = (
+                  "https://html.duckduckgo.com/html/?q="
+                  + quote(query)
+              )
+
+              try:
+                  r = requests.get(
+                      search_url,
+                      timeout=20,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 Nox-Ledger-Research/1.0"
+                      }
+                  )
+                  html_text = r.text if r.ok else ""
+              except Exception:
+                  html_text = ""
+
+              links = re.findall(
+                  r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                  html_text,
+                  re.I | re.S
+              )
+
+              for raw_url, raw_title in links[:MAX_RESULTS]:
+                  title = re.sub("<.*?>", "", raw_title)
+                  title = html.unescape(" ".join(title.split()))
+
+                  url = html.unescape(raw_url)
+
+                  if url.startswith("//"):
+                      url = "https:" + url
+
+                  parsed = urlparse(url)
+
+                  if parsed.scheme not in {"http", "https"}:
+                      continue
+
+                  source_text = fetch_page(url)
+
+                  if not source_text:
+                      continue
+
+                  evidence = {
+                      "query": query,
+                      "title": title[:300],
+                      "url": url[:1000],
+                      "domain": parsed.netloc,
+                      "excerpt": source_text[:1800],
+                      "fingerprint": fingerprint(
+                          title + url + source_text[:1000]
+                      )
+                  }
+
+                  research_results.append(evidence)
+
+                  time.sleep(0.4)
+
+          # ---------------------------------------------------------
+          # 5. Store knowledge with evidence
+          # ---------------------------------------------------------
+
+          existing = {
+              x.get("fingerprint")
+              for x in memory.get("knowledge", [])
+              if isinstance(x, dict)
+          }
+
+          added = 0
+
+          for result in research_results:
+              if result["fingerprint"] in existing:
+                  continue
+
+              entry = {
+                  "id": "knowledge-" + result["fingerprint"],
+                  "created_at": now,
+                  "topic": result["query"],
+                  "claim": result["title"],
+                  "evidence": result["excerpt"],
+                  "source_url": result["url"],
+                  "source_domain": result["domain"],
+                  "confidence": 0.55,
+                  "status": "UNVERIFIED_EXTERNAL_SOURCE",
+                  "requires_cross_check": True,
+                  "fingerprint": result["fingerprint"]
+              }
+
+              memory.setdefault("knowledge", []).append(entry)
+              added += 1
+
+          # ---------------------------------------------------------
+          # 6. Knowledge gaps
+          # ---------------------------------------------------------
+
+          gaps = []
+
+          for item in attention:
+              content = item["content"]
+              low = content.lower()
+
+              if any(k in low for k in [
+                  "why", "how", "unclear", "unknown", "does anyone know",
+                  "looking for", "need help"
+              ]):
+                  gaps.append({
+                      "created_at": now,
+                      "question": content[:1000],
+                      "status": "OPEN"
+                  })
+
+          memory["gaps"] = (
+              memory.get("gaps", []) + gaps
+          )[-100:]
+
+          memory["attention"] = attention
+          memory["research_runs"] = (
+              memory.get("research_runs", []) + [{
+                  "timestamp": now,
+                  "queries": unique_queries,
+                  "sources_found": len(research_results),
+                  "knowledge_added": added,
+                  "external_ai_used": False,
+                  "gemini_used": False,
+                  "project_cost_eur": 0
+              }]
+          )[-100:]
+
+          memory["knowledge"] = memory.get("knowledge", [])[-500:]
+          memory["updated_at"] = now
+
+          memory["stats"] = {
+              "knowledge_entries": len(memory["knowledge"]),
+              "open_gaps": len([
+                  x for x in memory["gaps"]
+                  if x.get("status") == "OPEN"
+              ]),
+              "attention_items": len(attention),
+              "research_sources_this_run": len(research_results),
+              "knowledge_added_this_run": added
+          }
+
+          save_json(FILE, memory)
+
+          print("")
+          print("=== NØX LEDGER 01 ===")
+          print(f"Identity: {username}")
+          print(f"Attention: {len(attention)}")
+          print(f"Research queries: {len(unique_queries)}")
+          print(f"Web sources: {len(research_results)}")
+          print(f"Knowledge added: {added}")
+          print(f"Knowledge total: {len(memory['knowledge'])}")
+          print(f"Open gaps: {memory['stats']['open_gaps']}")
+          print("Gemini: False")
+          print("External AI: False")
+          print("Payments: False")
+          print("Spending: False")
+          print("Project cost: €0")
+          PY
+
+      - name: Commit knowledge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
+          git add memory/nox_ledger_knowledge.json
+
+          if git diff --cached --quiet; then
+            echo "No knowledge changes."
+            exit 0
+          fi
+
+          git commit -m "ledger01: update knowledge and research"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main || {
+              git rebase --abort || true
+              sleep 2
+              continue
+            }
+
+            git push origin HEAD:main && exit 0
+
+            sleep 2
+          done
+
+          echo "Push failed after retries."
+          exit 1
