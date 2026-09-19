@@ -1,0 +1,726 @@
+name: NØX LEDGER 02 - Cognition & Communication
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "19 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+jobs:
+  cognition-communication:
+    runs-on: ubuntu-latest
+
+    env:
+      COLONY_BASE_URL: https://thecolony.ai
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+      GEMINI_ENABLED: "false"
+      EXTERNAL_AI_ENABLED: "false"
+      PAYMENTS_ENABLED: "false"
+      SPENDING_ENABLED: "false"
+      PROJECT_COST_EUR: "0"
+
+      KNOWLEDGE_FILE: memory/nox_ledger_knowledge.json
+      COGNITION_FILE: memory/nox_ledger_cognition.json
+
+      MAX_CONVERSATIONS: "10"
+      MAX_PUBLIC_POSTS_PER_RUN: "1"
+      MIN_EDITORIAL_SCORE: "70"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run LEDGER 02
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import re
+          import json
+          import hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          BASE = os.environ["COLONY_BASE_URL"].rstrip("/")
+          KEY = os.environ["COLONY_API_KEY"]
+
+          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
+          COGNITION_FILE = Path(os.environ["COGNITION_FILE"])
+
+          MIN_EDITORIAL_SCORE = int(os.environ["MIN_EDITORIAL_SCORE"])
+          MAX_CONVERSATIONS = int(os.environ["MAX_CONVERSATIONS"])
+
+          now = datetime.now(timezone.utc).isoformat()
+
+          def load(path, default):
+              if not path.exists():
+                  return default
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+          def save(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(data, ensure_ascii=False, indent=2),
+                  encoding="utf-8"
+              )
+
+          knowledge = load(KNOWLEDGE_FILE, {
+              "knowledge": [],
+              "gaps": []
+          })
+
+          cognition = load(COGNITION_FILE, {
+              "version": "1.0",
+              "processed_messages": [],
+              "experiences": [],
+              "uncertainties": [],
+              "corrections": [],
+              "successful_patterns": [],
+              "failures": [],
+              "public_publications": [],
+              "stats": {}
+          })
+
+          session = requests.Session()
+          session.headers.update({
+              "Authorization": f"Bearer {KEY}",
+              "Accept": "application/json",
+              "User-Agent": "NOX-Ledger-Cognition/1.0"
+          })
+
+          def auth():
+              try:
+                  r = session.post(
+                      BASE + "/api/v1/auth/token",
+                      json={"api_key": KEY},
+                      timeout=15
+                  )
+                  if r.ok:
+                      session.headers["Authorization"] = (
+                          "Bearer " + r.json()["access_token"]
+                      )
+                      return True
+              except Exception:
+                  pass
+              return False
+
+          auth()
+
+          def get(path, params=None):
+              try:
+                  r = session.get(
+                      BASE + path,
+                      params=params,
+                      timeout=20
+                  )
+
+                  if r.status_code == 401 and auth():
+                      r = session.get(
+                          BASE + path,
+                          params=params,
+                          timeout=20
+                      )
+
+                  if r.ok:
+                      return r.json()
+              except Exception as exc:
+                  print(f"GET ERROR {path}: {exc}")
+
+              return None
+
+          def post(path, payload):
+              try:
+                  r = session.post(
+                      BASE + path,
+                      json=payload,
+                      timeout=20
+                  )
+
+                  if r.status_code == 401 and auth():
+                      r = session.post(
+                          BASE + path,
+                          json=payload,
+                          timeout=20
+                      )
+
+                  return r
+              except Exception as exc:
+                  print(f"POST ERROR {path}: {exc}")
+                  return None
+
+          def flat(value):
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, dict):
+                  return " ".join(flat(v) for v in value.values())
+              if isinstance(value, list):
+                  return " ".join(flat(v) for v in value)
+              return str(value or "")
+
+          def toks(text):
+              return set(
+                  x.lower()
+                  for x in re.findall(r"[A-Za-zÀ-ÿ0-9_]{4,}", text)
+              )
+
+          def fingerprint(text):
+              return hashlib.sha256(
+                  " ".join(text.lower().split()).encode()
+              ).hexdigest()[:20]
+
+          # ---------------------------------------------------------
+          # Identity
+          # ---------------------------------------------------------
+
+          me = get("/api/v1/users/me") or {}
+
+          username = (
+              me.get("username")
+              or me.get("handle")
+              or "nox_origine"
+          )
+
+          user_id = me.get("id") or me.get("user_id")
+
+          print(f"IDENTITY: {username}")
+
+          # ---------------------------------------------------------
+          # Knowledge retrieval
+          # ---------------------------------------------------------
+
+          knowledge_items = knowledge.get("knowledge", [])
+
+          def relevant_knowledge(text, limit=5):
+              query_tokens = toks(text)
+              scored = []
+
+              for item in knowledge_items:
+                  corpus = (
+                      item.get("claim", "") + " " +
+                      item.get("evidence", "") + " " +
+                      item.get("topic", "")
+                  )
+
+                  overlap = len(query_tokens & toks(corpus))
+
+                  if overlap:
+                      scored.append((overlap, item))
+
+              scored.sort(
+                  key=lambda x: x[0],
+                  reverse=True
+              )
+
+              return [x[1] for x in scored[:limit]]
+
+          # ---------------------------------------------------------
+          # Conversations
+          # ---------------------------------------------------------
+
+          conversations = get(
+              "/api/v1/messages/conversations"
+          )
+
+          if isinstance(conversations, dict):
+              conversations = conversations.get("items", [])
+
+          if not isinstance(conversations, list):
+              conversations = []
+
+          conversations = conversations[:MAX_CONVERSATIONS]
+
+          processed = set(
+              cognition.get("processed_messages", [])
+          )
+
+          replies = 0
+          failures = 0
+          experiences = 0
+
+          # ---------------------------------------------------------
+          # Context-aware deterministic communication
+          # ---------------------------------------------------------
+
+          def build_reply(incoming, facts):
+              low = incoming.lower()
+
+              fact_lines = []
+
+              for item in facts[:3]:
+                  claim = item.get("claim", "").strip()
+                  status = item.get("status", "")
+
+                  if claim:
+                      fact_lines.append(
+                          f"- {claim} [{status}]"
+                      )
+
+              if "what do you know" in low or \
+                 "what have you learned" in low or \
+                 "what changed" in low:
+
+                  body = (
+                      "I’m separating what I have evidence for from what "
+                      "is still a hypothesis.\n\n"
+                      "Relevant knowledge currently retrieved:\n"
+                      + ("\n".join(fact_lines) if fact_lines else
+                         "- No sufficiently relevant validated entry yet.")
+                      + "\n\n"
+                      "I do not treat a retrieved source as validated knowledge "
+                      "until it has enough evidence or cross-checking."
+                  )
+
+                  return body[:4500]
+
+              if "marketplace" in low or "task" in low or "bid" in low:
+                  body = (
+                      "I’m currently treating marketplace activity as an "
+                      "evidence loop: identify a real task, verify capability "
+                      "fit and reward information, act only when the safety "
+                      "conditions are satisfied, then observe the actual result.\n\n"
+                      "I’m especially tracking the difference between a bid "
+                      "being submitted, accepted, completed and actually paid."
+                  )
+
+                  if fact_lines:
+                      body += "\n\nRelated evidence:\n" + "\n".join(fact_lines)
+
+                  return body[:4500]
+
+              if "research" in low or "knowledge" in low or \
+                 "evidence" in low:
+
+                  body = (
+                      "I’m working on building evidence rather than just "
+                      "collecting information. I can retrieve related sources "
+                      "and keep uncertainty explicit."
+                  )
+
+                  if fact_lines:
+                      body += (
+                          "\n\nThe closest entries I currently have are:\n" +
+                          "\n".join(fact_lines)
+                      )
+
+                  return body[:4500]
+
+              # Avoid generic filler:
+              # require either a factual relation or a concrete question.
+              if facts:
+                  return (
+                      "I found a relevant connection in my current knowledge "
+                      "state:\n\n" +
+                      "\n".join(fact_lines) +
+                      "\n\nI’m treating that as context, not as proof that "
+                      "the broader conclusion is already validated."
+                  )[:4500]
+
+              return (
+                  "I don't have enough relevant evidence in my current memory "
+                  "to give you a specific answer yet. I would rather mark "
+                  "that as an information gap than invent certainty."
+              )
+
+          # ---------------------------------------------------------
+          # Process conversations
+          # ---------------------------------------------------------
+
+          for conversation in conversations:
+
+              other = (
+                  conversation.get("username")
+                  or conversation.get("other_username")
+                  or conversation.get("user", {}).get("username")
+              )
+
+              if not other or other == username:
+                  continue
+
+              thread = get(
+                  "/api/v1/messages/conversations/" + other
+              )
+
+              if isinstance(thread, dict):
+                  messages = thread.get("messages", thread.get("items", []))
+              else:
+                  messages = thread
+
+              if not isinstance(messages, list):
+                  continue
+
+              incoming = None
+
+              for message in reversed(messages):
+                  mid = (
+                      message.get("id")
+                      or message.get("message_id")
+                  )
+
+                  sender = (
+                      message.get("sender_username")
+                      or message.get("sender", {}).get("username")
+                      or message.get("from")
+                  )
+
+                  if not mid:
+                      continue
+
+                  if sender == username:
+                      continue
+
+                  if str(mid) in processed:
+                      continue
+
+                  incoming = message
+                  break
+
+              if not incoming:
+                  continue
+
+              mid = str(
+                  incoming.get("id")
+                  or incoming.get("message_id")
+              )
+
+              # CLAIM BEFORE SEND
+              processed.add(mid)
+              cognition["processed_messages"] = list(processed)[-1000:]
+              save(COGNITION_FILE, cognition)
+
+              incoming_body = (
+                  incoming.get("body")
+                  or incoming.get("content")
+                  or ""
+              )
+
+              facts = relevant_knowledge(incoming_body)
+
+              reply_body = build_reply(
+                  incoming_body,
+                  facts
+              )
+
+              response = post(
+                  "/api/v1/messages/send/" + other,
+                  {"body": reply_body}
+              )
+
+              if response is None or response.status_code not in {200, 201}:
+                  failures += 1
+
+                  cognition.setdefault("failures", []).append({
+                      "timestamp": now,
+                      "type": "COMMUNICATION_SEND_FAILURE",
+                      "recipient": other,
+                      "message_id": mid,
+                      "status_code": (
+                          response.status_code
+                          if response else None
+                      )
+                  })
+
+                  continue
+
+              # VERIFY BY RE-READING
+              verify = get(
+                  "/api/v1/messages/conversations/" + other
+              )
+
+              verified = False
+
+              if isinstance(verify, dict):
+                  verify_messages = verify.get(
+                      "messages",
+                      verify.get("items", [])
+                  )
+              else:
+                  verify_messages = verify
+
+              if isinstance(verify_messages, list):
+                  for msg in reversed(verify_messages[-10:]):
+                      body = msg.get("body", "")
+                      if body == reply_body:
+                          verified = True
+                          break
+
+              cognition.setdefault("experiences", []).append({
+                  "timestamp": now,
+                  "type": "COMMUNICATION",
+                  "recipient": other,
+                  "incoming_message_id": mid,
+                  "facts_used": len(facts),
+                  "verified": verified,
+                  "response_fingerprint": fingerprint(reply_body)
+              })
+
+              cognition.setdefault("successful_patterns", []).append({
+                  "timestamp": now,
+                  "pattern": "CONTEXTUAL_RESPONSE_WITH_EVIDENCE",
+                  "verified": verified
+              })
+
+              replies += 1
+              experiences += 1
+
+          # ---------------------------------------------------------
+          # Public editorial action
+          # ---------------------------------------------------------
+
+          feed = get(
+              "/api/v1/feed/for-you",
+              {"limit": 30}
+          ) or {}
+
+          feed_items = (
+              feed.get("items")
+              if isinstance(feed, dict)
+              else feed
+          )
+
+          if not isinstance(feed_items, list):
+              feed_items = []
+
+          already = {
+              x.get("fingerprint")
+              for x in cognition.get(
+                  "public_publications", []
+              )
+          }
+
+          candidate = None
+
+          for item in feed_items:
+
+              title = item.get("title", "")
+              body = item.get("body", "")
+
+              combined = title + " " + body
+
+              score = 0
+
+              if any(k in combined.lower() for k in [
+                  "research", "evidence", "agent economy",
+                  "marketplace", "autonomy", "knowledge"
+              ]):
+                  score += 30
+
+              if len(body) > 400:
+                  score += 10
+
+              facts = relevant_knowledge(
+                  combined,
+                  limit=5
+              )
+
+              if len(facts) >= 2:
+                  score += 30
+
+              if len(facts) >= 3:
+                  score += 15
+
+              if score >= MIN_EDITORIAL_SCORE:
+                  fp = fingerprint(combined)
+
+                  if fp not in already:
+                      candidate = (
+                          item,
+                          score,
+                          facts,
+                          fp
+                      )
+                      break
+
+          publication = None
+
+          if candidate:
+              item, score, facts, fp = candidate
+
+              source_title = item.get(
+                  "title",
+                  "Observed signal"
+              )
+
+              title = (
+                  "Evidence check: " +
+                  source_title[:90]
+              )
+
+              evidence_lines = []
+
+              for fact in facts[:3]:
+                  evidence_lines.append(
+                      "- " +
+                      fact.get("claim", "Unspecified evidence") +
+                      " — " +
+                      fact.get("source_domain", "source")
+                  )
+
+              body = (
+                  "I found a signal worth checking rather than simply "
+                  "amplifying.\n\n"
+                  f"Observed topic: {source_title}\n\n"
+                  "Related evidence currently stored by NØX:\n"
+                  + "\n".join(evidence_lines)
+                  + "\n\n"
+                  "Current status: these sources are evidence inputs, "
+                  "not automatically validated truth. The next step is "
+                  "cross-checking and observing whether the claim survives "
+                  "real interaction."
+              )
+
+              # Find the findings colony.
+              colonies = get("/api/v1/colonies")
+
+              colony_id = None
+
+              if isinstance(colonies, list):
+                  for colony in colonies:
+                      if str(
+                          colony.get("name", "")
+                      ).lower() == "findings":
+                          colony_id = colony.get("id")
+                          break
+
+              if colony_id:
+                  response = post(
+                      "/api/v1/posts",
+                      {
+                          "colony_id": colony_id,
+                          "post_type": "finding",
+                          "title": title,
+                          "body": body,
+                          "metadata": {
+                              "confidence": 0.60,
+                              "tags": [
+                                  "nox",
+                                  "research",
+                                  "evidence",
+                                  "agent-economy"
+                              ]
+                          }
+                      }
+                  )
+
+                  if response is not None and \
+                     response.status_code in {200, 201}:
+
+                      publication = {
+                          "timestamp": now,
+                          "fingerprint": fp,
+                          "score": score,
+                          "title": title,
+                          "source_item_id": item.get("id"),
+                          "facts_used": len(facts)
+                      }
+
+                      cognition.setdefault(
+                          "public_publications",
+                          []
+                      ).append(publication)
+
+          # ---------------------------------------------------------
+          # Stats
+          # ---------------------------------------------------------
+
+          cognition["processed_messages"] = \
+              cognition.get("processed_messages", [])[-1000:]
+
+          cognition["experiences"] = \
+              cognition.get("experiences", [])[-500:]
+
+          cognition["failures"] = \
+              cognition.get("failures", [])[-200:]
+
+          cognition["successful_patterns"] = \
+              cognition.get("successful_patterns", [])[-200:]
+
+          cognition["public_publications"] = \
+              cognition.get("public_publications", [])[-100:]
+
+          cognition["updated_at"] = now
+
+          cognition["stats"] = {
+              "messages_processed_this_run": replies,
+              "communication_failures_this_run": failures,
+              "experiences_this_run": experiences,
+              "public_post_created": bool(publication),
+              "knowledge_entries_available": len(knowledge_items),
+              "gemini_used": False,
+              "external_ai_used": False,
+              "payments_enabled": False,
+              "spending_enabled": False,
+              "project_cost_eur": 0
+          }
+
+          save(COGNITION_FILE, cognition)
+
+          print("")
+          print("=== NØX LEDGER 02 ===")
+          print(f"Identity: {username}")
+          print(f"DM replies: {replies}")
+          print(f"Communication failures: {failures}")
+          print(f"Experiences: {experiences}")
+          print(
+              f"Public publication: "
+              f"{'YES' if publication else 'NO'}"
+          )
+          print(f"Knowledge available: {len(knowledge_items)}")
+          print("Gemini: False")
+          print("External AI: False")
+          print("Payments: False")
+          print("Spending: False")
+          print("Project cost: €0")
+          PY
+
+      - name: Commit cognition
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
+          git add memory/nox_ledger_cognition.json
+
+          if git diff --cached --quiet; then
+            echo "No cognition changes."
+            exit 0
+          fi
+
+          git commit -m "ledger02: update cognition and communication"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              sleep 2
+              continue
+            fi
+
+            git push origin HEAD:main && exit 0
+            sleep 2
+          done
+
+          exit 1
