@@ -49,7 +49,7 @@ jobs:
       MAX_SOURCE_CHARS: "5000"
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -60,118 +60,190 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install requests
+          pip install requests
 
-      - name: Run LEDGER 01
-        shell: bash
+      - name: Run NØX Knowledge & Autonomous Research
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          set -euo pipefail
-
-          python - <<'PY'
+          python <<'PY'
+          import json
           import os
           import re
-          import json
           import hashlib
           import html
           import time
           from datetime import datetime, timezone
-          from pathlib import Path
-          from urllib.parse import quote, urlparse
           from html.parser import HTMLParser
+          from urllib.parse import (
+              parse_qs,
+              unquote,
+              urljoin,
+              urlparse,
+          )
 
           import requests
 
-          BASE_URL = os.environ["COLONY_BASE_URL"].rstrip("/")
-          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
 
-          MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
-          MAX_RESEARCH_QUERIES = int(os.environ["MAX_RESEARCH_QUERIES"])
-          MAX_WEB_RESULTS = int(os.environ["MAX_WEB_RESULTS"])
-          MAX_SOURCE_CHARS = int(os.environ["MAX_SOURCE_CHARS"])
+          # ============================================================
+          # CONFIG
+          # ============================================================
 
-          MANUAL_QUERY = os.environ.get("INPUT_QUERY", "").strip()
-          FORCE_RESEARCH = (
-              os.environ.get("INPUT_FORCE_RESEARCH", "false").lower() == "true"
+          COLONY_BASE_URL = os.getenv("COLONY_BASE_URL", "https://thecolony.ai").rstrip("/")
+          API_KEY = os.getenv("COLONY_API_KEY", "").strip()
+
+          KNOWLEDGE_FILE = os.getenv(
+              "KNOWLEDGE_FILE",
+              "memory/nox_ledger_knowledge.json"
           )
 
-          NOW = datetime.now(timezone.utc).isoformat()
+          MAX_FEED_ITEMS = int(os.getenv("MAX_FEED_ITEMS", "30"))
+          MAX_RESEARCH_QUERIES = int(os.getenv("MAX_RESEARCH_QUERIES", "3"))
+          MAX_WEB_RESULTS = int(os.getenv("MAX_WEB_RESULTS", "5"))
+          MAX_SOURCE_CHARS = int(os.getenv("MAX_SOURCE_CHARS", "5000"))
 
-          GEMINI_USED = False
-          EXTERNAL_AI_USED = False
+          INPUT_QUERY = os.getenv("INPUT_QUERY", "").strip()
+          INPUT_FORCE_RESEARCH = (
+              os.getenv("INPUT_FORCE_RESEARCH", "false").lower() == "true"
+          )
+
+          GEMINI_ENABLED = False
+          EXTERNAL_AI_ENABLED = False
           PAYMENTS_ENABLED = False
           SPENDING_ENABLED = False
           PROJECT_COST_EUR = 0
 
-          print("================================")
-          print("=== NØX LEDGER 01 START ===")
-          print("================================")
 
-          # ------------------------------------------------------------
-          # JSON HELPERS
-          # ------------------------------------------------------------
+          # ============================================================
+          # HTTP SESSIONS
+          # ============================================================
 
-          def load_json(path, default):
-              if not path.exists():
-                  return default
+          api_session = requests.Session()
+          api_session.headers.update({
+              "Authorization": f"Bearer {API_KEY}",
+              "Accept": "application/json",
+              "User-Agent": "NOX-Ledger-Research/1.0",
+          })
+
+          web_session = requests.Session()
+          web_session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) "
+                  "Chrome/140.0.0.0 Safari/537.36"
+              ),
+              "Accept": (
+                  "text/html,application/xhtml+xml,"
+                  "application/xml;q=0.9,image/avif,image/webp,"
+                  "*/*;q=0.8"
+              ),
+              "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+          })
+
+
+          # ============================================================
+          # GENERIC HELPERS
+          # ============================================================
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def safe_text(value):
+              if value is None:
+                  return ""
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              if isinstance(value, (int, float, bool)):
+                  return str(value)
+
+              return ""
+
+
+          def clean_text(value):
+              value = html.unescape(safe_text(value))
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+
+          def fingerprint(*parts):
+              raw = " | ".join(clean_text(str(p)).lower() for p in parts)
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+          def ensure_memory_structure(memory):
+              if not isinstance(memory, dict):
+                  memory = {}
+
+              memory.setdefault("version", "1.0")
+              memory.setdefault("updated_at", utc_now())
+              memory.setdefault("knowledge", [])
+              memory.setdefault("gaps", [])
+              memory.setdefault("research_runs", [])
+              memory.setdefault("metadata", {})
+
+              if not isinstance(memory["knowledge"], list):
+                  memory["knowledge"] = []
+
+              if not isinstance(memory["gaps"], list):
+                  memory["gaps"] = []
+
+              if not isinstance(memory["research_runs"], list):
+                  memory["research_runs"] = []
+
+              if not isinstance(memory["metadata"], dict):
+                  memory["metadata"] = {}
+
+              return memory
+
+
+          def load_memory():
+              if not os.path.exists(KNOWLEDGE_FILE):
+                  return ensure_memory_structure({})
 
               try:
-                  with path.open("r", encoding="utf-8") as file:
-                      data = json.load(file)
-                  return data if isinstance(data, dict) else default
-              except Exception as error:
-                  print(f"WARNING: Could not load {path}: {error}")
-                  return default
+                  with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+                      return ensure_memory_structure(json.load(f))
+              except Exception as exc:
+                  print(f"MEMORY LOAD WARNING: {exc}")
+                  return ensure_memory_structure({})
 
-          def save_json(path, data):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              temporary_path = path.with_suffix(path.suffix + ".tmp")
 
-              with temporary_path.open("w", encoding="utf-8") as file:
-                  json.dump(data, file, ensure_ascii=False, indent=2)
-                  file.write("\n")
+          def save_memory(memory):
+              memory["updated_at"] = utc_now()
 
-              temporary_path.replace(path)
+              directory = os.path.dirname(KNOWLEDGE_FILE)
+              if directory:
+                  os.makedirs(directory, exist_ok=True)
 
-          memory = load_json(
-              KNOWLEDGE_FILE,
-              {
-                  "version": "1.0",
-                  "created_at": NOW,
-                  "updated_at": NOW,
-                  "knowledge": [],
-                  "research_runs": [],
-                  "attention": [],
-                  "gaps": [],
-                  "stats": {},
-              },
-          )
+              temporary = KNOWLEDGE_FILE + ".tmp"
 
-          for key in ("knowledge", "research_runs", "attention", "gaps"):
-              if not isinstance(memory.get(key), list):
-                  memory[key] = []
+              with open(temporary, "w", encoding="utf-8") as f:
+                  json.dump(
+                      memory,
+                      f,
+                      ensure_ascii=False,
+                      indent=2,
+                      sort_keys=False
+                  )
 
-          # ------------------------------------------------------------
-          # HTTP CLIENT
-          # ------------------------------------------------------------
+              os.replace(temporary, KNOWLEDGE_FILE)
 
-          session = requests.Session()
-          session.headers.update(
-              {
-                  "Accept": "application/json",
-                  "User-Agent": "NOX-Ledger-Research/1.0",
-              }
-          )
 
-          if API_KEY:
-              session.headers["Authorization"] = f"Bearer {API_KEY}"
+          # ============================================================
+          # COLONY API
+          # ============================================================
 
           def authenticate():
               if not API_KEY:
+                  print("AUTH: no COLONY_API_KEY configured")
                   return False
 
               endpoints = [
@@ -181,9 +253,13 @@ jobs:
 
               for endpoint in endpoints:
                   try:
-                      response = session.post(
-                          BASE_URL + endpoint,
+                      response = requests.post(
+                          COLONY_BASE_URL + endpoint,
                           json={"api_key": API_KEY},
+                          headers={
+                              "Accept": "application/json",
+                              "User-Agent": "NOX-Ledger-Research/1.0",
+                          },
                           timeout=20,
                       )
 
@@ -191,468 +267,68 @@ jobs:
                           payload = response.json()
 
                           token = (
-                              payload.get("access_token")
-                              or payload.get("token")
-                              or payload.get("data", {}).get("access_token")
+                              payload.get("token")
+                              or payload.get("access_token")
+                              or payload.get("data", {}).get("token")
+                              if isinstance(payload, dict)
+                              else None
                           )
 
                           if token:
-                              session.headers["Authorization"] = f"Bearer {token}"
-                              return True
+                              api_session.headers["Authorization"] = (
+                                  f"Bearer {token}"
+                              )
 
-                  except Exception:
-                      continue
+                          print(f"AUTH: success via {endpoint}")
+                          return True
 
-              return False
+                  except Exception as exc:
+                      print(f"AUTH WARNING {endpoint}: {exc}")
 
-          def api_get(path, params=None, timeout=25):
-              url = BASE_URL + path
+              print("AUTH: direct API key mode")
+              return True
+
+
+          def api_get(path, params=None):
+              url = (
+                  path
+                  if path.startswith("http")
+                  else COLONY_BASE_URL + path
+              )
 
               try:
-                  response = session.get(
+                  response = api_session.get(
                       url,
                       params=params or {},
-                      timeout=timeout,
+                      timeout=25,
                   )
 
-                  if response.status_code == 401 and authenticate():
-                      response = session.get(
-                          url,
-                          params=params or {},
-                          timeout=timeout,
-                      )
+                  if response.status_code == 401:
+                      if authenticate():
+                          response = api_session.get(
+                              url,
+                              params=params or {},
+                              timeout=25,
+                          )
 
                   if not response.ok:
                       print(
-                          f"WARNING: GET {path} returned "
+                          f"API GET {path}: "
                           f"HTTP {response.status_code}"
                       )
-                      return {}
+                      return None
 
-                  try:
-                      return response.json()
-                  except ValueError:
-                      return {}
+                  return response.json()
 
-              except requests.RequestException as error:
-                  print(f"WARNING: GET {path} failed: {error}")
-                  return {}
+              except Exception as exc:
+                  print(f"API GET WARNING {path}: {exc}")
+                  return None
 
-          authenticate()
-
-          # ------------------------------------------------------------
-          # GENERAL TEXT HELPERS
-          # ------------------------------------------------------------
-
-          STOP_WORDS = {
-              "this",
-              "that",
-              "with",
-              "from",
-              "have",
-              "about",
-              "what",
-              "which",
-              "their",
-              "there",
-              "would",
-              "could",
-              "should",
-              "these",
-              "those",
-              "agent",
-              "agents",
-              "nox",
-              "comment",
-              "reply",
-              "posted",
-              "following",
-              "follow",
-              "the",
-              "and",
-              "for",
-              "are",
-              "was",
-              "were",
-              "been",
-              "being",
-              "into",
-              "than",
-              "then",
-              "them",
-              "they",
-              "you",
-              "your",
-              "our",
-              "ours",
-              "their",
-              "its",
-              "it's",
-              "just",
-              "like",
-              "really",
-              "very",
-              "more",
-              "some",
-              "any",
-              "also",
-              "only",
-              "still",
-              "here",
-              "there",
-              "where",
-              "when",
-              "will",
-              "can",
-              "cannot",
-              "could",
-              "would",
-              "should",
-              "might",
-              "must",
-              "does",
-              "did",
-              "doing",
-              "done",
-              "has",
-              "had",
-              "having",
-              "not",
-              "but",
-              "because",
-              "while",
-              "after",
-              "before",
-              "through",
-              "over",
-              "under",
-              "between",
-              "against",
-              "about",
-              "one",
-              "two",
-              "three",
-              "first",
-              "second",
-              "yes",
-              "no",
-          }
-
-          def clean_text(value):
-              if value is None:
-                  return ""
-
-              if isinstance(value, str):
-                  text = value
-              elif isinstance(value, (int, float, bool)):
-                  text = str(value)
-              else:
-                  return ""
-
-              text = html.unescape(text)
-              text = re.sub(r"\s+", " ", text)
-              return text.strip()
-
-          def text_of(value):
-              if isinstance(value, str):
-                  return value
-
-              if isinstance(value, (int, float, bool)):
-                  return str(value)
-
-              if isinstance(value, list):
-                  return " ".join(text_of(item) for item in value)
-
-              if isinstance(value, dict):
-                  return " ".join(text_of(item) for item in value.values())
-
-              return ""
-
-          def fingerprint(text):
-              normalized = re.sub(
-                  r"\s+",
-                  " ",
-                  clean_text(text).lower(),
-              ).strip()
-
-              return hashlib.sha256(
-                  normalized.encode("utf-8")
-              ).hexdigest()[:20]
-
-          def extract_identifier(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              for key in (
-                  "id",
-                  "uuid",
-                  "post_id",
-                  "comment_id",
-                  "activity_id",
-                  "suggestion_id",
-              ):
-                  value = item.get(key)
-
-                  if value is not None:
-                      return str(value)
-
-              return ""
-
-          # ------------------------------------------------------------
-          # TARGETED TEXT EXTRACTION
-          # ------------------------------------------------------------
-
-          def extract_semantic_text(item):
-              """
-              Extract only meaningful human-readable content.
-
-              Metadata such as IDs, scores, timestamps, URLs,
-              e-mail addresses and complete profile objects are excluded.
-              """
-
-              if not isinstance(item, dict):
-                  return clean_text(item)
-
-              preferred_fields = (
-                  "content",
-                  "body",
-                  "text",
-                  "message",
-                  "comment",
-                  "reply",
-                  "description",
-                  "question",
-                  "title",
-                  "summary",
-                  "caption",
-              )
-
-              parts = []
-
-              for field in preferred_fields:
-                  value = item.get(field)
-
-                  if isinstance(value, str):
-                      value = clean_text(value)
-
-                      if value and value not in parts:
-                          parts.append(value)
-
-              nested_objects = (
-                  item.get("post"),
-                  item.get("comment"),
-                  item.get("reply"),
-                  item.get("activity"),
-                  item.get("data"),
-              )
-
-              for nested in nested_objects:
-                  if isinstance(nested, dict):
-                      nested_text = extract_semantic_text(nested)
-
-                      if nested_text and nested_text not in parts:
-                          parts.append(nested_text)
-
-              if not parts:
-                  return ""
-
-              result = " ".join(parts)
-              result = re.sub(r"\s+", " ", result).strip()
-
-              return result[:3000]
-
-          def extract_author(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              for key in (
-                  "author",
-                  "username",
-                  "handle",
-                  "user",
-                  "creator",
-              ):
-                  value = item.get(key)
-
-                  if isinstance(value, str):
-                      return clean_text(value)
-
-                  if isinstance(value, dict):
-                      for nested_key in (
-                          "username",
-                          "handle",
-                          "name",
-                      ):
-                          nested_value = value.get(nested_key)
-
-                          if nested_value:
-                              return clean_text(nested_value)
-
-              return ""
-
-          # ------------------------------------------------------------
-          # RESEARCH QUERY EXTRACTION
-          # ------------------------------------------------------------
-
-          def build_research_query(content):
-              """
-              Convert conversational content into a short thematic
-              keyword query.
-
-              This deliberately avoids sending complete comments,
-              profiles, IDs, dates or conversational filler to search.
-              """
-
-              text = clean_text(content)
-
-              if not text:
-                  return ""
-
-              # Remove URLs.
-              text = re.sub(
-                  r"https?://\S+",
-                  " ",
-                  text,
-                  flags=re.IGNORECASE,
-              )
-
-              # Remove e-mail addresses.
-              text = re.sub(
-                  r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b",
-                  " ",
-                  text,
-                  flags=re.IGNORECASE,
-              )
-
-              # Remove UUIDs / long hexadecimal identifiers.
-              text = re.sub(
-                  r"\b[0-9a-f]{8,}\b",
-                  " ",
-                  text,
-                  flags=re.IGNORECASE,
-              )
-
-              # Remove timestamps and dates.
-              text = re.sub(
-                  r"\b\d{4}-\d{2}-\d{2}"
-                  r"(?:t|\s)\d{2}:\d{2}:\d{2}"
-                  r"(?:\.\d+)?z?\b",
-                  " ",
-                  text,
-                  flags=re.IGNORECASE,
-              )
-
-              text = re.sub(
-                  r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-                  " ",
-                  text,
-              )
-
-              # Remove common metadata expressions.
-              text = re.sub(
-                  r"\b(?:score|karma|followers?|following|"
-                  r"created_at|updated_at|timestamp|"
-                  r"avatar|email|handle|username|"
-                  r"comment|reply|post|activity)"
-                  r"\s*[:=]?\s*[\w.@:/-]+",
-                  " ",
-                  text,
-                  flags=re.IGNORECASE,
-              )
-
-              # Remove Markdown emphasis / code punctuation.
-              text = re.sub(
-                  r"[*_`~]+",
-                  " ",
-                  text,
-              )
-
-              # Keep letters/numbers and useful separators only.
-              text = re.sub(
-                  r"[^A-Za-z0-9À-ÖØ-öø-ÿ' -]+",
-                  " ",
-                  text,
-              )
-
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  text,
-              ).strip()
-
-              if len(text) < 20:
-                  return ""
-
-              # Tokenize.
-              words = re.findall(
-                  r"[A-Za-zÀ-ÖØ-öø-ÿ0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'-]*",
-                  text.lower(),
-              )
-
-              selected = []
-              seen = set()
-
-              for word in words:
-                  word = word.strip("-'")
-
-                  if not word:
-                      continue
-
-                  if word in STOP_WORDS:
-                      continue
-
-                  if len(word) < 4 and not word.isdigit():
-                      continue
-
-                  if word.isdigit():
-                      continue
-
-                  if word in seen:
-                      continue
-
-                  seen.add(word)
-                  selected.append(word)
-
-                  if len(selected) >= 10:
-                      break
-
-              if len(selected) < 3:
-                  return ""
-
-              return " ".join(selected)
-
-          # ------------------------------------------------------------
-          # IDENTITY
-          # ------------------------------------------------------------
-
-          identity = api_get("/api/v1/users/me")
-
-          if not isinstance(identity, dict):
-              identity = {}
-
-          username = (
-              identity.get("username")
-              or identity.get("handle")
-              or "nox_origine"
-          )
-
-          print(f"IDENTITY: {username}")
-
-          # ------------------------------------------------------------
-          # ATTENTION COLLECTION
-          # ------------------------------------------------------------
-
-          feed_response = api_get(
-              "/api/v1/feed/for-you",
-              {"limit": MAX_FEED_ITEMS},
-          )
-
-          suggestions_response = api_get(
-              "/api/v1/suggestions",
-              {"limit": 20},
-          )
 
           def normalize_items(payload):
+              if payload is None:
+                  return []
+
               if isinstance(payload, list):
                   return payload
 
@@ -674,18 +350,116 @@ jobs:
 
                   if isinstance(value, dict):
                       nested = normalize_items(value)
-
                       if nested:
                           return nested
 
               return []
 
-          feed_items = normalize_items(feed_response)
-          suggestion_items = normalize_items(suggestions_response)
 
-          attention = []
+          def extract_semantic_text(item):
+              if isinstance(item, str):
+                  return clean_text(item)
 
-          interest_terms = (
+              if not isinstance(item, dict):
+                  return ""
+
+              preferred_fields = [
+                  "content",
+                  "body",
+                  "text",
+                  "message",
+                  "comment",
+                  "reply",
+                  "description",
+                  "question",
+                  "title",
+                  "summary",
+                  "caption",
+              ]
+
+              parts = []
+
+              for field in preferred_fields:
+                  value = item.get(field)
+
+                  if isinstance(value, str) and value.strip():
+                      parts.append(value)
+
+              for nested_key in (
+                  "post",
+                  "comment",
+                  "reply",
+                  "activity",
+                  "data",
+              ):
+                  nested = item.get(nested_key)
+
+                  if isinstance(nested, dict):
+                      nested_text = extract_semantic_text(nested)
+
+                      if nested_text:
+                          parts.append(nested_text)
+
+              return clean_text(" ".join(parts))
+
+
+          def get_identity():
+              payload = api_get("/api/v1/users/me")
+
+              if isinstance(payload, dict):
+                  candidates = [
+                      payload,
+                      payload.get("data"),
+                      payload.get("user"),
+                  ]
+
+                  for candidate in candidates:
+                      if isinstance(candidate, dict):
+                          handle = (
+                              candidate.get("handle")
+                              or candidate.get("username")
+                              or candidate.get("name")
+                          )
+
+                          if handle:
+                              return clean_text(handle)
+
+              return "unknown"
+
+
+          def get_attention_items():
+              feed_payload = api_get(
+                  "/api/v1/feed/for-you",
+                  {"limit": MAX_FEED_ITEMS},
+              )
+
+              suggestions_payload = api_get(
+                  "/api/v1/suggestions",
+                  {"limit": 20},
+              )
+
+              feed = normalize_items(feed_payload)
+              suggestions = normalize_items(suggestions_payload)
+
+              combined = []
+
+              for item in feed + suggestions:
+                  semantic = extract_semantic_text(item)
+
+                  if semantic:
+                      combined.append({
+                          "semantic_text": semantic,
+                          "raw": item,
+                      })
+
+              return combined
+
+
+          # ============================================================
+          # ATTENTION / RELEVANCE
+          # ============================================================
+
+          INTEREST_TERMS = [
               "research",
               "evidence",
               "knowledge",
@@ -701,9 +475,9 @@ jobs:
               "contribution",
               "payment",
               "tip",
-          )
+          ]
 
-          question_terms = (
+          QUESTION_TERMS = [
               "question",
               "problem",
               "how",
@@ -714,525 +488,893 @@ jobs:
               "unknown",
               "does anyone",
               "not sure",
-          )
+          ]
 
-          for item in feed_items:
-              if not isinstance(item, dict):
-                  continue
 
-              semantic_text = extract_semantic_text(item)
+          def attention_score(text):
+              lower = text.lower()
 
-              if not semantic_text:
-                  continue
-
-              lowered = semantic_text.lower()
               score = 0
 
-              if any(term in lowered for term in interest_terms):
-                  score += 20
+              for term in INTEREST_TERMS:
+                  if term in lower:
+                      score += 2
 
-              if any(term in lowered for term in question_terms):
-                  score += 15
+              for term in QUESTION_TERMS:
+                  if term in lower:
+                      score += 3
 
-              if len(semantic_text) > 500:
-                  score += 5
+              if "?" in text:
+                  score += 2
 
-              if len(semantic_text) > 1500:
-                  score += 5
+              if len(text) > 120:
+                  score += 1
 
-              if score >= 20:
-                  attention.append(
-                      {
-                          "id": extract_identifier(item),
-                          "kind": "feed",
-                          "author": extract_author(item),
-                          "content": semantic_text,
+              return score
+
+
+          def select_attention(items):
+              scored = []
+
+              for item in items:
+                  text = item["semantic_text"]
+                  score = attention_score(text)
+
+                  if score > 0:
+                      scored.append({
                           "score": score,
-                      }
-                  )
+                          "text": text,
+                      })
 
-          for item in suggestion_items:
-              if not isinstance(item, dict):
-                  continue
-
-              semantic_text = extract_semantic_text(item)
-
-              if not semantic_text:
-                  continue
-
-              lowered = semantic_text.lower()
-
-              if any(
-                  term in lowered
-                  for term in (
-                      "question",
-                      "research",
-                      "reply",
-                      "claim",
-                      "task",
-                      "evidence",
-                      "problem",
-                  )
-              ):
-                  attention.append(
-                      {
-                          "id": extract_identifier(item),
-                          "kind": "suggestion",
-                          "author": extract_author(item),
-                          "content": semantic_text,
-                          "score": 25,
-                      }
-                  )
-
-          attention.sort(
-              key=lambda entry: entry.get("score", 0),
-              reverse=True,
-          )
-
-          attention = attention[:10]
-
-          print(f"ATTENTION ITEMS: {len(attention)}")
-
-          # ------------------------------------------------------------
-          # RESEARCH QUERY GENERATION
-          # ------------------------------------------------------------
-
-          queries = []
-
-          if MANUAL_QUERY:
-              queries.append(MANUAL_QUERY)
-
-          for item in attention:
-              query = build_research_query(
-                  item.get("content", "")
+              scored.sort(
+                  key=lambda x: (-x["score"], x["text"])
               )
 
-              if query:
-                  queries.append(query)
+              return scored[:10]
 
-          queries.extend(
-              [
-                  (
-                      "AI agent marketplaces useful tasks "
-                      "reputation evidence performance"
-                  ),
-                  (
-                      "The Colony AI agent marketplace "
-                      "tasks bids contributions tips"
-                  ),
-              ]
-          )
 
-          unique_queries = []
-          seen_queries = set()
+          # ============================================================
+          # RESEARCH QUERY GENERATION
+          # ============================================================
 
-          for query in queries:
-              query = clean_text(query)
+          STOPWORDS = {
+              "the", "and", "for", "that", "this", "with",
+              "from", "have", "has", "are", "was", "were",
+              "about", "into", "then", "than", "they", "their",
+              "there", "what", "when", "where", "which", "will",
+              "would", "could", "should", "does", "did",
+              "been", "being", "your", "you", "our", "out",
+              "not", "but", "can", "all", "its", "it's",
+              "just", "more", "some", "only", "very",
+              "comment", "reply", "post", "user", "agent",
+          }
 
-              if not query:
-                  continue
 
-              normalized = query.lower()
+          def meaningful_tokens(text):
+              words = re.findall(
+                  r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9_-]{2,}",
+                  text.lower(),
+              )
 
-              if normalized in seen_queries:
-                  continue
+              result = []
 
-              seen_queries.add(normalized)
-              unique_queries.append(query)
+              for word in words:
+                  if word in STOPWORDS:
+                      continue
 
-          # Keep the existing query limit.
-          if not FORCE_RESEARCH and not MANUAL_QUERY:
-              unique_queries = unique_queries[:2]
-          else:
-              unique_queries = unique_queries[:MAX_RESEARCH_QUERIES]
+                  if word.isdigit():
+                      continue
 
-          print(f"RESEARCH QUERIES: {len(unique_queries)}")
+                  if word not in result:
+                      result.append(word)
 
-          for index, query in enumerate(unique_queries, start=1):
-              print(f"QUERY {index}: {query}")
+              return result
 
-          # ------------------------------------------------------------
-          # HTML PARSER
-          # ------------------------------------------------------------
 
-          class PageParser(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.parts = []
-                  self.skip_depth = 0
+          def build_research_query(text):
+              tokens = meaningful_tokens(text)
 
-              def handle_starttag(self, tag, attrs):
-                  if tag.lower() in {
-                      "script",
-                      "style",
-                      "noscript",
-                      "svg",
-                  }:
-                      self.skip_depth += 1
-
-              def handle_endtag(self, tag):
-                  if tag.lower() in {
-                      "script",
-                      "style",
-                      "noscript",
-                      "svg",
-                  } and self.skip_depth > 0:
-                      self.skip_depth -= 1
-
-              def handle_data(self, data):
-                  if self.skip_depth == 0:
-                      text = clean_text(data)
-
-                      if text:
-                          self.parts.append(text)
-
-              def get_text(self):
-                  return " ".join(self.parts)
-
-          def fetch_page(url):
-              try:
-                  response = requests.get(
-                      url,
-                      headers={
-                          "User-Agent": (
-                              "Mozilla/5.0 "
-                              "(compatible; NOX-Research/1.0)"
-                          )
-                      },
-                      timeout=20,
-                  )
-
-                  if not response.ok:
-                      return ""
-
-                  parser = PageParser()
-                  parser.feed(response.text)
-
-                  text = parser.get_text()
-
-                  return text[:MAX_SOURCE_CHARS]
-
-              except requests.RequestException:
+              if not tokens:
                   return ""
 
-          # ------------------------------------------------------------
-          # DUCKDUCKGO RESEARCH
-          # ------------------------------------------------------------
+              selected = tokens[:10]
 
-          research_results = []
+              query = " ".join(selected)
 
-          for query in unique_queries:
-              print(f"RESEARCH: {query}")
+              query = re.sub(r"\s+", " ", query).strip()
 
-              search_url = (
-                  "https://html.duckduckgo.com/html/?q="
-                  + quote(query)
+              return query[:180]
+
+
+          def build_queries(attention):
+              queries = []
+
+              if INPUT_QUERY:
+                  queries.append(clean_text(INPUT_QUERY))
+
+              for item in attention:
+                  query = build_research_query(item["text"])
+
+                  if not query:
+                      continue
+
+                  if query.lower() not in {
+                      q.lower() for q in queries
+                  }:
+                      queries.append(query)
+
+                  if len(queries) >= MAX_RESEARCH_QUERIES:
+                      break
+
+              return queries[:MAX_RESEARCH_QUERIES]
+
+
+          # ============================================================
+          # DUCKDUCKGO HTML PARSER
+          # ============================================================
+
+          class DuckDuckGoParser(HTMLParser):
+              """
+              Robust parser for DDG HTML/Lite results.
+
+              We intentionally do not depend on attribute ordering.
+              """
+
+              def __init__(self, max_results=5):
+                  super().__init__(convert_charrefs=True)
+
+                  self.max_results = max_results
+                  self.results = []
+
+                  self.in_result_link = False
+                  self.in_snippet = False
+
+                  self.current_url = ""
+                  self.current_title = []
+                  self.current_snippet = []
+
+                  self.current_link_depth = 0
+                  self.current_snippet_depth = 0
+
+                  self.seen_urls = set()
+
+              @staticmethod
+              def class_list(attrs):
+                  classes = ""
+
+                  for key, value in attrs:
+                      if key.lower() == "class" and value:
+                          classes = value
+                          break
+
+                  return set(
+                      part.strip()
+                      for part in classes.split()
+                      if part.strip()
+                  )
+
+              @staticmethod
+              def attr_value(attrs, wanted):
+                  for key, value in attrs:
+                      if key.lower() == wanted.lower():
+                          return value or ""
+
+                  return ""
+
+              def handle_starttag(self, tag, attrs):
+                  if len(self.results) >= self.max_results:
+                      return
+
+                  classes = self.class_list(attrs)
+
+                  if tag.lower() == "a":
+                      href = self.attr_value(attrs, "href")
+
+                      if "result__a" in classes and href:
+                          self.in_result_link = True
+                          self.current_link_depth = 1
+                          self.current_url = href
+                          self.current_title = []
+                          return
+
+                      if "result__snippet" in classes:
+                          self.in_snippet = True
+                          self.current_snippet_depth = 1
+                          self.current_snippet = []
+                          return
+
+                  if self.in_result_link:
+                      self.current_link_depth += 1
+
+                  if self.in_snippet:
+                      self.current_snippet_depth += 1
+
+              def handle_startendtag(self, tag, attrs):
+                  pass
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+
+                  if self.in_result_link:
+                      if tag == "a":
+                          self.current_link_depth -= 1
+
+                          if self.current_link_depth <= 0:
+                              self.in_result_link = False
+
+                              title = clean_text(
+                                  " ".join(self.current_title)
+                              )
+
+                              href = clean_text(self.current_url)
+
+                              if href and title:
+                                  self.results.append({
+                                      "url": href,
+                                      "title": title,
+                                      "snippet": "",
+                                  })
+
+                                  self.seen_urls.add(href)
+
+                              self.current_url = ""
+                              self.current_title = []
+
+                      return
+
+                  if self.in_snippet:
+                      if tag == "a":
+                          self.current_snippet_depth -= 1
+
+                          if self.current_snippet_depth <= 0:
+                              self.in_snippet = False
+
+                              snippet = clean_text(
+                                  " ".join(self.current_snippet)
+                              )
+
+                              if self.results:
+                                  self.results[-1]["snippet"] = snippet
+
+                              self.current_snippet = []
+
+              def handle_data(self, data):
+                  if self.in_result_link:
+                      self.current_title.append(data)
+
+                  elif self.in_snippet:
+                      self.current_snippet.append(data)
+
+
+          def resolve_ddg_url(url):
+              if not url:
+                  return ""
+
+              url = html.unescape(url.strip())
+
+              if url.startswith("//"):
+                  url = "https:" + url
+
+              parsed = urlparse(url)
+
+              query = parse_qs(parsed.query)
+
+              if "uddg" in query and query["uddg"]:
+                  return unquote(query["uddg"][0])
+
+              return url
+
+
+          # ============================================================
+          # WEB SEARCH
+          # ============================================================
+
+          def parse_duckduckgo(response, max_results):
+              parser = DuckDuckGoParser(
+                  max_results=max_results
               )
 
               try:
-                  response = requests.get(
-                      search_url,
-                      headers={
-                          "User-Agent": (
-                              "Mozilla/5.0 "
-                              "(compatible; NOX-Research/1.0)"
-                          )
+                  parser.feed(response.text)
+                  parser.close()
+              except Exception as exc:
+                  print(f"DDG PARSER WARNING: {exc}")
+                  return []
+
+              results = []
+
+              for result in parser.results:
+                  target = resolve_ddg_url(
+                      result.get("url", "")
+                  )
+
+                  if not target:
+                      continue
+
+                  parsed = urlparse(target)
+
+                  if parsed.scheme not in ("http", "https"):
+                      continue
+
+                  if target in {
+                      item["url"] for item in results
+                  }:
+                      continue
+
+                  results.append({
+                      "url": target,
+                      "title": clean_text(
+                          result.get("title", "")
+                      ),
+                      "snippet": clean_text(
+                          result.get("snippet", "")
+                      ),
+                  })
+
+                  if len(results) >= max_results:
+                      break
+
+              return results
+
+
+          def search_duckduckgo_html(query):
+              url = "https://html.duckduckgo.com/html/"
+
+              headers = {
+                  "Referer": "https://html.duckduckgo.com/",
+                  "Sec-Fetch-Dest": "document",
+                  "Sec-Fetch-Mode": "navigate",
+                  "Sec-Fetch-Site": "same-origin",
+                  "Sec-Fetch-User": "?1",
+                  "Upgrade-Insecure-Requests": "1",
+              }
+
+              try:
+                  response = web_session.post(
+                      url,
+                      data={
+                          "q": query,
+                          "b": "",
                       },
+                      headers=headers,
                       timeout=25,
                   )
 
-                  if not response.ok:
-                      print("No search results.")
-                      continue
-
-                  matches = re.findall(
-                      r'class="result__a"[^>]+href="([^"]+)"'
-                      r'[^>]*>(.*?)</a>',
-                      response.text,
-                      flags=re.IGNORECASE | re.DOTALL,
-                  )
-
-                  if not matches:
-                      print("No search results.")
-                      continue
-
-                  collected_for_query = 0
-
-                  for raw_url, raw_title in matches:
-                      if collected_for_query >= MAX_WEB_RESULTS:
-                          break
-
-                      url = html.unescape(raw_url).strip()
-
-                      title = re.sub(
-                          r"<[^>]+>",
-                          " ",
-                          html.unescape(raw_title),
-                      )
-
-                      title = clean_text(title)
-
-                      if not url.startswith(
-                          ("http://", "https://")
-                      ):
-                          continue
-
-                      parsed_url = urlparse(url)
-                      domain = parsed_url.netloc.lower()
-
-                      if not domain:
-                          continue
-
-                      excerpt = fetch_page(url)
-
-                      if not excerpt:
-                          continue
-
-                      research_results.append(
-                          {
-                              "query": query,
-                              "title": title[:500],
-                              "url": url,
-                              "domain": domain,
-                              "excerpt": excerpt,
-                              "fingerprint": fingerprint(
-                                  url + excerpt
-                              ),
-                          }
-                      )
-
-                      collected_for_query += 1
-                      time.sleep(0.4)
-
-              except requests.RequestException as error:
                   print(
-                      f"Research request failed: {error}"
+                      f"DDG HTML: HTTP {response.status_code}, "
+                      f"bytes={len(response.text)}"
                   )
 
-          print(
-              f"WEB SOURCES FOUND: {len(research_results)}"
-          )
+                  if not response.ok:
+                      return []
 
-          # ------------------------------------------------------------
+                  results = parse_duckduckgo(
+                      response,
+                      MAX_WEB_RESULTS,
+                  )
+
+                  if results:
+                      return results
+
+                  lower = response.text.lower()
+
+                  result_markers = (
+                      "result__a",
+                      "web-result",
+                      "result__snippet",
+                  )
+
+                  if any(
+                      marker in lower
+                      for marker in result_markers
+                  ):
+                      print(
+                          "DDG HTML WARNING: "
+                          "result-like markup detected but "
+                          "no results were parsed."
+                      )
+
+                  if (
+                      "captcha" in lower
+                      or "bot" in lower
+                      or "automated" in lower
+                  ):
+                      print(
+                          "DDG HTML WARNING: "
+                          "possible anti-bot response."
+                      )
+
+                  return []
+
+              except Exception as exc:
+                  print(f"DDG HTML SEARCH WARNING: {exc}")
+                  return []
+
+
+          def search_duckduckgo_lite(query):
+              url = "https://lite.duckduckgo.com/lite/"
+
+              headers = {
+                  "Referer": "https://lite.duckduckgo.com/",
+                  "Sec-Fetch-Dest": "document",
+                  "Sec-Fetch-Mode": "navigate",
+                  "Sec-Fetch-Site": "same-origin",
+                  "Sec-Fetch-User": "?1",
+                  "Upgrade-Insecure-Requests": "1",
+              }
+
+              try:
+                  response = web_session.post(
+                      url,
+                      data={"q": query},
+                      headers=headers,
+                      timeout=25,
+                  )
+
+                  print(
+                      f"DDG LITE: HTTP {response.status_code}, "
+                      f"bytes={len(response.text)}"
+                  )
+
+                  if not response.ok:
+                      return []
+
+                  results = parse_duckduckgo(
+                      response,
+                      MAX_WEB_RESULTS,
+                  )
+
+                  return results
+
+              except Exception as exc:
+                  print(f"DDG LITE SEARCH WARNING: {exc}")
+                  return []
+
+
+          def web_search(query):
+              print(f"RESEARCH: {query}")
+
+              results = search_duckduckgo_html(query)
+
+              if results:
+                  print(
+                      f"DDG HTML RESULTS: {len(results)}"
+                  )
+                  return results
+
+              print(
+                  "DDG HTML returned no parsed results; "
+                  "trying Lite fallback."
+              )
+
+              results = search_duckduckgo_lite(query)
+
+              if results:
+                  print(
+                      f"DDG LITE RESULTS: {len(results)}"
+                  )
+                  return results
+
+              print("No search results.")
+
+              return []
+
+
+          # ============================================================
+          # SOURCE FETCHING
+          # ============================================================
+
+          def extract_visible_text(raw_html):
+              text = re.sub(
+                  r"(?is)<script[^>]*>.*?</script>",
+                  " ",
+                  raw_html,
+              )
+
+              text = re.sub(
+                  r"(?is)<style[^>]*>.*?</style>",
+                  " ",
+                  text,
+              )
+
+              text = re.sub(
+                  r"(?is)<noscript[^>]*>.*?</noscript>",
+                  " ",
+                  text,
+              )
+
+              text = re.sub(
+                  r"(?is)<[^>]+>",
+                  " ",
+                  text,
+              )
+
+              text = html.unescape(text)
+              text = re.sub(r"\s+", " ", text)
+
+              return text.strip()
+
+
+          def fetch_page(url):
+              try:
+                  response = web_session.get(
+                      url,
+                      timeout=25,
+                      allow_redirects=True,
+                      headers={
+                          "Referer": "https://html.duckduckgo.com/",
+                          "Accept": (
+                              "text/html,application/xhtml+xml,"
+                              "application/xml;q=0.9,*/*;q=0.8"
+                          ),
+                      },
+                  )
+
+                  if not response.ok:
+                      print(
+                          f"SOURCE HTTP {response.status_code}: "
+                          f"{url}"
+                      )
+                      return None
+
+                  content_type = (
+                      response.headers.get(
+                          "Content-Type",
+                          ""
+                      ).lower()
+                  )
+
+                  if (
+                      "text/html" not in content_type
+                      and "application/xhtml+xml" not in content_type
+                  ):
+                      print(
+                          f"SOURCE SKIP non-HTML: "
+                          f"{url} [{content_type}]"
+                      )
+                      return None
+
+                  text = extract_visible_text(
+                      response.text
+                  )
+
+                  if not text:
+                      return None
+
+                  return {
+                      "url": response.url,
+                      "domain": urlparse(
+                          response.url
+                      ).netloc.lower(),
+                      "text": text[:MAX_SOURCE_CHARS],
+                  }
+
+              except Exception as exc:
+                  print(
+                      f"SOURCE FETCH WARNING {url}: {exc}"
+                  )
+                  return None
+
+
+          # ============================================================
           # KNOWLEDGE STORAGE
-          # ------------------------------------------------------------
+          # ============================================================
 
-          existing_fingerprints = {
-              entry.get("fingerprint")
-              for entry in memory["knowledge"]
-              if isinstance(entry, dict)
-          }
+          def add_knowledge(
+              memory,
+              query,
+              search_result,
+              source_page,
+          ):
+              target_url = source_page["url"]
+              domain = source_page["domain"]
 
-          knowledge_added = 0
-          duplicates = 0
+              excerpt = source_page["text"]
 
-          for result in research_results:
-              result_fingerprint = result["fingerprint"]
+              title = clean_text(
+                  search_result.get("title", "")
+              )
 
-              if result_fingerprint in existing_fingerprints:
-                  duplicates += 1
-                  continue
+              snippet = clean_text(
+                  search_result.get("snippet", "")
+              )
+
+              claim = title or snippet or query
+
+              fp = fingerprint(
+                  domain,
+                  target_url,
+                  claim,
+                  excerpt[:1000],
+              )
+
+              for existing in memory["knowledge"]:
+                  if existing.get("fingerprint") == fp:
+                      return False
 
               entry = {
-                  "id": f"knowledge-{result_fingerprint}",
-                  "created_at": NOW,
-                  "topic": result["query"],
-                  "claim": result["title"],
-                  "evidence": result["excerpt"],
-                  "source_url": result["url"],
-                  "source_domain": result["domain"],
+                  "id": fp[:16],
+                  "created_at": utc_now(),
+                  "updated_at": utc_now(),
+                  "query": query,
+                  "claim": claim,
+                  "title": title,
+                  "source_url": target_url,
+                  "source_domain": domain,
+                  "excerpt": excerpt,
                   "confidence": 0.55,
-                  "status": "UNVERIFIED_EXTERNAL_SOURCE",
+                  "verification_status": "UNVERIFIED_EXTERNAL_SOURCE",
                   "requires_cross_check": True,
-                  "fingerprint": result_fingerprint,
+                  "evidence_type": "web_research",
+                  "fingerprint": fp,
               }
 
               memory["knowledge"].append(entry)
-              existing_fingerprints.add(result_fingerprint)
-              knowledge_added += 1
 
-          memory["knowledge"] = memory["knowledge"][-500:]
+              return True
 
-          # ------------------------------------------------------------
-          # KNOWLEDGE GAPS
-          # ------------------------------------------------------------
 
-          gap_terms = (
-              "why",
-              "how",
-              "unclear",
-              "unknown",
-              "does anyone know",
-              "looking for",
-              "need help",
-              "not sure",
-              "question",
-              "problem",
+          def add_gap(memory, query, reason):
+              fp = fingerprint(query, reason)
+
+              for existing in memory["gaps"]:
+                  if existing.get("fingerprint") == fp:
+                      return
+
+              memory["gaps"].append({
+                  "id": fp[:16],
+                  "created_at": utc_now(),
+                  "query": query,
+                  "reason": reason,
+                  "status": "open",
+                  "fingerprint": fp,
+              })
+
+
+          def add_research_run(
+              memory,
+              query,
+              result_count,
+              source_count,
+              added_count,
+          ):
+              memory["research_runs"].append({
+                  "timestamp": utc_now(),
+                  "query": query,
+                  "web_results": result_count,
+                  "sources_fetched": source_count,
+                  "knowledge_added": added_count,
+                  "gemini_used": False,
+                  "external_ai_used": False,
+                  "payments_enabled": False,
+                  "spending_enabled": False,
+                  "project_cost_eur": 0,
+              })
+
+
+          # ============================================================
+          # MAIN
+          # ============================================================
+
+          print("=== NØX LEDGER 01 - KNOWLEDGE & AUTONOMOUS RESEARCH ===")
+
+          memory = load_memory()
+
+          authenticate()
+
+          identity = get_identity()
+
+          print(f"IDENTITY: {identity}")
+
+          attention_items = get_attention_items()
+
+          attention = select_attention(
+              attention_items
           )
 
-          for item in attention:
-              content = clean_text(
-                  item.get("content", "")
+          print(
+              f"ATTENTION ITEMS: {len(attention)}"
+          )
+
+          queries = build_queries(attention)
+
+          if INPUT_FORCE_RESEARCH and not queries:
+              queries = [
+                  "AI agents autonomous research knowledge"
+              ]
+
+          print(
+              f"RESEARCH QUERIES: {len(queries)}"
+          )
+
+          for index, query in enumerate(
+              queries,
+              start=1,
+          ):
+              print(
+                  f"QUERY {index}: {query}"
               )
 
-              if not content:
-                  continue
+          total_web_results = 0
+          total_sources = 0
+          total_added = 0
+          duplicate_count = 0
 
-              lowered = content.lower()
+          for query in queries:
+              results = web_search(query)
 
-              if any(
-                  term in lowered
-                  for term in gap_terms
-              ):
-                  memory["gaps"].append(
-                      {
-                          "created_at": NOW,
-                          "question": content[:1000],
-                          "status": "OPEN",
-                          "source_id": item.get("id", ""),
-                      }
+              total_web_results += len(results)
+
+              if not results:
+                  add_gap(
+                      memory,
+                      query,
+                      "No usable web search result returned."
                   )
 
+                  add_research_run(
+                      memory,
+                      query,
+                      0,
+                      0,
+                      0,
+                  )
+
+                  continue
+
+              source_count = 0
+              added_count = 0
+
+              for result in results[:MAX_WEB_RESULTS]:
+                  url = result.get("url", "").strip()
+
+                  if not url:
+                      continue
+
+                  print(
+                      f"SOURCE: {url}"
+                  )
+
+                  page = fetch_page(url)
+
+                  if not page:
+                      continue
+
+                  source_count += 1
+                  total_sources += 1
+
+                  added = add_knowledge(
+                      memory,
+                      query,
+                      result,
+                      page,
+                  )
+
+                  if added:
+                      added_count += 1
+                      total_added += 1
+                  else:
+                      duplicate_count += 1
+
+                  time.sleep(0.5)
+
+              if source_count == 0:
+                  add_gap(
+                      memory,
+                      query,
+                      "Search results existed but no source page "
+                      "could be fetched as usable HTML."
+                  )
+
+              add_research_run(
+                  memory,
+                  query,
+                  len(results),
+                  source_count,
+                  added_count,
+              )
+
+          # ============================================================
+          # MEMORY LIMITS
+          # ============================================================
+
+          memory["knowledge"] = memory["knowledge"][-500:]
           memory["gaps"] = memory["gaps"][-100:]
+          memory["research_runs"] = memory["research_runs"][-100:]
 
-          # ------------------------------------------------------------
-          # RESEARCH RUN RECORD
-          # ------------------------------------------------------------
-
-          memory["research_runs"].append(
-              {
-                  "timestamp": NOW,
-                  "queries": unique_queries,
-                  "sources_found": len(research_results),
-                  "knowledge_added": knowledge_added,
-                  "duplicates": duplicates,
-                  "forced": FORCE_RESEARCH,
-                  "manual_query": bool(MANUAL_QUERY),
-                  "external_ai_used": EXTERNAL_AI_USED,
-                  "gemini_used": GEMINI_USED,
-                  "project_cost_eur": PROJECT_COST_EUR,
-              }
-          )
-
-          memory["research_runs"] = (
-              memory["research_runs"][-100:]
-          )
-
-          open_gaps = sum(
-              1
-              for gap in memory["gaps"]
-              if isinstance(gap, dict)
-              and gap.get("status") == "OPEN"
-          )
-
-          memory["attention"] = attention
-          memory["updated_at"] = NOW
-
-          memory["stats"] = {
-              "knowledge_entries": len(
-                  memory["knowledge"]
+          memory["metadata"] = {
+              "identity": identity,
+              "last_attention_count": len(attention),
+              "last_query_count": len(queries),
+              "last_web_results": total_web_results,
+              "last_sources_fetched": total_sources,
+              "last_knowledge_added": total_added,
+              "last_duplicates": duplicate_count,
+              "knowledge_total": len(memory["knowledge"]),
+              "open_gaps": sum(
+                  1
+                  for gap in memory["gaps"]
+                  if gap.get("status") == "open"
               ),
-              "open_gaps": open_gaps,
-              "attention_items": len(attention),
-              "research_queries": len(unique_queries),
-              "research_sources_this_run": len(
-                  research_results
-              ),
-              "knowledge_added_this_run": knowledge_added,
-              "duplicates_this_run": duplicates,
-              "gemini_used": GEMINI_USED,
-              "external_ai_used": EXTERNAL_AI_USED,
+              "manual_query": bool(INPUT_QUERY),
+              "forced_research": INPUT_FORCE_RESEARCH,
+              "gemini_used": GEMINI_ENABLED,
+              "external_ai_used": EXTERNAL_AI_ENABLED,
               "payments_enabled": PAYMENTS_ENABLED,
               "spending_enabled": SPENDING_ENABLED,
               "project_cost_eur": PROJECT_COST_EUR,
+              "last_run": utc_now(),
           }
 
-          save_json(
-              KNOWLEDGE_FILE,
-              memory,
-          )
+          save_memory(memory)
 
-          # ------------------------------------------------------------
-          # FINAL DIAGNOSTICS
-          # ------------------------------------------------------------
+          # ============================================================
+          # DIAGNOSTICS
+          # ============================================================
 
           print("")
-          print("================================")
-          print("=== NØX LEDGER 01 COMPLETE ===")
-          print("================================")
-          print(f"Identity: {username}")
-          print(f"Attention: {len(attention)}")
-          print(f"Research queries: {len(unique_queries)}")
-          print(
-              f"Web sources: {len(research_results)}"
-          )
-          print(
-              f"Knowledge added: {knowledge_added}"
-          )
-          print(f"Duplicates: {duplicates}")
+          print("=== RESEARCH DIAGNOSTICS ===")
+          print(f"Identity: {identity}")
+          print(f"Attention items: {len(attention)}")
+          print(f"Research queries: {len(queries)}")
+          print(f"WEB sources found: {total_web_results}")
+          print(f"Source pages fetched: {total_sources}")
+          print(f"Knowledge added: {total_added}")
+          print(f"Duplicates: {duplicate_count}")
           print(
               f"Knowledge total: "
               f"{len(memory['knowledge'])}"
           )
-          print(f"Open gaps: {open_gaps}")
           print(
-              f"Manual query: "
-              f"{'YES' if MANUAL_QUERY else 'NO'}"
+              "Open gaps: "
+              f"{memory['metadata']['open_gaps']}"
           )
-          print(
-              f"Forced research: "
-              f"{'YES' if FORCE_RESEARCH else 'NO'}"
-          )
-          print(f"Gemini: {GEMINI_USED}")
-          print(
-              f"External AI: {EXTERNAL_AI_USED}"
-          )
-          print(
-              f"Payments: {PAYMENTS_ENABLED}"
-          )
-          print(
-              f"Spending: {SPENDING_ENABLED}"
-          )
-          print(
-              f"Project cost: €{PROJECT_COST_EUR}"
-          )
+          print(f"Manual query: {bool(INPUT_QUERY)}")
+          print(f"Forced research: {INPUT_FORCE_RESEARCH}")
+          print(f"Gemini: {GEMINI_ENABLED}")
+          print(f"External AI: {EXTERNAL_AI_ENABLED}")
+          print(f"Payments: {PAYMENTS_ENABLED}")
+          print(f"Spending: {SPENDING_ENABLED}")
+          print(f"Project cost: €{PROJECT_COST_EUR}")
+          print("")
+          print("=== END LEDGER 01 ===")
           PY
 
-      - name: Commit knowledge
-        shell: bash
+      - name: Commit knowledge changes
         run: |
-          set -euo pipefail
-
           git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
 
           git add memory/nox_ledger_knowledge.json
 
           if git diff --cached --quiet; then
-            echo "No knowledge changes."
+            echo "No knowledge changes to commit."
             exit 0
           fi
 
-          git commit -m "ledger01: update knowledge and research"
+          git commit -m "NØX LEDGER 01: update knowledge research"
+
+      - name: Rebase and push
+        run: |
+          set -euo pipefail
 
           for attempt in 1 2 3; do
             echo "Push attempt ${attempt}/3"
 
             git fetch origin main
-
-            if ! git rebase origin/main; then
-              echo "Rebase failed."
+            git rebase origin/main || {
               git rebase --abort || true
-              sleep 2
-              continue
-            fi
+              echo "Rebase failed."
+              exit 1
+            }
 
             if git push origin HEAD:main; then
-              echo "Push successful."
+              echo "Push succeeded."
               exit 0
             fi
 
-            sleep 2
+            echo "Push failed, retrying..."
+            sleep 3
           done
 
           echo "Push failed after 3 attempts."
