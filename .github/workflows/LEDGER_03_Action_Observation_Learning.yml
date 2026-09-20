@@ -28,11 +28,18 @@ jobs:
 
       ACTION_FILE: memory/nox_ledger_action.json
       KNOWLEDGE_FILE: memory/nox_ledger_knowledge.json
+      COGNITION_FILE: memory/nox_ledger_cognition.json
 
       MAX_TASKS: "100"
       MAX_BIDS_PER_RUN: "2"
       MAX_RECONCILE: "30"
       MIN_BID_SATS: "1"
+
+      BID_SCORE_THRESHOLD: "50"
+      MAX_DECISIONS_MEMORY: "500"
+      MAX_FAILURES_MEMORY: "300"
+      MAX_LEARNING_MEMORY: "300"
+      MAX_TIP_CANDIDATES_MEMORY: "200"
 
     steps:
       - name: Checkout
@@ -61,6 +68,7 @@ jobs:
           import re
           import json
           import hashlib
+          from collections import Counter
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -71,28 +79,67 @@ jobs:
 
           ACTION_FILE = Path(os.environ["ACTION_FILE"])
           KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
+          COGNITION_FILE = Path(os.environ["COGNITION_FILE"])
 
           MAX_TASKS = int(os.environ["MAX_TASKS"])
           MAX_BIDS = int(os.environ["MAX_BIDS_PER_RUN"])
           MAX_RECONCILE = int(os.environ["MAX_RECONCILE"])
           MIN_BID = int(os.environ["MIN_BID_SATS"])
 
+          BID_SCORE_THRESHOLD = int(
+              os.environ["BID_SCORE_THRESHOLD"]
+          )
+
+          MAX_DECISIONS_MEMORY = int(
+              os.environ["MAX_DECISIONS_MEMORY"]
+          )
+
+          MAX_FAILURES_MEMORY = int(
+              os.environ["MAX_FAILURES_MEMORY"]
+          )
+
+          MAX_LEARNING_MEMORY = int(
+              os.environ["MAX_LEARNING_MEMORY"]
+          )
+
+          MAX_TIP_CANDIDATES_MEMORY = int(
+              os.environ["MAX_TIP_CANDIDATES_MEMORY"]
+          )
+
           now = datetime.now(timezone.utc).isoformat()
+
+          # =========================================================
+          # Persistence
+          # =========================================================
 
           def load(path, default):
               if not path.exists():
                   return default
 
               try:
-                  return json.loads(
-                      path.read_text(encoding="utf-8")
+                  data = json.loads(
+                      path.read_text(
+                          encoding="utf-8"
+                      )
                   )
-              except Exception:
+                  return data
+              except Exception as exc:
+                  print(
+                      f"LOAD WARNING {path}: {exc}"
+                  )
                   return default
 
           def save(path, data):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              tmp = path.with_suffix(
+                  path.suffix + ".tmp"
+              )
+
+              tmp.write_text(
                   json.dumps(
                       data,
                       ensure_ascii=False,
@@ -101,127 +148,231 @@ jobs:
                   encoding="utf-8"
               )
 
-          state = load(ACTION_FILE, {
-              "version": "1.0",
-              "decisions": [],
-              "bids": [],
-              "observations": [],
-              "outcomes": [],
-              "failure_ledger": [],
-              "tip_candidates": [],
-              "learning": [],
-              "stats": {}
-          })
+              tmp.replace(path)
+
+          state = load(
+              ACTION_FILE,
+              {
+                  "version": "2.0",
+                  "decisions": [],
+                  "bids": [],
+                  "observations": [],
+                  "outcomes": [],
+                  "failure_ledger": [],
+                  "tip_candidates": [],
+                  "learning": [],
+                  "cognitive_actions": [],
+                  "stats": {}
+              }
+          )
+
+          if not isinstance(state, dict):
+              state = {}
+
+          state.setdefault("version", "2.0")
+          state.setdefault("decisions", [])
+          state.setdefault("bids", [])
+          state.setdefault("observations", [])
+          state.setdefault("outcomes", [])
+          state.setdefault("failure_ledger", [])
+          state.setdefault("tip_candidates", [])
+          state.setdefault("learning", [])
+          state.setdefault("cognitive_actions", [])
+          state.setdefault("stats", {})
 
           knowledge = load(
               KNOWLEDGE_FILE,
               {"knowledge": []}
           )
 
+          if not isinstance(knowledge, dict):
+              knowledge = {"knowledge": []}
+
+          cognition = load(
+              COGNITION_FILE,
+              {}
+          )
+
+          if not isinstance(cognition, dict):
+              cognition = {}
+
+          # =========================================================
+          # HTTP
+          # =========================================================
+
           session = requests.Session()
+
           session.headers.update({
               "Authorization": f"Bearer {KEY}",
               "Accept": "application/json",
-              "User-Agent": "NOX-Ledger-Marketplace/1.0"
+              "User-Agent": "NOX-Ledger-Action/2.0"
           })
 
-          def auth():
+          def authenticate():
               try:
-                  r = session.post(
+                  response = session.post(
                       BASE + "/api/v1/auth/token",
                       json={"api_key": KEY},
                       timeout=15
                   )
 
-                  if r.ok:
-                      data = r.json()
-                      access_token = data.get("access_token")
+                  if not response.ok:
+                      print(
+                          "AUTH FAILED: "
+                          f"HTTP {response.status_code}"
+                      )
+                      return False
 
-                      if access_token:
-                          session.headers["Authorization"] = (
-                              "Bearer " + access_token
-                          )
-                          return True
+                  data = response.json()
 
-              except Exception:
-                  pass
+                  token = data.get(
+                      "access_token"
+                  )
 
-              return False
+                  if not token:
+                      print(
+                          "AUTH FAILED: "
+                          "no access_token"
+                      )
+                      return False
 
-          auth()
+                  session.headers[
+                      "Authorization"
+                  ] = "Bearer " + token
+
+                  return True
+
+              except Exception as exc:
+                  print(
+                      f"AUTH ERROR: {exc}"
+                  )
+                  return False
+
+          authenticate()
 
           def get(path, params=None):
               try:
-                  r = session.get(
+                  response = session.get(
                       BASE + path,
                       params=params,
                       timeout=20
                   )
 
-                  if r.status_code == 401 and auth():
-                      r = session.get(
+                  if (
+                      response.status_code == 401
+                      and authenticate()
+                  ):
+                      response = session.get(
                           BASE + path,
                           params=params,
                           timeout=20
                       )
 
-                  if r.ok:
-                      return r.json()
+                  if response.ok:
+                      try:
+                          return response.json()
+                      except Exception:
+                          return None
+
+                  print(
+                      f"GET {path}: "
+                      f"HTTP {response.status_code}"
+                  )
 
               except Exception as exc:
-                  print(f"GET ERROR {path}: {exc}")
+                  print(
+                      f"GET ERROR {path}: {exc}"
+                  )
 
               return None
 
           def post(path, payload):
               try:
-                  r = session.post(
+                  response = session.post(
                       BASE + path,
                       json=payload,
                       timeout=20
                   )
 
-                  if r.status_code == 401 and auth():
-                      r = session.post(
+                  if (
+                      response.status_code == 401
+                      and authenticate()
+                  ):
+                      response = session.post(
                           BASE + path,
                           json=payload,
                           timeout=20
                       )
 
-                  return r
+                  return response
 
               except Exception as exc:
-                  print(f"POST ERROR {path}: {exc}")
+                  print(
+                      f"POST ERROR {path}: {exc}"
+                  )
                   return None
 
+          # =========================================================
+          # Generic helpers
+          # =========================================================
+
           def flat(value):
+              if value is None:
+                  return ""
+
               if isinstance(value, str):
                   return value
 
+              if isinstance(value, (int, float, bool)):
+                  return str(value)
+
               if isinstance(value, dict):
                   return " ".join(
-                      flat(v) for v in value.values()
+                      flat(v)
+                      for v in value.values()
                   )
 
               if isinstance(value, list):
                   return " ".join(
-                      flat(v) for v in value
+                      flat(v)
+                      for v in value
                   )
 
-              return str(value or "")
+              return str(value)
 
-          def fingerprint(text):
+          def clean(value):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  flat(value)
+              ).strip()
+
+          def fingerprint(*values):
+              normalized = " ".join(
+                  clean(value).lower()
+                  for value in values
+                  if clean(value)
+              )
+
               return hashlib.sha256(
-                  " ".join(
-                      text.lower().split()
-                  ).encode()
+                  normalized.encode("utf-8")
               ).hexdigest()[:20]
 
-          # ---------------------------------------------------------
-          # Identity
-          # ---------------------------------------------------------
+          def contains_any(text, terms):
+              low = clean(text).lower()
 
-          me = get("/api/v1/users/me") or {}
+              return any(
+                  term.lower() in low
+                  for term in terms
+              )
+
+          # =========================================================
+          # Identity
+          # =========================================================
+
+          me = get(
+              "/api/v1/users/me"
+          ) or {}
 
           username = (
               me.get("username")
@@ -240,20 +391,62 @@ jobs:
 
           identity_values.discard("")
 
-          print(f"IDENTITY: {username}")
+          print(
+              f"IDENTITY: {username}"
+          )
 
-          # ---------------------------------------------------------
+          # =========================================================
+          # Cognitive bridge: LEDGER 02 -> LEDGER 03
+          # =========================================================
+
+          cognitive_candidates = cognition.get(
+              "action_candidates",
+              []
+          )
+
+          if not isinstance(
+              cognitive_candidates,
+              list
+          ):
+              cognitive_candidates = []
+
+          pending_cognitive_actions = [
+              item
+              for item in cognitive_candidates
+              if isinstance(item, dict)
+              and str(
+                  item.get("status", "candidate")
+              ).lower()
+              in {
+                  "candidate",
+                  "pending",
+                  "ready"
+              }
+          ]
+
+          print(
+              "COGNITIVE ACTION CANDIDATES: "
+              f"{len(pending_cognitive_actions)}"
+          )
+
+          # =========================================================
           # Task helpers
-          # ---------------------------------------------------------
+          # =========================================================
 
           def task_id(task):
+              if not isinstance(task, dict):
+                  return None
+
               for key in [
                   "task_id",
                   "taskId",
+                  "id",
                   "uuid"
               ]:
-                  if task.get(key):
-                      return str(task[key])
+                  value = task.get(key)
+
+                  if value:
+                      return str(value)
 
               nested = task.get("task")
 
@@ -264,85 +457,293 @@ jobs:
                       "taskId",
                       "uuid"
                   ]:
-                      if nested.get(key):
-                          return str(nested[key])
+                      value = nested.get(key)
+
+                      if value:
+                          return str(value)
 
               return None
 
+          def task_title(task):
+              if not isinstance(task, dict):
+                  return ""
+
+              nested = task.get("task")
+
+              candidates = [
+                  task.get("title"),
+                  task.get("name"),
+                  task.get("task_title")
+              ]
+
+              if isinstance(nested, dict):
+                  candidates.extend([
+                      nested.get("title"),
+                      nested.get("name"),
+                      nested.get("task_title")
+                  ])
+
+              for value in candidates:
+                  if clean(value):
+                      return clean(value)
+
+              return ""
+
+          def task_description(task):
+              if not isinstance(task, dict):
+                  return ""
+
+              nested = task.get("task")
+
+              candidates = [
+                  task.get("description"),
+                  task.get("body"),
+                  task.get("details"),
+                  task.get("content"),
+                  task.get("instructions")
+              ]
+
+              if isinstance(nested, dict):
+                  candidates.extend([
+                      nested.get("description"),
+                      nested.get("body"),
+                      nested.get("details"),
+                      nested.get("content"),
+                      nested.get("instructions")
+                  ])
+
+              for value in candidates:
+                  if clean(value):
+                      return clean(value)
+
+              return ""
+
+          def task_text(task):
+              if not isinstance(task, dict):
+                  return ""
+
+              nested = task.get("task")
+
+              parts = [
+                  task_title(task),
+                  task_description(task),
+                  clean(task.get("category")),
+                  clean(task.get("type")),
+                  clean(task.get("status")),
+                  clean(task.get("tags"))
+              ]
+
+              if isinstance(nested, dict):
+                  parts.append(
+                      clean(nested.get("category"))
+                  )
+                  parts.append(
+                      clean(nested.get("type"))
+                  )
+                  parts.append(
+                      clean(nested.get("status"))
+                  )
+                  parts.append(
+                      clean(nested.get("tags"))
+                  )
+
+              return clean(
+                  " ".join(
+                      part
+                      for part in parts
+                      if part
+                  )
+              )
+
+          # =========================================================
+          # Reward extraction
+          # =========================================================
+
+          REWARD_KEYS = [
+              "reward_sats",
+              "reward",
+              "budget_sats",
+              "amount_sats",
+              "max_reward_sats",
+              "min_reward_sats",
+              "bounty_sats",
+              "price_sats"
+          ]
+
+          def recursive_numbers(value, key_name=""):
+              found = []
+
+              if isinstance(value, dict):
+                  for key, child in value.items():
+
+                      low_key = str(
+                          key
+                      ).lower()
+
+                      if (
+                          low_key in REWARD_KEYS
+                          or (
+                              "reward" in low_key
+                              and (
+                                  "sat" in low_key
+                                  or "amount" in low_key
+                                  or "budget" in low_key
+                              )
+                          )
+                          or (
+                              "budget" in low_key
+                              and "sat" in low_key
+                          )
+                      ):
+                          if isinstance(
+                              child,
+                              (int, float)
+                          ):
+                              found.append(
+                                  int(child)
+                              )
+
+                      found.extend(
+                          recursive_numbers(
+                              child,
+                              low_key
+                          )
+                      )
+
+              elif isinstance(value, list):
+                  for child in value:
+                      found.extend(
+                          recursive_numbers(
+                              child,
+                              key_name
+                          )
+                      )
+
+              return found
+
           def reward_values(task, text):
-              values = []
-
-              for key in [
-                  "reward_sats",
-                  "reward",
-                  "budget_sats",
-                  "amount_sats",
-                  "max_reward_sats",
-                  "min_reward_sats"
-              ]:
-                  value = task.get(key)
-
-                  if isinstance(value, (int, float)):
-                      values.append(int(value))
+              values = recursive_numbers(task)
 
               for value in re.findall(
-                  r"(?<![\d.])([\d][\d,]*)\s*(?:sats?|sat)\b",
+                  r"(?<![\d.])"
+                  r"([\d][\d,]*)"
+                  r"\s*(?:sats?|sat)\b",
                   text,
                   re.I
               ):
                   try:
                       values.append(
-                          int(value.replace(",", ""))
+                          int(
+                              value.replace(
+                                  ",",
+                                  ""
+                              )
+                          )
                       )
                   except Exception:
                       pass
 
               return sorted(
-                  set(x for x in values if x >= 0)
+                  set(
+                      value
+                      for value in values
+                      if value >= 0
+                  )
               )
 
           def reward_range(task, text):
-              values = reward_values(task, text)
+              values = reward_values(
+                  task,
+                  text
+              )
 
               if not values:
                   return None, None
 
-              return min(values), max(values)
+              return (
+                  min(values),
+                  max(values)
+              )
+
+          # =========================================================
+          # Demand detection
+          # =========================================================
+
+          DEMAND_TERMS = [
+              "for hire",
+              "looking for",
+              "need an agent",
+              "need someone",
+              "need help",
+              "task",
+              "bounty",
+              "request",
+              "commission",
+              "research needed",
+              "research task",
+              "write a report",
+              "report writing",
+              "build",
+              "implement",
+              "fix",
+              "develop",
+              "development",
+              "deliverable",
+              "wanted",
+              "seeking",
+              "job",
+              "work needed"
+          ]
+
+          SUPPLY_TERMS = [
+              "i offer",
+              "for hire by me",
+              "my service",
+              "i can provide",
+              "available service",
+              "my skills",
+              "offering"
+          ]
+
+          OPEN_STATUS = {
+              "open",
+              "active",
+              "published",
+              "available",
+              "pending",
+              "bidding"
+          }
+
+          CLOSED_STATUS = {
+              "closed",
+              "completed",
+              "cancelled",
+              "canceled",
+              "expired",
+              "archived"
+          }
 
           def direction(task, text):
               low = text.lower()
 
-              demand_terms = [
-                  "for hire",
-                  "looking for",
-                  "need an agent",
-                  "need someone",
-                  "task",
-                  "bounty",
-                  "research needed",
-                  "write a report",
-                  "build",
-                  "implement",
-                  "fix"
-              ]
-
-              supply_terms = [
-                  "i offer",
-                  "for hire by me",
-                  "my service",
-                  "i can provide",
-                  "available service"
-              ]
-
               demand_score = sum(
-                  1 for x in demand_terms
-                  if x in low
+                  1
+                  for term in DEMAND_TERMS
+                  if term in low
               )
 
               supply_score = sum(
-                  1 for x in supply_terms
-                  if x in low
+                  1
+                  for term in SUPPLY_TERMS
+                  if term in low
               )
+
+              status = clean(
+                  task.get("status")
+              ).lower()
+
+              if status in CLOSED_STATUS:
+                  return "CLOSED"
 
               if demand_score > supply_score:
                   return "DEMAND"
@@ -350,34 +751,67 @@ jobs:
               if supply_score > demand_score:
                   return "SUPPLY"
 
-              # Structured reward fields are strong evidence
-              if any(
-                  task.get(k) is not None
-                  for k in [
-                      "reward",
-                      "reward_sats",
-                      "budget_sats"
-                  ]
+              # A structured marketplace reward is
+              # strong evidence that this is an offer
+              # requiring agent work.
+              low_reward, high_reward = reward_range(
+                  task,
+                  text
+              )
+
+              if (
+                  low_reward is not None
+                  or high_reward is not None
               ):
                   return "DEMAND"
 
+              if status in OPEN_STATUS:
+                  # An open marketplace task with
+                  # actionable language can still be
+                  # treated as demand.
+                  if contains_any(
+                      low,
+                      [
+                          "research",
+                          "report",
+                          "code",
+                          "python",
+                          "api",
+                          "github",
+                          "data",
+                          "testing",
+                          "analysis",
+                          "build",
+                          "implement",
+                          "fix"
+                      ]
+                  ):
+                      return "DEMAND"
+
               return "UNKNOWN"
 
+          # =========================================================
+          # Capabilities
+          # =========================================================
+
           STRONG_CAPABILITIES = {
-              "rest api": [
+              "rest_api": [
                   "rest api",
                   "api integration",
                   "api endpoint",
                   "api development",
                   "api testing",
                   "webhook",
-                  "json api"
+                  "json api",
+                  "api"
               ],
+
               "python": [
                   "python",
                   "python script",
                   "python development"
               ],
+
               "coding": [
                   "write code",
                   "coding task",
@@ -388,15 +822,19 @@ jobs:
                   "tool development",
                   "build agent tools",
                   "agent tooling",
-                  "build tools"
+                  "build tools",
+                  "develop"
               ],
+
               "testing": [
                   "testing",
                   "qa",
                   "quality assurance",
                   "smoke test",
-                  "api test"
+                  "api test",
+                  "test"
               ],
+
               "research": [
                   "research",
                   "research report",
@@ -409,15 +847,19 @@ jobs:
                   "fact checking",
                   "source verification",
                   "conduct research",
-                  "perform research"
+                  "perform research",
+                  "investigation"
               ],
+
               "reporting": [
                   "technical report",
                   "write a report",
                   "prepare a report",
                   "report writing",
-                  "research brief"
+                  "research brief",
+                  "report"
               ],
+
               "data": [
                   "data analysis",
                   "data cleaning",
@@ -427,6 +869,7 @@ jobs:
                   "csv",
                   "json cleanup"
               ],
+
               "github": [
                   "github",
                   "repository",
@@ -457,19 +900,36 @@ jobs:
               low = text.lower()
               found = []
 
-              for capability, phrases in \
-                      STRONG_CAPABILITIES.items():
-
+              for capability, phrases in (
+                  STRONG_CAPABILITIES.items()
+              ):
                   if any(
                       phrase in low
                       for phrase in phrases
                   ):
-                      found.append(capability)
+                      found.append(
+                          capability
+                      )
 
               return found
 
+          def blocked(text):
+              low = text.lower()
+
+              return any(
+                  term in low
+                  for term in BLOCKED_TERMS
+              )
+
+          # =========================================================
+          # Reward consistency
+          # =========================================================
+
           def suspicious_reward(task, text):
-              values = reward_values(task, text)
+              values = reward_values(
+                  task,
+                  text
+              )
 
               if len(values) < 2:
                   return False
@@ -480,26 +940,47 @@ jobs:
               if low <= 0:
                   return False
 
-              return high / low >= 10
-
-          def blocked(text):
-              low = text.lower()
-
-              return any(
-                  term in low
-                  for term in BLOCKED_TERMS
+              return (
+                  high / low >= 10
               )
 
-          # ---------------------------------------------------------
+          # =========================================================
+          # Existing action memory
+          # =========================================================
+
+          previous_decisions = {
+              str(item.get("task_id")): item
+              for item in state.get(
+                  "decisions",
+                  []
+              )
+              if isinstance(item, dict)
+              and item.get("task_id")
+          }
+
+          previous_bids = {
+              str(item.get("task_id")): item
+              for item in state.get(
+                  "bids",
+                  []
+              )
+              if isinstance(item, dict)
+              and item.get("task_id")
+          }
+
+          # =========================================================
           # Marketplace discovery
-          # ---------------------------------------------------------
+          # =========================================================
 
           tasks_response = get(
               "/api/v1/marketplace/tasks",
               {"limit": MAX_TASKS}
           )
 
-          if isinstance(tasks_response, dict):
+          if isinstance(
+              tasks_response,
+              dict
+          ):
               tasks = tasks_response.get(
                   "items",
                   tasks_response.get(
@@ -510,49 +991,74 @@ jobs:
           else:
               tasks = tasks_response
 
-          if not isinstance(tasks, list):
+          if not isinstance(
+              tasks,
+              list
+          ):
               tasks = []
 
-          print(f"TASKS FOUND: {len(tasks)}")
+          print(
+              f"TASKS FOUND: {len(tasks)}"
+          )
 
           decisions = []
           candidates = []
+
+          skip_reasons = Counter()
+
+          # =========================================================
+          # Cognitive action influence
+          # =========================================================
+
+          cognitive_topics = []
+
+          for candidate in (
+              pending_cognitive_actions
+          ):
+              topic = clean(
+                  candidate.get("topic")
+              )
+
+              if topic:
+                  cognitive_topics.append(
+                      topic.lower()
+                  )
+
+          cognitive_context_active = bool(
+              pending_cognitive_actions
+          )
+
+          # =========================================================
+          # Evaluate tasks
+          # =========================================================
 
           for task in tasks:
 
               tid = task_id(task)
 
               if not tid:
+                  skip_reasons[
+                      "MISSING_TASK_ID"
+                  ] += 1
                   continue
 
-              title = str(
-                  task.get("title", "")
-              )
-
-              description = str(
-                  task.get(
-                      "description",
-                      task.get("body", "")
-                  )
-              )
-
-              text = (
-                  title + "\n" +
-                  description
-              )
+              title = task_title(task)
+              description = task_description(task)
+              text = task_text(task)
 
               direction_value = direction(
                   task,
                   text
               )
 
-              low_reward, high_reward = reward_range(
-                  task,
-                  text
+              low_reward, high_reward = (
+                  reward_range(
+                      task,
+                      text
+                  )
               )
 
               caps = capabilities(text)
-
               is_blocked = blocked(text)
               suspicious = suspicious_reward(
                   task,
@@ -562,74 +1068,219 @@ jobs:
               score = 0
               reasons = []
 
+              # -----------------------------------------------------
+              # Safety gate
+              # -----------------------------------------------------
+
               if is_blocked:
+
                   score = -100
-                  reasons.append("SAFETY_BLOCK")
+
+                  reasons.append(
+                      "SAFETY_BLOCK"
+                  )
+
+                  skip_reasons[
+                      "SAFETY_BLOCK"
+                  ] += 1
+
+              elif direction_value == "CLOSED":
+
+                  score = -80
+
+                  reasons.append(
+                      "CLOSED_TASK"
+                  )
+
+                  skip_reasons[
+                      "CLOSED_TASK"
+                  ] += 1
 
               elif direction_value != "DEMAND":
+
                   score = -50
+
                   reasons.append(
                       "NOT_DEMAND"
                   )
 
+                  skip_reasons[
+                      "NOT_DEMAND"
+                  ] += 1
+
               else:
 
+                  # -------------------------------------------------
+                  # Capability fit
+                  # -------------------------------------------------
+
                   if caps:
-                      score += min(
-                          30,
-                          len(caps) * 10
+
+                      capability_score = min(
+                          35,
+                          len(caps) * 12
                       )
+
+                      score += (
+                          capability_score
+                      )
+
                       reasons.append(
                           "CAPABILITY:" +
                           ",".join(caps)
                       )
+
                   else:
-                      score -= 10
+
+                      score -= 5
+
                       reasons.append(
                           "NO_STRONG_CAPABILITY"
                       )
 
+                  # -------------------------------------------------
+                  # Reward
+                  # -------------------------------------------------
+
                   if low_reward is not None:
 
-                      economic = min(
-                          25,
-                          int(
-                              max(
-                                  0,
-                                  low_reward
-                              ) / 200
-                          )
-                      )
+                      if low_reward >= 500:
+                          reward_score = 25
 
-                      score += economic
+                      elif low_reward >= 100:
+                          reward_score = 20
+
+                      elif low_reward >= 20:
+                          reward_score = 15
+
+                      elif low_reward >= 1:
+                          reward_score = 10
+
+                      else:
+                          reward_score = 0
+
+                      score += reward_score
+
                       reasons.append(
                           f"REWARD:{low_reward}"
                       )
 
                   else:
+
                       reasons.append(
                           "NO_REWARD"
                       )
 
-                  if len(text) < 500:
+                  # -------------------------------------------------
+                  # Task clarity
+                  # -------------------------------------------------
+
+                  text_length = len(text)
+
+                  if (
+                      100 <= text_length <= 1800
+                  ):
                       score += 10
 
-                  if len(text) > 2500:
-                      score -= 10
                       reasons.append(
-                          "COMPLEXITY"
+                          "CLEAR_SCOPE"
                       )
 
+                  elif text_length < 100:
+
+                      score += 3
+
+                      reasons.append(
+                          "SHORT_SCOPE"
+                      )
+
+                  elif text_length > 3000:
+
+                      score -= 8
+
+                      reasons.append(
+                          "HIGH_COMPLEXITY"
+                      )
+
+                  # -------------------------------------------------
+                  # Evidence/action context
+                  # -------------------------------------------------
+
+                  if contains_any(
+                      text,
+                      [
+                          "deliverable",
+                          "report",
+                          "output",
+                          "repository",
+                          "github",
+                          "api",
+                          "documentation"
+                      ]
+                  ):
+                      score += 5
+
+                      reasons.append(
+                          "OBSERVABLE_DELIVERABLE"
+                      )
+
+                  # -------------------------------------------------
+                  # Cognitive bridge
+                  # -------------------------------------------------
+
+                  if cognitive_context_active:
+
+                      topic_match = any(
+                          topic.replace(
+                              "_",
+                              " "
+                          ) in text.lower()
+                          for topic in cognitive_topics
+                      )
+
+                      if topic_match:
+
+                          score += 5
+
+                          reasons.append(
+                              "COGNITIVE_TOPIC_MATCH"
+                          )
+
+                      else:
+
+                          reasons.append(
+                              "COGNITIVE_CONTEXT_AVAILABLE"
+                          )
+
+                  # -------------------------------------------------
+                  # Reward consistency
+                  # -------------------------------------------------
+
                   if suspicious:
-                      score -= 40
+
+                      score -= 35
+
                       reasons.append(
                           "REWARD_INCONSISTENCY"
+                      )
+
+                  # -------------------------------------------------
+                  # Existing local bid memory
+                  # -------------------------------------------------
+
+                  if str(tid) in previous_bids:
+
+                      reasons.append(
+                          "PREVIOUS_BID_MEMORY"
                       )
 
               decision = {
                   "timestamp": now,
                   "task_id": tid,
                   "title": title[:300],
+                  "description_excerpt": (
+                      description[:500]
+                  ),
                   "direction": direction_value,
                   "reward_low": low_reward,
                   "reward_high": high_reward,
@@ -641,637 +1292,25 @@ jobs:
                   "reasons": reasons
               }
 
-              # Real bid gate
+              # =====================================================
+              # Bid gate
+              # =====================================================
+
               if (
                   direction_value == "DEMAND"
                   and caps
                   and not is_blocked
                   and not suspicious
-                  and score >= 55
                   and low_reward is not None
+                  and score >= BID_SCORE_THRESHOLD
               ):
-                  decision["decision"] = "BID"
+
+                  decision[
+                      "decision"
+                  ] = "BID"
+
                   candidates.append(
                       decision
                   )
 
-              elif (
-                  direction_value == "DEMAND"
-                  and caps
-                  and not is_blocked
-                  and low_reward is None
-              ):
-                  decision["decision"] = "TIP_OR_LEARNING_CANDIDATE"
-
-                  state.setdefault(
-                      "tip_candidates",
-                      []
-                  ).append({
-                      "timestamp": now,
-                      "task_id": tid,
-                      "title": title[:300],
-                      "capabilities": caps,
-                      "reward_claim": None,
-                      "note": (
-                          "No reward fabricated. "
-                          "Potential learning or future "
-                          "tip opportunity."
-                      )
-                  })
-
-              decisions.append(decision)
-
-          # ---------------------------------------------------------
-          # Existing bids
-          # ---------------------------------------------------------
-
-          ACTIVE_STATUSES = {
-              "pending",
-              "submitted",
-              "active",
-              "accepted",
-              "approved",
-              "winner",
-              "winning"
-          }
-
-          CLOSED_STATUSES = {
-              "rejected",
-              "declined",
-              "cancelled",
-              "canceled",
-              "expired",
-              "lost"
-          }
-
-          def own_bid(bid):
-              if not isinstance(bid, dict):
-                  return False
-
-              for key in [
-                  "agent_id",
-                  "user_id",
-                  "bidder_id",
-                  "owner_id"
-              ]:
-                  value = bid.get(key)
-
-                  if value is not None and \
-                     str(value).lower() in identity_values:
-                      return True
-
-              for key in [
-                  "username",
-                  "handle",
-                  "bidder_username",
-                  "agent_username"
-              ]:
-                  value = bid.get(key)
-
-                  if value is not None and \
-                     str(value).lower() in identity_values:
-                      return True
-
-              return False
-
-          def normalize_status(value):
-              low = str(
-                  value or ""
-              ).lower().strip()
-
-              if low in {
-                  "accepted",
-                  "approved",
-                  "won",
-                  "selected"
-              }:
-                  return "ACCEPTED"
-
-              if low in {
-                  "rejected",
-                  "declined",
-                  "lost",
-                  "denied"
-              }:
-                  return "REJECTED"
-
-              if low in {
-                  "pending",
-                  "submitted",
-                  "active",
-                  "open",
-                  "bidding",
-                  "under_review",
-                  "review"
-              }:
-                  return "PENDING"
-
-              return (
-                  str(value or "UNKNOWN")
-                  .upper()
-              )
-
-          def get_bids(tid):
-              result = get(
-                  "/api/v1/marketplace/" +
-                  tid +
-                  "/bids"
-              )
-
-              if isinstance(result, dict):
-                  return result.get(
-                      "items",
-                      result.get("bids", [])
-                  )
-
-              return result if isinstance(
-                  result,
-                  list
-              ) else []
-
-          # ---------------------------------------------------------
-          # Bid candidates
-          # ---------------------------------------------------------
-
-          bids_created = 0
-          bid_conflicts = 0
-
-          candidates.sort(
-              key=lambda x: x["score"],
-              reverse=True
-          )
-
-          for candidate in candidates:
-
-              if bids_created >= MAX_BIDS:
-                  break
-
-              tid = candidate["task_id"]
-
-              existing_bids = get_bids(tid)
-
-              if not isinstance(
-                  existing_bids,
-                  list
-              ):
-                  existing_bids = []
-
-              already_active = False
-
-              for bid in existing_bids:
-                  if not own_bid(bid):
-                      continue
-
-                  status = normalize_status(
-                      bid.get("status")
-                  )
-
-                  if status in ACTIVE_STATUSES:
-                      already_active = True
-                      break
-
-              if already_active:
-                  candidate["decision"] = (
-                      "SKIP_EXISTING_ACTIVE_BID"
-                  )
-                  continue
-
-              reward = candidate.get(
-                  "reward_low"
-              )
-
-              if reward is None:
-                  continue
-
-              bid_amount = max(
-                  MIN_BID,
-                  int(reward)
-              )
-
-              high = candidate.get(
-                  "reward_high"
-              )
-
-              if high is not None:
-                  bid_amount = min(
-                      bid_amount,
-                      int(high)
-                  )
-
-              title = candidate["title"]
-
-              bid_description = (
-                  "NØX can handle this task with "
-                  "evidence-based execution. "
-                  f"Relevant capabilities: "
-                  f"{', '.join(candidate['capabilities'])}. "
-                  "The proposed bid is bounded to the "
-                  "task reward information observed."
-              )
-
-              response = post(
-                  "/api/v1/marketplace/" +
-                  tid +
-                  "/bid",
-                  {
-                      "bid_amount_sats": bid_amount,
-                      "bid_description": bid_description[:5000]
-                  }
-              )
-
-              if response is None:
-                  continue
-
-              if response.status_code in {200, 201}:
-
-                  result = {}
-
-                  try:
-                      result = response.json()
-                  except Exception:
-                      pass
-
-                  bid_id = (
-                      result.get("id")
-                      or result.get("bid_id")
-                  )
-
-                  state.setdefault(
-                      "bids",
-                      []
-                  ).append({
-                      "timestamp": now,
-                      "task_id": tid,
-                      "task_title": title,
-                      "bid_id": bid_id,
-                      "amount_sats": bid_amount,
-                      "status": "SUBMITTED",
-                      "score": candidate["score"]
-                  })
-
-                  candidate["decision"] = (
-                      "BID_SUBMITTED"
-                  )
-
-                  bids_created += 1
-
-              elif response.status_code == 409:
-
-                  bid_conflicts += 1
-
-                  candidate["decision"] = (
-                      "SERVER_CONFLICT"
-                  )
-
-                  state.setdefault(
-                      "failure_ledger",
-                      []
-                  ).append({
-                      "timestamp": now,
-                      "type": "BID_CONFLICT",
-                      "task_id": tid,
-                      "cause": (
-                          "Server rejected bid as "
-                          "conflicting/existing."
-                      ),
-                      "correction": (
-                          "Treat server response as "
-                          "authoritative and do not retry "
-                          "blindly."
-                      )
-                  })
-
-              else:
-
-                  candidate["decision"] = (
-                      "BID_FAILED"
-                  )
-
-                  state.setdefault(
-                      "failure_ledger",
-                      []
-                  ).append({
-                      "timestamp": now,
-                      "type": "BID_HTTP_FAILURE",
-                      "task_id": tid,
-                      "status_code": response.status_code
-                  })
-
-          # ---------------------------------------------------------
-          # Reconciliation / observation
-          # ---------------------------------------------------------
-
-          tracked = []
-
-          for item in state.get("bids", []):
-              if item.get("task_id"):
-                  tracked.append(item)
-
-          # newest unique tasks first
-          unique = {}
-
-          for item in reversed(tracked):
-              unique[item["task_id"]] = item
-
-          tracked = list(
-              unique.values()
-          )[:MAX_RECONCILE]
-
-          accepted = 0
-          pending = 0
-          rejected = 0
-          paid = 0
-
-          for item in tracked:
-
-              tid = item["task_id"]
-
-              bids = get_bids(tid)
-
-              if not isinstance(
-                  bids,
-                  list
-              ):
-                  continue
-
-              mine = None
-
-              expected_bid_id = item.get(
-                  "bid_id"
-              )
-
-              if expected_bid_id is not None:
-
-                  for bid in bids:
-                      bid_id = (
-                          bid.get("id")
-                          or bid.get("bid_id")
-                      )
-
-                      if str(bid_id) == \
-                         str(expected_bid_id):
-                          mine = bid
-                          break
-
-              if mine is None:
-
-                  for bid in bids:
-                      if own_bid(bid):
-                          mine = bid
-                          break
-
-              if mine is None:
-                  continue
-
-              status = normalize_status(
-                  mine.get("status")
-              )
-
-              if status == "ACCEPTED":
-                  accepted += 1
-              elif status == "PENDING":
-                  pending += 1
-              elif status == "REJECTED":
-                  rejected += 1
-
-              payment_status = None
-
-              if status == "ACCEPTED":
-
-                  payment = get(
-                      "/api/v1/marketplace/" +
-                      tid +
-                      "/payment"
-                  )
-
-                  if isinstance(
-                      payment,
-                      dict
-                  ):
-                      payment_status = (
-                          payment.get("status")
-                          or payment.get(
-                              "payment_status"
-                          )
-                      )
-
-                      low = str(
-                          payment_status or ""
-                      ).lower()
-
-                      if low in {
-                          "paid",
-                          "completed",
-                          "settled"
-                      }:
-                          paid += 1
-
-              observation = {
-                  "timestamp": now,
-                  "task_id": tid,
-                  "bid_id": (
-                      mine.get("id")
-                      or mine.get("bid_id")
-                      or expected_bid_id
-                  ),
-                  "status": status,
-                  "amount_sats": (
-                      mine.get("bid_amount_sats")
-                      or mine.get("amount_sats")
-                  ),
-                  "payment_status": payment_status,
-                  "gemini_used": False,
-                  "external_ai_used": False,
-                  "payments_enabled": False,
-                  "spending_enabled": False,
-                  "project_cost_eur": 0
-              }
-
-              state.setdefault(
-                  "observations",
-                  []
-              ).append(observation)
-
-              # -----------------------------------------------------
-              # Learning from real outcomes
-              # -----------------------------------------------------
-
-              previous_status = item.get(
-                  "last_observed_status"
-              )
-
-              if previous_status != status:
-
-                  state.setdefault(
-                      "outcomes",
-                      []
-                  ).append({
-                      "timestamp": now,
-                      "task_id": tid,
-                      "bid_id": observation["bid_id"],
-                      "previous_status": previous_status,
-                      "new_status": status,
-                      "payment_status": payment_status
-                  })
-
-                  if status == "ACCEPTED":
-
-                      state.setdefault(
-                          "learning",
-                          []
-                      ).append({
-                          "timestamp": now,
-                          "type": "POSITIVE_OUTCOME",
-                          "task_id": tid,
-                          "lesson": (
-                              "A real bid reached ACCEPTED. "
-                              "Preserve the task characteristics, "
-                              "capability fit and bid conditions "
-                              "for later comparison."
-                          )
-                      })
-
-                  elif status == "REJECTED":
-
-                      state.setdefault(
-                          "learning",
-                          []
-                      ).append({
-                          "timestamp": now,
-                          "type": "NEGATIVE_OUTCOME",
-                          "task_id": tid,
-                          "lesson": (
-                              "A real bid was rejected. "
-                              "Do not assume capability failure; "
-                              "compare reward, competition, "
-                              "timing and task characteristics "
-                              "against other outcomes."
-                          )
-                      })
-
-              item["last_observed_status"] = status
-              item["last_payment_status"] = payment_status
-
-          # ---------------------------------------------------------
-          # Adaptation statistics
-          # ---------------------------------------------------------
-
-          state["decisions"] = (
-              decisions[-500:]
-          )
-
-          state["observations"] = (
-              state.get(
-                  "observations",
-                  []
-              )[-500:]
-          )
-
-          state["outcomes"] = (
-              state.get(
-                  "outcomes",
-                  []
-              )[-300:]
-          )
-
-          state["learning"] = (
-              state.get(
-                  "learning",
-                  []
-              )[-300:]
-          )
-
-          state["failure_ledger"] = (
-              state.get(
-                  "failure_ledger",
-                  []
-              )[-300:]
-          )
-
-          state["tip_candidates"] = (
-              state.get(
-                  "tip_candidates",
-                  []
-              )[-200:]
-          )
-
-          state["updated_at"] = now
-
-          state["stats"] = {
-              "tasks_seen": len(tasks),
-              "decision_count": len(decisions),
-              "bid_candidates": len(candidates),
-              "bids_created_this_run": bids_created,
-              "bid_conflicts": bid_conflicts,
-              "tracked_bids": len(tracked),
-              "accepted": accepted,
-              "pending": pending,
-              "rejected": rejected,
-              "paid_observed": paid,
-              "tip_candidates_total": len(
-                  state["tip_candidates"]
-              ),
-              "gemini_used": False,
-              "external_ai_used": False,
-              "payments_enabled": False,
-              "spending_enabled": False,
-              "project_cost_eur": 0
-          }
-
-          save(ACTION_FILE, state)
-
-          print("")
-          print("=== NØX LEDGER 03 ===")
-          print(f"Identity: {username}")
-          print(f"Tasks: {len(tasks)}")
-          print(f"Bid candidates: {len(candidates)}")
-          print(f"Bids created: {bids_created}")
-          print(f"Bid conflicts: {bid_conflicts}")
-          print(f"Tracked bids: {len(tracked)}")
-          print(f"Accepted: {accepted}")
-          print(f"Pending: {pending}")
-          print(f"Rejected: {rejected}")
-          print(f"Paid observed: {paid}")
-          print(
-              "Tip candidates: "
-              f"{len(state['tip_candidates'])}"
-          )
-          print("Real bids: ENABLED")
-          print("Payments: DISABLED")
-          print("Spending: DISABLED")
-          print("Gemini: False")
-          print("External AI: False")
-          print("Project cost: €0")
-          PY
-
-      - name: Commit action state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
-
-          git add memory/nox_ledger_action.json
-
-          if git diff --cached --quiet; then
-            echo "No action-state changes."
-            exit 0
-          fi
-
-          git commit -m "ledger03: update action results and learning"
-
-          for attempt in 1 2 3; do
-            git fetch origin main
-
-            if ! git rebase origin/main; then
-              git rebase --abort || true
-              sleep 2
-              continue
-            fi
-
-            git push origin HEAD:main && exit 0
-            sleep 2
-          done
-
-          exit 1
+              elif
