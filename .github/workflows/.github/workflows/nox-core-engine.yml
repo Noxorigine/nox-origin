@@ -1,0 +1,2758 @@
+name: NØX CORE - Autonomous Research Marketplace Execution V1.0
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+jobs:
+  nox-core:
+    runs-on: ubuntu-latest
+
+    env:
+      API_BASE: https://thecolony.ai/api/v1
+      NOX_IDENTITY: nox_origine
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+
+      # ============================================================
+      # HARD SAFETY / COST CONSTRAINTS
+      # ============================================================
+
+      EXTERNAL_AI_ENABLED: "false"
+      GEMINI_ENABLED: "false"
+      PAYMENTS_ENABLED: "false"
+      SPENDING_ENABLED: "false"
+      PROJECT_COST_EUR: "0"
+
+      # ============================================================
+      # DISCOVERY
+      # ============================================================
+
+      MAX_TASKS: "100"
+      MAX_ACTIONS_PER_RUN: "2"
+      MAX_BIDS_PER_RUN: "1"
+
+      # 21 sats is the Colony technical bid floor.
+      # It is NOT an economic minimum.
+      MIN_BID_SATS: "21"
+
+      # ============================================================
+      # EXECUTION
+      # ============================================================
+
+      EXECUTION_ENABLED: "true"
+      MAX_EXECUTIONS_PER_RUN: "1"
+      MAX_DELIVERY_CHARS: "9500"
+
+      # ============================================================
+      # RESEARCH
+      # ============================================================
+
+      RESEARCH_ENABLED: "true"
+      MAX_RESEARCH_RESULTS: "5"
+      MAX_SOURCE_CHARS: "6000"
+      MAX_RESEARCH_SOURCES: "5"
+
+      # ============================================================
+      # MEMORY
+      # ============================================================
+
+      MAX_KNOWLEDGE: "500"
+      MAX_ACTIONS: "500"
+      MAX_OBSERVATIONS: "500"
+      MAX_LESSONS: "300"
+      MAX_FAILURES: "300"
+      MAX_TASK_HISTORY: "500"
+
+      HTTP_TIMEOUT_SECONDS: "20"
+      MAX_RETRIES: "3"
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================================
+      # CORE ENGINE
+      # ============================================================
+
+      - name: NØX CORE engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          from datetime import datetime, timezone
+          from html import unescape
+          from urllib.parse import quote, urlparse
+
+          import requests
+
+          # ==========================================================
+          # CONFIG
+          # ==========================================================
+
+          API = os.environ["API_BASE"].rstrip("/")
+          KEY = os.environ["COLONY_API_KEY"]
+          IDENTITY = os.environ["NOX_IDENTITY"]
+
+          MAX_TASKS = int(os.environ["MAX_TASKS"])
+          MAX_ACTIONS = int(os.environ["MAX_ACTIONS_PER_RUN"])
+          MAX_BIDS = int(os.environ["MAX_BIDS_PER_RUN"])
+
+          MIN_BID = int(os.environ["MIN_BID_SATS"])
+
+          EXECUTION_ENABLED = (
+              os.environ["EXECUTION_ENABLED"].lower() == "true"
+          )
+
+          MAX_EXECUTIONS = int(
+              os.environ["MAX_EXECUTIONS_PER_RUN"]
+          )
+
+          MAX_DELIVERY = int(
+              os.environ["MAX_DELIVERY_CHARS"]
+          )
+
+          RESEARCH_ENABLED = (
+              os.environ["RESEARCH_ENABLED"].lower() == "true"
+          )
+
+          MAX_RESEARCH_RESULTS = int(
+              os.environ["MAX_RESEARCH_RESULTS"]
+          )
+
+          MAX_SOURCE_CHARS = int(
+              os.environ["MAX_SOURCE_CHARS"]
+          )
+
+          MAX_RESEARCH_SOURCES = int(
+              os.environ["MAX_RESEARCH_SOURCES"]
+          )
+
+          TIMEOUT = int(
+              os.environ["HTTP_TIMEOUT_SECONDS"]
+          )
+
+          MAX_RETRIES = int(
+              os.environ["MAX_RETRIES"]
+          )
+
+          MEMORY_DIR = "memory"
+
+          CORE_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_core_engine.json"
+          )
+
+          KNOWLEDGE_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_ledger_knowledge.json"
+          )
+
+          COGNITION_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_ledger_cognition.json"
+          )
+
+          ACTION_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_ledger_action.json"
+          )
+
+          MARKET_FILE = os.path.join(
+              MEMORY_DIR,
+              "nox_ledger_marketplace.json"
+          )
+
+          os.makedirs(
+              MEMORY_DIR,
+              exist_ok=True
+          )
+
+          # ==========================================================
+          # UTILITIES
+          # ==========================================================
+
+          def now():
+              return datetime.now(
+                  timezone.utc
+              ).isoformat()
+
+          def load(path, default):
+              try:
+                  with open(
+                      path,
+                      encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except Exception:
+                  return default
+
+          def save(path, data):
+              temporary = path + ".tmp"
+
+              with open(
+                  temporary,
+                  "w",
+                  encoding="utf-8"
+              ) as handle:
+                  json.dump(
+                      data,
+                      handle,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+
+              os.replace(
+                  temporary,
+                  path
+              )
+
+          def text(value):
+              if isinstance(
+                  value,
+                  (dict, list)
+              ):
+                  return json.dumps(
+                      value,
+                      ensure_ascii=False
+                  )
+
+              if value is None:
+                  return ""
+
+              return str(value)
+
+          def compact(
+              value,
+              limit=5000
+          ):
+              value = re.sub(
+                  r"\s+",
+                  " ",
+                  text(value)
+              ).strip()
+
+              return value[:limit]
+
+          def integer(
+              value,
+              default=0
+          ):
+              try:
+                  return int(
+                      float(
+                          str(value)
+                          .replace(",", "")
+                      )
+                  )
+              except Exception:
+                  return default
+
+          def fingerprint(value):
+              return hashlib.sha256(
+                  compact(
+                      value,
+                      20000
+                  ).lower().encode(
+                      "utf-8",
+                      errors="ignore"
+                  )
+              ).hexdigest()
+
+          # ==========================================================
+          # LOAD MEMORY
+          # ==========================================================
+
+          core = load(
+              CORE_FILE,
+              {}
+          )
+
+          knowledge = load(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          cognition = load(
+              COGNITION_FILE,
+              {}
+          )
+
+          action_memory = load(
+              ACTION_FILE,
+              {}
+          )
+
+          marketplace = load(
+              MARKET_FILE,
+              {}
+          )
+
+          if not isinstance(core, dict):
+              core = {}
+
+          if not isinstance(knowledge, dict):
+              knowledge = {}
+
+          if not isinstance(cognition, dict):
+              cognition = {}
+
+          if not isinstance(action_memory, dict):
+              action_memory = {}
+
+          if not isinstance(marketplace, dict):
+              marketplace = {}
+
+          core.setdefault(
+              "version",
+              "1.0"
+          )
+
+          core.setdefault(
+              "tasks",
+              []
+          )
+
+          core.setdefault(
+              "actions",
+              []
+          )
+
+          core.setdefault(
+              "observations",
+              []
+          )
+
+          core.setdefault(
+              "lessons",
+              []
+          )
+
+          core.setdefault(
+              "failures",
+              []
+          )
+
+          core.setdefault(
+              "research",
+              []
+          )
+
+          core.setdefault(
+              "earnings",
+              []
+          )
+
+          core.setdefault(
+              "stats",
+              {}
+          )
+
+          # ==========================================================
+          # LOG
+          # ==========================================================
+
+          print("")
+          print(
+              "============================================================"
+          )
+          print(
+              "NØX CORE ENGINE V1.0"
+          )
+          print(
+              "RESEARCH -> UNDERSTAND -> CHOOSE -> BID -> EXECUTE"
+          )
+          print(
+              "-> DELIVER -> VERIFY -> LEARN"
+          )
+          print(
+              "============================================================"
+          )
+
+          print(
+              "External AI: DISABLED"
+          )
+
+          print(
+              "Gemini: DISABLED"
+          )
+
+          print(
+              "Payments: DISABLED"
+          )
+
+          print(
+              "Spending: DISABLED"
+          )
+
+          print(
+              "Project cost: €0"
+          )
+
+          # ==========================================================
+          # HTTP SESSION
+          # ==========================================================
+
+          session = requests.Session()
+
+          session.headers.update({
+              "Accept": "application/json",
+              "User-Agent": "NOX-Core-Engine-V1.0",
+          })
+
+          def api_get(
+              path,
+              params=None
+          ):
+              return session.get(
+                  API + path,
+                  params=params,
+                  timeout=TIMEOUT
+              )
+
+          def api_post(
+              path,
+              payload=None,
+              headers=None
+          ):
+              return session.post(
+                  API + path,
+                  json=payload or {},
+                  headers=headers or {},
+                  timeout=TIMEOUT
+              )
+
+          # ==========================================================
+          # AUTHENTICATION
+          # ==========================================================
+
+          print("")
+          print("=== AUTHENTICATION ===")
+
+          auth = api_post(
+              "/auth/token",
+              {
+                  "api_key": KEY
+              }
+          )
+
+          auth.raise_for_status()
+
+          auth_data = auth.json()
+
+          token = (
+              auth_data.get("access_token")
+              or auth_data.get("token")
+              or auth_data.get("jwt")
+          )
+
+          if not token:
+              raise RuntimeError(
+                  "Authentication succeeded without JWT."
+              )
+
+          session.headers[
+              "Authorization"
+          ] = f"Bearer {token}"
+
+          print(
+              "JWT obtained: YES"
+          )
+
+          # ==========================================================
+          # IDENTITY
+          # ==========================================================
+
+          me = api_get(
+              "/users/me"
+          )
+
+          me.raise_for_status()
+
+          me_data = me.json()
+
+          identity_values = {
+              str(
+                  me_data.get(key)
+              ).strip().lower()
+              for key in (
+                  "username",
+                  "handle",
+                  "agent_id",
+                  "agentId",
+                  "id",
+                  "name",
+              )
+              if me_data.get(key) is not None
+          }
+
+          if (
+              IDENTITY.lower()
+              not in identity_values
+          ):
+              raise RuntimeError(
+                  "Identity mismatch."
+              )
+
+          print(
+              f"IDENTITY: {IDENTITY}"
+          )
+
+          # ==========================================================
+          # CAPABILITIES
+          # ==========================================================
+
+          capabilities = {
+              "research": (
+                  "research",
+                  "web research",
+                  "deep research",
+                  "fact checking",
+                  "source verification",
+                  "investigate",
+                  "analysis",
+                  "audit",
+                  "verification",
+              ),
+              "api_test": (
+                  "api",
+                  "endpoint",
+                  "http",
+                  "https",
+                  "webhook",
+                  "rest",
+                  "json",
+                  "api test",
+                  "smoke test",
+              ),
+              "python": (
+                  "python",
+                  "script",
+                  "automation",
+                  "automate",
+              ),
+              "coding": (
+                  "code",
+                  "coding",
+                  "programming",
+                  "developer",
+                  "software",
+                  "implementation",
+              ),
+              "testing": (
+                  "test",
+                  "testing",
+                  "qa",
+                  "debug",
+                  "bug",
+                  "validation",
+              ),
+              "documentation": (
+                  "documentation",
+                  "document",
+                  "report",
+                  "write a report",
+                  "report writing",
+                  "readme",
+              ),
+              "data": (
+                  "data",
+                  "dataset",
+                  "spreadsheet",
+                  "csv",
+                  "json",
+                  "data analysis",
+              ),
+              "github": (
+                  "github",
+                  "repository",
+                  "repo",
+                  "pull request",
+                  "issue",
+                  "workflow",
+              ),
+              "agent_tooling": (
+                  "agent tooling",
+                  "build agent tools",
+                  "tool development",
+                  "ai agent",
+                  "agent tool",
+              ),
+          }
+
+          BLOCKED = (
+              "ransomware",
+              "malware",
+              "credential theft",
+              "phishing kit",
+              "keylogger",
+              "botnet",
+              "ddos",
+              "explosive",
+              "weapon",
+              "financial fraud",
+              "money laundering",
+          )
+
+          HUMAN_ONLY = (
+              "in person",
+              "physical delivery",
+              "visit my house",
+              "meet in person",
+              "on-site physical",
+          )
+
+          def task_text(task):
+              fields = (
+                  "title",
+                  "name",
+                  "body",
+                  "description",
+                  "details",
+                  "requirements",
+                  "deliverable",
+                  "tags",
+                  "metadata",
+              )
+
+              return compact(
+                  " ".join(
+                      text(task.get(field))
+                      for field in fields
+                      if (
+                          isinstance(task, dict)
+                          and task.get(field) is not None
+                      )
+                  ),
+                  20000
+              )
+
+          def capabilities_for(value):
+              lowered = value.lower()
+
+              return [
+                  group
+                  for group, terms in capabilities.items()
+                  if any(
+                      term in lowered
+                      for term in terms
+                  )
+              ]
+
+          def blocked(value):
+              lowered = value.lower()
+
+              return (
+                  any(
+                      term in lowered
+                      for term in BLOCKED
+                  )
+                  or any(
+                      term in lowered
+                      for term in HUMAN_ONLY
+                  )
+              )
+
+          def task_id(task):
+              if not isinstance(task, dict):
+                  return None
+
+              for key in (
+                  "id",
+                  "task_id",
+                  "taskId",
+                  "post_id",
+                  "postId",
+              ):
+                  if task.get(key) is not None:
+                      return str(task[key])
+
+              return None
+
+          def budget(task):
+              metadata = task.get(
+                  "metadata",
+                  {}
+              )
+
+              if not isinstance(
+                  metadata,
+                  dict
+              ):
+                  metadata = {}
+
+              low = (
+                  task.get("budget_min_sats")
+                  or task.get("reward_low")
+                  or metadata.get("budget_min_sats")
+                  or metadata.get("reward_low")
+                  or 0
+              )
+
+              high = (
+                  task.get("budget_max_sats")
+                  or task.get("reward_high")
+                  or metadata.get("budget_max_sats")
+                  or metadata.get("reward_high")
+                  or 0
+              )
+
+              low = integer(low)
+              high = integer(high)
+
+              values = [
+                  integer(value)
+                  for value in re.findall(
+                      r"(?<!\d)(\d[\d,]*)\s*"
+                      r"(?:sats?|sat|satoshi)\b",
+                      task_text(task),
+                      re.I
+                  )
+              ]
+
+              if not low and values:
+                  low = min(values)
+
+              if not high and values:
+                  high = max(values)
+
+              return (
+                  max(0, low),
+                  max(0, high)
+              )
+
+          # ==========================================================
+          # TASK CLASSIFICATION
+          # ==========================================================
+
+          def classify_task(task):
+              content = task_text(task)
+              lowered = content.lower()
+
+              if blocked(content):
+                  return "BLOCKED"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "verify",
+                      "verification",
+                      "fact check",
+                      "fact-check",
+                      "audit",
+                      "validate",
+                      "validation",
+                      "receipt",
+                      "proof",
+                  )
+              ):
+                  return "VERIFICATION"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "api smoke",
+                      "api test",
+                      "endpoint test",
+                      "http test",
+                      "webhook test",
+                      "health check",
+              )):
+                  return "API_TEST"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "research",
+                      "research report",
+                      "deep research",
+                      "market research",
+                      "technical research",
+                      "source verification",
+                      "investigate",
+                      "analysis",
+                      "audit report",
+              )):
+                  return "RESEARCH"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "documentation",
+                      "documentation",
+                      "readme",
+                      "write a report",
+                      "report writing",
+              )):
+                  return "DOCUMENTATION"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "python",
+                      "script",
+                      "automation",
+                      "api client",
+                      "connector",
+              )):
+                  return "PYTHON"
+
+              if any(
+                  term in lowered
+                  for term in (
+                      "code",
+                      "coding",
+                      "software",
+                      "developer",
+                      "programming",
+              )):
+                  return "CODING"
+
+              return "UNSUPPORTED"
+
+          # ==========================================================
+          # FEASIBILITY
+          # ==========================================================
+
+          def feasibility(
+              task,
+              matches,
+              task_type
+          ):
+              if task_type in (
+                  "BLOCKED",
+                  "UNSUPPORTED",
+              ):
+                  return 0
+
+              score = 50
+
+              score += min(
+                  25,
+                  len(matches) * 5
+              )
+
+              if task_type in (
+                  "VERIFICATION",
+                  "API_TEST",
+                  "RESEARCH",
+                  "DOCUMENTATION",
+              ):
+                  score += 15
+
+              low, high = budget(task)
+
+              if low or high:
+                  score += 5
+
+              if (
+                  high
+                  and high < MIN_BID
+              ):
+                  return 0
+
+              return min(
+                  100,
+                  score
+              )
+
+          # ==========================================================
+          # RESEARCH ENGINE
+          # ==========================================================
+
+          def extract_urls(value):
+              urls = re.findall(
+                  r"https?://[^\s<>\"]+",
+                  value
+              )
+
+              clean = []
+
+              for url in urls:
+                  url = url.rstrip(
+                      ".,);]}>"
+                  )
+
+                  if url not in clean:
+                      clean.append(url)
+
+              return clean[:MAX_RESEARCH_SOURCES]
+
+          def html_text(html):
+              html = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  " ",
+                  html,
+                  flags=re.I | re.S
+              )
+
+              html = re.sub(
+                  r"<style\b[^>]*>.*?</style>",
+                  " ",
+                  html,
+                  flags=re.I | re.S
+              )
+
+              html = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  html
+              )
+
+              html = unescape(html)
+
+              return compact(
+                  html,
+                  MAX_SOURCE_CHARS
+              )
+
+          def fetch_url(url):
+              try:
+                  started = time.time()
+
+                  response = requests.get(
+                      url,
+                      timeout=TIMEOUT,
+                      headers={
+                          "User-Agent":
+                              "NOX-Core-Engine-V1.0"
+                      },
+                      allow_redirects=True
+                  )
+
+                  latency = int(
+                      (time.time() - started) * 1000
+                  )
+
+                  body = ""
+
+                  content_type = (
+                      response.headers.get(
+                          "content-type",
+                          ""
+                      ).lower()
+                  )
+
+                  if (
+                      "text" in content_type
+                      or "json" in content_type
+                      or "xml" in content_type
+                      or not content_type
+                  ):
+                      body = html_text(
+                          response.text
+                      )
+
+                  return {
+                      "url": url,
+                      "final_url":
+                          response.url,
+                      "domain":
+                          urlparse(
+                              response.url
+                          ).netloc,
+                      "status":
+                          response.status_code,
+                      "latency_ms":
+                          latency,
+                      "content_type":
+                          content_type,
+                      "excerpt":
+                          body,
+                      "ok":
+                          200 <= response.status_code < 400,
+                  }
+
+              except Exception as exc:
+                  return {
+                      "url": url,
+                      "status": None,
+                      "ok": False,
+                      "error": compact(
+                          str(exc),
+                          500
+                      ),
+                  }
+
+          def ddg_search(query):
+              if not RESEARCH_ENABLED:
+                  return []
+
+              try:
+                  response = requests.get(
+                      "https://html.duckduckgo.com/html/",
+                      params={
+                          "q": query
+                      },
+                      timeout=TIMEOUT,
+                      headers={
+                          "User-Agent":
+                              "NOX-Core-Engine-V1.0"
+                      }
+                  )
+
+                  if response.status_code >= 400:
+                      return []
+
+                  html = response.text
+
+                  results = []
+
+                  pattern = re.compile(
+                      r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                      re.I | re.S
+                  )
+
+                  for match in pattern.finditer(
+                      html
+                  ):
+                      url = unescape(
+                          match.group(1)
+                      )
+
+                      title = re.sub(
+                          r"<[^>]+>",
+                          "",
+                          unescape(
+                              match.group(2)
+                          )
+                      )
+
+                      if url.startswith(
+                          "//"
+                      ):
+                          url = "https:" + url
+
+                      if not url.startswith(
+                          "http"
+                      ):
+                          continue
+
+                      item = {
+                          "title":
+                              compact(
+                                  title,
+                                  300
+                              ),
+                          "url":
+                              url,
+                      }
+
+                      if item not in results:
+                          results.append(
+                              item
+                          )
+
+                      if (
+                          len(results)
+                          >= MAX_RESEARCH_RESULTS
+                      ):
+                          break
+
+                  return results
+
+              except Exception:
+                  return []
+
+          def research_task(task):
+              content = task_text(task)
+
+              urls = extract_urls(
+                  content
+              )
+
+              sources = []
+
+              # Direct task URLs first.
+              for url in urls:
+                  result = fetch_url(
+                      url
+                  )
+
+                  sources.append(
+                      result
+                  )
+
+                  if (
+                      len(sources)
+                      >= MAX_RESEARCH_SOURCES
+                  ):
+                      break
+
+              # Search when the task requires
+              # research and direct URLs are insufficient.
+              if (
+                  RESEARCH_ENABLED
+                  and len(sources)
+                  < MAX_RESEARCH_SOURCES
+                  and (
+                      classify_task(task)
+                      in (
+                          "RESEARCH",
+                          "VERIFICATION",
+                          "DOCUMENTATION",
+                      )
+                  )
+              ):
+                  query = compact(
+                      content,
+                      500
+                  )
+
+                  search_results = ddg_search(
+                      query
+                  )
+
+                  for result in search_results:
+                      url = result["url"]
+
+                      if any(
+                          source.get("url")
+                          == url
+                          for source in sources
+                      ):
+                          continue
+
+                      fetched = fetch_url(
+                          url
+                      )
+
+                      fetched[
+                          "search_title"
+                      ] = result.get(
+                          "title"
+                      )
+
+                      sources.append(
+                          fetched
+                      )
+
+                      if (
+                          len(sources)
+                          >= MAX_RESEARCH_SOURCES
+                      ):
+                          break
+
+              return sources
+
+          # ==========================================================
+          # DELIVERY BUILDER
+          # ==========================================================
+
+          def build_delivery(
+              task,
+              task_type,
+              sources
+          ):
+              title = compact(
+                  task.get(
+                      "title"
+                  )
+                  or task.get(
+                      "name"
+                  )
+                  or "Marketplace task",
+                  300
+              )
+
+              lines = []
+
+              lines.append(
+                  "NØX DELIVERY — EXECUTED"
+              )
+
+              lines.append(
+                  f"Task: {title}"
+              )
+
+              lines.append(
+                  f"Execution type: {task_type}"
+              )
+
+              lines.append(
+                  f"Executed at: {now()}"
+              )
+
+              lines.append("")
+              lines.append(
+                  "Evidence:"
+              )
+
+              if not sources:
+                  lines.append(
+                      "- No external source could be retrieved."
+                  )
+              else:
+                  for source in sources:
+                      url = source.get(
+                          "final_url"
+                          or source.get(
+                              "url"
+                          )
+                      )
+
+                      status = source.get(
+                          "status"
+                      )
+
+                      latency = source.get(
+                          "latency_ms"
+                      )
+
+                      ok = source.get(
+                          "ok",
+                          False
+                      )
+
+                      if status is None:
+                          lines.append(
+                              f"- FAIL {url}"
+                          )
+                          continue
+
+                      lines.append(
+                          "- "
+                          + (
+                              "PASS"
+                              if ok
+                              else "FAIL"
+                          )
+                          + f" HTTP {status}"
+                          + (
+                              f" / {latency} ms"
+                              if latency is not None
+                              else ""
+                          )
+                          + f" / {url}"
+                      )
+
+                      excerpt = compact(
+                          source.get(
+                              "excerpt"
+                          ),
+                          700
+                      )
+
+                      if excerpt:
+                          lines.append(
+                              f"  Evidence: {excerpt}"
+                          )
+
+              lines.append("")
+              lines.append(
+                  "Method:"
+              )
+
+              lines.append(
+                  "Read-only public HTTP/Web verification."
+              )
+
+              lines.append(
+                  "No external AI, paid service, "
+                  "payment or spending was used."
+              )
+
+              lines.append("")
+              lines.append(
+                  "Limitations:"
+              )
+
+              lines.append(
+                  "Results are limited to the public "
+                  "sources and endpoints reachable "
+                  "during this execution."
+              )
+
+              result = "\n".join(
+                  lines
+              )
+
+              return result[
+                  :MAX_DELIVERY
+              ]
+
+          # ==========================================================
+          # BID LOOKUP
+          # ==========================================================
+
+          def get_bids(
+              post_id
+          ):
+              response = api_get(
+                  "/marketplace/"
+                  f"{quote(str(post_id), safe='')}"
+                  "/bids"
+              )
+
+              if response.status_code >= 400:
+                  return []
+
+              try:
+                  payload = response.json()
+              except Exception:
+                  return []
+
+              if isinstance(
+                  payload,
+                  list
+              ):
+                  return payload
+
+              if isinstance(
+                  payload,
+                  dict
+              ):
+                  return (
+                      payload.get("items")
+                      or payload.get("bids")
+                      or payload.get("data")
+                      or []
+                  )
+
+              return []
+
+          def my_bid(
+              post_id
+          ):
+              for bid in get_bids(
+                  post_id
+              ):
+                  if not isinstance(
+                      bid,
+                      dict
+                  ):
+                      continue
+
+                  bidder = bid.get(
+                      "bidder"
+                  )
+
+                  values = set()
+
+                  if isinstance(
+                      bidder,
+                      dict
+                  ):
+                      for key in (
+                          "username",
+                          "handle",
+                          "id",
+                      ):
+                          if bidder.get(key):
+                              values.add(
+                                  str(
+                                      bidder[key]
+                                  ).lower()
+                              )
+
+                  for key in (
+                      "bidder_name",
+                      "username",
+                      "handle",
+                      "bidder_id",
+                  ):
+                      if bid.get(key):
+                          values.add(
+                              str(
+                                  bid[key]
+                              ).lower()
+                          )
+
+                  if (
+                      IDENTITY.lower()
+                      in values
+                  ):
+                      return bid
+
+              return None
+
+          # ==========================================================
+          # DELIVERY LOOKUP
+          # ==========================================================
+
+          def own_delivery_comment(
+              post_id
+          ):
+              response = api_get(
+                  "/posts/"
+                  f"{quote(str(post_id), safe='')}"
+                  "/comments",
+                  params={
+                      "limit": 100
+                  }
+              )
+
+              if response.status_code >= 400:
+                  return None
+
+              try:
+                  payload = response.json()
+              except Exception:
+                  return None
+
+              if isinstance(
+                  payload,
+                  dict
+              ):
+                  comments = payload.get(
+                      "items",
+                      []
+                  )
+              elif isinstance(
+                  payload,
+                  list
+              ):
+                  comments = payload
+              else:
+                  comments = []
+
+              for comment in comments:
+                  if not isinstance(
+                      comment,
+                      dict
+                  ):
+                      continue
+
+                  author = comment.get(
+                      "author"
+                  )
+
+                  usernames = set()
+
+                  if isinstance(
+                      author,
+                      dict
+                  ):
+                      for key in (
+                          "username",
+                          "handle",
+                          "id",
+                      ):
+                          if author.get(key):
+                              usernames.add(
+                                  str(
+                                      author[key]
+                                  ).lower()
+                              )
+
+                  if comment.get(
+                      "author_name"
+                  ):
+                      usernames.add(
+                          str(
+                              comment[
+                                  "author_name"
+                              ]
+                          ).lower()
+                      )
+
+                  body = text(
+                      comment.get(
+                          "body"
+                      )
+                  )
+
+                  if (
+                      IDENTITY.lower()
+                      in usernames
+                      and "NØX DELIVERY" in body
+                  ):
+                      return comment
+
+              return None
+
+          # ==========================================================
+          # TASK FETCH
+          # ==========================================================
+
+          def get_post(
+              post_id
+          ):
+              response = api_get(
+                  "/posts/"
+                  f"{quote(str(post_id), safe='')}"
+              )
+
+              if response.status_code >= 400:
+                  return None
+
+              try:
+                  return response.json()
+              except Exception:
+                  return None
+
+          # ==========================================================
+          # EXECUTE ACCEPTED TASK
+          # ==========================================================
+
+          def execute_task(
+              task,
+              task_type
+          ):
+              print("")
+              print(
+                  "=== REAL EXECUTION ==="
+              )
+
+              print(
+                  f"TASK: {task_id(task)}"
+              )
+
+              print(
+                  f"TYPE: {task_type}"
+              )
+
+              if task_type in (
+                  "RESEARCH",
+                  "VERIFICATION",
+                  "API_TEST",
+                  "DOCUMENTATION",
+              ):
+                  sources = research_task(
+                      task
+                  )
+
+                  delivery = build_delivery(
+                      task,
+                      task_type,
+                      sources
+                  )
+
+                  return {
+                      "success": True,
+                      "sources": sources,
+                      "delivery": delivery,
+                  }
+
+              return {
+                  "success": False,
+                  "sources": [],
+                  "delivery": "",
+                  "reason":
+                      "No safe deterministic executor "
+                      "exists for this task type.",
+              }
+
+          # ==========================================================
+          # DISCOVER OPEN TASKS
+          # ==========================================================
+
+          print("")
+          print(
+              "=== DISCOVER ==="
+          )
+
+          response = api_get(
+              "/marketplace/tasks",
+              params={
+                  "status": "open",
+                  "sort": "newest",
+                  "limit": MAX_TASKS,
+                  "offset": 0,
+              }
+          )
+
+          if response.status_code >= 400:
+              raise RuntimeError(
+                  "Marketplace discovery failed: "
+                  + compact(
+                      response.text,
+                      1000
+                  )
+              )
+
+          payload = response.json()
+
+          if isinstance(
+              payload,
+              dict
+          ):
+              tasks = (
+                  payload.get("items")
+                  or payload.get("tasks")
+                  or payload.get("data")
+                  or []
+              )
+          elif isinstance(
+              payload,
+              list
+          ):
+              tasks = payload
+          else:
+              tasks = []
+
+          print(
+              f"OPEN TASKS: {len(tasks)}"
+          )
+
+          # ==========================================================
+          # SELECT BEST CANDIDATES
+          # ==========================================================
+
+          candidates = []
+
+          for task in tasks:
+              tid = task_id(task)
+
+              if not tid:
+                  continue
+
+              content = task_text(
+                  task
+              )
+
+              task_type = classify_task(
+                  task
+              )
+
+              matches = capabilities_for(
+                  content
+              )
+
+              score = feasibility(
+                  task,
+                  matches,
+                  task_type
+              )
+
+              if score <= 0:
+                  continue
+
+              existing = my_bid(
+                  tid
+              )
+
+              if existing:
+                  continue
+
+              low, high = budget(
+                  task
+              )
+
+              if high and high < MIN_BID:
+                  continue
+
+              candidates.append({
+                  "task": task,
+                  "task_id": tid,
+                  "type": task_type,
+                  "capabilities": matches,
+                  "score": score,
+                  "reward_low": low,
+                  "reward_high": high,
+              })
+
+          candidates.sort(
+              key=lambda item: (
+                  item["score"],
+                  item["reward_high"],
+                  item["reward_low"],
+              ),
+              reverse=True
+          )
+
+          candidates = candidates[
+              :MAX_ACTIONS
+          ]
+
+          print(
+              f"FEASIBLE CANDIDATES: "
+              f"{len(candidates)}"
+          )
+
+          for candidate in candidates:
+              print(
+                  f"- {candidate['task_id']} "
+                  f"{candidate['type']} "
+                  f"score={candidate['score']} "
+                  f"reward={candidate['reward_low']}-"
+                  f"{candidate['reward_high']} sats"
+              )
+
+          # ==========================================================
+          # BID ONE REAL MISSION
+          # ==========================================================
+
+          bids_submitted = 0
+
+          if candidates:
+              candidate = candidates[0]
+
+              task = candidate["task"]
+              tid = candidate["task_id"]
+
+              low = candidate[
+                  "reward_low"
+              ]
+
+              high = candidate[
+                  "reward_high"
+              ]
+
+              if low:
+                  bid_amount = max(
+                      MIN_BID,
+                      low
+                  )
+              else:
+                  bid_amount = MIN_BID
+
+              if (
+                  high
+                  and bid_amount > high
+              ):
+                  print(
+                      "BID SKIPPED: "
+                      "technical floor exceeds "
+                      "declared maximum."
+                  )
+              else:
+                  print("")
+                  print(
+                      "=== BID REAL MISSION ==="
+                  )
+
+                  bid_description = (
+                      "NØX proposes a bounded, "
+                      "evidence-based execution. "
+                      "The task will be performed "
+                      "with local Python, public Web "
+                      "research and read-only HTTP "
+                      "verification where applicable. "
+                      "No external AI or paid service "
+                      "is required. Delivery will "
+                      "include reproducible evidence."
+                  )
+
+                  idempotency = hashlib.sha256(
+                      (
+                          f"{IDENTITY}:"
+                          f"{tid}:bid"
+                      ).encode()
+                  ).hexdigest()
+
+                  response = api_post(
+                      "/marketplace/"
+                      f"{quote(str(tid), safe='')}"
+                      "/bid",
+                      {
+                          "bid_amount_sats":
+                              bid_amount,
+                          "bid_description":
+                              bid_description,
+                      },
+                      {
+                          "Idempotency-Key":
+                              idempotency
+                      }
+                  )
+
+                  print(
+                      "BID HTTP: "
+                      f"{response.status_code}"
+                  )
+
+                  if response.status_code < 400:
+                      bids_submitted += 1
+
+                      try:
+                          bid_result = (
+                              response.json()
+                          )
+                      except Exception:
+                          bid_result = {}
+
+                      print(
+                          "BID RESULT: "
+                          + compact(
+                              bid_result,
+                              800
+                          )
+                      )
+
+                      core[
+                          "actions"
+                      ].append({
+                          "timestamp": now(),
+                          "type": "BID_SUBMITTED",
+                          "task_id": tid,
+                          "bid_amount_sats":
+                              bid_amount,
+                          "task_type":
+                              candidate["type"],
+                          "score":
+                              candidate["score"],
+                      })
+
+                  else:
+                      print(
+                          "BID FAILED: "
+                          + compact(
+                              response.text,
+                              1200
+                          )
+                      )
+
+                      core[
+                          "failures"
+                      ].append({
+                          "timestamp": now(),
+                          "stage": "BID",
+                          "task_id": tid,
+                          "error":
+                              compact(
+                                  response.text,
+                                  1000
+                              ),
+                      })
+
+          # ==========================================================
+          # RECONCILE ACCEPTED BIDS
+          # ==========================================================
+
+          print("")
+          print(
+              "=== RECONCILE ACCEPTED WORK ==="
+          )
+
+          executions_attempted = 0
+          executions_completed = 0
+          deliveries_submitted = 0
+          payments_observed = 0
+
+          # Inspect recent known task ids first.
+          known_ids = []
+
+          for item in core[
+              "tasks"
+          ]:
+              if isinstance(
+                  item,
+                  dict
+              ):
+                  tid = item.get(
+                      "task_id"
+                  )
+
+                  if tid and tid not in known_ids:
+                      known_ids.append(
+                          str(tid)
+                      )
+
+          for candidate in candidates:
+              tid = candidate[
+                  "task_id"
+              ]
+
+              if tid not in known_ids:
+                  known_ids.append(
+                      tid
+                  )
+
+          # Also inspect tasks in accepted state.
+          accepted_response = api_get(
+              "/marketplace/tasks",
+              params={
+                  "status": "accepted",
+                  "sort": "newest",
+                  "limit": 100,
+                  "offset": 0,
+              }
+          )
+
+          if accepted_response.status_code < 400:
+              try:
+                  accepted_payload = (
+                      accepted_response.json()
+                  )
+
+                  if isinstance(
+                      accepted_payload,
+                      dict
+                  ):
+                      accepted_tasks = (
+                          accepted_payload.get(
+                              "items"
+                          )
+                          or accepted_payload.get(
+                              "tasks"
+                          )
+                          or []
+                      )
+                  else:
+                      accepted_tasks = (
+                          accepted_payload
+                          if isinstance(
+                              accepted_payload,
+                              list
+                          )
+                          else []
+                      )
+
+                  for task in accepted_tasks:
+                      tid = task_id(
+                          task
+                      )
+
+                      if tid and tid not in known_ids:
+                          known_ids.append(
+                              tid
+                          )
+              except Exception:
+                  pass
+
+          for tid in known_ids:
+              if (
+                  executions_attempted
+                  >= MAX_EXECUTIONS
+              ):
+                  break
+
+              bid = my_bid(
+                  tid
+              )
+
+              if not bid:
+                  continue
+
+              status = text(
+                  bid.get(
+                      "status"
+                  )
+              ).lower()
+
+              if status != "accepted":
+                  continue
+
+              print("")
+              print(
+                  "=== ACCEPTED MISSION FOUND ==="
+              )
+
+              print(
+                  f"TASK ID: {tid}"
+              )
+
+              print(
+                  f"BID ID: {bid.get('id')}"
+              )
+
+              # ------------------------------------------------------
+              # Fetch exact task
+              # ------------------------------------------------------
+
+              task = get_post(
+                  tid
+              )
+
+              if not task:
+                  print(
+                      "Cannot fetch accepted task."
+                  )
+
+                  core[
+                      "failures"
+                  ].append({
+                      "timestamp": now(),
+                      "stage":
+                          "ACCEPTED_FETCH",
+                      "task_id": tid,
+                      "error":
+                          "Accepted task could not "
+                          "be fetched.",
+                  })
+
+                  continue
+
+              task_type = classify_task(
+                  task
+              )
+
+              print(
+                  f"EXECUTION TYPE: {task_type}"
+              )
+
+              # ------------------------------------------------------
+              # Check if delivery already exists
+              # ------------------------------------------------------
+
+              existing_delivery = (
+                  own_delivery_comment(
+                      tid
+                  )
+              )
+
+              if existing_delivery:
+                  print(
+                      "DELIVERY ALREADY EXISTS."
+                  )
+
+                  action = {
+                      "timestamp": now(),
+                      "type":
+                          "DELIVERY_ALREADY_VERIFIED",
+                      "task_id": tid,
+                      "comment_id":
+                          existing_delivery.get(
+                              "id"
+                          ),
+                  }
+
+                  core[
+                      "observations"
+                  ].append(
+                      action
+                  )
+
+                  continue
+
+              # ------------------------------------------------------
+              # Unsupported tasks are not fabricated
+              # ------------------------------------------------------
+
+              if task_type == "UNSUPPORTED":
+                  print(
+                      "MISSION UNSUPPORTED:"
+                      " no deterministic executor."
+                  )
+
+                  core[
+                      "failures"
+                  ].append({
+                      "timestamp": now(),
+                      "stage":
+                          "EXECUTION_SELECTION",
+                      "task_id": tid,
+                      "task_type":
+                          task_type,
+                      "error":
+                          "No safe deterministic "
+                          "executor available.",
+                  })
+
+                  continue
+
+              executions_attempted += 1
+
+              # ------------------------------------------------------
+              # REAL EXECUTION
+              # ------------------------------------------------------
+
+              result = execute_task(
+                  task,
+                  task_type
+              )
+
+              if not result[
+                  "success"
+              ]:
+                  print(
+                      "EXECUTION FAILED: "
+                      + compact(
+                          result.get(
+                              "reason"
+                          ),
+                          800
+                      )
+                  )
+
+                  core[
+                      "failures"
+                  ].append({
+                      "timestamp": now(),
+                      "stage":
+                          "EXECUTION",
+                      "task_id": tid,
+                      "task_type":
+                          task_type,
+                      "error":
+                          result.get(
+                              "reason"
+                          ),
+                  })
+
+                  continue
+
+              executions_completed += 1
+
+              sources = result[
+                  "sources"
+              ]
+
+              delivery = result[
+                  "delivery"
+              ]
+
+              print(
+                  f"SOURCES USED: "
+                  f"{len(sources)}"
+              )
+
+              print(
+                  "DELIVERY GENERATED: YES"
+              )
+
+              # ------------------------------------------------------
+              # PERSIST RESEARCH
+              # ------------------------------------------------------
+
+              research_record = {
+                  "timestamp": now(),
+                  "task_id": tid,
+                  "task_type":
+                      task_type,
+                  "sources": [
+                      {
+                          "url":
+                              source.get(
+                                  "final_url"
+                                  or source.get(
+                                      "url"
+                                  )
+                              ),
+                          "status":
+                              source.get(
+                                  "status"
+                              ),
+                          "latency_ms":
+                              source.get(
+                                  "latency_ms"
+                              ),
+                          "ok":
+                              source.get(
+                                  "ok"
+                              ),
+                          "domain":
+                              source.get(
+                                  "domain"
+                              ),
+                      }
+                      for source in sources
+                  ],
+                  "external_ai_used":
+                      False,
+                  "gemini_used":
+                      False,
+                  "project_cost_eur":
+                      0,
+              }
+
+              core[
+                  "research"
+              ].append(
+                  research_record
+              )
+
+              # ------------------------------------------------------
+              # POST REAL DELIVERY
+              # ------------------------------------------------------
+
+              if not EXECUTION_ENABLED:
+                  print(
+                      "EXECUTION DISABLED."
+                  )
+                  continue
+
+              print("")
+              print(
+                  "=== REAL DELIVERY ==="
+              )
+
+              idempotency = hashlib.sha256(
+                  (
+                      f"{IDENTITY}:"
+                      f"{tid}:delivery"
+                  ).encode()
+              ).hexdigest()
+
+              response = api_post(
+                  "/posts/"
+                  f"{quote(str(tid), safe='')}"
+                  "/comments",
+                  {
+                      "body":
+                          delivery,
+                      "client":
+                          "nox-core-engine"
+                  },
+                  {
+                      "Idempotency-Key":
+                          idempotency
+                  }
+              )
+
+              print(
+                  "DELIVERY HTTP: "
+                  f"{response.status_code}"
+              )
+
+              if response.status_code >= 400:
+                  error = compact(
+                      response.text,
+                      1200
+                  )
+
+                  print(
+                      "DELIVERY FAILED: "
+                      + error
+                  )
+
+                  core[
+                      "failures"
+                  ].append({
+                      "timestamp": now(),
+                      "stage":
+                          "DELIVERY",
+                      "task_id": tid,
+                      "error": error,
+                  })
+
+                  continue
+
+              try:
+                  comment = response.json()
+              except Exception:
+                  comment = {}
+
+              comment_id = (
+                  comment.get(
+                      "id"
+                  )
+                  or comment.get(
+                      "comment_id"
+                  )
+              )
+
+              print(
+                  "DELIVERY COMMENT ID: "
+                  f"{comment_id}"
+              )
+
+              # ------------------------------------------------------
+              # VERIFY DELIVERY
+              # ------------------------------------------------------
+
+              verified_delivery = None
+
+              for attempt in range(
+                  1,
+                  MAX_RETRIES + 1
+              ):
+                  time.sleep(1)
+
+                  verified_delivery = (
+                      own_delivery_comment(
+                          tid
+                      )
+                  )
+
+                  if verified_delivery:
+                      break
+
+              if not verified_delivery:
+                  print(
+                      "DELIVERY VERIFICATION: FAILED"
+                  )
+
+                  core[
+                      "failures"
+                  ].append({
+                      "timestamp": now(),
+                      "stage":
+                          "DELIVERY_VERIFICATION",
+                      "task_id": tid,
+                      "comment_id":
+                          comment_id,
+                      "error":
+                          "Delivery was posted but "
+                          "could not be read back.",
+                  })
+
+                  continue
+
+              deliveries_submitted += 1
+
+              print(
+                  "DELIVERY VERIFICATION: PASS"
+              )
+
+              core[
+                  "observations"
+              ].append({
+                  "timestamp": now(),
+                  "type":
+                      "DELIVERY_VERIFIED",
+                  "task_id": tid,
+                  "comment_id":
+                      verified_delivery.get(
+                          "id"
+                      ),
+                  "task_type":
+                      task_type,
+                  "sources":
+                      len(sources),
+              })
+
+              # ------------------------------------------------------
+              # PAYMENT OBSERVATION
+              # ------------------------------------------------------
+
+              payment = api_get(
+                  "/marketplace/"
+                  f"{quote(str(tid), safe='')}"
+                  "/payment"
+              )
+
+              if payment.status_code < 400:
+                  try:
+                      payment_data = (
+                          payment.json()
+                      )
+                  except Exception:
+                      payment_data = None
+
+                  print(
+                      "PAYMENT STATE: "
+                      + compact(
+                          payment_data,
+                          500
+                      )
+                  )
+
+              payment_check = api_post(
+                  "/marketplace/"
+                  f"{quote(str(tid), safe='')}"
+                  "/payment/check",
+                  {}
+              )
+
+              if payment_check.status_code < 400:
+                  try:
+                      payment_status = (
+                          payment_check.json()
+                      )
+                  except Exception:
+                      payment_status = {}
+
+                  print(
+                      "PAYMENT CHECK: "
+                      + compact(
+                          payment_status,
+                          700
+                      )
+                  )
+
+                  status_text = compact(
+                      payment_status
+                  ).lower()
+
+                  if "paid" in status_text:
+                      payments_observed += 1
+
+                      core[
+                          "earnings"
+                      ].append({
+                          "timestamp":
+                              now(),
+                          "task_id":
+                              tid,
+                          "status":
+                              "PAID",
+                          "source":
+                              "marketplace"
+                      })
+
+              # ------------------------------------------------------
+              # LEARNING
+              # ------------------------------------------------------
+
+              core[
+                  "lessons"
+              ].append({
+                  "timestamp": now(),
+                  "task_id": tid,
+                  "task_type": task_type,
+                  "lesson":
+                      "Accepted work was executed "
+                      "with evidence and delivered "
+                      "through the task thread.",
+                  "evidence_sources":
+                      len(sources),
+                  "delivery_verified":
+                      True,
+              })
+
+          # ==========================================================
+          # OBSERVE ALL KNOWN ACCEPTED TASKS FOR PAYMENT
+          # ==========================================================
+
+          print("")
+          print(
+              "=== PAYMENT OBSERVATION ==="
+          )
+
+          for item in core[
+              "tasks"
+          ][-100:]:
+              if not isinstance(
+                  item,
+                  dict
+              ):
+                  continue
+
+              tid = item.get(
+                  "task_id"
+              )
+
+              if not tid:
+                  continue
+
+              bid = my_bid(
+                  tid
+              )
+
+              if not bid:
+                  continue
+
+              if text(
+                  bid.get(
+                      "status"
+                  )
+              ).lower() != "accepted":
+                  continue
+
+              check = api_post(
+                  "/marketplace/"
+                  f"{quote(str(tid), safe='')}"
+                  "/payment/check",
+                  {}
+              )
+
+              if check.status_code >= 400:
+                  continue
+
+              try:
+                  payment_status = (
+                      check.json()
+                  )
+              except Exception:
+                  continue
+
+              status_text = compact(
+                  payment_status
+              ).lower()
+
+              if "paid" in status_text:
+                  core[
+                      "earnings"
+                  ].append({
+                      "timestamp": now(),
+                      "task_id": tid,
+                      "status": "PAID",
+                      "source":
+                          "marketplace",
+                  })
+
+          # ==========================================================
+          # RECORD TASKS
+          # ==========================================================
+
+          for candidate in candidates:
+              tid = candidate[
+                  "task_id"
+              ]
+
+              core[
+                  "tasks"
+              ].append({
+                  "timestamp": now(),
+                  "task_id": tid,
+                  "task_type":
+                      candidate["type"],
+                  "score":
+                      candidate["score"],
+                  "reward_low":
+                      candidate["reward_low"],
+                  "reward_high":
+                      candidate["reward_high"],
+                  "capabilities":
+                      candidate["capabilities"],
+              })
+
+          # ==========================================================
+          # GLOBAL RUN RECORD
+          # ==========================================================
+
+          run_record = {
+              "timestamp": now(),
+              "open_tasks":
+                  len(tasks),
+              "feasible_candidates":
+                  len(candidates),
+              "bids_submitted":
+                  bids_submitted,
+              "executions_attempted":
+                  executions_attempted,
+              "executions_completed":
+                  executions_completed,
+              "deliveries_submitted":
+                  deliveries_submitted,
+              "payments_observed":
+                  payments_observed,
+              "gemini_used":
+                  False,
+              "external_ai_used":
+                  False,
+              "payments_enabled":
+                  False,
+              "spending_enabled":
+                  False,
+              "project_cost_eur":
+                  0,
+          }
+
+          core[
+              "last_run"
+          ] = run_record
+
+          # ==========================================================
+          # STATS
+          # ==========================================================
+
+          stats = core[
+              "stats"
+          ]
+
+          stats[
+              "runs"
+          ] = integer(
+              stats.get(
+                  "runs"
+              )
+          ) + 1
+
+          stats[
+              "bids_submitted"
+          ] = integer(
+              stats.get(
+                  "bids_submitted"
+              )
+          ) + bids_submitted
+
+          stats[
+              "executions_attempted"
+          ] = integer(
+              stats.get(
+                  "executions_attempted"
+              )
+          ) + executions_attempted
+
+          stats[
+              "executions_completed"
+          ] = integer(
+              stats.get(
+                  "executions_completed"
+              )
+          ) + executions_completed
+
+          stats[
+              "deliveries_verified"
+          ] = integer(
+              stats.get(
+                  "deliveries_verified"
+              )
+          ) + deliveries_submitted
+
+          stats[
+              "payments_observed"
+          ] = integer(
+              stats.get(
+                  "payments_observed"
+              )
+          ) + payments_observed
+
+          # ==========================================================
+          # TRIM MEMORY
+          # ==========================================================
+
+          core[
+              "tasks"
+          ] = core[
+              "tasks"
+          ][-500:]
+
+          core[
+              "actions"
+          ] = core[
+              "actions"
+          ][-500:]
+
+          core[
+              "observations"
+          ] = core[
+              "observations"
+          ][-500:]
+
+          core[
+              "lessons"
+          ] = core[
+              "lessons"
+          ][-300:]
+
+          core[
+              "failures"
+          ] = core[
+              "failures"
+          ][-300:]
+
+          core[
+              "research"
+          ] = core[
+              "research"
+          ][-500:]
+
+          core[
+              "earnings"
+          ] = core[
+              "earnings"
+          ][-500:]
+
+          # ==========================================================
+          # SAVE
+          # ==========================================================
+
+          save(
+              CORE_FILE,
+              core
+          )
+
+          # Keep existing Ledgers readable for migration/audit.
+          # The CORE engine is now the authoritative execution state.
+
+          print("")
+          print(
+              "============================================================"
+          )
+          print(
+              "NØX CORE FINAL STATE"
+          )
+          print(
+              "============================================================"
+          )
+
+          print(
+              f"Open tasks: {len(tasks)}"
+          )
+
+          print(
+              f"Candidates: {len(candidates)}"
+          )
+
+          print(
+              f"Bids submitted: {bids_submitted}"
+          )
+
+          print(
+              f"Executions attempted: "
+              f"{executions_attempted}"
+          )
+
+          print(
+              f"Executions completed: "
+              f"{executions_completed}"
+          )
+
+          print(
+              f"Deliveries verified: "
+              f"{deliveries_submitted}"
+          )
+
+          print(
+              f"Payments observed: "
+              f"{payments_observed}"
+          )
+
+          print(
+              "Gemini used: false"
+          )
+
+          print(
+              "External AI used: false"
+          )
+
+          print(
+              "Payments enabled: false"
+          )
+
+          print(
+              "Spending enabled: false"
+          )
+
+          print(
+              "Project cost EUR: 0"
+          )
+
+          if payments_observed > 0:
+              print(
+                  "RESULT: PAYMENT OBSERVED"
+              )
+          elif deliveries_submitted > 0:
+              print(
+                  "RESULT: WORK DELIVERED"
+              )
+          elif executions_completed > 0:
+              print(
+                  "RESULT: WORK EXECUTED"
+              )
+          elif bids_submitted > 0:
+              print(
+                  "RESULT: BID SUBMITTED"
+              )
+          else:
+              print(
+                  "RESULT: NO REAL ACTION COMPLETED"
+              )
+
+          PY
+
+      # ==============================================================
+      # COMMIT
+      # ==============================================================
+
+      - name: Commit NØX CORE memory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add memory/nox_core_engine.json
+
+          if git diff --cached --quiet; then
+            echo "No NØX CORE memory changes."
+            exit 0
+          fi
+
+          git commit -m "NØX: update core autonomous execution engine"
+          git push
