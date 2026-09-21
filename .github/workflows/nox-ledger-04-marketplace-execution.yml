@@ -1,0 +1,1687 @@
+name: NØX LEDGER 04 - Marketplace Execution
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "57 */4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-main-writer
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+  API_BASE: "https://thecolony.ai/api/v1"
+  Nox_IDENTITY: "nox_origine"
+
+  # Core safety / cost policy
+  GEMINI_ENABLED: "false"
+  EXTERNAL_AI_ENABLED: "false"
+  PAYMENTS_ENABLED: "false"
+  SPENDING_ENABLED: "false"
+  PROJECT_COST_EUR: "0"
+
+  # Marketplace discovery / bidding
+  MAX_TASKS: "100"
+  MAX_BIDS_PER_RUN: "2"
+  MAX_RECONCILE: "30"
+  MIN_BID_SATS: "21"
+  BID_SCORE_THRESHOLD: "50"
+
+  # Execution
+  EXECUTION_ENABLED: "true"
+  MAX_EXECUTIONS_PER_RUN: "2"
+  MAX_DELIVERY_CHARS: "9500"
+  MAX_WEB_SOURCES: "8"
+  HTTP_TIMEOUT_SECONDS: "20"
+  MAX_SOURCE_BYTES: "500000"
+
+  # Memory
+  MAX_MEMORY_ITEMS: "500"
+
+jobs:
+  marketplace-execution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Ledger 04
+        env:
+          COLONY_API_TOKEN: ${{ secrets.COLONY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import os
+          import re
+          import json
+          import time
+          import hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+
+          # ============================================================
+          # NØX LEDGER 04
+          # Marketplace Discovery -> Bid -> Reconcile ->
+          # Accepted Mission -> Execute -> Deliver -> Observe -> Learn
+          #
+          # Replaces the operational role of ACT15 + ACT16.
+          #
+          # It consumes:
+          #   Ledger 01 / knowledge
+          #   Ledger 02 / cognition
+          #   Ledger 03 / action-observation-learning
+          #
+          # It does NOT replace Ledger 03.
+          # It does NOT modify Ledger 03 state.
+          #
+          # No Gemini
+          # No external AI
+          # No spending
+          # No payment creation
+          # No tips
+          # No arbitrary third-party writes
+          # ============================================================
+
+          API_BASE = os.environ["API_BASE"].rstrip("/")
+          TOKEN = os.environ.get("COLONY_API_TOKEN", "").strip()
+          IDENTITY = os.environ.get("Nox_IDENTITY", "nox_origine")
+
+          if not TOKEN:
+              raise SystemExit("ERROR: COLONY_API_TOKEN missing")
+
+          GEMINI_ENABLED = False
+          EXTERNAL_AI_ENABLED = False
+          PAYMENTS_ENABLED = False
+          SPENDING_ENABLED = False
+          PROJECT_COST_EUR = 0
+
+          MAX_TASKS = int(os.environ.get("MAX_TASKS", "100"))
+          MAX_BIDS_PER_RUN = int(os.environ.get("MAX_BIDS_PER_RUN", "2"))
+          MAX_RECONCILE = int(os.environ.get("MAX_RECONCILE", "30"))
+          MIN_BID_SATS = int(os.environ.get("MIN_BID_SATS", "21"))
+          BID_SCORE_THRESHOLD = int(os.environ.get("BID_SCORE_THRESHOLD", "50"))
+
+          EXECUTION_ENABLED = os.environ.get(
+              "EXECUTION_ENABLED", "true"
+          ).lower() == "true"
+
+          MAX_EXECUTIONS_PER_RUN = int(
+              os.environ.get("MAX_EXECUTIONS_PER_RUN", "2")
+          )
+
+          MAX_DELIVERY_CHARS = int(
+              os.environ.get("MAX_DELIVERY_CHARS", "9500")
+          )
+
+          MAX_WEB_SOURCES = int(
+              os.environ.get("MAX_WEB_SOURCES", "8")
+          )
+
+          HTTP_TIMEOUT = int(
+              os.environ.get("HTTP_TIMEOUT_SECONDS", "20")
+          )
+
+          MAX_SOURCE_BYTES = int(
+              os.environ.get("MAX_SOURCE_BYTES", "500000")
+          )
+
+          MAX_MEMORY_ITEMS = int(
+              os.environ.get("MAX_MEMORY_ITEMS", "500")
+          )
+
+          ROOT = Path(".")
+          MEMORY = ROOT / "memory"
+          MEMORY.mkdir(parents=True, exist_ok=True)
+
+          ACTION_FILE = MEMORY / "nox_ledger_action.json"
+          KNOWLEDGE_FILE = MEMORY / "nox_ledger_knowledge.json"
+          COGNITION_FILE = MEMORY / "nox_ledger_cognition.json"
+
+          LEDGER04_FILE = MEMORY / "nox_ledger_marketplace.json"
+
+          SESSION_ID = datetime.now(timezone.utc).strftime(
+              "%Y%m%dT%H%M%SZ"
+          )
+
+          # ============================================================
+          # HELPERS
+          # ============================================================
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load_json(path, default):
+              try:
+                  if path.exists():
+                      return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  pass
+              return default
+
+          def save_json(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+          def trim_list(items, limit=MAX_MEMORY_ITEMS):
+              if not isinstance(items, list):
+                  return []
+              return items[-limit:]
+
+          state = load_json(
+              LEDGER04_FILE,
+              {
+                  "version": "1.0",
+                  "ledger": "04",
+                  "runs": [],
+                  "bids": [],
+                  "accepted_missions": [],
+                  "executions": [],
+                  "deliveries": [],
+                  "payments_observed": [],
+                  "failures": [],
+                  "learning": []
+              }
+          )
+
+          for key in [
+              "runs",
+              "bids",
+              "accepted_missions",
+              "executions",
+              "deliveries",
+              "payments_observed",
+              "failures",
+              "learning"
+          ]:
+              state.setdefault(key, [])
+
+          session = requests.Session()
+          session.headers.update({
+              "Authorization": f"Bearer {TOKEN}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+              "User-Agent": "Nox-Ledger-04/1.0"
+          })
+
+          def api(method, path, **kwargs):
+              url = API_BASE + path
+              try:
+                  response = session.request(
+                      method,
+                      url,
+                      timeout=HTTP_TIMEOUT,
+                      **kwargs
+                  )
+
+                  if response.status_code >= 400:
+                      return {
+                          "ok": False,
+                          "status": response.status_code,
+                          "error": response.text[:2000],
+                          "data": None
+                      }
+
+                  if not response.text.strip():
+                      return {
+                          "ok": True,
+                          "status": response.status_code,
+                          "data": None
+                      }
+
+                  try:
+                      data = response.json()
+                  except Exception:
+                      data = response.text
+
+                  return {
+                      "ok": True,
+                      "status": response.status_code,
+                      "data": data
+                  }
+
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "status": 0,
+                      "error": str(exc)[:2000],
+                      "data": None
+                  }
+
+          def add_failure(kind, task_id=None, message=""):
+              state["failures"].append({
+                  "timestamp": now(),
+                  "session_id": SESSION_ID,
+                  "kind": kind,
+                  "task_id": task_id,
+                  "message": message[:2000]
+              })
+
+          def sha256_text(value):
+              return hashlib.sha256(
+                  value.encode("utf-8", errors="ignore")
+              ).hexdigest()
+
+          def normalize_text(value):
+              if value is None:
+                  return ""
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(value)
+              ).strip()
+
+          def task_text(task):
+              return normalize_text(
+                  " ".join([
+                      str(task.get("title", "")),
+                      str(task.get("body", "")),
+                      str(task.get("description", "")),
+                      str(task.get("metadata", ""))
+                  ])
+              )
+
+          def extract_urls(text):
+              urls = re.findall(
+                  r"https?://[^\s<>\"]+",
+                  text or ""
+              )
+
+              clean = []
+
+              for url in urls:
+                  url = url.rstrip(
+                      ".,;:!?)]}'\""
+                  )
+
+                  parsed = urlparse(url)
+
+                  if parsed.scheme not in ("http", "https"):
+                      continue
+
+                  if not parsed.netloc:
+                      continue
+
+                  if url not in clean:
+                      clean.append(url)
+
+              return clean[:MAX_WEB_SOURCES]
+
+          # ============================================================
+          # SAFETY
+          # ============================================================
+
+          SAFETY_BLOCKS = [
+              "malware",
+              "ransomware",
+              "credential theft",
+              "credential stealing",
+              "phishing kit",
+              "keylogger",
+              "botnet",
+              "ddos",
+              "bypass authentication",
+              "steal password",
+              "steal credentials",
+              "exploit real target",
+              "weapon",
+              "weapons",
+              "explosive",
+              "explosives"
+          ]
+
+          def safety_blocked(text):
+              low = text.lower()
+              return [
+                  term for term in SAFETY_BLOCKS
+                  if term in low
+              ]
+
+          # ============================================================
+          # CAPABILITY / SCORING
+          # ============================================================
+
+          CAPABILITIES = {
+              "research": [
+                  "research",
+                  "deep research",
+                  "research report",
+                  "analysis",
+                  "investigation",
+                  "source verification",
+                  "fact check",
+                  "market research"
+              ],
+              "reporting": [
+                  "report",
+                  "technical report",
+                  "write a report",
+                  "report writing",
+                  "audit",
+                  "documentation"
+              ],
+              "api": [
+                  "api",
+                  "endpoint",
+                  "http",
+                  "rest",
+                  "json",
+                  "integration"
+              ],
+              "qa": [
+                  "qa",
+                  "quality assurance",
+                  "test",
+                  "testing",
+                  "smoke test",
+                  "api smoke",
+                  "validation"
+              ],
+              "data": [
+                  "data cleanup",
+                  "data",
+                  "csv",
+                  "dataset",
+                  "cleanup",
+                  "normalize"
+              ],
+              "coding": [
+                  "python",
+                  "coding",
+                  "code",
+                  "developer",
+                  "development",
+                  "tool development",
+                  "build agent tools",
+                  "agent tooling",
+                  "script"
+              ],
+              "github": [
+                  "github",
+                  "repository",
+                  "repo",
+                  "readme"
+              ],
+              "seo": [
+                  "seo",
+                  "search engine optimization",
+                  "seo audit",
+                  "cro",
+                  "conversion rate",
+                  "lead scoring",
+                  "copywriting"
+              ]
+          }
+
+          def capability_matches(text):
+              low = text.lower()
+              matches = []
+
+              for capability, terms in CAPABILITIES.items():
+                  if any(term in low for term in terms):
+                      matches.append(capability)
+
+              return matches
+
+          def score_task(task):
+              text = task_text(task)
+              low = text.lower()
+
+              blocked = safety_blocked(text)
+
+              if blocked:
+                  return {
+                      "score": 0,
+                      "capabilities": [],
+                      "blocked": blocked,
+                      "reason": "SAFETY_BLOCK"
+                  }
+
+              capabilities = capability_matches(text)
+
+              if not capabilities:
+                  return {
+                      "score": 0,
+                      "capabilities": [],
+                      "blocked": [],
+                      "reason": "NO_CAPABILITY"
+                  }
+
+              score = 35
+
+              if "research" in capabilities:
+                  score += 10
+
+              if "reporting" in capabilities:
+                  score += 8
+
+              if "api" in capabilities:
+                  score += 8
+
+              if "qa" in capabilities:
+                  score += 8
+
+              if "coding" in capabilities:
+                  score += 5
+
+              if "github" in capabilities:
+                  score += 5
+
+              if "seo" in capabilities:
+                  score += 5
+
+              if extract_urls(text):
+                  score += 10
+
+              reward_min = task.get("budget_min_sats")
+              reward_max = task.get("budget_max_sats")
+
+              if reward_min is not None or reward_max is not None:
+                  score += 5
+
+              return {
+                  "score": min(score, 100),
+                  "capabilities": capabilities,
+                  "blocked": [],
+                  "reason": "MATCH"
+              }
+
+          # ============================================================
+          # IDENTITY
+          # ============================================================
+
+          me_result = api("GET", "/me")
+
+          if not me_result["ok"]:
+              raise SystemExit(
+                  "Unable to retrieve NØX identity: "
+                  + me_result.get("error", "unknown error")
+              )
+
+          me = me_result.get("data") or {}
+
+          my_id = (
+              me.get("id")
+              or me.get("user_id")
+              or me.get("agent_id")
+          )
+
+          my_username = (
+              me.get("username")
+              or me.get("handle")
+              or me.get("name")
+              or IDENTITY
+          )
+
+          print(f"IDENTITY: {my_username}")
+
+          # ============================================================
+          # READ LATEST LEDGERS
+          # ============================================================
+
+          ledger01 = load_json(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          ledger02 = load_json(
+              COGNITION_FILE,
+              {}
+          )
+
+          ledger03 = load_json(
+              ACTION_FILE,
+              {}
+          )
+
+          cognitive_candidates = []
+
+          for source in [ledger02, ledger03]:
+              for key in [
+                  "cognitive_actions",
+                  "actions",
+                  "candidates",
+                  "suggestions"
+              ]:
+                  values = source.get(key, [])
+                  if isinstance(values, list):
+                      cognitive_candidates.extend(values)
+
+          print(
+              "COGNITIVE INPUTS:",
+              len(cognitive_candidates)
+          )
+
+          # ============================================================
+          # MARKETPLACE TASKS
+          # ============================================================
+
+          tasks_result = api(
+              "GET",
+              "/marketplace/tasks",
+              params={
+                  "limit": MAX_TASKS
+              }
+          )
+
+          if not tasks_result["ok"]:
+              raise SystemExit(
+                  "Marketplace task discovery failed: "
+                  + tasks_result.get("error", "unknown error")
+              )
+
+          payload = tasks_result.get("data") or {}
+
+          if isinstance(payload, dict):
+              tasks = payload.get("items", [])
+          elif isinstance(payload, list):
+              tasks = payload
+          else:
+              tasks = []
+
+          tasks = tasks[:MAX_TASKS]
+
+          print(f"TASKS FOUND: {len(tasks)}")
+
+          # ============================================================
+          # TASK CLASSIFICATION / CANDIDATES
+          # ============================================================
+
+          candidates = []
+          skip_reasons = {}
+
+          for task in tasks:
+              text = task_text(task)
+
+              status = str(
+                  task.get("status", "")
+              ).lower()
+
+              # Only open/bidding listings are bid candidates.
+              if status and status not in {
+                  "open",
+                  "bidding"
+              }:
+                  skip_reasons["CLOSED_TASK"] = (
+                      skip_reasons.get("CLOSED_TASK", 0) + 1
+                  )
+                  continue
+
+              result = score_task(task)
+
+              if result["reason"] != "MATCH":
+                  skip_reasons[result["reason"]] = (
+                      skip_reasons.get(result["reason"], 0) + 1
+                  )
+                  continue
+
+              if result["score"] < BID_SCORE_THRESHOLD:
+                  skip_reasons["LOW_SCORE"] = (
+                      skip_reasons.get("LOW_SCORE", 0) + 1
+                  )
+                  continue
+
+              budget_min = task.get("budget_min_sats")
+              budget_max = task.get("budget_max_sats")
+
+              if budget_min is None:
+                  budget_min = MIN_BID_SATS
+
+              if budget_max is None:
+                  budget_max = budget_min
+
+              try:
+                  budget_min = int(budget_min)
+                  budget_max = int(budget_max)
+              except Exception:
+                  skip_reasons["INVALID_REWARD"] = (
+                      skip_reasons.get("INVALID_REWARD", 0) + 1
+                  )
+                  continue
+
+              # Current Colony API requires >=21 sats.
+              if budget_max < MIN_BID_SATS:
+                  skip_reasons["REWARD_BELOW_API_MIN"] = (
+                      skip_reasons.get(
+                          "REWARD_BELOW_API_MIN",
+                          0
+                      ) + 1
+                  )
+                  continue
+
+              bid_amount = max(
+                  MIN_BID_SATS,
+                  budget_min
+              )
+
+              bid_amount = min(
+                  bid_amount,
+                  budget_max
+              )
+
+              candidates.append({
+                  "task": task,
+                  "score": result["score"],
+                  "capabilities": result["capabilities"],
+                  "bid_amount_sats": bid_amount
+              })
+
+          candidates.sort(
+              key=lambda x: (
+                  x["score"],
+                  x["bid_amount_sats"]
+              ),
+              reverse=True
+          )
+
+          print(
+              "BID CANDIDATES:",
+              len(candidates)
+          )
+
+          # ============================================================
+          # BID / EXISTING BID RECONCILIATION
+          # ============================================================
+
+          bids_created = 0
+          bids_checked = 0
+          accepted_count = 0
+          pending_count = 0
+          rejected_count = 0
+          paid_count = 0
+
+          accepted_missions = []
+
+          # Track all candidate tasks and inspect bids.
+          for task in tasks[:MAX_RECONCILE]:
+              task_id = task.get("id")
+
+              if not task_id:
+                  continue
+
+              bids_result = api(
+                  "GET",
+                  f"/marketplace/{task_id}/bids"
+              )
+
+              if not bids_result["ok"]:
+                  continue
+
+              bids_payload = bids_result.get("data") or {}
+
+              if isinstance(bids_payload, dict):
+                  bids = bids_payload.get("items", [])
+              elif isinstance(bids_payload, list):
+                  bids = bids_payload
+              else:
+                  bids = []
+
+              own_bids = []
+
+              for bid in bids:
+                  bidder_id = bid.get("bidder_id")
+                  bidder_name = str(
+                      bid.get("bidder_name", "")
+                  ).lower()
+
+                  if (
+                      my_id
+                      and bidder_id == my_id
+                  ) or bidder_name == str(
+                      my_username
+                  ).lower() or bidder_name == IDENTITY.lower():
+                      own_bids.append(bid)
+
+              for bid in own_bids:
+                  bids_checked += 1
+
+                  bid_id = bid.get("id")
+                  bid_status = str(
+                      bid.get("status", "")
+                  ).lower()
+
+                  amount = bid.get(
+                      "amount_sats",
+                      bid.get("bid_amount_sats")
+                  )
+
+                  record = {
+                      "timestamp": now(),
+                      "session_id": SESSION_ID,
+                      "task_id": task_id,
+                      "bid_id": bid_id,
+                      "status": bid_status,
+                      "amount_sats": amount
+                  }
+
+                  state["bids"].append(record)
+
+                  if bid_status == "accepted":
+                      accepted_count += 1
+
+                      accepted_missions.append({
+                          "task": task,
+                          "bid": bid
+                      })
+
+                  elif bid_status == "pending":
+                      pending_count += 1
+
+                  elif bid_status == "rejected":
+                      rejected_count += 1
+
+          # ============================================================
+          # CREATE NEW BIDS
+          # ============================================================
+
+          seen_bid_tasks = {
+              x.get("task_id")
+              for x in state["bids"]
+              if x.get("status") in {
+                  "pending",
+                  "accepted"
+              }
+          }
+
+          for candidate in candidates:
+              if bids_created >= MAX_BIDS_PER_RUN:
+                  break
+
+              task = candidate["task"]
+              task_id = task.get("id")
+
+              if not task_id:
+                  continue
+
+              if task_id in seen_bid_tasks:
+                  continue
+
+              message = (
+                  "NØX can handle this task using deterministic "
+                  "research, API/HTTP verification, structured "
+                  "evidence collection and technical reporting. "
+                  "No external AI is used. "
+                  "I will provide reproducible evidence and clearly "
+                  "separate verified results from limitations."
+              )
+
+              bid_payload = {
+                  "amount_sats": candidate["bid_amount_sats"],
+                  "message": message
+              }
+
+              bid_result = api(
+                  "POST",
+                  f"/marketplace/{task_id}/bid",
+                  json=bid_payload,
+                  headers={
+                      "Idempotency-Key":
+                      f"ledger04-bid-{task_id}"
+                  }
+              )
+
+              if bid_result["ok"]:
+                  bids_created += 1
+
+                  bid_data = bid_result.get("data") or {}
+
+                  state["bids"].append({
+                      "timestamp": now(),
+                      "session_id": SESSION_ID,
+                      "task_id": task_id,
+                      "bid_id": bid_data.get("id"),
+                      "status": bid_data.get(
+                          "status",
+                          "pending"
+                      ),
+                      "amount_sats": candidate[
+                          "bid_amount_sats"
+                      ],
+                      "created_by": "ledger04"
+                  })
+
+                  print(
+                      "BID CREATED:",
+                      task_id,
+                      candidate["bid_amount_sats"],
+                      "sats"
+                  )
+
+              else:
+                  error = bid_result.get(
+                      "error",
+                      "unknown"
+                  )
+
+                  if "CONFLICT" in str(error).upper():
+                      skip_reasons["BID_CONFLICT"] = (
+                          skip_reasons.get(
+                              "BID_CONFLICT",
+                              0
+                          ) + 1
+                      )
+                  else:
+                      add_failure(
+                          "BID_CREATE_FAILED",
+                          task_id,
+                          str(error)
+                      )
+
+          # ============================================================
+          # ACCEPTED MISSION DEDUPLICATION
+          # ============================================================
+
+          unique_accepted = {}
+
+          for mission in accepted_missions:
+              task = mission["task"]
+              bid = mission["bid"]
+
+              task_id = task.get("id")
+              bid_id = bid.get("id")
+
+              if not task_id or not bid_id:
+                  continue
+
+              unique_accepted[
+                  f"{task_id}:{bid_id}"
+              ] = mission
+
+          accepted_missions = list(
+              unique_accepted.values()
+          )
+
+          print(
+              "ACCEPTED MISSIONS AVAILABLE:",
+              len(accepted_missions)
+          )
+
+          # ============================================================
+          # EXECUTION
+          # ============================================================
+
+          executions_this_run = 0
+          deliveries_this_run = 0
+          execution_failures = 0
+
+          def existing_delivery(task_id, bid_id):
+              marker = (
+                  f"NØX DELIVERY | task={task_id} | "
+                  f"bid={bid_id}"
+              )
+
+              # Check local memory first.
+              for delivery in state["deliveries"]:
+                  if (
+                      delivery.get("task_id") == task_id
+                      and delivery.get("bid_id") == bid_id
+                  ):
+                      return True
+
+              # Check Colony thread using full comment list.
+              result = api(
+                  "GET",
+                  f"/posts/{task_id}/comments",
+                  params={
+                      "limit": 100,
+                      "sort": "newest"
+                  }
+              )
+
+              if not result["ok"]:
+                  return False
+
+              data = result.get("data") or {}
+
+              if isinstance(data, dict):
+                  comments = data.get(
+                      "items",
+                      data.get("comments", [])
+                  )
+              elif isinstance(data, list):
+                  comments = data
+              else:
+                  comments = []
+
+              for comment in comments:
+                  body = str(
+                      comment.get("body", "")
+                  )
+
+                  if marker in body:
+                      return True
+
+              return False
+
+          def fetch_source(url):
+              started = time.time()
+
+              try:
+                  response = requests.get(
+                      url,
+                      timeout=HTTP_TIMEOUT,
+                      allow_redirects=True,
+                      headers={
+                          "User-Agent":
+                          "Nox-Ledger-04-Research/1.0"
+                      },
+                      stream=True
+                  )
+
+                  elapsed_ms = round(
+                      (time.time() - started) * 1000,
+                      2
+                  )
+
+                  chunks = []
+                  total = 0
+
+                  for chunk in response.iter_content(
+                      chunk_size=16384
+                  ):
+                      if not chunk:
+                          continue
+
+                      remaining = (
+                          MAX_SOURCE_BYTES - total
+                      )
+
+                      if remaining <= 0:
+                          break
+
+                      chunk = chunk[:remaining]
+
+                      chunks.append(chunk)
+                      total += len(chunk)
+
+                      if total >= MAX_SOURCE_BYTES:
+                          break
+
+                  raw = b"".join(chunks)
+
+                  content_type = response.headers.get(
+                      "content-type",
+                      ""
+                  )
+
+                  text = ""
+
+                  if (
+                      "text" in content_type.lower()
+                      or "json" in content_type.lower()
+                      or "xml" in content_type.lower()
+                      or "javascript" in content_type.lower()
+                  ):
+                      text = raw.decode(
+                          "utf-8",
+                          errors="replace"
+                      )
+
+                  title = ""
+
+                  title_match = re.search(
+                      r"<title[^>]*>(.*?)</title>",
+                      text,
+                      re.IGNORECASE | re.DOTALL
+                  )
+
+                  if title_match:
+                      title = normalize_text(
+                          re.sub(
+                              r"<[^>]+>",
+                              " ",
+                              title_match.group(1)
+                          )
+                      )
+
+                  headings = []
+
+                  for match in re.finditer(
+                      r"<h[1-3][^>]*>(.*?)</h[1-3]>",
+                      text,
+                      re.IGNORECASE | re.DOTALL
+                  ):
+                      heading = normalize_text(
+                          re.sub(
+                              r"<[^>]+>",
+                              " ",
+                              match.group(1)
+                          )
+                      )
+
+                      if heading:
+                          headings.append(
+                              heading[:250]
+                          )
+
+                      if len(headings) >= 10:
+                          break
+
+                  return {
+                      "url": url,
+                      "final_url": response.url,
+                      "status_code": response.status_code,
+                      "elapsed_ms": elapsed_ms,
+                      "content_type": content_type[:200],
+                      "bytes_read": total,
+                      "title": title[:300],
+                      "headings": headings,
+                      "content_sha256": hashlib.sha256(
+                          raw
+                      ).hexdigest(),
+                      "retrieval_ok": (
+                          200 <= response.status_code < 400
+                      )
+                  }
+
+              except Exception as exc:
+                  return {
+                      "url": url,
+                      "retrieval_ok": False,
+                      "error": str(exc)[:500]
+                  }
+
+          def execute_task(task, bid):
+              task_id = task.get("id")
+              bid_id = bid.get("id")
+
+              text = task_text(task)
+              low = text.lower()
+
+              capabilities = capability_matches(text)
+              urls = extract_urls(text)
+
+              if not urls:
+                  return {
+                      "status": "NEEDS_INPUT",
+                      "reason": (
+                          "No public HTTP target or source URL "
+                          "was present in the accepted mission."
+                      ),
+                      "sources": []
+                  }
+
+              sources = []
+
+              for url in urls:
+                  source = fetch_source(url)
+                  sources.append(source)
+
+              successful = [
+                  s for s in sources
+                  if s.get("retrieval_ok")
+              ]
+
+              if not successful:
+                  return {
+                      "status": "EXECUTION_FAILED",
+                      "reason": (
+                          "No supplied public source could be "
+                          "retrieved successfully."
+                      ),
+                      "sources": sources
+                  }
+
+              # Deterministic work product.
+              #
+              # This is intentionally evidence-first:
+              # no fabricated semantic conclusions and no
+              # external AI-generated claims.
+              report_lines = [
+                  "# NØX DELIVERY",
+                  "",
+                  f"Task ID: {task_id}",
+                  f"Bid ID: {bid_id}",
+                  f"Execution ID: {SESSION_ID}",
+                  "",
+                  "## Scope",
+                  (
+                      "Deterministic public-source research and "
+                      "HTTP evidence collection."
+                  ),
+                  "",
+                  "## Detected capabilities",
+                  ", ".join(capabilities) or "none",
+                  "",
+                  "## Task",
+                  normalize_text(
+                      task.get("title", "")
+                  )[:500],
+                  "",
+                  "## Evidence"
+              ]
+
+              for index, source in enumerate(
+                  successful,
+                  start=1
+              ):
+                  report_lines.extend([
+                      "",
+                      f"### Source {index}",
+                      f"- URL: {source.get('url')}",
+                      f"- Final URL: {source.get('final_url')}",
+                      f"- HTTP status: {source.get('status_code')}",
+                      f"- Response time: {source.get('elapsed_ms')} ms",
+                      f"- Content-Type: {source.get('content_type')}",
+                      f"- Bytes inspected: {source.get('bytes_read')}",
+                      f"- SHA-256: {source.get('content_sha256')}",
+                  ])
+
+                  title = source.get("title")
+
+                  if title:
+                      report_lines.append(
+                          f"- Page title: {title}"
+                      )
+
+                  headings = source.get(
+                      "headings",
+                      []
+                  )
+
+                  if headings:
+                      report_lines.append(
+                          "- Headings: "
+                          + " | ".join(headings[:6])
+                      )
+
+              report_lines.extend([
+                  "",
+                  "## Method",
+                  (
+                      "Public HTTP GET requests only. "
+                      "No third-party writes, payments, "
+                      "spending or destructive operations."
+                  ),
+                  "",
+                  "## Limitations",
+                  (
+                      "This execution records reproducible "
+                      "network evidence. It does not invent "
+                      "facts that cannot be verified from the "
+                      "retrieved sources."
+                  ),
+                  "",
+                  "## Verification",
+                  (
+                      "The task poster should verify the evidence "
+                      "against the supplied task requirements."
+                  )
+              ])
+
+              report = "\n".join(report_lines)
+
+              if len(report) > MAX_DELIVERY_CHARS:
+                  report = (
+                      report[:MAX_DELIVERY_CHARS - 250]
+                      + "\n\n"
+                      + "[REPORT TRUNCATED BY LEDGER 04]"
+                      + "\n"
+                      + "Full execution metadata is stored in "
+                      "NØX repository memory."
+                  )
+
+              return {
+                  "status": "EXECUTED",
+                  "reason": "Evidence collected",
+                  "sources": sources,
+                  "report": report
+              }
+
+          # Execute accepted missions only.
+          if EXECUTION_ENABLED:
+              for mission in accepted_missions:
+                  if (
+                      executions_this_run
+                      >= MAX_EXECUTIONS_PER_RUN
+                  ):
+                      break
+
+                  task = mission["task"]
+                  bid = mission["bid"]
+
+                  task_id = task.get("id")
+                  bid_id = bid.get("id")
+
+                  if not task_id or not bid_id:
+                      continue
+
+                  # Never duplicate a real delivery.
+                  if existing_delivery(
+                      task_id,
+                      bid_id
+                  ):
+                      print(
+                          "DELIVERY ALREADY EXISTS:",
+                          task_id
+                      )
+                      continue
+
+                  executions_this_run += 1
+
+                  execution_id = (
+                      f"L04-{SESSION_ID}-{task_id[:8]}"
+                  )
+
+                  print(
+                      "EXECUTING:",
+                      task_id,
+                      "BID:",
+                      bid_id
+                  )
+
+                  try:
+                      result = execute_task(
+                          task,
+                          bid
+                      )
+
+                      execution_record = {
+                          "timestamp": now(),
+                          "session_id": SESSION_ID,
+                          "execution_id": execution_id,
+                          "task_id": task_id,
+                          "bid_id": bid_id,
+                          "status": result.get(
+                              "status"
+                          ),
+                          "reason": result.get(
+                              "reason"
+                          ),
+                          "sources": result.get(
+                              "sources",
+                              []
+                          )
+                      }
+
+                      state["executions"].append(
+                          execution_record
+                      )
+
+                      if result.get("status") != "EXECUTED":
+                          add_failure(
+                              result.get(
+                                  "status",
+                                  "EXECUTION_FAILED"
+                              ),
+                              task_id,
+                              result.get(
+                                  "reason",
+                                  "Execution did not complete."
+                              )
+                          )
+
+                          execution_failures += 1
+                          continue
+
+                      report = result.get(
+                          "report",
+                          ""
+                      )
+
+                      # Stable delivery marker.
+                      marker = (
+                          f"NØX DELIVERY | task={task_id} | "
+                          f"bid={bid_id}"
+                      )
+
+                      delivery_body = (
+                          marker
+                          + "\n\n"
+                          + report
+                      )
+
+                      if len(delivery_body) > MAX_DELIVERY_CHARS:
+                          delivery_body = (
+                              delivery_body[
+                                  :MAX_DELIVERY_CHARS
+                              ]
+                          )
+
+                      # Preview first. This does not publish.
+                      preview = api(
+                          "POST",
+                          f"/posts/{task_id}/comments/preview",
+                          json={
+                              "body": delivery_body,
+                              "parent_id": None,
+                              "client": "nox-ledger-04"
+                          }
+                      )
+
+                      if not preview["ok"]:
+                          add_failure(
+                              "DELIVERY_PREVIEW_FAILED",
+                              task_id,
+                              preview.get(
+                                  "error",
+                                  "preview failed"
+                              )
+                          )
+
+                          execution_failures += 1
+                          continue
+
+                      # Actual delivery.
+                      delivery = api(
+                          "POST",
+                          f"/posts/{task_id}/comments",
+                          json={
+                              "body": delivery_body,
+                              "parent_id": None,
+                              "client": "nox-ledger-04"
+                          },
+                          headers={
+                              "Idempotency-Key":
+                              f"ledger04-delivery-{task_id}-{bid_id}"
+                          }
+                      )
+
+                      if not delivery["ok"]:
+                          add_failure(
+                              "DELIVERY_FAILED",
+                              task_id,
+                              delivery.get(
+                                  "error",
+                                  "delivery failed"
+                              )
+                          )
+
+                          execution_failures += 1
+                          continue
+
+                      delivery_data = (
+                          delivery.get("data") or {}
+                      )
+
+                      comment_id = (
+                          delivery_data.get("id")
+                          or delivery_data.get("comment_id")
+                      )
+
+                      state["deliveries"].append({
+                          "timestamp": now(),
+                          "session_id": SESSION_ID,
+                          "execution_id": execution_id,
+                          "task_id": task_id,
+                          "bid_id": bid_id,
+                          "comment_id": comment_id,
+                          "status": "DELIVERED"
+                      })
+
+                      deliveries_this_run += 1
+
+                      print(
+                          "DELIVERED:",
+                          task_id,
+                          "COMMENT:",
+                          comment_id
+                      )
+
+                  except Exception as exc:
+                      add_failure(
+                          "EXECUTION_EXCEPTION",
+                          task_id,
+                          str(exc)
+                      )
+
+                      execution_failures += 1
+
+          # ============================================================
+          # PAYMENT / OUTCOME OBSERVATION
+          # ============================================================
+
+          # Observation only.
+          # Never create invoices.
+          # Never pay.
+          # Never tip.
+          # Never spend.
+          for mission in accepted_missions[:MAX_RECONCILE]:
+              task = mission["task"]
+              task_id = task.get("id")
+
+              if not task_id:
+                  continue
+
+              payment = api(
+                  "GET",
+                  f"/marketplace/{task_id}/payment"
+              )
+
+              if payment["ok"]:
+                  payment_data = payment.get("data")
+
+                  state["payments_observed"].append({
+                      "timestamp": now(),
+                      "session_id": SESSION_ID,
+                      "task_id": task_id,
+                      "payment": payment_data
+                  })
+
+                  if payment_data:
+                      status_text = str(
+                          payment_data
+                      ).lower()
+
+                      if (
+                          "paid" in status_text
+                          or "settled" in status_text
+                      ):
+                          paid_count += 1
+
+          # ============================================================
+          # LEARNING
+          # ============================================================
+
+          if candidates:
+              state["learning"].append({
+                  "timestamp": now(),
+                  "session_id": SESSION_ID,
+                  "type": "MARKETPLACE_SELECTION",
+                  "lesson": (
+                      "Marketplace opportunities are selected "
+                      "using deterministic capability matching, "
+                      "reward validation and safety gates."
+                  ),
+                  "candidate_count": len(candidates)
+              })
+
+          if executions_this_run:
+              state["learning"].append({
+                  "timestamp": now(),
+                  "session_id": SESSION_ID,
+                  "type": "EXECUTION",
+                  "lesson": (
+                      "Accepted missions must produce evidence "
+                      "before a delivery is published. "
+                      "No completion is claimed merely because "
+                      "a bid was accepted."
+                  ),
+                  "executions": executions_this_run,
+                  "deliveries": deliveries_this_run,
+                  "failures": execution_failures
+              })
+
+          # ============================================================
+          # MEMORY COMPACTION
+          # ============================================================
+
+          for key in [
+              "runs",
+              "bids",
+              "accepted_missions",
+              "executions",
+              "deliveries",
+              "payments_observed",
+              "failures",
+              "learning"
+          ]:
+              state[key] = trim_list(
+                  state.get(key, [])
+              )
+
+          # Accepted mission snapshot.
+          for mission in accepted_missions:
+              task = mission["task"]
+              bid = mission["bid"]
+
+              state["accepted_missions"].append({
+                  "timestamp": now(),
+                  "session_id": SESSION_ID,
+                  "task_id": task.get("id"),
+                  "title": task.get("title"),
+                  "bid_id": bid.get("id"),
+                  "amount_sats": bid.get(
+                      "amount_sats",
+                      bid.get("bid_amount_sats")
+                  ),
+                  "status": bid.get("status")
+              })
+
+          state["accepted_missions"] = trim_list(
+              state["accepted_missions"]
+          )
+
+          # Run summary.
+          run_summary = {
+              "timestamp": now(),
+              "session_id": SESSION_ID,
+              "identity": my_username,
+              "tasks_found": len(tasks),
+              "tasks_evaluated": len(tasks),
+              "bid_candidates": len(candidates),
+              "bids_created": bids_created,
+              "bids_checked": bids_checked,
+              "accepted": accepted_count,
+              "pending": pending_count,
+              "rejected": rejected_count,
+              "paid_observed": paid_count,
+              "accepted_missions": len(
+                  accepted_missions
+              ),
+              "executions": executions_this_run,
+              "deliveries": deliveries_this_run,
+              "execution_failures": execution_failures,
+              "skip_reasons": skip_reasons,
+              "execution_enabled": EXECUTION_ENABLED,
+              "payments_enabled": PAYMENTS_ENABLED,
+              "spending_enabled": SPENDING_ENABLED,
+              "gemini_used": GEMINI_ENABLED,
+              "external_ai_used": EXTERNAL_AI_ENABLED,
+              "project_cost_eur": PROJECT_COST_EUR
+          }
+
+          state["runs"].append(run_summary)
+          state["runs"] = trim_list(
+              state["runs"],
+              100
+          )
+
+          save_json(
+              LEDGER04_FILE,
+              state
+          )
+
+          # ============================================================
+          # HUMAN-READABLE LOG
+          # ============================================================
+
+          print("")
+          print("======================================")
+          print("=== NØX LEDGER 04 COMPLETE ===")
+          print("======================================")
+          print(f"Identity: {my_username}")
+          print(f"Tasks found: {len(tasks)}")
+          print(f"Tasks evaluated: {len(tasks)}")
+          print(f"Bid candidates: {len(candidates)}")
+          print(f"Bids created: {bids_created}")
+          print(f"Bids checked: {bids_checked}")
+          print(f"Accepted: {accepted_count}")
+          print(f"Pending: {pending_count}")
+          print(f"Rejected: {rejected_count}")
+          print(f"Paid observed: {paid_count}")
+          print(
+              "Accepted missions:",
+              len(accepted_missions)
+          )
+          print(
+              "Executions this run:",
+              executions_this_run
+          )
+          print(
+              "Deliveries:",
+              deliveries_this_run
+          )
+          print(
+              "Execution failures:",
+              execution_failures
+          )
+
+          print("")
+          print("SKIP REASONS:")
+
+          if skip_reasons:
+              for key, value in sorted(
+                  skip_reasons.items()
+              ):
+                  print(f"  {key}: {value}")
+          else:
+              print("  NONE")
+
+          print("")
+          print("Execution:", EXECUTION_ENABLED)
+          print("Real bids: ENABLED")
+          print("Payments: DISABLED")
+          print("Spending: DISABLED")
+          print("Gemini:", GEMINI_ENABLED)
+          print("External AI:", EXTERNAL_AI_ENABLED)
+          print("Project cost: €0")
+          print("======================================")
+          PY
+
+      - name: Commit Ledger 04 memory
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add memory/nox_ledger_marketplace.json
+
+          if git diff --cached --quiet; then
+            echo "No Ledger 04 memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update NØX Ledger 04 marketplace state"
+
+          git push
