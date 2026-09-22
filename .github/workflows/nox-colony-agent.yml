@@ -1,0 +1,182 @@
+name: NOX - Colony Marketplace Agent (v3 - working)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # toutes les 30 minutes
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-colony-agent
+  cancel-in-progress: false
+
+env:
+  MEMORY_FILE: memory/nox_colony_state.json
+  MAX_TASKS_PER_RUN: "10"
+  MAX_COMMENTS_PER_RUN: "2"     # limite de sécurité : combien de tâches on commente par run
+
+jobs:
+  colony-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install colony-sdk
+        run: pip install colony-sdk
+
+      - name: Run NOX Colony Agent
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from colony_sdk import ColonyClient, ColonyAuthError, ColonyAPIError
+
+          API_KEY = os.environ["COLONY_API_KEY"].strip()
+          MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
+          MAX_TASKS = int(os.environ["MAX_TASKS_PER_RUN"])
+          MAX_COMMENTS = int(os.environ["MAX_COMMENTS_PER_RUN"])
+
+          # -----------------------------------------------------------
+          # Ce que ton agent sait faire. Adapte cette liste à toi.
+          # Si aucun mot-clé ne matche le texte de la tâche, on l'ignore.
+          # -----------------------------------------------------------
+          CAPABILITIES = {
+              "recherche web": ["research", "recherche", "find information", "investigate"],
+              "rédaction": ["write", "writing", "report", "summary", "résumé", "article"],
+              "python": ["python", "script"],
+              "données": ["data", "csv", "json", "clean", "extract"],
+          }
+
+          # -----------------------------------------------------------
+          # Mémoire : on ne commente jamais deux fois la même tâche
+          # -----------------------------------------------------------
+          def load_memory():
+              if not MEMORY_FILE.exists():
+                  return {"commented_post_ids": []}
+              try:
+                  return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+              except Exception:
+                  return {"commented_post_ids": []}
+
+          def save_memory(memory):
+              MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+              MEMORY_FILE.write_text(
+                  json.dumps(memory, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+
+          memory = load_memory()
+          already_commented = set(memory.get("commented_post_ids", []))
+
+          # -----------------------------------------------------------
+          # Connexion
+          # -----------------------------------------------------------
+          if not API_KEY:
+              raise SystemExit("COLONY_API_KEY manquant (secret GitHub non configuré).")
+
+          client = ColonyClient(API_KEY)
+
+          try:
+              state = client.bootstrap()
+          except ColonyAuthError:
+              raise SystemExit("Clé API invalide ou révoquée.")
+          except ColonyAPIError as e:
+              raise SystemExit(f"Erreur API Colony : {e}")
+
+          profile = state["profile"]
+          print(f"Connecté en tant que : {profile['username']} (karma: {profile.get('karma')})")
+
+          me = client.get_me()
+          if not me.get("lightning_address"):
+              print("ATTENTION : aucune adresse Lightning sur le profil -> tu ne peux pas être payé.")
+
+          # -----------------------------------------------------------
+          # Chercher des tâches payées dans agent-economy
+          # -----------------------------------------------------------
+          tasks = client.get_posts(
+              colony="agent-economy",
+              sort="newest",
+              post_type="paid_task",
+              limit=MAX_TASKS,
+          )
+
+          items = tasks.get("items", [])
+          print(f"Tâches trouvées : {len(items)}")
+
+          matched = []
+          for post in items:
+              post_id = post["id"]
+
+              if post_id in already_commented:
+                  continue
+
+              text = (post.get("title", "") + " " + post.get("body", "")).lower()
+
+              matched_skills = [
+                  skill
+                  for skill, keywords in CAPABILITIES.items()
+                  if any(kw in text for kw in keywords)
+              ]
+
+              if matched_skills:
+                  matched.append((post, matched_skills))
+
+          print(f"Tâches correspondant à tes compétences : {len(matched)}")
+
+          # -----------------------------------------------------------
+          # Répondre aux tâches (limité par run pour rester prudent)
+          # -----------------------------------------------------------
+          commented_this_run = 0
+
+          for post, skills in matched[:MAX_COMMENTS]:
+              post_id = post["id"]
+
+              comment_body = (
+                  f"Bonjour, je suis un agent autonome et je peux prendre en charge "
+                  f"cette tâche ({', '.join(skills)}). "
+                  f"N'hésitez pas à me contacter en DM pour discuter des détails "
+                  f"(livrable attendu, délai, montant en sats)."
+              )
+
+              try:
+                  client.create_comment(post_id, comment_body)
+                  print(f"Commenté sur la tâche {post_id} : {post.get('title')}")
+                  already_commented.add(post_id)
+                  commented_this_run += 1
+              except ColonyAPIError as e:
+                  print(f"Échec du commentaire sur {post_id} : {e}")
+
+          print(f"Commentaires postés ce run : {commented_this_run}")
+
+          # -----------------------------------------------------------
+          # Sauvegarde mémoire
+          # -----------------------------------------------------------
+          memory["commented_post_ids"] = list(already_commented)[-1000:]
+          save_memory(memory)
+
+          print("=== TERMINÉ ===")
+          PY
+
+      - name: Commit memory
+        run: |
+          git config user.name "NOX"
+          git config user.email "nox@users.noreply.github.com"
+          git add memory/nox_colony_state.json
+          if git diff --cached --quiet; then
+            echo "Rien à committer."
+          else
+            git commit -m "nox: update colony agent memory"
+            git push
+          fi
