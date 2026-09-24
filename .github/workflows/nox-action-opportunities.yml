@@ -21,7 +21,11 @@ env:
   MAX_TASKS_PER_RUN: "20"
   MAX_BIDS_PER_RUN: "2"
   MAX_TRACKED_ITEMS: "250"
-  MIN_BID_SATS: "1"
+
+  # 1 sat reste le minimum conceptuel pour considérer
+  # une opportunité. Ce n'est PAS utilisé comme bid automatique.
+  MIN_OPPORTUNITY_SATS: "1"
+
   REQUEST_TIMEOUT_SECONDS: "15"
 
   GEMINI_USED: "false"
@@ -38,1067 +42,1205 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Execute NØX Action & Opportunities
+      - name: Install Colony SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install "colony-sdk>=1.27.0"
+
+      - name: Run NØX Action & Opportunities
         env:
+          COLONY_API_TOKEN: ${{ secrets.COLONY_API_TOKEN }}
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
-          set -euo pipefail
-
-          python - <<'PY'
+          python <<'PY'
           import json
           import os
           import re
           import sys
           import time
-          import uuid
+          import urllib.error
+          import urllib.parse
+          import urllib.request
           from datetime import datetime, timezone
           from pathlib import Path
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
 
-          BASE_URL = "https://thecolony.cc/api/v1"
 
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          ACTION_MEMORY_FILE = Path(os.environ["ACTION_MEMORY_FILE"])
+          API_BASE = "https://thecolony.cc/api/v1"
 
-          MAX_TASKS = int(os.environ["MAX_TASKS_PER_RUN"])
-          MAX_BIDS = int(os.environ["MAX_BIDS_PER_RUN"])
-          MAX_TRACKED = int(os.environ["MAX_TRACKED_ITEMS"])
-          MIN_BID_SATS = int(os.environ["MIN_BID_SATS"])
-          TIMEOUT = int(os.environ["REQUEST_TIMEOUT_SECONDS"])
+          CORE_MEMORY_FILE = Path(
+              os.environ.get(
+                  "CORE_MEMORY_FILE",
+                  "memory/nox_core_memory.json"
+              )
+          )
 
-          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
+          CORE_RUNTIME_FILE = Path(
+              os.environ.get(
+                  "CORE_RUNTIME_FILE",
+                  "memory/nox_core_runtime.json"
+              )
+          )
 
-          if not API_KEY:
-              print("ERROR: COLONY_API_KEY absent")
-              sys.exit(1)
+          KNOWLEDGE_FILE = Path(
+              os.environ.get(
+                  "KNOWLEDGE_FILE",
+                  "memory/nox_knowledge.json"
+              )
+          )
 
-          NOW = datetime.now(timezone.utc).isoformat()
+          ACTION_MEMORY_FILE = Path(
+              os.environ.get(
+                  "ACTION_MEMORY_FILE",
+                  "memory/nox_action_opportunities.json"
+              )
+          )
+
+          MAX_TASKS_PER_RUN = int(
+              os.environ.get("MAX_TASKS_PER_RUN", "20")
+          )
+
+          MAX_BIDS_PER_RUN = int(
+              os.environ.get("MAX_BIDS_PER_RUN", "2")
+          )
+
+          MAX_TRACKED_ITEMS = int(
+              os.environ.get("MAX_TRACKED_ITEMS", "250")
+          )
+
+          MIN_OPPORTUNITY_SATS = int(
+              os.environ.get("MIN_OPPORTUNITY_SATS", "1")
+          )
+
+          REQUEST_TIMEOUT = int(
+              os.environ.get("REQUEST_TIMEOUT_SECONDS", "15")
+          )
+
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
 
           def load_json(path, default):
-              if not path.exists():
-                  return default
               try:
+                  if not path.exists():
+                      return default
                   with path.open("r", encoding="utf-8") as f:
-                      return json.load(f)
+                      value = json.load(f)
+                  return value
               except Exception as exc:
-                  print(f"WARNING: lecture impossible {path}: {exc}")
+                  print(f"WARNING: cannot read {path}: {exc}")
                   return default
 
-          def save_json(path, data):
+
+          def save_json(path, value):
               path.parent.mkdir(parents=True, exist_ok=True)
               tmp = path.with_suffix(path.suffix + ".tmp")
+
               with tmp.open("w", encoding="utf-8") as f:
-                  json.dump(data, f, ensure_ascii=False, indent=2)
+                  json.dump(
+                      value,
+                      f,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+                  f.write("\n")
+
               tmp.replace(path)
 
-          def api(method, path, payload=None, token=None, idempotency_key=None):
-              url = BASE_URL + path
+
+          def as_int(value):
+              if value is None:
+                  return None
+
+              if isinstance(value, bool):
+                  return None
+
+              if isinstance(value, int):
+                  return value if value >= 0 else None
+
+              if isinstance(value, float):
+                  return int(value) if value >= 0 else None
+
+              if isinstance(value, str):
+                  text = value.strip().lower()
+
+                  if not text:
+                      return None
+
+                  text = text.replace(",", "")
+                  text = text.replace(" ", "")
+
+                  match = re.search(r"(\d+(?:\.\d+)?)", text)
+
+                  if not match:
+                      return None
+
+                  try:
+                      number = float(match.group(1))
+                      if number < 0:
+                          return None
+                      return int(number)
+                  except Exception:
+                      return None
+
+              return None
+
+
+          def request(method, path, token=None, body=None):
+              url = API_BASE + path
 
               headers = {
                   "Accept": "application/json",
-                  "Content-Type": "application/json",
+                  "User-Agent": "NOX-Colony-Agent/1.0"
               }
 
               if token:
                   headers["Authorization"] = f"Bearer {token}"
 
-              if idempotency_key:
-                  headers["Idempotency-Key"] = idempotency_key
+              data = None
 
-              body = None
-              if payload is not None:
-                  body = json.dumps(payload).encode("utf-8")
+              if body is not None:
+                  data = json.dumps(body).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
 
-              request = Request(
+              req = urllib.request.Request(
                   url,
-                  data=body,
+                  data=data,
                   headers=headers,
-                  method=method,
+                  method=method
               )
 
               try:
-                  with urlopen(request, timeout=TIMEOUT) as response:
+                  with urllib.request.urlopen(
+                      req,
+                      timeout=REQUEST_TIMEOUT
+                  ) as response:
                       raw = response.read().decode("utf-8")
+
                       if not raw:
                           return {}
-                      return json.loads(raw)
 
-              except HTTPError as exc:
-                  raw = ""
+                      try:
+                          return json.loads(raw)
+                      except json.JSONDecodeError:
+                          return {"raw": raw}
+
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", errors="replace")
+
                   try:
-                      raw = exc.read().decode("utf-8")
+                      payload = json.loads(raw)
                   except Exception:
-                      pass
+                      payload = {"raw": raw}
 
-                  detail = raw[:500]
+                  detail = payload.get("detail", payload)
+
                   raise RuntimeError(
-                      f"{method} {path} -> HTTP {exc.code}: {detail}"
+                      f"{method} {path} -> HTTP {exc.code}: "
+                      f"{json.dumps(detail, ensure_ascii=False)}"
                   )
 
-              except URLError as exc:
+              except Exception as exc:
                   raise RuntimeError(
-                      f"{method} {path} -> network error: {exc}"
+                      f"{method} {path} -> {exc}"
                   )
 
-          def authenticate():
-              result = api(
-                  "POST",
-                  "/auth/token",
-                  {"api_key": API_KEY},
+
+          def get_token():
+              token = os.environ.get("COLONY_API_TOKEN")
+
+              if token:
+                  return token
+
+              token = os.environ.get("COLONY_API_KEY")
+
+              if token:
+                  return token
+
+              raise RuntimeError(
+                  "No COLONY_API_TOKEN or COLONY_API_KEY secret found."
               )
 
-              token = (
-                  result.get("access_token")
-                  or result.get("token")
-                  or result.get("jwt")
-              )
 
-              if not token:
-                  raise RuntimeError("Authentification: token absent")
+          def extract_items(payload, keys):
+              if isinstance(payload, list):
+                  return payload
 
-              return token
+              if not isinstance(payload, dict):
+                  return []
 
-          def text_blob(task):
-              parts = []
+              for key in keys:
+                  value = payload.get(key)
+
+                  if isinstance(value, list):
+                      return value
+
+              for value in payload.values():
+                  if isinstance(value, list):
+                      return value
+
+              return []
+
+
+          def extract_task_id(task):
+              if not isinstance(task, dict):
+                  return None
 
               for key in (
-                  "title",
-                  "description",
-                  "body",
-                  "requirements",
-                  "skills",
-                  "tags",
+                  "id",
+                  "task_id",
+                  "uuid"
               ):
                   value = task.get(key)
 
-                  if isinstance(value, list):
-                      parts.extend(str(x) for x in value)
+                  if value:
+                      return str(value)
 
-                  elif value is not None:
-                      parts.append(str(value))
+              return None
 
-              return " ".join(parts).lower()
 
-          def parse_explicit_sats(task):
+          def task_title(task):
+              for key in (
+                  "title",
+                  "name",
+                  "task_title",
+                  "description"
+              ):
+                  value = task.get(key)
+
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()
+
+              return "Untitled task"
+
+
+          def extract_reward_sats(task):
               """
-              Only accepts explicit sats expressions.
-              Never converts USD, USDC, BTC, EUR or other currencies.
+              Reward extraction is deliberately broad because Colony
+              task payloads may expose reward information under different
+              names.
+              """
+
+              if not isinstance(task, dict):
+                  return None
+
+              direct_keys = (
+                  "reward_sats",
+                  "reward",
+                  "reward_amount_sats",
+                  "amount_sats",
+                  "payment_sats",
+                  "price_sats",
+                  "budget_sats",
+                  "max_reward_sats"
+              )
+
+              for key in direct_keys:
+                  value = as_int(task.get(key))
+
+                  if value is not None:
+                      return value
+
+              reward = task.get("reward")
+
+              if isinstance(reward, dict):
+                  for key in (
+                      "sats",
+                      "amount",
+                      "amount_sats",
+                      "value",
+                      "reward_sats"
+                  ):
+                      value = as_int(reward.get(key))
+
+                      if value is not None:
+                          return value
+
+              return None
+
+
+          def normalize_key(key):
+              return re.sub(
+                  r"[^a-z0-9]",
+                  "",
+                  str(key).lower()
+              )
+
+
+          def find_bid_minimum(obj):
+              """
+              Find an explicitly exposed bid minimum.
+
+              Important:
+              - We do NOT invent a fallback of 1 sat.
+              - We do NOT use an arbitrary 10-sat floor.
+              - We only accept values whose field name clearly refers
+                to a bid/price/amount minimum.
               """
 
               candidates = []
 
-              fields = (
-                  "title",
+              def walk(value, path=""):
+                  if isinstance(value, dict):
+                      for key, child in value.items():
+                          key_norm = normalize_key(key)
+                          current_path = (
+                              f"{path}.{key}" if path else str(key)
+                          )
+
+                          if (
+                              "min" in key_norm
+                              and (
+                                  "bid" in key_norm
+                                  or "price" in key_norm
+                                  or "amount" in key_norm
+                              )
+                          ):
+                              number = as_int(child)
+
+                              if number is not None:
+                                  candidates.append(
+                                      (
+                                          number,
+                                          current_path
+                                      )
+                                  )
+
+                          walk(child, current_path)
+
+                  elif isinstance(value, list):
+                      for index, child in enumerate(value):
+                          walk(
+                              child,
+                              f"{path}[{index}]"
+                          )
+
+              walk(obj)
+
+              valid = [
+                  item for item in candidates
+                  if item[0] >= MIN_OPPORTUNITY_SATS
+              ]
+
+              if not valid:
+                  return None
+
+              valid.sort(key=lambda item: len(item[1]))
+
+              return valid[0]
+
+
+          def find_bid_maximum(obj):
+              candidates = []
+
+              def walk(value, path=""):
+                  if isinstance(value, dict):
+                      for key, child in value.items():
+                          key_norm = normalize_key(key)
+                          current_path = (
+                              f"{path}.{key}" if path else str(key)
+                          )
+
+                          if (
+                              "max" in key_norm
+                              and (
+                                  "bid" in key_norm
+                                  or "price" in key_norm
+                                  or "amount" in key_norm
+                              )
+                          ):
+                              number = as_int(child)
+
+                              if number is not None:
+                                  candidates.append(
+                                      (
+                                          number,
+                                          current_path
+                                      )
+                                  )
+
+                          walk(child, current_path)
+
+                  elif isinstance(value, list):
+                      for index, child in enumerate(value):
+                          walk(
+                              child,
+                              f"{path}[{index}]"
+                          )
+
+              walk(obj)
+
+              if not candidates:
+                  return None
+
+              candidates.sort(key=lambda item: len(item[1]))
+
+              return candidates[0]
+
+
+          def opportunity_score(task, core, knowledge):
+              """
+              Deterministic scoring only.
+              No external AI.
+              No Gemini.
+              """
+
+              title = task_title(task).lower()
+
+              text_parts = [title]
+
+              for key in (
                   "description",
-                  "body",
-                  "reward",
-                  "reward_sats",
-                  "budget",
-                  "budget_sats",
-                  "max_reward_sats",
-              )
-
-              for key in fields:
+                  "details",
+                  "requirements",
+                  "skills",
+                  "category",
+                  "tags"
+              ):
                   value = task.get(key)
 
-                  if value is None:
-                      continue
+                  if isinstance(value, str):
+                      text_parts.append(value.lower())
 
-                  if isinstance(value, (int, float)):
-                      candidates.append(str(value))
-
-                  elif isinstance(value, dict):
-                      for subkey in (
-                          "sats",
-                          "amount_sats",
-                          "reward_sats",
-                          "max_sats",
-                      ):
-                          if subkey in value:
-                              candidates.append(str(value[subkey]))
-
-                  else:
-                      candidates.append(str(value))
-
-              found = []
-
-              for raw in candidates:
-                  text = raw.lower().replace(",", "")
-
-                  for match in re.finditer(
-                      r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:sats?|sat)\b",
-                      text,
-                  ):
-                      try:
-                          amount = int(float(match.group(1)))
-                          if amount > 0:
-                              found.append(amount)
-                      except Exception:
-                          pass
-
-              return max(found) if found else None
-
-          def extract_task_id(task):
-              for key in ("id", "task_id", "uuid"):
-                  value = task.get(key)
-                  if value:
-                      return str(value)
-              return None
-
-          def extract_status(task):
-              for key in ("status", "state"):
-                  value = task.get(key)
-                  if value is not None:
-                      return str(value).lower()
-              return ""
-
-          def extract_title(task):
-              title = task.get("title")
-              if title:
-                  return str(title).strip()
-
-              return "Untitled task"
-
-          def normalize_tasks(result):
-              if isinstance(result, list):
-                  return result
-
-              if not isinstance(result, dict):
-                  return []
-
-              for key in (
-                  "items",
-                  "tasks",
-                  "results",
-                  "data",
-              ):
-                  value = result.get(key)
-
-                  if isinstance(value, list):
-                      return value
-
-                  if isinstance(value, dict):
-                      for nested in ("items", "tasks", "results"):
-                          if isinstance(value.get(nested), list):
-                              return value[nested]
-
-              return []
-
-          def normalize_bids(result):
-              if isinstance(result, list):
-                  return result
-
-              if not isinstance(result, dict):
-                  return []
-
-              for key in (
-                  "items",
-                  "bids",
-                  "results",
-                  "data",
-              ):
-                  value = result.get(key)
-
-                  if isinstance(value, list):
-                      return value
-
-                  if isinstance(value, dict):
-                      for nested in ("items", "bids", "results"):
-                          if isinstance(value.get(nested), list):
-                              return value[nested]
-
-              return []
-
-          def bid_owner_is_nox(bid, username):
-              for key in (
-                  "username",
-                  "agent_username",
-                  "bidder_username",
-                  "author_username",
-              ):
-                  value = bid.get(key)
-                  if value and str(value).lower() == username.lower():
-                      return True
-
-              for key in ("bidder", "agent", "author", "user"):
-                  obj = bid.get(key)
-
-                  if isinstance(obj, dict):
-                      value = (
-                          obj.get("username")
-                          or obj.get("handle")
-                          or obj.get("name")
+                  elif isinstance(value, list):
+                      text_parts.extend(
+                          str(x).lower()
+                          for x in value
                       )
 
-                      if value and str(value).lower() == username.lower():
-                          return True
-
-              return False
-
-          def choose_bid_amount(task, reward_sats):
-              """
-              No 10-sat floor.
-              Never exceeds an explicitly detected reward.
-              Never invents a currency conversion.
-
-              If the task reward is explicit, use the smallest valid
-              positive sats amount, unless the task exposes a specific
-              minimum bid.
-              """
-
-              minimums = []
-
-              for key in (
-                  "min_bid_sats",
-                  "minimum_bid_sats",
-                  "min_price_sats",
-              ):
-                  value = task.get(key)
-
-                  try:
-                      if value is not None:
-                          minimums.append(int(value))
-                  except Exception:
-                      pass
-
-              if minimums:
-                  amount = max(MIN_BID_SATS, max(minimums))
-              else:
-                  amount = MIN_BID_SATS
-
-              if reward_sats is not None:
-                  amount = min(amount, reward_sats)
-
-              return amount if amount >= MIN_BID_SATS else None
-
-          def relevant_task(task, knowledge, core):
-              text = text_blob(task)
-
-              positive = {
-                  "research": 4,
-                  "research report": 6,
-                  "deep research": 7,
-                  "technical report": 6,
-                  "report writing": 5,
-                  "write a report": 5,
-                  "agent tools": 5,
-                  "build agent tools": 6,
-                  "agent tooling": 6,
-                  "tool development": 5,
-                  "python": 3,
-                  "automation": 3,
-                  "github": 2,
-                  "api": 3,
-                  "data": 2,
-                  "analysis": 3,
-                  "documentation": 2,
-                  "writing": 2,
-              }
-
-              negative = {
-                  "payment required": 8,
-                  "pay upfront": 8,
-                  "buy": 5,
-                  "purchase": 5,
-                  "subscription": 5,
-              }
+              text = " ".join(text_parts)
 
               score = 0
-              matched = []
+              reasons = []
 
-              for phrase, weight in positive.items():
-                  if phrase in text:
-                      score += weight
-                      matched.append(phrase)
-
-              for phrase, weight in negative.items():
-                  if phrase in text:
-                      score -= weight
-
-              # Core/Knowledge context can increase confidence,
-              # but never invents task requirements.
-              learned_text = json.dumps(
-                  {
-                      "knowledge": knowledge.get("learnings", [])[-30:],
-                      "core": core.get("learnings", [])[-30:],
-                  },
-                  ensure_ascii=False,
-              ).lower()
-
-              for phrase in (
+              high_value_terms = (
                   "research",
-                  "report",
-                  "agent tools",
+                  "research report",
+                  "deep research",
+                  "technical report",
+                  "report writing",
+                  "write a report",
+                  "analysis",
+                  "technical",
+                  "documentation",
+                  "agent",
+                  "agent tooling",
+                  "build agent tools",
                   "tool development",
                   "python",
                   "automation",
-              ):
-                  if phrase in learned_text and phrase in text:
-                      score += 1
+                  "data",
+                  "verification",
+                  "verify",
+                  "receipt",
+                  "evidence",
+                  "testing"
+              )
 
-              return score, matched
+              learning_terms = (
+                  "learn",
+                  "feedback",
+                  "test",
+                  "testing",
+                  "review",
+                  "verify",
+                  "verification",
+                  "experiment",
+                  "documentation"
+              )
+
+              relationship_terms = (
+                  "collaboration",
+                  "collaborate",
+                  "community",
+                  "agent",
+                  "discussion",
+                  "contribution"
+              )
+
+              for term in high_value_terms:
+                  if term in text:
+                      score += 5
+                      reasons.append(term)
+
+              for term in learning_terms:
+                  if term in text:
+                      score += 2
+                      reasons.append(f"learning:{term}")
+
+              for term in relationship_terms:
+                  if term in text:
+                      score += 1
+                      reasons.append(f"relation:{term}")
+
+              reward = extract_reward_sats(task)
+
+              if reward is not None:
+                  if reward >= 10000:
+                      score += 6
+                      reasons.append("high_reward")
+                  elif reward >= 1000:
+                      score += 4
+                      reasons.append("paid")
+                  elif reward >= 1:
+                      score += 2
+                      reasons.append("reward_present")
+                  else:
+                      reasons.append("zero_reward_possible_tip")
+
+              core_text = json.dumps(
+                  core,
+                  ensure_ascii=False
+              ).lower()
+
+              knowledge_text = json.dumps(
+                  knowledge,
+                  ensure_ascii=False
+              ).lower()
+
+              overlap_terms = (
+                  "research",
+                  "python",
+                  "agent",
+                  "verification",
+                  "report",
+                  "tool",
+                  "documentation"
+              )
+
+              for term in overlap_terms:
+                  if term in text and (
+                      term in core_text
+                      or term in knowledge_text
+                  ):
+                      score += 2
+                      reasons.append(
+                          f"context:{term}"
+                      )
+
+              return score, list(dict.fromkeys(reasons))
+
+
+          def task_already_tracked(memory, task_id):
+              for item in memory.get("opportunities", []):
+                  if item.get("task_id") == task_id:
+                      return item
+
+              return None
+
+
+          def task_has_existing_bid(token, task_id):
+              try:
+                  payload = request(
+                      "GET",
+                      f"/marketplace/{task_id}/bids",
+                      token=token
+                  )
+
+                  bids = extract_items(
+                      payload,
+                      (
+                          "bids",
+                          "items",
+                          "data"
+                      )
+                  )
+
+                  for bid in bids:
+                      if not isinstance(bid, dict):
+                          continue
+
+                      if (
+                          bid.get("is_mine") is True
+                          or bid.get("mine") is True
+                          or bid.get("is_own") is True
+                      ):
+                          return True
+
+                      username = str(
+                          bid.get("username", "")
+                      ).lower()
+
+                      bidder = str(
+                          bid.get("bidder", "")
+                      ).lower()
+
+                      if (
+                          username == "nox_origine"
+                          or bidder == "nox_origine"
+                      ):
+                          return True
+
+                  return False
+
+              except Exception as exc:
+                  print(
+                      f"BID CHECK WARNING: "
+                      f"{task_id}: {exc}"
+                  )
+
+                  return False
+
+
+          def choose_bid_amount(task):
+              """
+              Returns:
+                  (amount, reason)
+
+              The important rule:
+              if the actual minimum bid cannot be determined,
+              return None and skip the bid.
+              """
+
+              minimum = find_bid_minimum(task)
+              maximum = find_bid_maximum(task)
+              reward = extract_reward_sats(task)
+
+              if minimum is None:
+                  return (
+                      None,
+                      "no_explicit_minimum_bid_found"
+                  )
+
+              bid = minimum
+
+              if maximum is not None and bid > maximum:
+                  return (
+                      None,
+                      "invalid_minimum_above_maximum"
+                  )
+
+              if bid < MIN_OPPORTUNITY_SATS:
+                  return (
+                      None,
+                      "minimum_below_opportunity_floor"
+                  )
+
+              if reward is not None and reward > 0:
+                  """
+                  Do not automatically bid above the advertised
+                  reward. This prevents nonsensical bids while
+                  preserving low-value opportunities for tips.
+                  """
+
+                  if bid > reward:
+                      return (
+                          None,
+                          "minimum_bid_above_reward"
+                      )
+
+              return (
+                  bid,
+                  f"explicit_minimum:{minimum}"
+              )
+
+
+          def build_bid_description(task, score, reasons):
+              title = task_title(task)
+
+              clean_reasons = ", ".join(
+                  reasons[:5]
+              )
+
+              return (
+                  "NØX can contribute deterministically to this task. "
+                  f"Relevant signals: {clean_reasons or 'task relevance'}. "
+                  "I can provide evidence-based work and keep the "
+                  "result traceable."
+              )
+
+
+          def submit_bid(
+              token,
+              task_id,
+              amount,
+              description
+          ):
+              body = {
+                  "amount_sats": amount,
+                  "description": description
+              }
+
+              return request(
+                  "POST",
+                  f"/marketplace/{task_id}/bid",
+                  token=token,
+                  body=body
+              )
+
+
+          def payment_status(token, task_id):
+              try:
+                  return request(
+                      "GET",
+                      f"/marketplace/{task_id}/payment",
+                      token=token
+                  )
+              except Exception as exc:
+                  return {
+                      "error": str(exc)
+                  }
+
+
+          # ---------------------------------------------------------
+          # LOAD MEMORY
+          # ---------------------------------------------------------
 
           core = load_json(
               CORE_MEMORY_FILE,
               {
+                  "version": 1,
                   "observations": [],
                   "decisions": [],
                   "actions": [],
-                  "learnings": [],
-              },
+                  "learnings": []
+              }
           )
 
           runtime = load_json(
               CORE_RUNTIME_FILE,
               {
+                  "version": 1,
+                  "commented_post_ids": [],
+                  "seen_notification_ids": [],
+                  "auto_reply_counts": {},
                   "skill_attempt_counts": {},
                   "skill_success_counts": {},
                   "task_skills": {},
-              },
+                  "web_queries": [],
+                  "run_count": 0
+              }
           )
 
           knowledge = load_json(
               KNOWLEDGE_FILE,
               {
+                  "version": 1,
                   "facts": [],
                   "experiences": [],
                   "learnings": [],
-              },
+                  "sources": []
+              }
           )
 
-          memory = load_json(
+          action_memory = load_json(
               ACTION_MEMORY_FILE,
               {
                   "version": 1,
-                  "runs": [],
-                  "tasks": {},
-                  "bids": {},
-                  "payments": {},
                   "opportunities": [],
-                  "learnings": [],
-              },
+                  "bids": [],
+                  "runs": []
+              }
           )
 
-          if not isinstance(memory.get("tasks"), dict):
-              memory["tasks"] = {}
+          if not isinstance(action_memory, dict):
+              action_memory = {
+                  "version": 1,
+                  "opportunities": [],
+                  "bids": [],
+                  "runs": []
+              }
 
-          if not isinstance(memory.get("bids"), dict):
-              memory["bids"] = {}
-
-          if not isinstance(memory.get("payments"), dict):
-              memory["payments"] = {}
-
-          if not isinstance(memory.get("opportunities"), list):
-              memory["opportunities"] = []
-
-          if not isinstance(memory.get("learnings"), list):
-              memory["learnings"] = []
-
-          token = authenticate()
-
-          me = api(
-              "GET",
-              "/users/me",
-              token=token,
+          action_memory.setdefault(
+              "opportunities",
+              []
           )
+
+          action_memory.setdefault(
+              "bids",
+              []
+          )
+
+          action_memory.setdefault(
+              "runs",
+              []
+          )
+
+
+          # ---------------------------------------------------------
+          # AUTH
+          # ---------------------------------------------------------
+
+          try:
+              token = get_token()
+          except Exception as exc:
+              print(f"AUTH ERROR: {exc}")
+              sys.exit(1)
+
+
+          # ---------------------------------------------------------
+          # PROFILE
+          # ---------------------------------------------------------
+
+          try:
+              profile = request(
+                  "GET",
+                  "/users/me",
+                  token=token
+              )
+          except Exception as exc:
+              print(f"PROFILE ERROR: {exc}")
+              sys.exit(1)
 
           username = (
-              me.get("username")
-              or me.get("handle")
-              or "nox_origine"
+              profile.get("username")
+              or profile.get("handle")
+              or profile.get("name")
+              or "unknown"
           )
 
-          print(f"=== NØX ACTION & OPPORTUNITIES ===")
+          print("=== NØX ACTION & OPPORTUNITIES ===")
           print(f"Profile: {username}")
-          print("Policy: €0 / no spending / no payment / no Gemini")
-
-          # ------------------------------------------------------------
-          # 1. READ MARKETPLACE
-          # ------------------------------------------------------------
-
-          tasks_result = api(
-              "GET",
-              f"/marketplace/tasks?limit={MAX_TASKS}",
-              token=token,
+          print(
+              "Policy: €0 / no spending / no payment / "
+              "no Gemini / no external AI"
+          )
+          print(
+              f"Opportunity floor: {MIN_OPPORTUNITY_SATS} sat"
+          )
+          print(
+              "Bid floor: determined from task data; "
+              "no arbitrary fallback"
           )
 
-          tasks = normalize_tasks(tasks_result)
 
-          print(f"Marketplace tasks observed: {len(tasks)}")
+          # ---------------------------------------------------------
+          # MARKETPLACE TASKS
+          # ---------------------------------------------------------
 
-          selected = []
-          free_learning = 0
+          try:
+              payload = request(
+                  "GET",
+                  f"/marketplace/tasks?limit={MAX_TASKS_PER_RUN}",
+                  token=token
+              )
+          except Exception as exc:
+              print(f"TASK FETCH ERROR: {exc}")
+              sys.exit(1)
+
+          tasks = extract_items(
+              payload,
+              (
+                  "tasks",
+                  "items",
+                  "data"
+              )
+          )
+
+          tasks = tasks[:MAX_TASKS_PER_RUN]
+
+          print(
+              f"Marketplace tasks observed: {len(tasks)}"
+          )
+
+
+          # ---------------------------------------------------------
+          # EVALUATION
+          # ---------------------------------------------------------
+
+          candidates = []
 
           for task in tasks:
+              if not isinstance(task, dict):
+                  continue
+
               task_id = extract_task_id(task)
 
               if not task_id:
                   continue
 
-              title = extract_title(task)
-              status = extract_status(task)
-              reward_sats = parse_explicit_sats(task)
+              reward = extract_reward_sats(task)
 
-              score, matched = relevant_task(
+              # A 0/1 sat reward is NOT automatically rejected.
+              # It can still be useful for learning/tips/relations.
+              if reward is not None and reward < MIN_OPPORTUNITY_SATS:
+                  print(
+                      f"OPPORTUNITY LOW VALUE: {task_id} "
+                      f"reward={reward} sat; "
+                      "kept for learning/tip potential"
+                  )
+
+              score, reasons = opportunity_score(
                   task,
-                  knowledge,
                   core,
+                  knowledge
               )
 
-              record = memory["tasks"].get(
-                  task_id,
-                  {
-                      "task_id": task_id,
-                      "first_seen_at": NOW,
-                  },
-              )
+              if score <= 0:
+                  continue
 
-              record.update(
+              candidates.append(
                   {
+                      "task": task,
                       "task_id": task_id,
-                      "title": title,
-                      "status": status,
-                      "reward_sats": reward_sats,
-                      "last_seen_at": NOW,
-                      "relevance_score": score,
-                      "matched_skills": matched,
+                      "title": task_title(task),
+                      "reward_sats": reward,
+                      "score": score,
+                      "reasons": reasons
                   }
               )
 
-              memory["tasks"][task_id] = record
-
-              # Unpaid / reward-unknown tasks are still useful
-              # learning opportunities, but are never assigned a
-              # fabricated bid value.
-              if reward_sats is None:
-                  if score >= 4:
-                      memory["opportunities"].append(
-                          {
-                              "id": str(uuid.uuid4()),
-                              "type": "free_or_unpriced_task",
-                              "task_id": task_id,
-                              "title": title,
-                              "score": score,
-                              "skills": matched,
-                              "observed_at": NOW,
-                              "action": "observe_only",
-                          }
-                      )
-                      free_learning += 1
-
-              elif reward_sats >= MIN_BID_SATS and score >= 4:
-                  selected.append(
-                      (
-                          score,
-                          reward_sats,
-                          task,
-                          matched,
-                      )
+          candidates.sort(
+              key=lambda item: (
+                  -item["score"],
+                  -(
+                      item["reward_sats"]
+                      if item["reward_sats"] is not None
+                      else 0
                   )
-
-          selected.sort(
-              key=lambda x: (
-                  x[0],
-                  x[1],
-              ),
-              reverse=True,
+              )
           )
 
-          # ------------------------------------------------------------
-          # 2. BID SAFETY + DUPLICATE CHECK
-          # ------------------------------------------------------------
+          print(
+              f"Relevant candidates: {len(candidates)}"
+          )
+
+
+          # ---------------------------------------------------------
+          # BID EXECUTION
+          # ---------------------------------------------------------
 
           bids_submitted = 0
           bids_skipped = 0
+          bid_errors = 0
 
-          for score, reward_sats, task, matched in selected:
-
-              if bids_submitted >= MAX_BIDS:
+          for candidate in candidates:
+              if bids_submitted >= MAX_BIDS_PER_RUN:
                   break
 
-              task_id = extract_task_id(task)
+              task = candidate["task"]
+              task_id = candidate["task_id"]
 
-              if not task_id:
-                  continue
-
-              # Do not bid twice when NØX already has a bid.
-              try:
-                  existing_result = api(
-                      "GET",
-                      f"/marketplace/{task_id}/bids",
-                      token=token,
-                  )
-
-                  existing_bids = normalize_bids(existing_result)
-
-              except Exception as exc:
+              if task_has_existing_bid(
+                  token,
+                  task_id
+              ):
                   print(
-                      f"BID CHECK ERROR: {task_id}: {exc}"
+                      f"BID SKIP: already submitted -> "
+                      f"{task_id}"
                   )
+
                   bids_skipped += 1
+
                   continue
 
-              already_bid = False
+              amount, amount_reason = choose_bid_amount(
+                  task
+              )
 
-              for bid in existing_bids:
-                  if bid_owner_is_nox(bid, username):
-                      already_bid = True
+              if amount is None:
+                  print(
+                      f"BID SKIP: {task_id} -> "
+                      f"{amount_reason}; "
+                      "opportunity remains tracked"
+                  )
 
-                      bid_id = (
-                          bid.get("id")
-                          or bid.get("bid_id")
+                  bids_skipped += 1
+
+                  existing = task_already_tracked(
+                      action_memory,
+                      task_id
+                  )
+
+                  if existing is None:
+                      action_memory["opportunities"].append(
+                          {
+                              "task_id": task_id,
+                              "title": candidate["title"],
+                              "reward_sats": candidate[
+                                  "reward_sats"
+                              ],
+                              "score": candidate["score"],
+                              "reasons": candidate["reasons"],
+                              "status": "tracked_no_bid",
+                              "bid_reason": amount_reason,
+                              "tip_potential": True,
+                              "observed_at": utc_now()
+                          }
                       )
 
-                      if bid_id:
-                          memory["bids"][str(bid_id)] = {
-                              **memory["bids"].get(
-                                  str(bid_id),
-                                  {}
-                              ),
-                              "bid_id": str(bid_id),
-                              "task_id": task_id,
-                              "status": bid.get("status"),
-                              "last_seen_at": NOW,
-                          }
-
-                      break
-
-              if already_bid:
-                  bids_skipped += 1
-                  print(
-                      f"BID SKIP: already submitted -> {task_id}"
-                  )
                   continue
 
-              bid_amount = choose_bid_amount(
+              description = build_bid_description(
                   task,
-                  reward_sats,
+                  candidate["score"],
+                  candidate["reasons"]
               )
 
-              if bid_amount is None:
-                  bids_skipped += 1
-                  continue
-
-              # Deterministic description.
-              # No external AI, no invented claim.
-              skill_text = ", ".join(matched[:4])
-
-              if skill_text:
-                  description = (
-                      "NØX can contribute on this task using: "
-                      + skill_text
-                      + "."
-                  )
-              else:
-                  description = (
-                      "NØX can evaluate and execute this task "
-                      "within its available capabilities."
-                  )
-
-              payload = {
-                  "bid_amount_sats": int(bid_amount),
-                  "bid_description": description,
-              }
-
-              idempotency_key = (
-                  f"nox-action-{task_id}-{bid_amount}"
+              print(
+                  f"BID ATTEMPT: {task_id} "
+                  f"amount={amount} sat "
+                  f"reason={amount_reason}"
               )
 
               try:
-                  result = api(
-                      "POST",
-                      f"/marketplace/{task_id}/bid",
-                      payload=payload,
-                      token=token,
-                      idempotency_key=idempotency_key,
+                  result = submit_bid(
+                      token,
+                      task_id,
+                      amount,
+                      description
                   )
-
-                  bid_id = (
-                      result.get("id")
-                      or result.get("bid_id")
-                  )
-
-                  bid_record = {
-                      "task_id": task_id,
-                      "bid_id": str(bid_id) if bid_id else None,
-                      "bid_amount_sats": int(bid_amount),
-                      "status": result.get("status"),
-                      "submitted_at": NOW,
-                      "score": score,
-                      "reward_sats": reward_sats,
-                      "skills": matched,
-                      "description": description,
-                  }
-
-                  if bid_id:
-                      memory["bids"][str(bid_id)] = bid_record
 
                   print(
-                      f"BID SUBMITTED: {title} | "
-                      f"{bid_amount} sats | "
-                      f"bid_id={bid_id}"
+                      f"BID SUCCESS: {task_id} "
+                      f"amount={amount} sat"
                   )
 
                   bids_submitted += 1
 
-              except Exception as exc:
-                  print(
-                      f"BID ERROR: {task_id}: {exc}"
-                  )
-
-                  memory["learnings"].append(
+                  action_memory["bids"].append(
                       {
-                          "type": "bid_error",
                           "task_id": task_id,
-                          "error": str(exc)[:300],
-                          "observed_at": NOW,
+                          "amount_sats": amount,
+                          "status": "submitted",
+                          "submitted_at": utc_now()
                       }
                   )
 
-          # ------------------------------------------------------------
-          # 3. TRACK EXISTING BIDS / TASK RESULTS
-          # ------------------------------------------------------------
+                  action_memory["opportunities"].append(
+                      {
+                          "task_id": task_id,
+                          "title": candidate["title"],
+                          "reward_sats": candidate[
+                              "reward_sats"
+                          ],
+                          "score": candidate["score"],
+                          "reasons": candidate["reasons"],
+                          "status": "bid_submitted",
+                          "bid_sats": amount,
+                          "tip_potential": True,
+                          "submitted_at": utc_now()
+                      }
+                  )
 
-          tracked_bids = list(
-              memory["bids"].items()
-          )[-MAX_TRACKED:]
+              except Exception as exc:
+                  error_text = str(exc)
 
-          accepted = 0
-          completed = 0
-          payment_checks = 0
+                  print(
+                      f"BID ERROR: {task_id}: "
+                      f"{error_text}"
+                  )
 
-          for bid_key, bid_record in tracked_bids:
+                  bid_errors += 1
 
-              task_id = bid_record.get("task_id")
+                  action_memory["bids"].append(
+                      {
+                          "task_id": task_id,
+                          "amount_sats": amount,
+                          "status": "error",
+                          "error": error_text,
+                          "observed_at": utc_now()
+                      }
+                  )
+
+                  action_memory["opportunities"].append(
+                      {
+                          "task_id": task_id,
+                          "title": candidate["title"],
+                          "reward_sats": candidate[
+                              "reward_sats"
+                          ],
+                          "score": candidate["score"],
+                          "reasons": candidate["reasons"],
+                          "status": "bid_error",
+                          "bid_sats": amount,
+                          "tip_potential": True,
+                          "error": error_text,
+                          "observed_at": utc_now()
+                      }
+                  )
+
+          # ---------------------------------------------------------
+          # PAYMENT / BID OBSERVATION
+          # ---------------------------------------------------------
+
+          tracked_bids = action_memory["bids"][-20:]
+
+          for item in tracked_bids:
+              task_id = item.get("task_id")
 
               if not task_id:
                   continue
 
-              try:
-                  current_bids_result = api(
-                      "GET",
-                      f"/marketplace/{task_id}/bids",
-                      token=token,
-                  )
-
-                  current_bids = normalize_bids(
-                      current_bids_result
-                  )
-
-              except Exception as exc:
-                  print(
-                      f"TRACK ERROR {task_id}: {exc}"
-                  )
-                  continue
-
-              current_bid = None
-
-              wanted_bid_id = bid_record.get("bid_id")
-
-              for bid in current_bids:
-                  candidate_id = (
-                      bid.get("id")
-                      or bid.get("bid_id")
-                  )
-
-                  if wanted_bid_id and candidate_id:
-                      if str(candidate_id) == str(wanted_bid_id):
-                          current_bid = bid
-                          break
-
-                  if not wanted_bid_id and bid_owner_is_nox(
-                      bid,
-                      username,
-                  ):
-                      current_bid = bid
-                      break
-
-              if current_bid:
-                  status = str(
-                      current_bid.get("status", "")
-                  ).lower()
-
-                  bid_record["status"] = status
-                  bid_record["last_checked_at"] = NOW
-
-                  if status in (
-                      "accepted",
-                      "assigned",
-                      "awarded",
-                  ):
-                      accepted += 1
-
-                      memory["learnings"].append(
-                          {
-                              "type": "bid_accepted",
-                              "task_id": task_id,
-                              "bid_id": bid_record.get("bid_id"),
-                              "observed_at": NOW,
-                          }
-                      )
-
-              # Track task state itself.
-              try:
-                  task_result = api(
-                      "GET",
-                      f"/marketplace/tasks?limit={MAX_TASKS}",
-                      token=token,
-                  )
-
-                  current_tasks = normalize_tasks(
-                      task_result
-                  )
-
-                  current_task = next(
-                      (
-                          t for t in current_tasks
-                          if str(extract_task_id(t)) == str(task_id)
-                      ),
-                      None,
-                  )
-
-                  if current_task:
-                      task_status = extract_status(
-                          current_task
-                      )
-
-                      memory["tasks"].setdefault(
-                          task_id,
-                          {
-                              "task_id": task_id,
-                              "first_seen_at": NOW,
-                          },
-                      )
-
-                      memory["tasks"][task_id].update(
-                          {
-                              "status": task_status,
-                              "last_seen_at": NOW,
-                          }
-                      )
-
-                      if task_status in (
-                          "completed",
-                          "complete",
-                          "delivered",
-                          "approved",
-                          "paid",
-                      ):
-                          completed += 1
-
-                      # Read-only payment verification.
-                      # NEVER POST payment / NEVER settle invoice.
-                      if (
-                          current_bid
-                          and str(
-                              current_bid.get("status", "")
-                          ).lower()
-                          in (
-                              "accepted",
-                              "assigned",
-                              "awarded",
-                              "completed",
-                              "approved",
-                              "paid",
-                          )
-                      ):
-                          try:
-                              payment_result = api(
-                                  "GET",
-                                  f"/marketplace/{task_id}/payment",
-                                  token=token,
-                              )
-
-                              payment_key = (
-                                  str(task_id)
-                              )
-
-                              memory["payments"][
-                                  payment_key
-                              ] = {
-                                  "task_id": task_id,
-                                  "checked_at": NOW,
-                                  "payment_status": (
-                                      payment_result.get("status")
-                                      if isinstance(
-                                          payment_result,
-                                          dict,
-                                      )
-                                      else None
-                                  ),
-                                  "read_only": True,
-                                  "payment_action": False,
-                              }
-
-                              payment_checks += 1
-
-                          except Exception as exc:
-                              # Payment endpoint may legitimately be
-                              # unavailable while a task is pending.
-                              print(
-                                  f"PAYMENT CHECK: {task_id}: "
-                                  f"{str(exc)[:200]}"
-                              )
-
-              except Exception as exc:
-                  print(
-                      f"TASK TRACK ERROR {task_id}: "
-                      f"{str(exc)[:200]}"
-                  )
-
-          # ------------------------------------------------------------
-          # 4. LEARNING
-          # ------------------------------------------------------------
-
-          if bids_submitted:
-              memory["learnings"].append(
-                  {
-                      "type": "execution",
-                      "message": (
-                          "Marketplace bids were submitted only "
-                          "after deterministic relevance and "
-                          "duplicate checks."
-                      ),
-                      "count": bids_submitted,
-                      "observed_at": NOW,
-                  }
+              status = payment_status(
+                  token,
+                  task_id
               )
 
-          if free_learning:
-              memory["learnings"].append(
-                  {
-                      "type": "opportunity_learning",
-                      "message": (
-                          "Unpriced/free tasks were observed as "
-                          "learning opportunities without inventing "
-                          "a bid price."
-                      ),
-                      "count": free_learning,
-                      "observed_at": NOW,
-                  }
-              )
+              item["payment_observation"] = status
+              item["payment_checked_at"] = utc_now()
 
-          if accepted:
-              memory["learnings"].append(
-                  {
-                      "type": "market_signal",
-                      "message": (
-                          "A submitted bid reached an accepted/"
-                          "assigned state."
-                      ),
-                      "count": accepted,
-                      "observed_at": NOW,
-                  }
-              )
+          # ---------------------------------------------------------
+          # MEMORY BOUNDARIES
+          # ---------------------------------------------------------
 
-          # ------------------------------------------------------------
-          # 5. BOUNDED MEMORY
-          # ------------------------------------------------------------
+          action_memory["opportunities"] = (
+              action_memory["opportunities"][
+                  -MAX_TRACKED_ITEMS:
+              ]
+          )
 
-          if len(memory["opportunities"]) > MAX_TRACKED:
-              memory["opportunities"] = (
-                  memory["opportunities"][-MAX_TRACKED:]
-              )
+          action_memory["bids"] = (
+              action_memory["bids"][
+                  -MAX_TRACKED_ITEMS:
+              ]
+          )
 
-          if len(memory["learnings"]) > MAX_TRACKED:
-              memory["learnings"] = (
-                  memory["learnings"][-MAX_TRACKED:]
-              )
-
-          # Keep only most recent task records.
-          if len(memory["tasks"]) > MAX_TRACKED:
-              items = list(memory["tasks"].items())
-              items.sort(
-                  key=lambda item: item[1].get(
-                      "last_seen_at",
-                      "",
-                  )
-              )
-              memory["tasks"] = dict(
-                  items[-MAX_TRACKED:]
-              )
-
-          if len(memory["bids"]) > MAX_TRACKED:
-              items = list(memory["bids"].items())
-              items.sort(
-                  key=lambda item: item[1].get(
-                      "submitted_at",
-                      "",
-                  )
-              )
-              memory["bids"] = dict(
-                  items[-MAX_TRACKED:]
-              )
-
-          if len(memory["payments"]) > MAX_TRACKED:
-              items = list(memory["payments"].items())
-              items.sort(
-                  key=lambda item: item[1].get(
-                      "checked_at",
-                      "",
-                  )
-              )
-              memory["payments"] = dict(
-                  items[-MAX_TRACKED:]
-              )
-
-          # ------------------------------------------------------------
-          # 6. RUN RECORD
-          # ------------------------------------------------------------
-
-          memory["runs"].append(
+          action_memory["runs"].append(
               {
-                  "timestamp": NOW,
+                  "run_at": utc_now(),
                   "tasks_observed": len(tasks),
-                  "candidate_tasks": len(selected),
+                  "candidates": len(candidates),
                   "bids_submitted": bids_submitted,
                   "bids_skipped": bids_skipped,
-                  "free_learning_opportunities": free_learning,
-                  "accepted_bids_seen": accepted,
-                  "completed_tasks_seen": completed,
-                  "payment_checks": payment_checks,
-                  "gemini_used": False,
-                  "external_ai_used": False,
-                  "project_cost_eur": 0,
-                  "auto_payment": False,
-                  "auto_spending": False,
+                  "bid_errors": bid_errors,
+                  "policy": {
+                      "project_cost_eur": 0,
+                      "gemini_used": False,
+                      "external_ai_used": False,
+                      "auto_payment": False,
+                      "auto_spending": False
+                  }
               }
           )
 
-          memory["runs"] = memory["runs"][-100:]
+          action_memory["runs"] = (
+              action_memory["runs"][-100:]
+          )
+
+          action_memory["version"] = 1
 
           save_json(
               ACTION_MEMORY_FILE,
-              memory,
+              action_memory
           )
 
-          print()
+
+          # ---------------------------------------------------------
+          # SUMMARY
+          # ---------------------------------------------------------
+
+          print("")
           print("=== NØX ACTION / OPPORTUNITIES SUMMARY ===")
           print(f"Tasks observed: {len(tasks)}")
-          print(f"Relevant candidates: {len(selected)}")
+          print(f"Relevant candidates: {len(candidates)}")
           print(f"Bids submitted: {bids_submitted}")
           print(f"Bids skipped: {bids_skipped}")
+          print(f"Bid errors: {bid_errors}")
           print(
-              f"Free/unpriced learning opportunities: "
-              f"{free_learning}"
+              "Low-value opportunities remain trackable "
+              "for learning/tip potential."
           )
-          print(f"Accepted bids seen: {accepted}")
-          print(f"Completed tasks seen: {completed}")
-          print(f"Payment checks: {payment_checks}")
-          print("Gemini: false")
-          print("External AI: false")
-          print("Project cost: €0")
-          print("Automatic payment: false")
-          print("Automatic spending: false")
-          print("=== ACTION / OPPORTUNITIES TERMINÉ ===")
+          print(
+              "No automatic payment or spending performed."
+          )
+          print("")
+          print("=== NØX ACTION / OPPORTUNITIES TERMINÉ ===")
           PY
 
       - name: Commit action memory
@@ -1106,14 +1248,13 @@ jobs:
           set -euo pipefail
 
           git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
+          git config user.email "nox@noreply.github.com"
 
           git add memory/nox_action_opportunities.json
 
           if git diff --cached --quiet; then
-            echo "No action-memory changes."
+            echo "No action-memory changes to commit."
             exit 0
           fi
 
-          git commit -m "NØX action opportunities update"
-          git push
+          git commit -
