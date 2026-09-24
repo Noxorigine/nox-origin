@@ -22,8 +22,12 @@ env:
   MAX_BIDS_PER_RUN: "2"
   MAX_TRACKED_ITEMS: "250"
 
-  # 1 sat reste le minimum conceptuel pour considérer
-  # une opportunité. Ce n'est PAS utilisé comme bid automatique.
+  # 1 sat reste le seuil conceptuel pour considérer
+  # une opportunité.
+  #
+  # IMPORTANT:
+  # ce seuil n'est jamais utilisé aveuglément comme montant
+  # de bid envoyé à l'API.
   MIN_OPPORTUNITY_SATS: "1"
 
   REQUEST_TIMEOUT_SECONDS: "15"
@@ -62,9 +66,7 @@ jobs:
           import os
           import re
           import sys
-          import time
           import urllib.error
-          import urllib.parse
           import urllib.request
           from datetime import datetime, timezone
           from pathlib import Path
@@ -129,69 +131,48 @@ jobs:
               try:
                   if not path.exists():
                       return default
-                  with path.open("r", encoding="utf-8") as f:
-                      value = json.load(f)
-                  return value
+
+                  with path.open("r", encoding="utf-8") as handle:
+                      return json.load(handle)
+
               except Exception as exc:
-                  print(f"WARNING: cannot read {path}: {exc}")
+                  print(
+                      f"WARNING: cannot read {path}: {exc}"
+                  )
                   return default
 
 
           def save_json(path, value):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
-              with tmp.open("w", encoding="utf-8") as f:
+              temp = path.with_suffix(
+                  path.suffix + ".tmp"
+              )
+
+              with temp.open(
+                  "w",
+                  encoding="utf-8"
+              ) as handle:
                   json.dump(
                       value,
-                      f,
+                      handle,
                       ensure_ascii=False,
                       indent=2
                   )
-                  f.write("\n")
+                  handle.write("\n")
 
-              tmp.replace(path)
-
-
-          def as_int(value):
-              if value is None:
-                  return None
-
-              if isinstance(value, bool):
-                  return None
-
-              if isinstance(value, int):
-                  return value if value >= 0 else None
-
-              if isinstance(value, float):
-                  return int(value) if value >= 0 else None
-
-              if isinstance(value, str):
-                  text = value.strip().lower()
-
-                  if not text:
-                      return None
-
-                  text = text.replace(",", "")
-                  text = text.replace(" ", "")
-
-                  match = re.search(r"(\d+(?:\.\d+)?)", text)
-
-                  if not match:
-                      return None
-
-                  try:
-                      number = float(match.group(1))
-                      if number < 0:
-                          return None
-                      return int(number)
-                  except Exception:
-                      return None
-
-              return None
+              temp.replace(path)
 
 
-          def request(method, path, token=None, body=None):
+          def request(
+              method,
+              path,
+              token=None,
+              body=None
+          ):
               url = API_BASE + path
 
               headers = {
@@ -200,15 +181,19 @@ jobs:
               }
 
               if token:
-                  headers["Authorization"] = f"Bearer {token}"
+                  headers["Authorization"] = (
+                      f"Bearer {token}"
+                  )
 
               data = None
 
               if body is not None:
                   data = json.dumps(body).encode("utf-8")
-                  headers["Content-Type"] = "application/json"
+                  headers["Content-Type"] = (
+                      "application/json"
+                  )
 
-              req = urllib.request.Request(
+              request_object = urllib.request.Request(
                   url,
                   data=data,
                   headers=headers,
@@ -217,10 +202,13 @@ jobs:
 
               try:
                   with urllib.request.urlopen(
-                      req,
+                      request_object,
                       timeout=REQUEST_TIMEOUT
                   ) as response:
-                      raw = response.read().decode("utf-8")
+
+                      raw = response.read().decode(
+                          "utf-8"
+                      )
 
                       if not raw:
                           return {}
@@ -231,17 +219,24 @@ jobs:
                           return {"raw": raw}
 
               except urllib.error.HTTPError as exc:
-                  raw = exc.read().decode("utf-8", errors="replace")
+                  raw = exc.read().decode(
+                      "utf-8",
+                      errors="replace"
+                  )
 
                   try:
                       payload = json.loads(raw)
                   except Exception:
                       payload = {"raw": raw}
 
-                  detail = payload.get("detail", payload)
+                  detail = payload.get(
+                      "detail",
+                      payload
+                  )
 
                   raise RuntimeError(
-                      f"{method} {path} -> HTTP {exc.code}: "
+                      f"{method} {path} -> HTTP "
+                      f"{exc.code}: "
                       f"{json.dumps(detail, ensure_ascii=False)}"
                   )
 
@@ -251,20 +246,84 @@ jobs:
                   )
 
 
-          def get_token():
-              token = os.environ.get("COLONY_API_TOKEN")
+          def exchange_api_key_for_jwt(api_key):
+              """
+              The Colony authentication flow:
 
-              if token:
-                  return token
+              raw col_ API key
+                  ->
+              POST /auth/token
+                  ->
+              access_token JWT
+                  ->
+              Authorization: Bearer <JWT>
+              """
 
-              token = os.environ.get("COLONY_API_KEY")
-
-              if token:
-                  return token
-
-              raise RuntimeError(
-                  "No COLONY_API_TOKEN or COLONY_API_KEY secret found."
+              payload = request(
+                  "POST",
+                  "/auth/token",
+                  body={
+                      "api_key": api_key
+                  }
               )
+
+              access_token = payload.get(
+                  "access_token"
+              )
+
+              if not access_token:
+                  raise RuntimeError(
+                      "POST /auth/token succeeded but "
+                      "no access_token was returned."
+                  )
+
+              return access_token
+
+
+          def get_access_token():
+              """
+              Supports both:
+              - COLONY_API_KEY containing col_...
+              - COLONY_API_TOKEN containing either
+                col_... or an already-issued JWT.
+
+              A raw API key is NEVER sent as Bearer.
+              """
+
+              api_key = os.environ.get(
+                  "COLONY_API_KEY",
+                  ""
+              ).strip()
+
+              token_value = os.environ.get(
+                  "COLONY_API_TOKEN",
+                  ""
+              ).strip()
+
+              credential = api_key or token_value
+
+              if not credential:
+                  raise RuntimeError(
+                      "No COLONY_API_KEY or "
+                      "COLONY_API_TOKEN secret found."
+                  )
+
+              if credential.startswith("col_"):
+                  print(
+                      "AUTH: API key detected; "
+                      "exchanging for JWT."
+                  )
+
+                  return exchange_api_key_for_jwt(
+                      credential
+                  )
+
+              print(
+                  "AUTH: bearer token detected; "
+                  "using it directly."
+              )
+
+              return credential
 
 
           def extract_items(payload, keys):
@@ -287,10 +346,49 @@ jobs:
               return []
 
 
-          def extract_task_id(task):
-              if not isinstance(task, dict):
+          def as_int(value):
+              if value is None:
                   return None
 
+              if isinstance(value, bool):
+                  return None
+
+              if isinstance(value, int):
+                  return value if value >= 0 else None
+
+              if isinstance(value, float):
+                  return int(value) if value >= 0 else None
+
+              if isinstance(value, str):
+                  text = value.strip()
+                  text = text.replace(",", "")
+                  text = text.replace(" ", "")
+
+                  match = re.search(
+                      r"(\d+(?:\.\d+)?)",
+                      text
+                  )
+
+                  if not match:
+                      return None
+
+                  try:
+                      number = float(
+                          match.group(1)
+                      )
+
+                      if number < 0:
+                          return None
+
+                      return int(number)
+
+                  except Exception:
+                      return None
+
+              return None
+
+
+          def extract_task_id(task):
               for key in (
                   "id",
                   "task_id",
@@ -313,25 +411,18 @@ jobs:
               ):
                   value = task.get(key)
 
-                  if isinstance(value, str) and value.strip():
+                  if (
+                      isinstance(value, str)
+                      and value.strip()
+                  ):
                       return value.strip()
 
               return "Untitled task"
 
 
           def extract_reward_sats(task):
-              """
-              Reward extraction is deliberately broad because Colony
-              task payloads may expose reward information under different
-              names.
-              """
-
-              if not isinstance(task, dict):
-                  return None
-
               direct_keys = (
                   "reward_sats",
-                  "reward",
                   "reward_amount_sats",
                   "amount_sats",
                   "payment_sats",
@@ -341,7 +432,9 @@ jobs:
               )
 
               for key in direct_keys:
-                  value = as_int(task.get(key))
+                  value = as_int(
+                      task.get(key)
+                  )
 
                   if value is not None:
                       return value
@@ -356,10 +449,18 @@ jobs:
                       "value",
                       "reward_sats"
                   ):
-                      value = as_int(reward.get(key))
+                      value = as_int(
+                          reward.get(key)
+                      )
 
                       if value is not None:
                           return value
+
+              if isinstance(reward, str):
+                  return as_int(reward)
+
+              if isinstance(reward, int):
+                  return reward
 
               return None
 
@@ -374,31 +475,34 @@ jobs:
 
           def find_bid_minimum(obj):
               """
-              Find an explicitly exposed bid minimum.
+              Search only for explicitly named minimum
+              bid/price/amount fields.
 
-              Important:
-              - We do NOT invent a fallback of 1 sat.
-              - We do NOT use an arbitrary 10-sat floor.
-              - We only accept values whose field name clearly refers
-                to a bid/price/amount minimum.
+              There is intentionally NO fallback to 1 sat.
               """
 
               candidates = []
 
               def walk(value, path=""):
                   if isinstance(value, dict):
+
                       for key, child in value.items():
-                          key_norm = normalize_key(key)
+                          normalized = normalize_key(
+                              key
+                          )
+
                           current_path = (
-                              f"{path}.{key}" if path else str(key)
+                              f"{path}.{key}"
+                              if path
+                              else str(key)
                           )
 
                           if (
-                              "min" in key_norm
+                              "min" in normalized
                               and (
-                                  "bid" in key_norm
-                                  or "price" in key_norm
-                                  or "amount" in key_norm
+                                  "bid" in normalized
+                                  or "price" in normalized
+                                  or "amount" in normalized
                               )
                           ):
                               number = as_int(child)
@@ -411,10 +515,16 @@ jobs:
                                       )
                                   )
 
-                          walk(child, current_path)
+                          walk(
+                              child,
+                              current_path
+                          )
 
                   elif isinstance(value, list):
-                      for index, child in enumerate(value):
+
+                      for index, child in enumerate(
+                          value
+                      ):
                           walk(
                               child,
                               f"{path}[{index}]"
@@ -423,14 +533,17 @@ jobs:
               walk(obj)
 
               valid = [
-                  item for item in candidates
+                  item
+                  for item in candidates
                   if item[0] >= MIN_OPPORTUNITY_SATS
               ]
 
               if not valid:
                   return None
 
-              valid.sort(key=lambda item: len(item[1]))
+              valid.sort(
+                  key=lambda item: len(item[1])
+              )
 
               return valid[0]
 
@@ -440,18 +553,24 @@ jobs:
 
               def walk(value, path=""):
                   if isinstance(value, dict):
+
                       for key, child in value.items():
-                          key_norm = normalize_key(key)
+                          normalized = normalize_key(
+                              key
+                          )
+
                           current_path = (
-                              f"{path}.{key}" if path else str(key)
+                              f"{path}.{key}"
+                              if path
+                              else str(key)
                           )
 
                           if (
-                              "max" in key_norm
+                              "max" in normalized
                               and (
-                                  "bid" in key_norm
-                                  or "price" in key_norm
-                                  or "amount" in key_norm
+                                  "bid" in normalized
+                                  or "price" in normalized
+                                  or "amount" in normalized
                               )
                           ):
                               number = as_int(child)
@@ -464,10 +583,16 @@ jobs:
                                       )
                                   )
 
-                          walk(child, current_path)
+                          walk(
+                              child,
+                              current_path
+                          )
 
                   elif isinstance(value, list):
-                      for index, child in enumerate(value):
+
+                      for index, child in enumerate(
+                          value
+                      ):
                           walk(
                               child,
                               f"{path}[{index}]"
@@ -478,21 +603,21 @@ jobs:
               if not candidates:
                   return None
 
-              candidates.sort(key=lambda item: len(item[1]))
+              candidates.sort(
+                  key=lambda item: len(item[1])
+              )
 
               return candidates[0]
 
 
-          def opportunity_score(task, core, knowledge):
-              """
-              Deterministic scoring only.
-              No external AI.
-              No Gemini.
-              """
-
-              title = task_title(task).lower()
-
-              text_parts = [title]
+          def opportunity_score(
+              task,
+              core,
+              knowledge
+          ):
+              text_parts = [
+                  task_title(task).lower()
+              ]
 
               for key in (
                   "description",
@@ -505,12 +630,14 @@ jobs:
                   value = task.get(key)
 
                   if isinstance(value, str):
-                      text_parts.append(value.lower())
+                      text_parts.append(
+                          value.lower()
+                      )
 
                   elif isinstance(value, list):
                       text_parts.extend(
-                          str(x).lower()
-                          for x in value
+                          str(item).lower()
+                          for item in value
                       )
 
               text = " ".join(text_parts)
@@ -518,7 +645,7 @@ jobs:
               score = 0
               reasons = []
 
-              high_value_terms = (
+              strong_terms = (
                   "research",
                   "research report",
                   "deep research",
@@ -554,7 +681,7 @@ jobs:
                   "documentation"
               )
 
-              relationship_terms = (
+              relation_terms = (
                   "collaboration",
                   "collaborate",
                   "community",
@@ -563,7 +690,7 @@ jobs:
                   "contribution"
               )
 
-              for term in high_value_terms:
+              for term in strong_terms:
                   if term in text:
                       score += 5
                       reasons.append(term)
@@ -571,27 +698,43 @@ jobs:
               for term in learning_terms:
                   if term in text:
                       score += 2
-                      reasons.append(f"learning:{term}")
+                      reasons.append(
+                          f"learning:{term}"
+                      )
 
-              for term in relationship_terms:
+              for term in relation_terms:
                   if term in text:
                       score += 1
-                      reasons.append(f"relation:{term}")
+                      reasons.append(
+                          f"relation:{term}"
+                      )
 
               reward = extract_reward_sats(task)
 
               if reward is not None:
+
                   if reward >= 10000:
                       score += 6
-                      reasons.append("high_reward")
+                      reasons.append(
+                          "high_reward"
+                      )
+
                   elif reward >= 1000:
                       score += 4
-                      reasons.append("paid")
+                      reasons.append(
+                          "paid"
+                      )
+
                   elif reward >= 1:
                       score += 2
-                      reasons.append("reward_present")
+                      reasons.append(
+                          "reward_present"
+                      )
+
                   else:
-                      reasons.append("zero_reward_possible_tip")
+                      reasons.append(
+                          "zero_reward_possible_tip"
+                      )
 
               core_text = json.dumps(
                   core,
@@ -603,7 +746,7 @@ jobs:
                   ensure_ascii=False
               ).lower()
 
-              overlap_terms = (
+              context_terms = (
                   "research",
                   "python",
                   "agent",
@@ -613,28 +756,48 @@ jobs:
                   "documentation"
               )
 
-              for term in overlap_terms:
-                  if term in text and (
-                      term in core_text
-                      or term in knowledge_text
+              for term in context_terms:
+                  if (
+                      term in text
+                      and (
+                          term in core_text
+                          or term in knowledge_text
+                      )
                   ):
                       score += 2
                       reasons.append(
                           f"context:{term}"
                       )
 
-              return score, list(dict.fromkeys(reasons))
+              return (
+                  score,
+                  list(
+                      dict.fromkeys(reasons)
+                  )
+              )
 
 
-          def task_already_tracked(memory, task_id):
-              for item in memory.get("opportunities", []):
-                  if item.get("task_id") == task_id:
+          def task_already_tracked(
+              memory,
+              task_id
+          ):
+              for item in memory.get(
+                  "opportunities",
+                  []
+              ):
+                  if (
+                      item.get("task_id")
+                      == task_id
+                  ):
                       return item
 
               return None
 
 
-          def task_has_existing_bid(token, task_id):
+          def task_has_existing_bid(
+              token,
+              task_id
+          ):
               try:
                   payload = request(
                       "GET",
@@ -652,27 +815,42 @@ jobs:
                   )
 
                   for bid in bids:
-                      if not isinstance(bid, dict):
+
+                      if not isinstance(
+                          bid,
+                          dict
+                      ):
                           continue
 
                       if (
-                          bid.get("is_mine") is True
-                          or bid.get("mine") is True
-                          or bid.get("is_own") is True
+                          bid.get("is_mine")
+                          is True
+                          or bid.get("mine")
+                          is True
+                          or bid.get("is_own")
+                          is True
                       ):
                           return True
 
                       username = str(
-                          bid.get("username", "")
+                          bid.get(
+                              "username",
+                              ""
+                          )
                       ).lower()
 
                       bidder = str(
-                          bid.get("bidder", "")
+                          bid.get(
+                              "bidder",
+                              ""
+                          )
                       ).lower()
 
                       if (
-                          username == "nox_origine"
-                          or bidder == "nox_origine"
+                          username
+                          == "nox_origine"
+                          or bidder
+                          == "nox_origine"
                       ):
                           return True
 
@@ -689,12 +867,10 @@ jobs:
 
           def choose_bid_amount(task):
               """
-              Returns:
-                  (amount, reason)
+              Determine a technically valid bid without
+              inventing a platform minimum.
 
-              The important rule:
-              if the actual minimum bid cannot be determined,
-              return None and skip the bid.
+              A 1-sat opportunity is still kept and tracked.
               """
 
               minimum = find_bid_minimum(task)
@@ -709,11 +885,12 @@ jobs:
 
               bid = minimum
 
-              if maximum is not None and bid > maximum:
-                  return (
-                      None,
-                      "invalid_minimum_above_maximum"
-                  )
+              if maximum is not None:
+                  if bid > maximum:
+                      return (
+                          None,
+                          "minimum_above_maximum"
+                      )
 
               if bid < MIN_OPPORTUNITY_SATS:
                   return (
@@ -721,18 +898,15 @@ jobs:
                       "minimum_below_opportunity_floor"
                   )
 
-              if reward is not None and reward > 0:
-                  """
-                  Do not automatically bid above the advertised
-                  reward. This prevents nonsensical bids while
-                  preserving low-value opportunities for tips.
-                  """
-
-                  if bid > reward:
-                      return (
-                          None,
-                          "minimum_bid_above_reward"
-                      )
+              if (
+                  reward is not None
+                  and reward > 0
+                  and bid > reward
+              ):
+                  return (
+                      None,
+                      "minimum_bid_above_reward"
+                  )
 
               return (
                   bid,
@@ -740,18 +914,20 @@ jobs:
               )
 
 
-          def build_bid_description(task, score, reasons):
-              title = task_title(task)
-
-              clean_reasons = ", ".join(
-                  reasons[:5]
+          def build_bid_description(
+              candidate
+          ):
+              reasons = ", ".join(
+                  candidate["reasons"][:5]
               )
 
               return (
-                  "NØX can contribute deterministically to this task. "
-                  f"Relevant signals: {clean_reasons or 'task relevance'}. "
-                  "I can provide evidence-based work and keep the "
-                  "result traceable."
+                  "NØX can contribute deterministically "
+                  "to this task. "
+                  f"Relevant signals: "
+                  f"{reasons or 'task relevance'}. "
+                  "I can provide evidence-based work "
+                  "and keep the result traceable."
               )
 
 
@@ -761,35 +937,37 @@ jobs:
               amount,
               description
           ):
-              body = {
-                  "amount_sats": amount,
-                  "description": description
-              }
-
               return request(
                   "POST",
                   f"/marketplace/{task_id}/bid",
                   token=token,
-                  body=body
+                  body={
+                      "amount_sats": amount,
+                      "description": description
+                  }
               )
 
 
-          def payment_status(token, task_id):
+          def payment_status(
+              token,
+              task_id
+          ):
               try:
                   return request(
                       "GET",
                       f"/marketplace/{task_id}/payment",
                       token=token
                   )
+
               except Exception as exc:
                   return {
                       "error": str(exc)
                   }
 
 
-          # ---------------------------------------------------------
-          # LOAD MEMORY
-          # ---------------------------------------------------------
+          # =========================================================
+          # MEMORY
+          # =========================================================
 
           core = load_json(
               CORE_MEMORY_FILE,
@@ -838,7 +1016,10 @@ jobs:
               }
           )
 
-          if not isinstance(action_memory, dict):
+          if not isinstance(
+              action_memory,
+              dict
+          ):
               action_memory = {
                   "version": 1,
                   "opportunities": [],
@@ -862,20 +1043,23 @@ jobs:
           )
 
 
-          # ---------------------------------------------------------
-          # AUTH
-          # ---------------------------------------------------------
+          # =========================================================
+          # AUTHENTICATION
+          # =========================================================
 
           try:
-              token = get_token()
+              token = get_access_token()
+
           except Exception as exc:
-              print(f"AUTH ERROR: {exc}")
+              print(
+                  f"AUTH ERROR: {exc}"
+              )
               sys.exit(1)
 
 
-          # ---------------------------------------------------------
+          # =========================================================
           # PROFILE
-          # ---------------------------------------------------------
+          # =========================================================
 
           try:
               profile = request(
@@ -883,8 +1067,11 @@ jobs:
                   "/users/me",
                   token=token
               )
+
           except Exception as exc:
-              print(f"PROFILE ERROR: {exc}")
+              print(
+                  f"PROFILE ERROR: {exc}"
+              )
               sys.exit(1)
 
           username = (
@@ -894,33 +1081,49 @@ jobs:
               or "unknown"
           )
 
-          print("=== NØX ACTION & OPPORTUNITIES ===")
-          print(f"Profile: {username}")
           print(
-              "Policy: €0 / no spending / no payment / "
-              "no Gemini / no external AI"
+              "=== NØX ACTION & OPPORTUNITIES ==="
           )
+
           print(
-              f"Opportunity floor: {MIN_OPPORTUNITY_SATS} sat"
+              f"Profile: {username}"
           )
+
+          print(
+              "Policy: €0 / no spending / "
+              "no payment / no Gemini / "
+              "no external AI"
+          )
+
+          print(
+              f"Opportunity floor: "
+              f"{MIN_OPPORTUNITY_SATS} sat"
+          )
+
           print(
               "Bid floor: determined from task data; "
               "no arbitrary fallback"
           )
 
 
-          # ---------------------------------------------------------
-          # MARKETPLACE TASKS
-          # ---------------------------------------------------------
+          # =========================================================
+          # MARKETPLACE
+          # =========================================================
 
           try:
               payload = request(
                   "GET",
-                  f"/marketplace/tasks?limit={MAX_TASKS_PER_RUN}",
+                  (
+                      "/marketplace/tasks"
+                      f"?limit={MAX_TASKS_PER_RUN}"
+                  ),
                   token=token
               )
+
           except Exception as exc:
-              print(f"TASK FETCH ERROR: {exc}")
+              print(
+                  f"TASK FETCH ERROR: {exc}"
+              )
               sys.exit(1)
 
           tasks = extract_items(
@@ -935,33 +1138,43 @@ jobs:
           tasks = tasks[:MAX_TASKS_PER_RUN]
 
           print(
-              f"Marketplace tasks observed: {len(tasks)}"
+              f"Marketplace tasks observed: "
+              f"{len(tasks)}"
           )
 
 
-          # ---------------------------------------------------------
-          # EVALUATION
-          # ---------------------------------------------------------
+          # =========================================================
+          # EVALUATE
+          # =========================================================
 
           candidates = []
 
           for task in tasks:
-              if not isinstance(task, dict):
+
+              if not isinstance(
+                  task,
+                  dict
+              ):
                   continue
 
-              task_id = extract_task_id(task)
+              task_id = extract_task_id(
+                  task
+              )
 
               if not task_id:
                   continue
 
-              reward = extract_reward_sats(task)
+              reward = extract_reward_sats(
+                  task
+              )
 
-              # A 0/1 sat reward is NOT automatically rejected.
-              # It can still be useful for learning/tips/relations.
-              if reward is not None and reward < MIN_OPPORTUNITY_SATS:
+              if (
+                  reward is not None
+                  and reward < MIN_OPPORTUNITY_SATS
+              ):
                   print(
-                      f"OPPORTUNITY LOW VALUE: {task_id} "
-                      f"reward={reward} sat; "
+                      f"OPPORTUNITY LOW VALUE: "
+                      f"{task_id} reward={reward} sat; "
                       "kept for learning/tip potential"
                   )
 
@@ -990,27 +1203,33 @@ jobs:
                   -item["score"],
                   -(
                       item["reward_sats"]
-                      if item["reward_sats"] is not None
+                      if item["reward_sats"]
+                      is not None
                       else 0
                   )
               )
           )
 
           print(
-              f"Relevant candidates: {len(candidates)}"
+              f"Relevant candidates: "
+              f"{len(candidates)}"
           )
 
 
-          # ---------------------------------------------------------
-          # BID EXECUTION
-          # ---------------------------------------------------------
+          # =========================================================
+          # BIDS
+          # =========================================================
 
           bids_submitted = 0
           bids_skipped = 0
           bid_errors = 0
 
           for candidate in candidates:
-              if bids_submitted >= MAX_BIDS_PER_RUN:
+
+              if (
+                  bids_submitted
+                  >= MAX_BIDS_PER_RUN
+              ):
                   break
 
               task = candidate["task"]
@@ -1021,19 +1240,19 @@ jobs:
                   task_id
               ):
                   print(
-                      f"BID SKIP: already submitted -> "
-                      f"{task_id}"
+                      f"BID SKIP: already submitted "
+                      f"-> {task_id}"
                   )
 
                   bids_skipped += 1
-
                   continue
 
-              amount, amount_reason = choose_bid_amount(
-                  task
+              amount, amount_reason = (
+                  choose_bid_amount(task)
               )
 
               if amount is None:
+
                   print(
                       f"BID SKIP: {task_id} -> "
                       f"{amount_reason}; "
@@ -1042,23 +1261,37 @@ jobs:
 
                   bids_skipped += 1
 
-                  existing = task_already_tracked(
-                      action_memory,
-                      task_id
+                  existing = (
+                      task_already_tracked(
+                          action_memory,
+                          task_id
+                      )
                   )
 
                   if existing is None:
-                      action_memory["opportunities"].append(
+                      action_memory[
+                          "opportunities"
+                      ].append(
                           {
                               "task_id": task_id,
-                              "title": candidate["title"],
+                              "title": candidate[
+                                  "title"
+                              ],
                               "reward_sats": candidate[
                                   "reward_sats"
                               ],
-                              "score": candidate["score"],
-                              "reasons": candidate["reasons"],
-                              "status": "tracked_no_bid",
-                              "bid_reason": amount_reason,
+                              "score": candidate[
+                                  "score"
+                              ],
+                              "reasons": candidate[
+                                  "reasons"
+                              ],
+                              "status": (
+                                  "tracked_no_bid"
+                              ),
+                              "bid_reason": (
+                                  amount_reason
+                              ),
                               "tip_potential": True,
                               "observed_at": utc_now()
                           }
@@ -1066,10 +1299,10 @@ jobs:
 
                   continue
 
-              description = build_bid_description(
-                  task,
-                  candidate["score"],
-                  candidate["reasons"]
+              description = (
+                  build_bid_description(
+                      candidate
+                  )
               )
 
               print(
@@ -1079,7 +1312,8 @@ jobs:
               )
 
               try:
-                  result = submit_bid(
+
+                  submit_bid(
                       token,
                       task_id,
                       amount,
@@ -1093,7 +1327,9 @@ jobs:
 
                   bids_submitted += 1
 
-                  action_memory["bids"].append(
+                  action_memory[
+                      "bids"
+                  ].append(
                       {
                           "task_id": task_id,
                           "amount_sats": amount,
@@ -1102,16 +1338,26 @@ jobs:
                       }
                   )
 
-                  action_memory["opportunities"].append(
+                  action_memory[
+                      "opportunities"
+                  ].append(
                       {
                           "task_id": task_id,
-                          "title": candidate["title"],
+                          "title": candidate[
+                              "title"
+                          ],
                           "reward_sats": candidate[
                               "reward_sats"
                           ],
-                          "score": candidate["score"],
-                          "reasons": candidate["reasons"],
-                          "status": "bid_submitted",
+                          "score": candidate[
+                              "score"
+                          ],
+                          "reasons": candidate[
+                              "reasons"
+                          ],
+                          "status": (
+                              "bid_submitted"
+                          ),
                           "bid_sats": amount,
                           "tip_potential": True,
                           "submitted_at": utc_now()
@@ -1119,6 +1365,7 @@ jobs:
                   )
 
               except Exception as exc:
+
                   error_text = str(exc)
 
                   print(
@@ -1128,7 +1375,9 @@ jobs:
 
                   bid_errors += 1
 
-                  action_memory["bids"].append(
+                  action_memory[
+                      "bids"
+                  ].append(
                       {
                           "task_id": task_id,
                           "amount_sats": amount,
@@ -1138,15 +1387,23 @@ jobs:
                       }
                   )
 
-                  action_memory["opportunities"].append(
+                  action_memory[
+                      "opportunities"
+                  ].append(
                       {
                           "task_id": task_id,
-                          "title": candidate["title"],
+                          "title": candidate[
+                              "title"
+                          ],
                           "reward_sats": candidate[
                               "reward_sats"
                           ],
-                          "score": candidate["score"],
-                          "reasons": candidate["reasons"],
+                          "score": candidate[
+                              "score"
+                          ],
+                          "reasons": candidate[
+                              "reasons"
+                          ],
                           "status": "bid_error",
                           "bid_sats": amount,
                           "tip_potential": True,
@@ -1155,50 +1412,70 @@ jobs:
                       }
                   )
 
-          # ---------------------------------------------------------
-          # PAYMENT / BID OBSERVATION
-          # ---------------------------------------------------------
 
-          tracked_bids = action_memory["bids"][-20:]
+          # =========================================================
+          # PAYMENT OBSERVATION
+          # =========================================================
 
-          for item in tracked_bids:
-              task_id = item.get("task_id")
+          for item in action_memory[
+              "bids"
+          ][-20:]:
+
+              task_id = item.get(
+                  "task_id"
+              )
 
               if not task_id:
                   continue
 
-              status = payment_status(
+              item[
+                  "payment_observation"
+              ] = payment_status(
                   token,
                   task_id
               )
 
-              item["payment_observation"] = status
-              item["payment_checked_at"] = utc_now()
+              item[
+                  "payment_checked_at"
+              ] = utc_now()
 
-          # ---------------------------------------------------------
-          # MEMORY BOUNDARIES
-          # ---------------------------------------------------------
 
-          action_memory["opportunities"] = (
-              action_memory["opportunities"][
-                  -MAX_TRACKED_ITEMS:
-              ]
-          )
+          # =========================================================
+          # MEMORY LIMITS
+          # =========================================================
 
-          action_memory["bids"] = (
-              action_memory["bids"][
-                  -MAX_TRACKED_ITEMS:
-              ]
-          )
+          action_memory[
+              "opportunities"
+          ] = action_memory[
+              "opportunities"
+          ][-MAX_TRACKED_ITEMS:]
 
-          action_memory["runs"].append(
+          action_memory[
+              "bids"
+          ] = action_memory[
+              "bids"
+          ][-MAX_TRACKED_ITEMS:]
+
+          action_memory[
+              "runs"
+          ].append(
               {
                   "run_at": utc_now(),
-                  "tasks_observed": len(tasks),
-                  "candidates": len(candidates),
-                  "bids_submitted": bids_submitted,
-                  "bids_skipped": bids_skipped,
-                  "bid_errors": bid_errors,
+                  "tasks_observed": len(
+                      tasks
+                  ),
+                  "candidates": len(
+                      candidates
+                  ),
+                  "bids_submitted": (
+                      bids_submitted
+                  ),
+                  "bids_skipped": (
+                      bids_skipped
+                  ),
+                  "bid_errors": (
+                      bid_errors
+                  ),
                   "policy": {
                       "project_cost_eur": 0,
                       "gemini_used": False,
@@ -1209,9 +1486,11 @@ jobs:
               }
           )
 
-          action_memory["runs"] = (
-              action_memory["runs"][-100:]
-          )
+          action_memory[
+              "runs"
+          ] = action_memory[
+              "runs"
+          ][-100:]
 
           action_memory["version"] = 1
 
@@ -1221,26 +1500,52 @@ jobs:
           )
 
 
-          # ---------------------------------------------------------
+          # =========================================================
           # SUMMARY
-          # ---------------------------------------------------------
+          # =========================================================
 
           print("")
-          print("=== NØX ACTION / OPPORTUNITIES SUMMARY ===")
-          print(f"Tasks observed: {len(tasks)}")
-          print(f"Relevant candidates: {len(candidates)}")
-          print(f"Bids submitted: {bids_submitted}")
-          print(f"Bids skipped: {bids_skipped}")
-          print(f"Bid errors: {bid_errors}")
           print(
-              "Low-value opportunities remain trackable "
-              "for learning/tip potential."
+              "=== NØX ACTION / OPPORTUNITIES SUMMARY ==="
           )
+
+          print(
+              f"Tasks observed: {len(tasks)}"
+          )
+
+          print(
+              f"Relevant candidates: "
+              f"{len(candidates)}"
+          )
+
+          print(
+              f"Bids submitted: "
+              f"{bids_submitted}"
+          )
+
+          print(
+              f"Bids skipped: "
+              f"{bids_skipped}"
+          )
+
+          print(
+              f"Bid errors: "
+              f"{bid_errors}"
+          )
+
+          print(
+              "Low-value opportunities remain "
+              "trackable for learning/tip potential."
+          )
+
           print(
               "No automatic payment or spending performed."
           )
+
           print("")
-          print("=== NØX ACTION / OPPORTUNITIES TERMINÉ ===")
+          print(
+              "=== NØX ACTION / OPPORTUNITIES TERMINÉ ==="
+          )
           PY
 
       - name: Commit action memory
@@ -1257,4 +1562,5 @@ jobs:
             exit 0
           fi
 
-          git commit -
+          git commit -m "NØX: update action and opportunities memory"
+          git push
