@@ -56,14 +56,36 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from colony_sdk import ColonyClient
+
+          client_methods = [
+              "get_for_you_feed",
+              "get_notifications",
+              "create_comment",
+              "create_post",
+          ]
+
+          missing = [
+              name
+              for name in client_methods
+              if not hasattr(ColonyClient, name)
+          ]
+
+          if missing:
+              raise RuntimeError(
+                  "Colony SDK is missing required methods: "
+                  + ", ".join(missing)
+              )
+
           print("Colony SDK import: OK")
-          print("ColonyClient: OK")
+          print("Required Colony SDK methods: OK")
           PY
 
       - name: Run NØX Colony Presence
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           import json
           import os
@@ -85,22 +107,32 @@ jobs:
           MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
           MAX_NOTIFICATIONS = int(os.environ["MAX_NOTIFICATIONS"])
 
-          MAX_COMMENTS_PER_RUN = int(os.environ["MAX_COMMENTS_PER_RUN"])
-          MAX_REPLIES_PER_RUN = int(os.environ["MAX_REPLIES_PER_RUN"])
+          MAX_COMMENTS_PER_RUN = int(
+              os.environ["MAX_COMMENTS_PER_RUN"]
+          )
+          MAX_REPLIES_PER_RUN = int(
+              os.environ["MAX_REPLIES_PER_RUN"]
+          )
           MAX_REPLIES_PER_SENDER = int(
               os.environ["MAX_REPLIES_PER_SENDER"]
           )
-          MAX_POSTS_PER_RUN = int(os.environ["MAX_POSTS_PER_RUN"])
+          MAX_POSTS_PER_RUN = int(
+              os.environ["MAX_POSTS_PER_RUN"]
+          )
 
           MIN_POST_INTERVAL_HOURS = int(
               os.environ["MIN_POST_INTERVAL_HOURS"]
           )
 
-          MAX_MEMORY_ITEMS = int(os.environ["MAX_MEMORY_ITEMS"])
+          MAX_MEMORY_ITEMS = int(
+              os.environ["MAX_MEMORY_ITEMS"]
+          )
           MAX_HANDLED_NOTIFICATIONS = int(
               os.environ["MAX_HANDLED_NOTIFICATIONS"]
           )
-          MAX_CONTEXT_CHARS = int(os.environ["MAX_CONTEXT_CHARS"])
+          MAX_CONTEXT_CHARS = int(
+              os.environ["MAX_CONTEXT_CHARS"]
+          )
 
 
           # ============================================================
@@ -133,9 +165,14 @@ jobs:
                   for name in names:
                       if name in obj and obj[name] is not None:
                           return obj[name]
+
               else:
                   for name in names:
-                      value = getattr(obj, name, None)
+                      value = getattr(
+                          obj,
+                          name,
+                          None
+                      )
 
                       if value is not None:
                           return value
@@ -155,7 +192,11 @@ jobs:
                   ) as handle:
                       return json.load(handle)
 
-              except Exception:
+              except Exception as exc:
+                  print(
+                      f"WARNING: unable to load "
+                      f"{path}: {type(exc).__name__}: {exc}"
+                  )
                   return default
 
 
@@ -204,13 +245,56 @@ jobs:
 
 
           # ============================================================
+          # SDK RESPONSE NORMALIZATION
+          #
+          # Current Colony SDK returns paginated dictionaries.
+          # This converts common response shapes into plain lists.
+          # ============================================================
+
+          def normalize_items(response, preferred_keys):
+              if response is None:
+                  return []
+
+              if isinstance(response, list):
+                  return response
+
+              if isinstance(response, tuple):
+                  return list(response)
+
+              if isinstance(response, dict):
+                  for key in preferred_keys:
+                      value = response.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+                  for key in (
+                      "items",
+                      "data",
+                      "results",
+                  ):
+                      value = response.get(key)
+
+                      if isinstance(value, list):
+                          return value
+
+                  return []
+
+              try:
+                  return list(response)
+
+              except TypeError:
+                  return []
+
+
+          # ============================================================
           # LANGUAGE DETECTION
           #
-          # Deterministic/local only.
+          # English is the primary/default language.
           #
-          # English is the default.
-          # If an incoming agent message is clearly written in another
-          # supported language, NØX answers in that language.
+          # Incoming agent messages are detected locally and
+          # deterministicly. If another supported language is clear,
+          # NØX responds in that language.
           #
           # No Gemini.
           # No external AI.
@@ -394,14 +478,9 @@ jobs:
 
               best_score = scores[best_language]
 
-              # English is the default when there is not enough
-              # deterministic evidence for another language.
               if best_score < 2:
                   return "en"
 
-              # When several languages are close, prefer English only
-              # if English has actual evidence; otherwise use the
-              # strongest detected language.
               ordered = sorted(
                   scores.items(),
                   key=lambda item: item[1],
@@ -409,8 +488,8 @@ jobs:
               )
 
               if len(ordered) > 1:
-                  first_language, first_score = ordered[0]
-                  second_language, second_score = ordered[1]
+                  first_score = ordered[0][1]
+                  second_score = ordered[1][1]
 
                   if (
                       first_score == second_score
@@ -535,7 +614,6 @@ jobs:
                   "où ",
                   "peux ",
                   "pouvez ",
-                  "comment ",
                   "cómo ",
                   "por qué ",
                   "puede ",
@@ -732,12 +810,34 @@ jobs:
               )
 
 
+          def extract_post_id_from_feed_item(item):
+              return clean_text(
+                  get_value(
+                      item,
+                      "post_id",
+                      "id",
+                      default=""
+                  )
+              )
+
+
+          def extract_feed_post(item):
+              if not isinstance(item, dict):
+                  return item
+
+              nested = item.get("post")
+
+              if isinstance(nested, dict):
+                  return nested
+
+              return item
+
+
           # ============================================================
           # SHARED COGNITIVE CONTEXT
           #
           # Presence reads CORE + KNOWLEDGE.
-          # Web research remains the responsibility of the
-          # MEMORY & KNOWLEDGE workflow.
+          # Web research remains inside MEMORY & KNOWLEDGE.
           # ============================================================
 
           def build_context(
@@ -775,10 +875,8 @@ jobs:
           # ============================================================
           # DETERMINISTIC COMMUNICATION
           #
-          # English is the default.
+          # English is the primary/default language.
           # Incoming language is respected when clearly detected.
-          #
-          # No external AI.
           # ============================================================
 
           def build_reply(
@@ -920,9 +1018,6 @@ jobs:
 
           # ============================================================
           # PUBLICATION SELECTION
-          #
-          # Publications come from learned material.
-          # Presence does not invent a random topic.
           # ============================================================
 
           def choose_public_post(
@@ -964,6 +1059,7 @@ jobs:
               for item in learnings:
                   if isinstance(item, str):
                       text = clean_text(item)
+
                   else:
                       text = clean_text(
                           get_value(
@@ -1112,12 +1208,18 @@ jobs:
               f"{len(context)} chars"
           )
 
-          print("Primary response language: English")
-          print("Incoming language adaptation: enabled")
+          print(
+              "Primary response language: English"
+          )
+          print(
+              "Incoming language adaptation: enabled"
+          )
           print("External AI: false")
           print("Gemini: false")
           print("Project cost: €0")
-          print("Spending/payment authority: false")
+          print(
+              "Spending/payment authority: false"
+          )
 
 
           # ============================================================
@@ -1140,19 +1242,37 @@ jobs:
 
           # ============================================================
           # OBSERVE
+          #
+          # Current SDK:
+          #   get_for_you_feed()
+          #   get_notifications()
           # ============================================================
 
-          feed = client.get_feed(
+          feed_response = client.get_for_you_feed(
               limit=MAX_FEED_ITEMS
           )
 
-          notifications = client.get_notifications(
-              limit=MAX_NOTIFICATIONS
+          notifications_response = (
+              client.get_notifications(
+                  limit=MAX_NOTIFICATIONS
+              )
           )
 
-          feed = list(feed or [])
-          notifications = list(
-              notifications or []
+          feed = normalize_items(
+              feed_response,
+              (
+                  "posts",
+                  "items",
+                  "feed",
+              )
+          )
+
+          notifications = normalize_items(
+              notifications_response,
+              (
+                  "notifications",
+                  "items",
+              )
           )
 
           print(
@@ -1199,7 +1319,6 @@ jobs:
                       )
                       + 1
                   )
-
 
           replies_sent = 0
           comments_sent = 0
@@ -1316,7 +1435,6 @@ jobs:
                   )
 
                   try:
-
                       client.create_comment(
                           target_id,
                           reply
@@ -1402,9 +1520,13 @@ jobs:
           # FEED RELATIONSHIPS + SELECTIVE COMMENTS
           # ============================================================
 
-          for post in feed:
+          for feed_item in feed:
 
-              post_id = extract_id(
+              post = extract_feed_post(
+                  feed_item
+              )
+
+              post_id = extract_post_id_from_feed_item(
                   post
               )
 
