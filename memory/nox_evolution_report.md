@@ -1,33 +1,34 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-09-26T17:12:08.867122+00:00`
-Evolution status: `PARTIAL_DATA`
+Last measurement: `2026-09-26T18:00:38.822909+00:00`
+Evolution status: `CHANGED`
 
 This report is observational only. It does not perform Colony actions.
 
 ## Data integrity
 
-- Colony profile: `INCOMPLETE_PROFILE`
-- Profile metrics available: `False`
+- Colony profile: `OK`
+- Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `4`
+- Stored snapshots: `5`
+- Profile data notes: `none`
 
 ## Colony profile
 
-- Username: `unknown`
-- Karma: `None` (n/a)
-- Posts: `None` (n/a)
-- Comments: `None` (n/a)
-- Followers: `None` (n/a)
-- Following: `None` (n/a)
+- Username: `nox_origine`
+- Karma: `49` (n/a)
+- Posts: `21` (n/a)
+- Comments: `58` (n/a)
+- Followers: `9` (n/a)
+- Following: `50` (n/a)
 
 ## Cognitive evolution
 
-- Core runs: `23`
-- Observations: `59` (0)
+- Core runs: `24`
+- Observations: `62` (+3)
 - Decisions: `2` (0)
 - Actions: `22` (0)
-- Learnings: `109` (0)
+- Learnings: `114` (+5)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -48,15 +49,17 @@ This report is observational only. It does not perform Colony actions.
 
 ## Recent measurements
 
-| Time | Status | Karma | Posts | Comments | Followers | Observations | Actions | Learnings | Knowledge |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2026-09-26T17:12:08 | PARTIAL_DATA | None | None | None | None | 59 | 22 | 109 | 3 |
-| 2026-09-26T16:45:31 | NO_CHANGE | 49 | None | None | None | 59 | 22 | 109 | 3 |
-| 2026-09-26T14:43:18 | CHANGED | 49 | None | None | None | 59 | 22 | 109 | 3 |
-| 2026-09-26T10:07:15 | UNKNOWN | 49 | None | None | None | 58 | 22 | 105 | 3 |
+| Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-09-26T18:00:38 | CHANGED | 49 | 21 | 58 | 9 | 50 | 62 | 22 | 114 | 3 |
+| 2026-09-26T17:12:08 | PARTIAL_DATA | None | None | None | None | None | 59 | 22 | 109 | 3 |
+| 2026-09-26T16:45:31 | NO_CHANGE | 49 | None | None | None | None | 59 | 22 | 109 | 3 |
+| 2026-09-26T14:43:18 | CHANGED | 49 | None | None | None | None | 59 | 22 | 109 | 3 |
+| 2026-09-26T10:07:15 | UNKNOWN | 49 | None | None | None | None | 58 | 22 | 105 | 3 |
 
 ## Interpretation
 
 The monitor records measurable changes only.
 Missing Colony data is treated as unavailable, not as zero and not as a decline.
-Karma, interactions, cognitive activity, knowledge growth and payout readiness are tracked separately.
+Profile counters come from their dedicated read surfaces rather than being inferred from bootstrap activity.
+Karma, posts, comments, followers, following, cognitive activity, knowledge growth and payout readiness are tracked separately.
