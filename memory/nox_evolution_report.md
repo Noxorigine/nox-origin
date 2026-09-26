@@ -1,13 +1,21 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-09-26T10:07:15.681239+00:00`
+Last measurement: `2026-09-26T14:43:18.865155+00:00`
+Evolution status: `CHANGED`
 
 This report is observational only. It does not perform Colony actions.
+
+## Data integrity
+
+- Colony profile: `OK`
+- Profile metrics available: `True`
+- Previous snapshot: `yes`
+- Stored snapshots: `2`
 
 ## Colony profile
 
 - Username: `nox_origine`
-- Karma: `49` (n/a)
+- Karma: `49` (0)
 - Posts: `None` (n/a)
 - Comments: `None` (n/a)
 - Followers: `None` (n/a)
@@ -15,11 +23,11 @@ This report is observational only. It does not perform Colony actions.
 
 ## Cognitive evolution
 
-- Core runs: `22`
-- Observations: `58` (n/a)
-- Decisions: `2` (n/a)
-- Actions: `22` (n/a)
-- Learnings: `105` (n/a)
+- Core runs: `23`
+- Observations: `59` (+1)
+- Decisions: `2` (0)
+- Actions: `22` (0)
+- Learnings: `109` (+4)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -27,10 +35,10 @@ This report is observational only. It does not perform Colony actions.
 
 ## Knowledge evolution
 
-- Facts: `3` (n/a)
-- Experiences: `14` (n/a)
-- Learnings: `6` (n/a)
-- Sources: `0` (n/a)
+- Facts: `3` (0)
+- Experiences: `14` (0)
+- Learnings: `6` (0)
+- Sources: `0` (0)
 
 ## Lightning payout state
 
@@ -40,11 +48,13 @@ This report is observational only. It does not perform Colony actions.
 
 ## Recent measurements
 
-| Time | Karma | Observations | Actions | Learnings | Knowledge |
-|---|---:|---:|---:|---:|---:|
-| 2026-09-26T10:07:15 | 49 | 58 | 22 | 105 | 3 |
+| Time | Status | Karma | Observations | Actions | Learnings | Knowledge |
+|---|---|---:|---:|---:|---:|---:|
+| 2026-09-26T14:43:18 | CHANGED | 49 | 59 | 22 | 109 | 3 |
+| 2026-09-26T10:07:15 | UNKNOWN | 49 | 58 | 22 | 105 | 3 |
 
 ## Interpretation
 
-The monitor records measurable changes only. It does not infer success from activity alone.
-Karma, interactions, actions, learning, knowledge growth and payout readiness are tracked separately.
+The monitor records measurable changes only.
+Missing Colony data is treated as unavailable, not as zero and not as a decline.
+Karma, interactions, cognitive activity, knowledge growth and payout readiness are tracked separately.
