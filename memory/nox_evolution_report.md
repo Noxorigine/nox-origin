@@ -1,7 +1,7 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-09-26T14:43:18.865155+00:00`
-Evolution status: `CHANGED`
+Last measurement: `2026-09-26T16:45:31.521005+00:00`
+Evolution status: `NO_CHANGE`
 
 This report is observational only. It does not perform Colony actions.
 
@@ -10,7 +10,7 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile metrics available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `2`
+- Stored snapshots: `3`
 
 ## Colony profile
 
@@ -24,10 +24,10 @@ This report is observational only. It does not perform Colony actions.
 ## Cognitive evolution
 
 - Core runs: `23`
-- Observations: `59` (+1)
+- Observations: `59` (0)
 - Decisions: `2` (0)
 - Actions: `22` (0)
-- Learnings: `109` (+4)
+- Learnings: `109` (0)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -50,6 +50,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|
+| 2026-09-26T16:45:31 | NO_CHANGE | 49 | 59 | 22 | 109 | 3 |
 | 2026-09-26T14:43:18 | CHANGED | 49 | 59 | 22 | 109 | 3 |
 | 2026-09-26T10:07:15 | UNKNOWN | 49 | 58 | 22 | 105 | 3 |
 
