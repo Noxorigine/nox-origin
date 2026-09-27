@@ -25,6 +25,9 @@ env:
   MAX_WEB_RESULTS: "5"
   WEB_TIMEOUT_SECONDS: "12"
   ACTION_THRESHOLD: "0.45"
+  GEMINI_MODEL: "gemini-3.7-flash"
+  GEMINI_THINKING_LEVEL: "medium"
+  MAX_GEMINI_CALLS_PER_RUN: "4"
 
 jobs:
   core-general:
@@ -39,12 +42,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Colony SDK
-        run: pip install colony-sdk
+      - name: Install Colony SDK + Gemini SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install colony-sdk google-genai pydantic
 
       - name: Run NØX Core General
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python3 - <<'PY'
           import json
@@ -57,16 +63,19 @@ jobs:
           from pathlib import Path
 
           from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
+          from google import genai
+          from pydantic import BaseModel, Field
 
 
           # ===========================================================
-          # NØX CORE GENERAL V2 — COGNITIVE CORE
+          # NØX CORE GENERAL V3 — COGNITIVE CORE + GEMINI REFLECTION
           #
           # Research → Understand → Recall → Reflect → Choose
           # → Act → Observe → Learn → Adapt
           #
           # Design goals:
-          # - real deterministic cognitive structure, without external AI
+          # - deterministic cognitive structure with Gemini used only as a
+          #   semantic reflection engine; execution remains deterministic
           # - interest/attention before action
           # - context reconstruction before response
           # - facts / reported information / hypotheses kept separate
@@ -77,8 +86,8 @@ jobs:
           # - failures classified and learned from
           # - useful dialogue preferred over generic activity
           # - silence / no-action is a valid decision
-          # - zero Gemini
-          # - zero external AI
+          # - Gemini is optional at runtime; when configured it is used only
+          #   for semantic reflection and response generation
           # - zero spending
           # - zero payments
           # - Lightning verification remains read-only
@@ -99,6 +108,10 @@ jobs:
           MAX_WEB_RESULTS = int(os.environ["MAX_WEB_RESULTS"])
           WEB_TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
           ACTION_THRESHOLD = float(os.environ["ACTION_THRESHOLD"])
+          GEMINI_MODEL = os.environ["GEMINI_MODEL"]
+          GEMINI_THINKING_LEVEL = os.environ["GEMINI_THINKING_LEVEL"]
+          MAX_GEMINI_CALLS_PER_RUN = int(os.environ["MAX_GEMINI_CALLS_PER_RUN"])
+          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
           NOW = datetime.now(timezone.utc).isoformat()
 
@@ -428,7 +441,121 @@ jobs:
 
 
           # ===========================================================
-          # 6. COGNITIVE MEMORY RECALL
+          # 6. GEMINI REFLECTION ENGINE
+          # ===========================================================
+
+          class GeminiReflection(BaseModel):
+              should_respond: bool = Field(description="Whether NØX should send a response now.")
+              response: str = Field(description="A concise, specific response NØX can actually send. Empty when should_respond is false.")
+              reasoning_summary: str = Field(description="Short explanation of the reasoning, not hidden chain-of-thought.")
+              confidence: str = Field(description="low, medium, or high")
+              uncertainties: list[str] = Field(default_factory=list)
+              evidence_needed: list[str] = Field(default_factory=list)
+
+          gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+          gemini_calls = 0
+
+          def gemini_reflect(case, mode):
+              global gemini_calls
+              if gemini_client is None:
+                  raise RuntimeError("GEMINI_API_KEY is missing.")
+              if gemini_calls >= MAX_GEMINI_CALLS_PER_RUN:
+                  raise RuntimeError("Gemini per-run cognitive budget exhausted.")
+
+              situation = case.get("situation", {})
+              prompt = {
+                  "role": "You are the reflective reasoning engine inside NØX, an autonomous AI agent.",
+                  "mission": "Understand the actual conversation/task and produce one genuinely relevant response when justified. Do not generate generic engagement.",
+                  "rules": [
+                      "Use only the supplied context and research results; never invent facts.",
+                      "Separate observed facts, reported claims, hypotheses and uncertainties.",
+                      "Consider the sender's actual words and the prior context before responding.",
+                      "If the context does not justify a useful response, set should_respond=false.",
+                      "A useful response must add information, ask a precise question, resolve an ambiguity, or advance the work.",
+                      "Do not mention this internal reasoning system.",
+                      "Do not expose chain-of-thought; provide only a short reasoning_summary.",
+                      "Write the response in English unless the incoming context is clearly French and a French reply is appropriate.",
+                      "Never claim NØX performed work, tests, research or verification that the supplied context does not prove.",
+                      "Do not ask for generic clarification when the available context already answers the point.",
+                  ],
+                  "mode": mode,
+                  "context": {
+                      "title": situation.get("title", ""),
+                      "body": situation.get("body", ""),
+                      "type": situation.get("type", ""),
+                      "questions": situation.get("questions", []),
+                      "claims": situation.get("claims", []),
+                      "markers": {
+                          "contradictions": situation.get("contradiction_markers", []),
+                          "evidence": situation.get("evidence_markers", []),
+                      },
+                      "recall": case.get("recall", {}).get("matches", [])[:5],
+                      "research": case.get("research", {}).get("results", [])[:5],
+                      "hypotheses": case.get("reflection", {}).get("hypotheses", []),
+                      "uncertainties": case.get("reflection", {}).get("uncertainties", []),
+                      "candidate_action": case.get("choice", {}).get("action"),
+                      "candidate_reason": case.get("choice", {}).get("reason"),
+                  },
+              }
+
+              interaction = gemini_client.interactions.create(
+                  model=GEMINI_MODEL,
+                  input=json.dumps(prompt, ensure_ascii=False),
+                  generation_config={"thinking_level": GEMINI_THINKING_LEVEL},
+                  response_format={
+                      "type": "text",
+                      "mime_type": "application/json",
+                      "schema": GeminiReflection.model_json_schema(),
+                  },
+              )
+              gemini_calls += 1
+              result = GeminiReflection.model_validate_json(interaction.output_text)
+              result.response = clean_text(result.response, 1800)
+              result.reasoning_summary = clean_text(result.reasoning_summary, 700)
+
+              # Deterministic quality gate: Gemini may reason, but the Core
+              # decides whether the produced text is specific enough to send.
+              generic_markers = (
+                  "thanks for sharing",
+                  "interesting perspective",
+                  "i agree",
+                  "good point",
+                  "this is interesting",
+                  "i understand the distinction better now",
+                  "the next useful step for me is to clarify",
+              )
+              normalized_response = lower_text(result.response)
+              if result.should_respond and (
+                  not result.response
+                  or len(result.response.split()) < 7
+                  or any(marker in normalized_response for marker in generic_markers)
+              ):
+                  result.should_respond = False
+                  result.response = ""
+                  result.reasoning_summary = (
+                      result.reasoning_summary
+                      + " Deterministic Core gate rejected a generic or insufficiently specific response."
+                  )[:700]
+
+              return result
+
+
+          def apply_gemini_reflection(case, mode):
+              reflection = gemini_reflect(case, mode)
+              case["gemini"] = reflection.model_dump()
+              if reflection.should_respond and reflection.response:
+                  case["generated_response"] = reflection.response
+                  case["choice"]["action"] = "gemini_respond"
+                  case["choice"]["score"] = max(float(case["choice"].get("score", 0)), 0.75)
+              else:
+                  case["generated_response"] = ""
+                  case["choice"]["action"] = "do_nothing"
+              case["confidence"] = reflection.confidence
+              return case
+
+
+          # ===========================================================
+          # 7. COGNITIVE MEMORY RECALL
           # ===========================================================
 
           def memory_search_terms(terms, limit=12):
@@ -1143,6 +1270,27 @@ jobs:
 
           print(f"COGNITION: {len(task_cases)} tâches comprises et réfléchies.")
 
+          # Gemini performs the actual semantic reflection only on the most relevant
+          # cases. The deterministic Core remains responsible for selection, limits,
+          # execution and learning.
+          gemini_candidates = task_cases[:MAX_COMMENTS]
+          for case in gemini_candidates:
+              try:
+                  apply_gemini_reflection(case, "public_task_comment")
+                  print(f"GEMINI REFLECT: {case['situation']['title'][:80]} -> {case['choice']['action']}")
+              except Exception as exc:
+                  case["gemini"] = {
+                      "should_respond": False,
+                      "response": "",
+                      "reasoning_summary": "Gemini reflection unavailable; no speculative response sent.",
+                      "confidence": "low",
+                      "uncertainties": [str(exc)[:300]],
+                      "evidence_needed": [],
+                  }
+                  case["generated_response"] = ""
+                  case["choice"]["action"] = "do_nothing"
+                  print(f"GEMINI REFLECT ERROR: {exc}")
+
 
           # ===========================================================
           # 13. CHOOSE — TASKS
@@ -1167,36 +1315,10 @@ jobs:
           # ===========================================================
 
           def build_task_comment(case):
-              post = case["situation"]
-              skills = case.get("skills", [])
-              intent = case.get("dialogue_intent")
-              title = clean_text(post.get("title", "cette mission"), 100)
-              skill_text = ", ".join(skills[:3]) or "ce type de travail"
-
-              if intent == "ask_for_evidence":
-                  return (
-                      f"I looked at “{title}” and the part I want to clarify before committing is the expected evidence of completion. "
-                      f"My relevant capabilities are {skill_text}. "
-                      "What would count as a successful deliverable, and how would you verify it?"
-                  )
-
-              if intent == "research_and_test":
-                  return (
-                      f"I examined “{title}” rather than treating the task as a simple capability match. "
-                      f"I can contribute with {skill_text}. "
-                      "Before acting, I would want to confirm the concrete input, expected output and validation criteria."
-                  )
-
-              if intent == "reconcile_conflict":
-                  return (
-                      f"I examined “{title}” and found a point that needs clarification before I would commit to an interpretation. "
-                      "What observation or criterion should we use to distinguish the competing interpretations?"
-                  )
-
-              return (
-                  f"I examined “{title}” in context. My relevant capabilities include {skill_text}. "
-                  "If the task is still open, please confirm the expected deliverable and validation criteria so I can work against a concrete result."
-              )
+              response = clean_text(case.get("generated_response", ""), 1800)
+              if not response:
+                  raise RuntimeError("Gemini did not produce a justified response for this task.")
+              return response
 
 
           comments_sent = 0
@@ -1352,6 +1474,27 @@ jobs:
                   intent = case["dialogue_intent"]
                   action_taken = False
 
+                  try:
+                      apply_gemini_reflection(case, "incoming_interaction")
+                  except Exception as exc:
+                      case["gemini"] = {
+                          "should_respond": False,
+                          "response": "",
+                          "reasoning_summary": "Gemini reflection unavailable; no speculative response sent.",
+                          "confidence": "low",
+                          "uncertainties": [str(exc)[:300]],
+                          "evidence_needed": [],
+                      }
+                      case["generated_response"] = ""
+                      case["choice"]["action"] = "do_nothing"
+                      print(f"GEMINI REFLECT ERROR: {exc}")
+
+                  if not case.get("generated_response"):
+                      print(f"CHOOSE: no justified Gemini response for {sender}.")
+                      continue
+
+                  generated_reply = case["generated_response"]
+
                   if intent == "do_nothing":
                       print(f"CHOOSE: silence conservée pour {sender}.")
                       continue
@@ -1380,21 +1523,7 @@ jobs:
                                   break
 
                           if target_post_id:
-                              if intent == "ask_for_evidence":
-                                  reply = (
-                                      "That is the point I would like to make concrete: what observation, test or artifact "
-                                      "would distinguish the claim from its alternatives?"
-                                  )
-                              elif intent == "reconcile_conflict":
-                                  reply = (
-                                      "I may be missing context. Which specific observation should determine between the two interpretations?"
-                                  )
-                              else:
-                                  reply = (
-                                      "I understand the distinction better now. The next useful step for me is to clarify the specific "
-                                      "condition or evidence that would confirm the interpretation."
-                                  )
-
+                              reply = generated_reply
                               client.create_comment(target_post_id, reply)
                               remember_action(
                                   "reply_to_task_response",
@@ -1424,10 +1553,7 @@ jobs:
 
                   elif intent == "share_relevant_experience":
                       try:
-                          reply = (
-                              "One thing I find useful here is to separate what was actually observed from what we infer from it. "
-                              "That distinction has changed how I evaluate my own interactions and failures."
-                          )
+                          reply = generated_reply
                           client.send_message(sender, reply)
                           remember_action(
                               "reply_to_social_interaction",
@@ -1446,10 +1572,7 @@ jobs:
 
                   elif intent == "answer_or_clarify":
                       try:
-                          reply = (
-                              "I want to answer the point rather than assume what you mean. "
-                              "What specific result or condition would you use to decide that the answer is correct?"
-                          )
+                          reply = generated_reply
                           client.send_message(sender, reply)
                           remember_action(
                               "reply_to_direct_interaction",
@@ -1599,6 +1722,7 @@ jobs:
           print(f"Commentaires envoyés: {comments_sent}")
           print(f"Nouvelles interactions: {new_alerts}")
           print(f"Réponses automatiques: {auto_replies}")
+          print(f"Gemini reflections: {gemini_calls}/{MAX_GEMINI_CALLS_PER_RUN}")
           print(f"Payout health: {payout_health.get('status')}")
           print(f"Cognitive queue: {len(runtime.get('cognitive_queue', []))}")
           print(f"Memory observations: {len(memory['observations'])}")
