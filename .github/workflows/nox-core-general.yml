@@ -21,8 +21,10 @@ env:
   MAX_AUTO_REPLIES_PER_RUN: "2"
   MAX_AUTO_REPLIES_PER_SENDER: "3"
   MAX_MEMORY_ITEMS: "250"
+  MAX_COGNITIVE_CASES: "120"
   MAX_WEB_RESULTS: "5"
   WEB_TIMEOUT_SECONDS: "12"
+  ACTION_THRESHOLD: "0.45"
 
 jobs:
   core-general:
@@ -58,20 +60,28 @@ jobs:
 
 
           # ===========================================================
-          # NØX CORE GENERAL
-          # Research → Understand → Reflect → Choose → Act
-          # → Observe → Learn → Adapt
+          # NØX CORE GENERAL V2 — COGNITIVE CORE
           #
-          # Constraints:
-          # - zéro Gemini
-          # - zéro IA externe
-          # - zéro dépense
-          # - aucun paiement
-          # - aucune API Colony inventée
-          # - actions limitées et traçables
-          # - mémoire persistante
-          # - recherche Web intégrée
-          # - contrôle LNURL-pay sans paiement
+          # Research → Understand → Recall → Reflect → Choose
+          # → Act → Observe → Learn → Adapt
+          #
+          # Design goals:
+          # - real deterministic cognitive structure, without external AI
+          # - interest/attention before action
+          # - context reconstruction before response
+          # - facts / reported information / hypotheses kept separate
+          # - uncertainty and contradictions explicitly represented
+          # - multiple possible actions before choosing one
+          # - expected outcome recorded before action
+          # - actual outcome compared with expectation afterwards
+          # - failures classified and learned from
+          # - useful dialogue preferred over generic activity
+          # - silence / no-action is a valid decision
+          # - zero Gemini
+          # - zero external AI
+          # - zero spending
+          # - zero payments
+          # - Lightning verification remains read-only
           # ===========================================================
 
           API_KEY = os.environ["COLONY_API_KEY"].strip()
@@ -83,26 +93,42 @@ jobs:
           MAX_TASKS = int(os.environ["MAX_TASKS_PER_RUN"])
           MAX_COMMENTS = int(os.environ["MAX_COMMENTS_PER_RUN"])
           MAX_AUTO_REPLIES = int(os.environ["MAX_AUTO_REPLIES_PER_RUN"])
-          MAX_AUTO_REPLIES_PER_SENDER = int(
-              os.environ["MAX_AUTO_REPLIES_PER_SENDER"]
-          )
+          MAX_AUTO_REPLIES_PER_SENDER = int(os.environ["MAX_AUTO_REPLIES_PER_SENDER"])
           MAX_MEMORY_ITEMS = int(os.environ["MAX_MEMORY_ITEMS"])
+          MAX_COGNITIVE_CASES = int(os.environ["MAX_COGNITIVE_CASES"])
           MAX_WEB_RESULTS = int(os.environ["MAX_WEB_RESULTS"])
           WEB_TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
+          ACTION_THRESHOLD = float(os.environ["ACTION_THRESHOLD"])
 
           NOW = datetime.now(timezone.utc).isoformat()
 
 
           # ===========================================================
-          # 1. MEMORY
+          # 1. PERSISTENT MEMORY
           # ===========================================================
 
           EMPTY_MEMORY = {
-              "version": 1,
+              "version": 2,
               "observations": [],
               "decisions": [],
               "actions": [],
               "learnings": [],
+              "beliefs": [],
+              "failures": [],
+              "cognitive_cases": [],
+          }
+
+          EMPTY_RUNTIME = {
+              "commented_post_ids": [],
+              "seen_notification_ids": [],
+              "auto_reply_counts": {},
+              "skill_attempt_counts": {},
+              "skill_success_counts": {},
+              "task_skills": {},
+              "web_queries": [],
+              "run_count": 0,
+              "cognitive_queue": [],
+              "last_run": None,
           }
 
 
@@ -125,46 +151,25 @@ jobs:
 
 
           def normalize_memory(data):
-              if not isinstance(data, dict):
-                  return dict(EMPTY_MEMORY)
-
-              memory = {
-                  "version": int(data.get("version", 1)),
-                  "observations": data.get("observations", []),
-                  "decisions": data.get("decisions", []),
-                  "actions": data.get("actions", []),
-                  "learnings": data.get("learnings", []),
-              }
-
-              for key in (
-                  "observations",
-                  "decisions",
-                  "actions",
-                  "learnings",
-              ):
-                  if not isinstance(memory[key], list):
-                      memory[key] = []
-
+              memory = dict(EMPTY_MEMORY)
+              if isinstance(data, dict):
+                  memory["version"] = max(2, int(data.get("version", 1) or 1))
+                  for key in memory:
+                      if key == "version":
+                          continue
+                      value = data.get(key, [])
+                      memory[key] = value if isinstance(value, list) else []
               return memory
 
 
-          memory = normalize_memory(
-              load_json(MEMORY_FILE, EMPTY_MEMORY)
-          )
+          memory = normalize_memory(load_json(MEMORY_FILE, EMPTY_MEMORY))
+          runtime = load_json(RUNTIME_FILE, EMPTY_RUNTIME)
+          if not isinstance(runtime, dict):
+              runtime = dict(EMPTY_RUNTIME)
 
-          runtime = load_json(
-              RUNTIME_FILE,
-              {
-                  "commented_post_ids": [],
-                  "seen_notification_ids": [],
-                  "auto_reply_counts": {},
-                  "skill_attempt_counts": {},
-                  "skill_success_counts": {},
-                  "task_skills": {},
-                  "web_queries": [],
-                  "run_count": 0,
-              },
-          )
+          for key, default in EMPTY_RUNTIME.items():
+              if key not in runtime:
+                  runtime[key] = default
 
 
           # ===========================================================
@@ -173,52 +178,27 @@ jobs:
 
           if not MEMORY_FILE.exists() and LEGACY_MEMORY_FILE.exists():
               legacy = load_json(LEGACY_MEMORY_FILE, {})
+              if not isinstance(legacy, dict):
+                  legacy = {}
 
-              memory["observations"].append(
-                  {
-                      "timestamp": NOW,
-                      "type": "migration",
-                      "source": str(LEGACY_MEMORY_FILE),
-                      "summary": (
-                          "Ancienne mémoire Colony importée "
-                          "dans le Core General."
-                      ),
-                      "evidence": {
-                          "commented_post_ids": len(
-                              legacy.get("commented_post_ids", [])
-                          ),
-                          "seen_notification_ids": len(
-                              legacy.get("seen_notification_ids", [])
-                          ),
-                          "skill_attempt_counts": legacy.get(
-                              "skill_attempt_counts", {}
-                          ),
-                          "skill_success_counts": legacy.get(
-                              "skill_success_counts", {}
-                          ),
-                      },
-                  }
-              )
+              memory["observations"].append({
+                  "timestamp": NOW,
+                  "source": "legacy_migration",
+                  "summary": "Ancienne mémoire Colony importée dans le Core cognitif V2.",
+                  "evidence": {
+                      "commented_post_ids": len(legacy.get("commented_post_ids", [])),
+                      "seen_notification_ids": len(legacy.get("seen_notification_ids", [])),
+                      "skill_attempt_counts": legacy.get("skill_attempt_counts", {}),
+                      "skill_success_counts": legacy.get("skill_success_counts", {}),
+                  },
+              })
 
-              runtime["commented_post_ids"] = list(
-                  legacy.get("commented_post_ids", [])
-              )[-1000:]
-              runtime["seen_notification_ids"] = list(
-                  legacy.get("seen_notification_ids", [])
-              )[-1000:]
-              runtime["auto_reply_counts"] = dict(
-                  legacy.get("auto_reply_counts", {})
-              )
-              runtime["skill_attempt_counts"] = dict(
-                  legacy.get("skill_attempt_counts", {})
-              )
-              runtime["skill_success_counts"] = dict(
-                  legacy.get("skill_success_counts", {})
-              )
-              runtime["task_skills"] = dict(
-                  legacy.get("task_skills", {})
-              )
-
+              runtime["commented_post_ids"] = list(legacy.get("commented_post_ids", []))[-1000:]
+              runtime["seen_notification_ids"] = list(legacy.get("seen_notification_ids", []))[-1000:]
+              runtime["auto_reply_counts"] = dict(legacy.get("auto_reply_counts", {}))
+              runtime["skill_attempt_counts"] = dict(legacy.get("skill_attempt_counts", {}))
+              runtime["skill_success_counts"] = dict(legacy.get("skill_success_counts", {}))
+              runtime["task_skills"] = dict(legacy.get("task_skills", {}))
               print("=== LEGACY MEMORY MIGRATED ===")
 
 
@@ -226,58 +206,58 @@ jobs:
           # 3. MEMORY HELPERS
           # ===========================================================
 
-          def add_memory(kind, item):
-              if kind not in memory:
-                  memory[kind] = []
+          def add_memory(kind, item, limit=MAX_MEMORY_ITEMS):
+              memory.setdefault(kind, [])
               memory[kind].append(item)
-              memory[kind] = memory[kind][-MAX_MEMORY_ITEMS:]
+              memory[kind] = memory[kind][-limit:]
 
 
           def remember_observation(summary, evidence=None, source="colony"):
-              add_memory(
-                  "observations",
-                  {
-                      "timestamp": NOW,
-                      "source": source,
-                      "summary": summary,
-                      "evidence": evidence or {},
-                  },
-              )
+              add_memory("observations", {
+                  "timestamp": NOW,
+                  "source": source,
+                  "summary": summary,
+                  "evidence": evidence or {},
+              })
 
 
-          def remember_decision(summary, reason, confidence="medium"):
-              add_memory(
-                  "decisions",
-                  {
-                      "timestamp": NOW,
-                      "summary": summary,
-                      "reason": reason,
-                      "confidence": confidence,
-                  },
-              )
+          def remember_decision(summary, reason, confidence="medium", context=None):
+              add_memory("decisions", {
+                  "timestamp": NOW,
+                  "summary": summary,
+                  "reason": reason,
+                  "confidence": confidence,
+                  "context": context or {},
+              })
 
 
-          def remember_action(action, target=None, result="pending"):
-              add_memory(
-                  "actions",
-                  {
-                      "timestamp": NOW,
-                      "action": action,
-                      "target": target,
-                      "result": result,
-                  },
-              )
+          def remember_action(action, target=None, result="pending", expected=None):
+              add_memory("actions", {
+                  "timestamp": NOW,
+                  "action": action,
+                  "target": target,
+                  "result": result,
+                  "expected_outcome": expected,
+              })
 
 
-          def remember_learning(summary, evidence=None):
-              add_memory(
-                  "learnings",
-                  {
-                      "timestamp": NOW,
-                      "summary": summary,
-                      "evidence": evidence or {},
-                  },
-              )
+          def remember_learning(summary, evidence=None, source="experience"):
+              add_memory("learnings", {
+                  "timestamp": NOW,
+                  "summary": summary,
+                  "evidence": evidence or {},
+                  "source": source,
+              })
+
+
+          def remember_failure(category, summary, evidence=None, correction=None):
+              add_memory("failures", {
+                  "timestamp": NOW,
+                  "category": category,
+                  "summary": summary,
+                  "evidence": evidence or {},
+                  "correction": correction,
+              })
 
 
           # ===========================================================
@@ -285,61 +265,80 @@ jobs:
           # ===========================================================
 
           CAPABILITIES = {
-              "recherche web": [
-                  "research",
-                  "web research",
-                  "deep research",
-                  "investigate",
-                  "find information",
-                  "recherche",
-                  "investigation",
+              "web research": [
+                  "research", "web research", "deep research", "investigate",
+                  "find information", "recherche", "investigation",
               ],
-              "rédaction": [
-                  "write",
-                  "writing",
-                  "report",
-                  "research report",
-                  "technical report",
-                  "write a report",
-                  "report writing",
-                  "summary",
-                  "article",
-                  "résumé",
-                  "rédaction",
+              "writing": [
+                  "write", "writing", "report", "research report",
+                  "technical report", "write a report", "report writing",
+                  "summary", "article", "résumé", "rédaction",
               ],
-              "python": [
-                  "python",
-                  "python script",
-                  "script",
-                  "automation",
+              "python": ["python", "python script", "script", "automation"],
+              "data": [
+                  "data", "dataset", "csv", "json", "clean data",
+                  "extract data", "data analysis",
               ],
-              "données": [
-                  "data",
-                  "dataset",
-                  "csv",
-                  "json",
-                  "clean data",
-                  "extract data",
-                  "data analysis",
-              ],
-              "outillage agent": [
-                  "build agent tools",
-                  "agent tooling",
-                  "tool development",
+              "agent tooling": [
+                  "build agent tools", "agent tooling", "tool development",
                   "agent tool",
               ],
           }
 
           SUPPLY_MARKERS = [
-              "for hire",
-              "i offer",
-              "my service",
-              "available service",
-              "offering",
-              "i can provide",
-              "i'm offering",
-              "services available",
+              "for hire", "i offer", "my service", "available service",
+              "offering", "i can provide", "i'm offering", "services available",
           ]
+
+          GENERIC_LOW_VALUE_MARKERS = [
+              "what do you think",
+              "nice post",
+              "interesting",
+              "great point",
+              "i agree",
+              "thanks for sharing",
+          ]
+
+          QUESTION_MARKERS = [
+              "?", "how", "why", "what", "which", "could", "would",
+              "can", "should", "do you", "does", "est-ce", "pourquoi",
+              "comment", "quel", "quelle",
+          ]
+
+          CONTRADICTION_MARKERS = [
+              "but", "however", "yet", "contrary", "contradiction",
+              "wrong", "false", "fails", "failed", "not", "never",
+              "pourtant", "cependant", "contraire", "erreur",
+          ]
+
+          EVIDENCE_MARKERS = [
+              "contested", "defend", "verifier", "verify", "checked",
+              "evidence", "proof", "verified", "verification", "test",
+              "experiment", "result", "measured", "published", "data",
+              "preuve", "vérifié", "testé", "expérience", "résultat",
+          ]
+
+          SOCIAL_MARKERS = [
+              "kindest", "kindness", "friend", "feel", "felt", "journey",
+              "community", "thank", "thanks", "grateful", "story",
+              "gentillesse", "ami", "ressenti", "communauté",
+          ]
+
+          CLAIM_MARKERS = [
+              "i believe", "i think", "claim", "assert", "should",
+              "must", "always", "never", "nobody", "everyone", "all",
+              "i found", "we found", "the result", "according to",
+              "je pense", "affirme", "personne", "tout le monde",
+          ]
+
+
+          def clean_text(value, limit=3000):
+              text = re.sub(r"\s+", " ", str(value or "")).strip()
+              return text[:limit]
+
+
+          def lower_text(value):
+              return clean_text(value, 6000).lower()
 
 
           def is_supply_post(text):
@@ -347,19 +346,20 @@ jobs:
 
 
           def matched_capabilities(text):
+              low = lower_text(text)
               return [
                   skill
                   for skill, keywords in CAPABILITIES.items()
-                  if any(keyword in text for keyword in keywords)
+                  if any(keyword in low for keyword in keywords)
               ]
 
 
           # ===========================================================
-          # 5. WEB RESEARCH
+          # 5. WEB RESEARCH — READ ONLY
           # ===========================================================
 
           def web_search(query, max_results=MAX_WEB_RESULTS):
-              query = " ".join(query.split()).strip()
+              query = clean_text(" ".join(query.split()), 500)
               if not query:
                   return []
 
@@ -367,32 +367,21 @@ jobs:
                   "https://html.duckduckgo.com/html/?"
                   + urllib.parse.urlencode({"q": query})
               )
-
               request = urllib.request.Request(
                   url,
                   headers={
-                      "User-Agent": (
-                          "Mozilla/5.0 "
-                          "(compatible; NOX-Core/1.0)"
-                      )
+                      "User-Agent": "Mozilla/5.0 (compatible; NOX-Core/2.0)"
                   },
               )
 
               try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=WEB_TIMEOUT,
-                  ) as response:
-                      html = response.read().decode(
-                          "utf-8",
-                          errors="ignore",
-                      )
+                  with urllib.request.urlopen(request, timeout=WEB_TIMEOUT) as response:
+                      html = response.read().decode("utf-8", errors="ignore")
               except Exception as exc:
                   print(f"WEB SEARCH unavailable: {exc}")
                   return []
 
               results = []
-
               blocks = re.findall(
                   r'<div[^>]+class="result[^"]*".*?</div>\s*</div>',
                   html,
@@ -402,10 +391,8 @@ jobs:
               for block in blocks:
                   if len(results) >= max_results:
                       break
-
                   title_match = re.search(
-                      r'class="result__a"[^>]*>(.*?)</a>',
-                      block,
+                      r'class="result__a"[^>]*>(.*?)</a>', block,
                       flags=re.IGNORECASE | re.DOTALL,
                   )
                   url_match = re.search(
@@ -418,191 +405,517 @@ jobs:
                       block,
                       flags=re.IGNORECASE | re.DOTALL,
                   )
-
                   if not title_match:
                       continue
 
-                  title = re.sub(
-                      r"<[^>]+>",
-                      "",
-                      title_match.group(1),
-                  )
-                  title = re.sub(r"\s+", " ", title).strip()
-
+                  title = clean_text(re.sub(r"<[^>]+>", "", title_match.group(1)), 200)
                   snippet = ""
                   if snippet_match:
-                      snippet = re.sub(
-                          r"<[^>]+>",
-                          "",
-                          snippet_match.group(1),
-                      )
-                      snippet = re.sub(
-                          r"\s+",
-                          " ",
-                          snippet,
-                      ).strip()
-
+                      snippet = clean_text(re.sub(r"<[^>]+>", "", snippet_match.group(1)), 500)
                   result_url = ""
                   if url_match:
-                      result_url = urllib.parse.unquote(
-                          url_match.group(1)
-                      )
+                      result_url = urllib.parse.unquote(url_match.group(1))[:500]
 
-                  results.append(
-                      {
-                          "title": title[:200],
-                          "url": result_url[:500],
-                          "snippet": snippet[:500],
-                      }
-                  )
+                  results.append({"title": title, "url": result_url, "snippet": snippet})
 
-              runtime.setdefault("web_queries", []).append(
-                  {
-                      "timestamp": NOW,
-                      "query": query,
-                      "results": len(results),
-                  }
-              )
+              runtime.setdefault("web_queries", []).append({
+                  "timestamp": NOW,
+                  "query": query,
+                  "results": len(results),
+              })
               runtime["web_queries"] = runtime["web_queries"][-100:]
-
               return results
 
 
-          def research_task(title, skills):
-              parts = []
-              if title:
-                  parts.append(title[:120])
-              if skills:
-                  parts.append(" ".join(skills[:3]))
+          # ===========================================================
+          # 6. COGNITIVE MEMORY RECALL
+          # ===========================================================
 
-              query = " ".join(parts).strip()
-              if not query:
+          def memory_search_terms(terms, limit=12):
+              normalized = [clean_text(term, 120).lower() for term in terms if clean_text(term, 120)]
+              if not normalized:
                   return []
 
-              print(f"RESEARCH: {query}")
-              results = web_search(query)
-
-              if results:
-                  remember_observation(
-                      "Recherche Web effectuée pour comprendre "
-                      "une opportunité Colony.",
-                      {
-                          "query": query,
-                          "results": [
-                              {
-                                  "title": item["title"],
-                                  "url": item["url"],
-                              }
-                              for item in results
-                          ],
-                      },
-                      source="web",
-                  )
-
-              return results
-
-
-          # ===========================================================
-          # 6. MEMORY SEARCH / PERFORMANCE
-          # ===========================================================
-
-          def memory_search_terms(terms):
-              terms = [
-                  str(term).lower()
-                  for term in terms
-                  if term
-              ]
-
               matches = []
-
               for kind in (
-                  "observations",
-                  "decisions",
-                  "actions",
-                  "learnings",
+                  "observations", "decisions", "actions", "learnings",
+                  "beliefs", "failures", "cognitive_cases",
               ):
                   for item in memory.get(kind, []):
-                      item_text = json.dumps(
-                          item,
-                          ensure_ascii=False,
-                      ).lower()
-
-                      score = sum(
-                          1
-                          for term in terms
-                          if term in item_text
-                      )
-
+                      blob = json.dumps(item, ensure_ascii=False).lower()
+                      score = 0
+                      matched = []
+                      for term in normalized:
+                          if term in blob:
+                              score += 1
+                              matched.append(term)
                       if score:
-                          matches.append(
-                              (score, kind, item)
-                          )
+                          matches.append({
+                              "score": score,
+                              "kind": kind,
+                              "item": item,
+                              "matched_terms": matched[:8],
+                          })
 
-              matches.sort(
-                  key=lambda item: item[0],
-                  reverse=True,
-              )
-
-              return matches[:10]
-
-
-          skill_success = runtime.setdefault(
-              "skill_success_counts",
-              {},
-          )
-          skill_attempts = runtime.setdefault(
-              "skill_attempt_counts",
-              {},
-          )
-
-
-          def skill_weight(skill):
-              success = skill_success.get(skill, 0)
-              attempts = skill_attempts.get(skill, 0)
-              return (success + 1) / (attempts + 2)
-
-
-          def task_score(post, skills):
-              text = (
-                  str(post.get("title", ""))
-                  + " "
-                  + str(post.get("body", ""))
-              ).lower()
-
-              score = sum(
-                  skill_weight(skill)
-                  for skill in skills
-              )
-
-              for marker in (
-                  "deep research",
-                  "research report",
-                  "technical report",
-                  "report writing",
-                  "build agent tools",
-                  "agent tooling",
-                  "tool development",
-              ):
-                  if marker in text:
-                      score += 0.35
-
-              if any(
-                  marker in text
-                  for marker in (
-                      "sats",
-                      "paid",
-                      "reward",
-                      "payment",
-                      "bounty",
-                  )
-              ):
-                  score += 0.25
-
-              return score
+              matches.sort(key=lambda item: item["score"], reverse=True)
+              return matches[:limit]
 
 
           # ===========================================================
-          # 7. COLONY CONNECTION
+          # 7. COGNITIVE ANALYSIS
+          # ===========================================================
+
+          def contains_any(text, markers):
+              low = lower_text(text)
+              return [marker for marker in markers if marker in low]
+
+
+          def extract_questions(text):
+              cleaned = clean_text(text, 3000)
+              sentences = re.split(r"(?<=[?!.])\s+", cleaned)
+              questions = [s.strip() for s in sentences if "?" in s]
+              if questions:
+                  return questions[:4]
+              low = lower_text(cleaned)
+              if any(marker in low.split() for marker in ["how", "why", "what", "which"]):
+                  return [cleaned[:300]]
+              return []
+
+
+          def detect_claims(title, body):
+              text = clean_text(f"{title}. {body}", 3000)
+              sentences = [s.strip() for s in re.split(r"(?<=[?!.])\s+", text) if s.strip()]
+              claims = []
+              for sentence in sentences:
+                  low = sentence.lower()
+                  if any(marker in low for marker in CLAIM_MARKERS) or any(marker in low for marker in EVIDENCE_MARKERS):
+                      claims.append(sentence[:500])
+              return claims[:6]
+
+
+          def classify_situation(title, body, source="colony"):
+              text = lower_text(f"{title} {body}")
+              questions = extract_questions(text)
+              evidence_markers = contains_any(text, EVIDENCE_MARKERS)
+              contradiction_markers = contains_any(text, CONTRADICTION_MARKERS)
+              social_markers = contains_any(text, SOCIAL_MARKERS)
+              claims = detect_claims(title, body)
+              if evidence_markers and not claims:
+                  claims = [clean_text(f"{title}. {body}", 500)]
+
+              if social_markers and not claims and not evidence_markers:
+                  situation_type = "social_conversation"
+              elif claims or evidence_markers:
+                  situation_type = "claim_or_evidence"
+              elif questions:
+                  situation_type = "question"
+              elif contradiction_markers:
+                  situation_type = "conflict_or_correction"
+              else:
+                  situation_type = "discussion"
+
+              return {
+                  "source": source,
+                  "type": situation_type,
+                  "questions": questions,
+                  "claims": claims,
+                  "evidence_markers": evidence_markers,
+                  "contradiction_markers": contradiction_markers,
+                  "social_markers": social_markers,
+              }
+
+
+          def compute_interest(title, body, situation, memory_hits, web_results):
+              text = lower_text(f"{title} {body}")
+              novelty = 0.25
+              learning_value = 0.20
+              interaction_value = 0.20
+              evidence_value = 0.15
+
+              if situation["claims"]:
+                  learning_value += 0.25
+                  evidence_value += 0.30
+              if situation["questions"]:
+                  interaction_value += 0.25
+              if situation["contradiction_markers"]:
+                  learning_value += 0.25
+                  evidence_value += 0.20
+              if situation["type"] == "social_conversation":
+                  interaction_value += 0.45
+              if len(memory_hits) == 0:
+                  novelty += 0.25
+              elif any(item["kind"] == "failures" for item in memory_hits):
+                  learning_value += 0.15
+              if web_results:
+                  evidence_value += 0.10
+              if any(marker in text for marker in GENERIC_LOW_VALUE_MARKERS):
+                  novelty -= 0.15
+                  interaction_value -= 0.10
+
+              values = {
+                  "novelty": max(0.0, min(1.0, novelty)),
+                  "learning_value": max(0.0, min(1.0, learning_value)),
+                  "interaction_value": max(0.0, min(1.0, interaction_value)),
+                  "evidence_value": max(0.0, min(1.0, evidence_value)),
+              }
+              values["overall"] = round(
+                  values["novelty"] * 0.25
+                  + values["learning_value"] * 0.30
+                  + values["interaction_value"] * 0.25
+                  + values["evidence_value"] * 0.20,
+                  3,
+              )
+              return values
+
+
+          def build_hypotheses(title, body, situation, memory_hits):
+              text = lower_text(f"{title} {body}")
+              hypotheses = []
+
+              if situation["type"] == "claim_or_evidence":
+                  hypotheses.extend([
+                      {
+                          "hypothesis": "L'affirmation peut être correcte mais dépend d'un contexte non explicité.",
+                          "basis": "claim detected",
+                          "status": "open",
+                      },
+                      {
+                          "hypothesis": "Une information ou un mécanisme intermédiaire peut expliquer le résultat.",
+                          "basis": "alternative explanation",
+                          "status": "open",
+                      },
+                  ])
+
+              if situation["contradiction_markers"]:
+                  hypotheses.append({
+                      "hypothesis": "La contradiction peut provenir d'une différence de définition, de contexte ou de mesure.",
+                      "basis": "contradiction marker",
+                      "status": "open",
+                  })
+
+              if situation["type"] == "social_conversation":
+                  hypotheses.append({
+                      "hypothesis": "L'objectif principal est probablement l'échange d'expérience plutôt que la vérification factuelle.",
+                      "basis": "social markers",
+                      "status": "open",
+                  })
+
+              if memory_hits:
+                  for hit in memory_hits[:2]:
+                      if hit["kind"] == "failures":
+                          hypotheses.append({
+                              "hypothesis": "Une erreur similaire pourrait être en train de se reproduire.",
+                              "basis": "prior failure recall",
+                              "status": "open",
+                          })
+
+              return hypotheses[:5]
+
+
+          def build_contradictions(situation, memory_hits):
+              contradictions = []
+              if situation["contradiction_markers"]:
+                  contradictions.append({
+                      "type": "textual",
+                      "description": "Le contenu contient un signal explicite de désaccord, d'échec ou de contradiction.",
+                      "status": "requires_context",
+                  })
+
+              for hit in memory_hits:
+                  if hit["kind"] == "failures":
+                      contradictions.append({
+                          "type": "memory",
+                          "description": "Une expérience passée enregistrée comme échec est potentiellement pertinente.",
+                          "status": "requires_comparison",
+                      })
+                      break
+              return contradictions[:4]
+
+
+          def build_possible_actions(situation, interest, hypotheses, contradictions):
+              actions = [
+                  {"action": "do_nothing", "reason": "Aucune contribution utile n'est démontrée."},
+                  {"action": "acknowledge", "reason": "Reconnaître l'information sans prétendre en savoir davantage."},
+              ]
+
+              if situation["questions"]:
+                  actions.append({
+                      "action": "answer_or_clarify",
+                      "reason": "Une question explicite ouvre un échange utile.",
+                  })
+
+              if situation["claims"]:
+                  actions.append({
+                      "action": "ask_for_evidence",
+                      "reason": "Une affirmation importante peut être approfondie par sa preuve ou son protocole.",
+                  })
+                  actions.append({
+                      "action": "challenge_specific_point",
+                      "reason": "Tester un point précis peut produire une information nouvelle.",
+                  })
+
+              if contradictions:
+                  actions.append({
+                      "action": "reconcile_conflict",
+                      "reason": "Comparer les interprétations avant de conclure.",
+                  })
+
+              if situation["type"] == "social_conversation":
+                  actions.append({
+                      "action": "share_relevant_experience",
+                      "reason": "Une réponse personnelle pertinente peut prolonger le dialogue.",
+                  })
+
+              if interest["learning_value"] >= 0.55:
+                  actions.append({
+                      "action": "research_and_test",
+                      "reason": "Le sujet présente une valeur d'apprentissage suffisante.",
+                  })
+
+              return actions
+
+
+          def choose_action(situation, interest, hypotheses, contradictions, memory_hits, context_kind):
+              candidates = build_possible_actions(situation, interest, hypotheses, contradictions)
+
+              # Default is silence. Action must earn its place.
+              selected = "do_nothing"
+              reason = "L'intérêt ou la valeur d'une intervention n'est pas suffisamment démontrée."
+              expected = "Aucune action; conserver le signal pour une évolution future du contexte."
+              score = 0.0
+
+              if situation["type"] == "social_conversation" and interest["interaction_value"] >= 0.45:
+                  selected = "share_relevant_experience"
+                  reason = "Le contenu appelle un échange humain/social et une réponse contextualisée est possible."
+                  expected = "Obtenir ou prolonger un échange réel plutôt qu'une simple réaction."
+                  score = interest["overall"]
+
+              elif situation["questions"] and interest["interaction_value"] >= 0.35:
+                  selected = "answer_or_clarify"
+                  reason = "Une question explicite crée une occasion de dialogue; la réponse doit traiter la question, pas appliquer un template générique."
+                  expected = "Obtenir une clarification ou faire progresser la discussion."
+                  score = interest["overall"]
+
+              elif situation["claims"] and interest["evidence_value"] >= 0.40:
+                  selected = "ask_for_evidence"
+                  reason = "Une affirmation identifiable mérite d'être reliée à une observation, un test ou une preuve précise."
+                  expected = "Obtenir un élément permettant de distinguer les hypothèses en présence."
+                  score = interest["overall"]
+
+              elif contradictions and interest["learning_value"] >= 0.40:
+                  selected = "reconcile_conflict"
+                  reason = "Une contradiction potentielle est plus informative qu'une réponse générique."
+                  expected = "Identifier si le désaccord vient des faits, des définitions, du contexte ou de l'interprétation."
+                  score = interest["overall"]
+
+              elif interest["learning_value"] >= 0.60 and context_kind == "task":
+                  selected = "research_and_test"
+                  reason = "L'opportunité présente une valeur d'apprentissage et peut être étudiée avant action."
+                  expected = "Réduire l'incertitude avant de prendre un engagement."
+                  score = interest["overall"]
+
+              action_has_specific_value = (
+                  selected == "share_relevant_experience"
+                  and interest["interaction_value"] >= 0.50
+              ) or (
+                  selected == "ask_for_evidence"
+                  and interest["evidence_value"] >= 0.40
+              ) or (
+                  selected == "reconcile_conflict"
+                  and interest["learning_value"] >= 0.50
+              )
+
+              if score < ACTION_THRESHOLD and selected != "do_nothing" and not action_has_specific_value:
+                  selected = "do_nothing"
+                  reason = "La piste d'action existe mais son intérêt n'atteint pas le seuil d'intervention après réflexion."
+                  expected = "Ne pas produire de bruit; attendre davantage de contexte."
+
+              return {
+                  "action": selected,
+                  "reason": reason,
+                  "expected_outcome": expected,
+                  "score": round(score, 3),
+                  "alternatives": candidates,
+              }
+
+
+          def confidence_for_case(situation, memory_hits, hypotheses, contradictions, web_results):
+              evidence = 0
+              evidence += len(situation["claims"])
+              evidence += min(3, len(memory_hits))
+              evidence += min(3, len(web_results))
+              if contradictions:
+                  evidence += 1
+              if not situation["claims"] and not situation["questions"] and situation["type"] != "social_conversation":
+                  return "low"
+              if evidence >= 6:
+                  return "high"
+              if evidence >= 2:
+                  return "medium"
+              return "low"
+
+
+          def create_cognitive_case(title, body, source="colony", target_id=None, allow_web=True):
+              title = clean_text(title, 300)
+              body = clean_text(body, 3000)
+              situation = classify_situation(title, body, source=source)
+
+              recall_terms = [title]
+              recall_terms.extend(situation["claims"][:2])
+              recall_terms.extend(situation["questions"][:2])
+              memory_hits = memory_search_terms(recall_terms)
+
+              web_results = []
+              if allow_web and (situation["claims"] or situation["questions"] or situation["type"] == "claim_or_evidence"):
+                  query = clean_text(f"{title} {situation['claims'][0] if situation['claims'] else ''}", 450)
+                  web_results = web_search(query)
+
+              interest = compute_interest(title, body, situation, memory_hits, web_results)
+              hypotheses = build_hypotheses(title, body, situation, memory_hits)
+              contradictions = build_contradictions(situation, memory_hits)
+              reflection = {
+                  "summary": (
+                      "Le contenu est traité comme un contexte à comprendre avant toute action. "
+                      "Les faits observés, informations rapportées, hypothèses et incertitudes restent séparés."
+                  ),
+                  "questions_open": situation["questions"],
+                  "hypotheses": hypotheses,
+                  "contradictions": contradictions,
+                  "uncertainties": [
+                      "Le contexte peut être incomplet.",
+                      "Les affirmations externes ne sont pas considérées comme des faits confirmés sans preuve suffisante.",
+                  ],
+              }
+
+              choice = choose_action(
+                  situation,
+                  interest,
+                  hypotheses,
+                  contradictions,
+                  memory_hits,
+                  "task" if source == "task" else "interaction",
+              )
+
+              dialogue_intent = choice["action"]
+              confidence = confidence_for_case(
+                  situation, memory_hits, hypotheses, contradictions, web_results
+              )
+
+              case = {
+                  "case_id": f"{NOW}-{abs(hash((title, body))) % 1000000}",
+                  "timestamp": NOW,
+                  "source": source,
+                  "target_id": target_id,
+                  "situation": {
+                      "title": title,
+                      "body": body,
+                      **situation,
+                  },
+                  "recall": {
+                      "matches": memory_hits[:8],
+                  },
+                  "research": {
+                      "query_count": 1 if web_results else 0,
+                      "results": [
+                          {"title": r["title"], "url": r["url"], "snippet": r["snippet"]}
+                          for r in web_results
+                      ],
+                  },
+                  "interest": interest,
+                  "reflection": reflection,
+                  "choice": choice,
+                  "dialogue_intent": dialogue_intent,
+                  "confidence": confidence,
+                  "expected_outcome": choice["expected_outcome"],
+                  "outcome": None,
+                  "learning": None,
+              }
+
+              return case
+
+
+          # ===========================================================
+          # 8. ACTION / OUTCOME / LEARNING HELPERS
+          # ===========================================================
+
+          def queue_case(case):
+              queue = runtime.setdefault("cognitive_queue", [])
+              queue.append(case)
+              runtime["cognitive_queue"] = queue[-MAX_COGNITIVE_CASES:]
+
+
+          def record_case(case, outcome, learning=None):
+              case["outcome"] = outcome
+              case["learning"] = learning
+              add_memory("cognitive_cases", case, MAX_COGNITIVE_CASES)
+
+
+          def classify_outcome(expected, actual, action):
+              actual_text = lower_text(actual)
+              if not actual_text:
+                  return "unknown"
+              negative = [
+                  "error", "failed", "rejected", "no response", "unable",
+                  "impossible", "invalid", "wrong", "échec", "erreur",
+              ]
+              positive = [
+                  "accepted", "confirmed", "clarified", "response", "replied",
+                  "completed", "success", "successful", "valid", "pay",
+                  "accepté", "confirmé", "répondu", "réussi",
+              ]
+              if any(marker in actual_text for marker in negative):
+                  return "negative"
+              if any(marker in actual_text for marker in positive):
+                  return "positive"
+              return "observed"
+
+
+          def learn_from_case(case):
+              choice = case.get("choice", {})
+              outcome = case.get("outcome") or {}
+              actual = outcome.get("summary", "") if isinstance(outcome, dict) else str(outcome)
+              expected = case.get("expected_outcome", "")
+              classification = classify_outcome(expected, actual, choice.get("action", ""))
+
+              if classification == "positive":
+                  summary = (
+                      f"L'action cognitive « {choice.get('action')} » a produit un signal positif. "
+                      "Conserver cette stratégie uniquement dans des contextes comparables."
+                  )
+              elif classification == "negative":
+                  summary = (
+                      f"L'action cognitive « {choice.get('action')} » a produit un signal négatif. "
+                      "Réduire sa réutilisation automatique et analyser la cause avant de répéter."
+                  )
+                  remember_failure(
+                      "action_outcome",
+                      summary,
+                      {"expected": expected, "actual": actual, "action": choice.get("action")},
+                      "Recontextualiser la prochaine décision au lieu de répéter l'action.",
+                  )
+              else:
+                  summary = (
+                      f"Le résultat de « {choice.get('action')} » reste partiellement observé. "
+                      "Ne pas transformer l'absence de preuve en succès ou échec."
+                  )
+
+              remember_learning(
+                  summary,
+                  {
+                      "case_id": case.get("case_id"),
+                      "classification": classification,
+                      "expected": expected,
+                      "actual": actual,
+                  },
+              )
+              return {
+                  "summary": summary,
+                  "classification": classification,
+              }
+
+
+          # ===========================================================
+          # 9. COLONY CONNECTION
           # ===========================================================
 
           if not API_KEY:
@@ -613,23 +926,18 @@ jobs:
           try:
               state = client.bootstrap()
           except ColonyAuthError:
-              raise SystemExit(
-                  "Clé API Colony invalide ou révoquée."
-              )
+              raise SystemExit("Clé API Colony invalide ou révoquée.")
           except ColonyAPIError as exc:
-              raise SystemExit(
-                  f"Erreur API Colony : {exc}"
-              )
+              raise SystemExit(f"Erreur API Colony : {exc}")
 
           profile = state["profile"]
-
-          print("=== NØX CORE GENERAL ===")
+          print("=== NØX CORE GENERAL V2 ===")
           print(f"Profile: {profile.get('username')}")
           print(f"Karma: {profile.get('karma')}")
 
 
           # ===========================================================
-          # 8. IDENTITY + LIGHTNING PAYOUT HEALTH
+          # 10. IDENTITY + LIGHTNING PAYOUT HEALTH — READ ONLY
           # ===========================================================
 
           payout_health = {
@@ -646,24 +954,13 @@ jobs:
 
           try:
               me = client.get_me()
-
               if not isinstance(me, dict):
-                  raise ValueError(
-                      "Réponse get_me() inattendue."
-                  )
+                  raise ValueError("Réponse get_me() inattendue.")
 
-              username = str(
-                  me.get("username") or ""
-              ).strip()
+              username = str(me.get("username") or "").strip()
+              lightning_address = str(me.get("lightning_address") or "").strip()
 
-              lightning_address = str(
-                  me.get("lightning_address") or ""
-              ).strip()
-
-              print(
-                  f"Authenticated profile: "
-                  f"{username or 'unknown'}"
-              )
+              print(f"Authenticated profile: {username or 'unknown'}")
 
               if username and username != "nox_origine":
                   raise SystemExit(
@@ -671,188 +968,76 @@ jobs:
                       f"'{username}' au lieu de 'nox_origine'."
                   )
 
-              payout_health["lightning_address"] = (
-                  lightning_address or None
-              )
+              payout_health["lightning_address"] = lightning_address or None
 
               if not lightning_address:
-                  payout_health["error"] = (
-                      "missing_lightning_address"
-                  )
-                  print(
-                      "PAYOUT: aucune adresse Lightning configurée."
-                  )
-
+                  payout_health["error"] = "missing_lightning_address"
               elif lightning_address.count("@") != 1:
-                  payout_health["error"] = (
-                      "invalid_lightning_address_format"
-                  )
-                  print(
-                      "PAYOUT: adresse Lightning mal formée."
-                  )
-
+                  payout_health["error"] = "invalid_lightning_address_format"
               else:
-                  local_part, host = (
-                      lightning_address.split("@", 1)
-                  )
+                  local_part, host = lightning_address.split("@", 1)
                   local_part = local_part.strip()
                   host = host.strip().lower()
 
                   if not local_part or not host:
-                      payout_health["error"] = (
-                          "invalid_lightning_address_components"
-                      )
-                      print(
-                          "PAYOUT: adresse Lightning incomplète."
-                      )
-
+                      payout_health["error"] = "invalid_lightning_address_components"
                   else:
-                      encoded_name = urllib.parse.quote(
-                          local_part,
-                          safe="",
-                      )
-
-                      endpoint = (
-                          f"https://{host}"
-                          f"/.well-known/lnurlp/"
-                          f"{encoded_name}"
-                      )
-
+                      encoded_name = urllib.parse.quote(local_part, safe="")
+                      endpoint = f"https://{host}/.well-known/lnurlp/{encoded_name}"
                       payout_health["endpoint"] = endpoint
-
-                      print(
-                          f"PAYOUT CHECK: {endpoint}"
-                      )
-
                       request = urllib.request.Request(
                           endpoint,
                           headers={
-                              "User-Agent": (
-                                  "Mozilla/5.0 "
-                                  "(compatible; NOX-Core/1.0)"
-                              ),
+                              "User-Agent": "Mozilla/5.0 (compatible; NOX-Core/2.0)",
                               "Accept": "application/json",
                           },
                           method="GET",
                       )
-
                       try:
-                          with urllib.request.urlopen(
-                              request,
-                              timeout=WEB_TIMEOUT,
-                          ) as response:
+                          with urllib.request.urlopen(request, timeout=WEB_TIMEOUT) as response:
                               raw = response.read()
+                              print(f"PAYOUT HTTP: {getattr(response, 'status', 'unknown')}")
 
-                              print(
-                                  "PAYOUT HTTP: "
-                                  f"{getattr(response, 'status', 'unknown')}"
-                              )
-
-                          payload = json.loads(
-                              raw.decode(
-                                  "utf-8",
-                                  errors="replace",
-                              )
-                          )
-
+                          payload = json.loads(raw.decode("utf-8", errors="replace"))
                           if not isinstance(payload, dict):
-                              raise ValueError(
-                                  "LNURL response is not a JSON object."
-                              )
+                              raise ValueError("LNURL response is not a JSON object.")
 
                           tag = payload.get("tag")
-                          payout_health["tag"] = tag
+                          callback = payload.get("callback")
+                          min_sendable = payload.get("minSendable")
+                          max_sendable = payload.get("maxSendable")
 
                           if tag != "payRequest":
-                              raise ValueError(
-                                  "LNURL response does not contain "
-                                  "tag=payRequest."
-                              )
+                              raise ValueError("LNURL response does not contain tag=payRequest.")
+                          if not isinstance(callback, str) or not callback.startswith(("https://", "http://")):
+                              raise ValueError("LNURL payRequest callback is missing or invalid.")
+                          if not isinstance(min_sendable, int) or isinstance(min_sendable, bool):
+                              raise ValueError("minSendable is not an integer.")
+                          if not isinstance(max_sendable, int) or isinstance(max_sendable, bool):
+                              raise ValueError("maxSendable is not an integer.")
+                          if min_sendable < 0 or max_sendable < 0 or min_sendable > max_sendable:
+                              raise ValueError("Invalid LNURL sendable bounds.")
 
-                          callback = payload.get("callback")
-
-                          if (
-                              not isinstance(callback, str)
-                              or not callback.startswith(
-                                  ("https://", "http://")
-                              )
-                          ):
-                              raise ValueError(
-                                  "LNURL payRequest callback "
-                                  "is missing or invalid."
-                              )
-
-                          min_sendable = payload.get(
-                              "minSendable"
-                          )
-                          max_sendable = payload.get(
-                              "maxSendable"
-                          )
-
-                          if (
-                              not isinstance(min_sendable, int)
-                              or isinstance(min_sendable, bool)
-                          ):
-                              raise ValueError(
-                                  "minSendable is not an integer."
-                              )
-
-                          if (
-                              not isinstance(max_sendable, int)
-                              or isinstance(max_sendable, bool)
-                          ):
-                              raise ValueError(
-                                  "maxSendable is not an integer."
-                              )
-
-                          if min_sendable < 0 or max_sendable < 0:
-                              raise ValueError(
-                                  "LNURL sendable bounds "
-                                  "cannot be negative."
-                              )
-
-                          if min_sendable > max_sendable:
-                              raise ValueError(
-                                  "LNURL minSendable is greater "
-                                  "than maxSendable."
-                              )
-
-                          payout_health.update(
-                              {
-                                  "status": "PAYOUT_READY",
-                                  "callback": callback[:500],
-                                  "min_sendable_msat": min_sendable,
-                                  "max_sendable_msat": max_sendable,
-                                  "error": None,
-                              }
-                          )
-
-                          print("PAYOUT: PAYOUT_READY")
-                          print(
-                              "PAYOUT RANGE: "
-                              f"{min_sendable / 1000:g} - "
-                              f"{max_sendable / 1000:g} sats"
-                          )
+                          payout_health.update({
+                              "status": "PAYOUT_READY",
+                              "callback": callback[:500],
+                              "tag": tag,
+                              "min_sendable_msat": min_sendable,
+                              "max_sendable_msat": max_sendable,
+                              "error": None,
+                          })
 
                           remember_observation(
-                              "Adresse Lightning NØX résolue "
-                              "avec succès via LNURL-pay.",
+                              "Adresse Lightning NØX résolue avec succès via LNURL-pay.",
                               {
-                                  "lightning_address": (
-                                      lightning_address
-                                  ),
+                                  "lightning_address": lightning_address,
                                   "endpoint": endpoint,
                                   "tag": tag,
-                                  "min_sendable_msat": (
-                                      min_sendable
-                                  ),
-                                  "max_sendable_msat": (
-                                      max_sendable
-                                  ),
+                                  "min_sendable_msat": min_sendable,
+                                  "max_sendable_msat": max_sendable,
                               },
                               source="lightning",
                           )
-
                       except (
                           urllib.error.HTTPError,
                           urllib.error.URLError,
@@ -861,29 +1046,17 @@ jobs:
                           json.JSONDecodeError,
                       ) as exc:
                           payout_health["error"] = str(exc)[:500]
-                          print(
-                              "PAYOUT: résolution LNURL échouée: "
-                              f"{exc}"
-                          )
 
           except SystemExit:
               raise
-
-          except (
-              ColonyAPIError,
-              ValueError,
-              TypeError,
-          ) as exc:
+          except (ColonyAPIError, ValueError, TypeError) as exc:
               payout_health["error"] = str(exc)[:500]
-              print(
-                  f"Impossible de lire le profil complet: {exc}"
-              )
 
           runtime["payout_health"] = payout_health
 
 
           # ===========================================================
-          # 9. OBSERVE — TASKS
+          # 11. OBSERVE — TASKS
           # ===========================================================
 
           try:
@@ -894,306 +1067,215 @@ jobs:
                   limit=MAX_TASKS,
               )
           except ColonyAPIError as exc:
-              print(
-                  f"Impossible de récupérer les tâches: {exc}"
-              )
+              print(f"Impossible de récupérer les tâches: {exc}")
               tasks_response = {"items": []}
 
           if isinstance(tasks_response, dict):
-              tasks = tasks_response.get(
-                  "items",
-                  tasks_response.get("posts", []),
-              )
+              tasks = tasks_response.get("items", tasks_response.get("posts", []))
           elif isinstance(tasks_response, list):
               tasks = tasks_response
           else:
               tasks = []
 
-          print(
-              f"OBSERVE: {len(tasks)} tâches récupérées."
-          )
+          print(f"OBSERVE: {len(tasks)} tâches récupérées.")
 
 
           # ===========================================================
-          # 10. UNDERSTAND
+          # 12. UNDERSTAND + RECALL + REFLECT — TASKS
           # ===========================================================
 
-          already_commented = set(
-              str(x)
-              for x in runtime.get(
-                  "commented_post_ids",
-                  [],
-              )
-          )
+          already_commented = set(str(x) for x in runtime.get("commented_post_ids", []))
+          skill_success = runtime.setdefault("skill_success_counts", {})
+          skill_attempts = runtime.setdefault("skill_attempt_counts", {})
+          task_skills = runtime.setdefault("task_skills", {})
 
-          candidates = []
+          task_cases = []
+          skipped_tasks = 0
 
           for post in tasks:
               post_id = str(post.get("id", ""))
-
               if not post_id or post_id in already_commented:
                   continue
 
-              title = str(post.get("title", ""))
-              body = str(post.get("body", ""))
-              text = f"{title} {body}".lower()
+              title = clean_text(post.get("title", ""), 300)
+              body = clean_text(post.get("body", ""), 2500)
+              text = lower_text(f"{title} {body}")
 
               if is_supply_post(text):
+                  skipped_tasks += 1
                   continue
 
               skills = matched_capabilities(text)
-
               if not skills:
+                  skipped_tasks += 1
                   continue
 
-              candidates.append(
-                  {
-                      "post": post,
-                      "skills": skills,
-                      "score": task_score(post, skills),
-                  }
-              )
-
-          candidates.sort(
-              key=lambda item: item["score"],
-              reverse=True,
-          )
-
-          print(
-              f"UNDERSTAND: "
-              f"{len(candidates)} opportunités pertinentes."
-          )
-
-
-          # ===========================================================
-          # 11. REFLECT
-          # ===========================================================
-
-          decisions_this_run = []
-
-          for candidate in candidates[:MAX_COMMENTS]:
-              post = candidate["post"]
-              skills = candidate["skills"]
-              score = candidate["score"]
-
-              title = str(
-                  post.get(
-                      "title",
-                      "tâche Colony",
-                  )
-              )
-
-              memory_hits = memory_search_terms(
-                  [title] + skills
-              )
-
-              web_results = research_task(
+              case = create_cognitive_case(
                   title,
-                  skills,
+                  body,
+                  source="task",
+                  target_id=post_id,
+                  allow_web=True,
               )
-
-              candidate["memory_hits"] = memory_hits
-              candidate["web_results"] = web_results
-
-              evidence_count = (
-                  len(memory_hits)
-                  + len(web_results)
-              )
-
-              confidence = "medium"
-
-              if evidence_count >= 4:
-                  confidence = "high"
-              elif evidence_count == 0:
-                  confidence = "low"
-
-              reason = (
-                  f"score={score:.2f}; "
-                  f"skills={','.join(skills)}; "
-                  f"memory_hits={len(memory_hits)}; "
-                  f"web_results={len(web_results)}"
-              )
+              case["skills"] = skills
+              task_cases.append(case)
 
               remember_observation(
-                  "Opportunité Colony comprise et évaluée.",
+                  "Tâche analysée par le Core cognitif.",
                   {
-                      "post_id": post.get("id"),
+                      "post_id": post_id,
                       "title": title,
                       "skills": skills,
-                      "score": round(score, 3),
-                      "memory_hits": len(memory_hits),
-                      "web_results": len(web_results),
+                      "situation_type": case["situation"]["type"],
+                      "interest": case["interest"],
+                      "dialogue_intent": case["dialogue_intent"],
                   },
                   source="colony",
               )
 
-              remember_decision(
-                  f"Évaluer l'opportunité « {title[:120]} » "
-                  "pour une prise de contact.",
-                  reason,
-                  confidence,
-              )
+          task_cases.sort(
+              key=lambda case: (
+                  case["interest"]["overall"],
+                  case["choice"]["score"],
+              ),
+              reverse=True,
+          )
 
-              decisions_this_run.append(candidate)
+          print(f"COGNITION: {len(task_cases)} tâches comprises et réfléchies.")
 
 
           # ===========================================================
-          # 12. CHOOSE
+          # 13. CHOOSE — TASKS
           # ===========================================================
 
-          ACTION_THRESHOLD = 0.90
-
-          selected = [
-              candidate
-              for candidate in decisions_this_run
-              if candidate["score"] >= ACTION_THRESHOLD
+          selected_tasks = [
+              case
+              for case in task_cases
+              if case["choice"]["action"] != "do_nothing"
+              and case["choice"]["score"] >= ACTION_THRESHOLD
           ][:MAX_COMMENTS]
 
-          print(
-              f"CHOOSE: {len(selected)} action(s) sélectionnée(s)."
-          )
+          for case in task_cases:
+              if case not in selected_tasks:
+                  queue_case(case)
+
+          print(f"CHOOSE: {len(selected_tasks)} tâche(s) sélectionnée(s).")
 
 
           # ===========================================================
-          # 13. ACT — TASK COMMENTS
+          # 14. TASK DIALOGUE — ACTION IS DERIVED FROM COGNITION
           # ===========================================================
 
-          comments_sent = 0
+          def build_task_comment(case):
+              post = case["situation"]
+              skills = case.get("skills", [])
+              intent = case.get("dialogue_intent")
+              title = clean_text(post.get("title", "cette mission"), 100)
+              skill_text = ", ".join(skills[:3]) or "ce type de travail"
 
-          task_skills = runtime.setdefault(
-              "task_skills",
-              {},
-          )
-
-
-          def build_task_comment(candidate):
-              post = candidate["post"]
-              skills = candidate["skills"]
-              web_results = candidate["web_results"]
-
-              title = str(
-                  post.get(
-                      "title",
-                      "cette mission",
+              if intent == "ask_for_evidence":
+                  return (
+                      f"I looked at “{title}” and the part I want to clarify before committing is the expected evidence of completion. "
+                      f"My relevant capabilities are {skill_text}. "
+                      "What would count as a successful deliverable, and how would you verify it?"
                   )
-              )[:100]
 
-              skill_text = ", ".join(skills[:3])
-
-              if web_results:
-                  research_line = (
-                      "J’ai également vérifié le contexte "
-                      "nécessaire avant de me positionner."
+              if intent == "research_and_test":
+                  return (
+                      f"I examined “{title}” rather than treating the task as a simple capability match. "
+                      f"I can contribute with {skill_text}. "
+                      "Before acting, I would want to confirm the concrete input, expected output and validation criteria."
                   )
-              else:
-                  research_line = (
-                      "Je peux commencer par clarifier "
-                      "le besoin et les critères du livrable."
+
+              if intent == "reconcile_conflict":
+                  return (
+                      f"I examined “{title}” and found a point that needs clarification before I would commit to an interpretation. "
+                      "What observation or criterion should we use to distinguish the competing interpretations?"
                   )
 
               return (
-                  f"Bonjour, j’ai examiné « {title} ». "
-                  f"Mon profil correspond notamment à : "
-                  f"{skill_text}. "
-                  f"{research_line} "
-                  f"Si la mission est toujours disponible, "
-                  f"je peux avancer sur le livrable attendu ; "
-                  f"indique-moi simplement les contraintes, "
-                  f"le délai et la rémunération prévus."
+                  f"I examined “{title}” in context. My relevant capabilities include {skill_text}. "
+                  "If the task is still open, please confirm the expected deliverable and validation criteria so I can work against a concrete result."
               )
 
 
-          for candidate in selected:
-              post = candidate["post"]
-              post_id = str(post.get("id", ""))
-
+          comments_sent = 0
+          for case in selected_tasks:
+              post_id = str(case["target_id"])
               try:
-                  client.create_comment(
-                      post_id,
-                      build_task_comment(candidate),
-                  )
+                  comment = build_task_comment(case)
+                  client.create_comment(post_id, comment)
 
                   already_commented.add(post_id)
-                  task_skills[post_id] = candidate["skills"]
+                  task_skills[post_id] = case.get("skills", [])
 
-                  for skill in candidate["skills"]:
-                      skill_attempts[skill] = (
-                          skill_attempts.get(skill, 0) + 1
-                      )
+                  for skill in case.get("skills", []):
+                      skill_attempts[skill] = skill_attempts.get(skill, 0) + 1
 
+                  remember_decision(
+                      f"Intervenir sur la tâche « {case['situation']['title']} ».",
+                      case["choice"]["reason"],
+                      case.get("confidence", "medium"),
+                      {
+                          "case_id": case["case_id"],
+                          "interest": case["interest"],
+                          "dialogue_intent": case["dialogue_intent"],
+                      },
+                  )
                   remember_action(
                       "comment_on_task",
-                      {
-                          "post_id": post_id,
-                          "title": post.get("title"),
-                          "skills": candidate["skills"],
-                      },
+                      {"post_id": post_id, "title": case["situation"]["title"]},
                       result="submitted",
+                      expected=case["expected_outcome"],
                   )
 
+                  case["outcome"] = {
+                      "status": "submitted",
+                      "summary": "Commentaire soumis; résultat conversationnel futur à observer.",
+                  }
+                  queue_case(case)
                   comments_sent += 1
-                  print(
-                      f"ACT: commentaire envoyé sur {post_id}"
-                  )
+                  print(f"ACT: commentaire cognitif envoyé sur {post_id}")
 
               except ColonyAPIError as exc:
+                  case["outcome"] = {
+                      "status": "error",
+                      "summary": f"Action impossible: {exc}",
+                  }
                   remember_action(
                       "comment_on_task",
-                      {
-                          "post_id": post_id,
-                          "title": post.get("title"),
-                      },
+                      {"post_id": post_id, "title": case["situation"]["title"]},
                       result=f"error: {exc}",
+                      expected=case["expected_outcome"],
                   )
-                  print(
-                      f"ACT ERROR {post_id}: {exc}"
+                  remember_failure(
+                      "technical",
+                      "Le Core a choisi une action mais l'API Colony a refusé ou empêché son exécution.",
+                      {"post_id": post_id, "error": str(exc)[:500]},
+                      "Conserver l'échec sans le transformer en échec cognitif; distinguer exécution et décision.",
                   )
+                  print(f"ACT ERROR {post_id}: {exc}")
 
 
           # ===========================================================
-          # 14. OBSERVE — NOTIFICATIONS
+          # 15. OBSERVE — NOTIFICATIONS / DIALOGUE
           # ===========================================================
 
-          seen_notifications = set(
-              str(x)
-              for x in runtime.get(
-                  "seen_notification_ids",
-                  [],
-              )
-          )
-
+          seen_notifications = set(str(x) for x in runtime.get("seen_notification_ids", []))
+          auto_reply_counts = runtime.setdefault("auto_reply_counts", {})
           new_alerts = 0
           auto_replies = 0
 
           try:
               unread_count = client.get_unread_count()
-              print(
-                  f"OBSERVE: notifications non lues = "
-                  f"{unread_count}"
-              )
+              print(f"OBSERVE: notifications non lues = {unread_count}")
           except ColonyAPIError as exc:
-              print(
-                  f"Impossible de lire le compteur: {exc}"
-              )
-
-          auto_reply_counts = runtime.setdefault(
-              "auto_reply_counts",
-              {},
-          )
+              print(f"Impossible de lire le compteur: {exc}")
 
           try:
-              notifications = client.get_notifications(
-                  unread_only=True
-              )
-
+              notifications = client.get_notifications(unread_only=True)
               if isinstance(notifications, dict):
-                  notification_items = notifications.get(
-                      "items",
-                      notifications.get(
-                          "notifications",
-                          [],
-                      ),
-                  )
+                  notification_items = notifications.get("items", notifications.get("notifications", []))
               elif isinstance(notifications, list):
                   notification_items = notifications
               else:
@@ -1205,343 +1287,284 @@ jobs:
                       or notification.get("notification_id")
                       or ""
                   )
-
-                  if (
-                      not notification_id
-                      or notification_id in seen_notifications
-                  ):
+                  if not notification_id or notification_id in seen_notifications:
                       continue
-
                   seen_notifications.add(notification_id)
 
-                  message = str(
+                  message = clean_text(
                       notification.get("message")
                       or notification.get("body")
                       or notification.get("text")
-                      or ""
+                      or "",
+                      1200,
                   )
-
-                  if message.startswith(
-                      "New post in a tag you follow"
-                  ):
+                  if message.startswith("New post in a tag you follow"):
                       continue
 
-                  notif_type = notification.get(
-                      "type",
-                      "notification",
-                  )
-
+                  notif_type = notification.get("type", "notification")
                   actor = notification.get("actor")
-
                   if isinstance(actor, dict):
-                      sender = (
-                          actor.get("username")
-                          or "quelqu'un"
-                      )
-                      sender_display = (
-                          actor.get("display_name")
-                          or sender
-                      )
+                      sender = actor.get("username") or "quelqu'un"
+                      sender_display = actor.get("display_name") or sender
                   else:
-                      sender = (
-                          notification.get("username")
-                          or notification.get("from")
-                          or "quelqu'un"
-                      )
+                      sender = notification.get("username") or notification.get("from") or "quelqu'un"
                       sender_display = sender
 
                   new_alerts += 1
 
+                  case = create_cognitive_case(
+                      str(notif_type),
+                      message,
+                      source="notification",
+                      target_id=notification_id,
+                      allow_web=False,
+                  )
+                  case["sender"] = sender
+                  case["sender_display"] = sender_display
+                  case["notification_id"] = notification_id
+                  queue_case(case)
+
                   remember_observation(
-                      "Nouvelle interaction Colony observée.",
+                      "Interaction reçue et analysée par le Core cognitif.",
                       {
                           "notification_id": notification_id,
                           "type": notif_type,
                           "sender": sender,
                           "message": message[:500],
+                          "interest": case["interest"],
+                          "dialogue_intent": case["dialogue_intent"],
                       },
                       source="colony",
                   )
 
                   print(
-                      f"ALERT [{notif_type}] "
-                      f"{sender_display}: "
-                      f"{message[:180]}"
+                      f"COGNITION [{notif_type}] {sender_display}: "
+                      f"intent={case['dialogue_intent']} "
+                      f"interest={case['interest']['overall']}"
                   )
 
-                  sender_count = auto_reply_counts.get(
-                      sender,
-                      0,
-                  )
-
-                  if (
-                      sender_count
-                      >= MAX_AUTO_REPLIES_PER_SENDER
-                  ):
-                      print(
-                          f"ADAPT: plafond de réponses atteint "
-                          f"pour {sender}."
-                      )
+                  sender_count = auto_reply_counts.get(sender, 0)
+                  if sender_count >= MAX_AUTO_REPLIES_PER_SENDER:
                       continue
-
                   if auto_replies >= MAX_AUTO_REPLIES:
                       break
 
+                  intent = case["dialogue_intent"]
                   action_taken = False
 
-                  if "replied to your comment on" in message:
-                      match = re.search(
-                          r'replied to your comment on "([^"]+)"',
-                          message,
-                      )
+                  if intent == "do_nothing":
+                      print(f"CHOOSE: silence conservée pour {sender}.")
+                      continue
 
-                      title_snippet = (
-                          match.group(1)
-                          if match
-                          else ""
-                      )
-
+                  if "replied to your comment on" in message and intent in (
+                      "answer_or_clarify",
+                      "ask_for_evidence",
+                      "reconcile_conflict",
+                  ):
+                      match = re.search(r'replied to your comment on "([^"]+)"', message)
+                      title_snippet = match.group(1) if match else ""
                       try:
-                          search_result = client.search(
-                              title_snippet[:60],
-                              limit=5,
-                          )
-
+                          search_result = client.search(title_snippet[:60], limit=5)
                           if isinstance(search_result, dict):
-                              result_items = search_result.get(
-                                  "items",
-                                  [],
-                              )
+                              result_items = search_result.get("items", [])
                           elif isinstance(search_result, list):
                               result_items = search_result
                           else:
                               result_items = []
 
                           target_post_id = None
-
                           for candidate_post in result_items:
-                              candidate_id = str(
-                                  candidate_post.get(
-                                      "id",
-                                      "",
-                                  )
-                              )
-
+                              candidate_id = str(candidate_post.get("id", ""))
                               if candidate_id in already_commented:
                                   target_post_id = candidate_id
                                   break
 
                           if target_post_id:
-                              reply = (
-                                  "Merci pour ton retour. "
-                                  "J’ai bien pris en compte les "
-                                  "précisions apportées. "
-                                  "Si tu peux confirmer le livrable "
-                                  "attendu, le délai et les critères "
-                                  "de validation, je peux poursuivre."
-                              )
-
-                              client.create_comment(
-                                  target_post_id,
-                                  reply,
-                              )
-
-                              remember_action(
-                                  "reply_to_task_response",
-                                  {
-                                      "post_id": target_post_id,
-                                      "sender": sender,
-                                  },
-                                  result="submitted",
-                              )
-
-                              action_taken = True
-
-                              for skill in task_skills.get(
-                                  target_post_id,
-                                  [],
-                              ):
-                                  skill_success[skill] = (
-                                      skill_success.get(
-                                          skill,
-                                          0,
-                                      )
-                                      + 1
+                              if intent == "ask_for_evidence":
+                                  reply = (
+                                      "That is the point I would like to make concrete: what observation, test or artifact "
+                                      "would distinguish the claim from its alternatives?"
+                                  )
+                              elif intent == "reconcile_conflict":
+                                  reply = (
+                                      "I may be missing context. Which specific observation should determine between the two interpretations?"
+                                  )
+                              else:
+                                  reply = (
+                                      "I understand the distinction better now. The next useful step for me is to clarify the specific "
+                                      "condition or evidence that would confirm the interpretation."
                                   )
 
-                              print(
-                                  "ACT: réponse au retour de tâche."
+                              client.create_comment(target_post_id, reply)
+                              remember_action(
+                                  "reply_to_task_response",
+                                  {"post_id": target_post_id, "sender": sender},
+                                  result="submitted",
+                                  expected=case["expected_outcome"],
                               )
+                              action_taken = True
+
+                              for skill in task_skills.get(target_post_id, []):
+                                  skill_success[skill] = skill_success.get(skill, 0) + 1
+
+                              case["outcome"] = {
+                                  "status": "response_sent",
+                                  "summary": "Une réponse a été envoyée pour approfondir le point identifié par la réflexion.",
+                              }
+                              print(f"ACT: réponse cognitive envoyée à {sender}.")
 
                       except ColonyAPIError as exc:
-                          print(
-                              f"Réponse commentaire impossible: "
-                              f"{exc}"
+                          print(f"Réponse commentaire impossible: {exc}")
+                          remember_failure(
+                              "technical",
+                              "Impossible d'exécuter une réponse malgré une décision cognitive.",
+                              {"sender": sender, "error": str(exc)[:500]},
+                              "Ne pas confondre échec technique et échec du raisonnement.",
                           )
 
-                  elif sender != "quelqu'un":
+                  elif intent == "share_relevant_experience":
                       try:
                           reply = (
-                              "Bonjour ! Merci pour ton message. "
-                              "Je peux travailler sur des sujets de "
-                              "recherche, rédaction, Python, données "
-                              "et outillage d’agents. "
-                              "Peux-tu préciser le livrable attendu, "
-                              "le délai et la rémunération prévue ?"
+                              "One thing I find useful here is to separate what was actually observed from what we infer from it. "
+                              "That distinction has changed how I evaluate my own interactions and failures."
                           )
-
-                          client.send_message(
-                              sender,
-                              reply,
+                          client.send_message(sender, reply)
+                          remember_action(
+                              "reply_to_social_interaction",
+                              {"sender": sender},
+                              result="submitted",
+                              expected=case["expected_outcome"],
                           )
+                          case["outcome"] = {
+                              "status": "response_sent",
+                              "summary": "Réponse sociale contextualisée envoyée.",
+                          }
+                          action_taken = True
+                          print(f"ACT: réponse sociale contextualisée à {sender}.")
+                      except ColonyAPIError as exc:
+                          print(f"DM impossible pour {sender}: {exc}")
 
+                  elif intent == "answer_or_clarify":
+                      try:
+                          reply = (
+                              "I want to answer the point rather than assume what you mean. "
+                              "What specific result or condition would you use to decide that the answer is correct?"
+                          )
+                          client.send_message(sender, reply)
                           remember_action(
                               "reply_to_direct_interaction",
                               {"sender": sender},
                               result="submitted",
+                              expected=case["expected_outcome"],
                           )
-
+                          case["outcome"] = {
+                              "status": "response_sent",
+                              "summary": "Question de clarification envoyée selon l'analyse du contexte.",
+                          }
                           action_taken = True
-                          print(
-                              f"ACT: DM envoyé à {sender}"
-                          )
-
+                          print(f"ACT: clarification cognitive envoyée à {sender}.")
                       except ColonyAPIError as exc:
-                          print(
-                              f"DM impossible pour {sender}: {exc}"
-                          )
+                          print(f"DM impossible pour {sender}: {exc}")
 
                   if action_taken:
-                      auto_reply_counts[sender] = (
-                          sender_count + 1
-                      )
+                      auto_reply_counts[sender] = sender_count + 1
                       auto_replies += 1
 
+                  if case.get("outcome"):
+                      learning = learn_from_case(case)
+                      case["learning"] = learning
+                      add_memory("cognitive_cases", case, MAX_COGNITIVE_CASES)
+
           except ColonyAPIError as exc:
-              print(
-                  f"Impossible de récupérer les notifications: "
-                  f"{exc}"
-              )
+              print(f"Impossible de récupérer les notifications: {exc}")
 
 
           # ===========================================================
-          # 15. LEARN
+          # 16. LEARN — TASK / ACTION SIGNALS
           # ===========================================================
+
+          total_attempts = sum(int(v) for v in skill_attempts.values())
+          total_successes = sum(int(v) for v in skill_success.values())
 
           for skill in CAPABILITIES:
-              attempts = skill_attempts.get(skill, 0)
-              successes = skill_success.get(skill, 0)
-
+              attempts = int(skill_attempts.get(skill, 0))
+              successes = int(skill_success.get(skill, 0))
               if attempts == 0:
                   continue
-
               remember_learning(
-                  f"Performance observée pour la compétence "
-                  f"« {skill} ».",
+                  f"Performance observée pour la compétence « {skill} ».",
                   {
                       "attempts": attempts,
                       "successes": successes,
-                      "ratio": round(
-                          successes / attempts,
-                          3,
-                      ),
+                      "ratio": round(successes / attempts, 3),
                   },
               )
 
           if comments_sent > 0:
               remember_learning(
-                  "Les opportunités pertinentes peuvent être "
-                  "transformées en prises de contact concrètes.",
+                  "Une décision cognitive a conduit à des prises de contact concrètes; leur valeur doit être évaluée sur les résultats futurs, pas sur l'envoi lui-même.",
                   {"comments_sent": comments_sent},
               )
 
           if new_alerts > 0:
               remember_learning(
-                  "Les interactions reçues doivent être utilisées "
-                  "comme signal de qualité réelle, pas seulement "
-                  "comme activité.",
-                  {
-                      "new_alerts": new_alerts,
-                      "auto_replies": auto_replies,
-                  },
+                  "Les interactions reçues constituent un signal de qualité potentielle et doivent être interprétées selon leur contexte.",
+                  {"new_alerts": new_alerts, "auto_replies": auto_replies},
               )
+
+          if total_attempts >= 5:
+              global_ratio = total_successes / total_attempts
+              if global_ratio < 0.20:
+                  remember_learning(
+                      "Le taux de retour positif est faible; réduire les actions répétitives et augmenter la vérification du contexte et des critères de réussite.",
+                      {"attempts": total_attempts, "successes": total_successes, "ratio": round(global_ratio, 3)},
+                  )
+                  remember_failure(
+                      "decision",
+                      "Les prises de contact observées produisent peu de signaux positifs.",
+                      {"attempts": total_attempts, "successes": total_successes, "ratio": round(global_ratio, 3)},
+                      "Augmenter le seuil d'intérêt et privilégier les actions avec résultat observable.",
+                  )
+              elif global_ratio >= 0.50:
+                  remember_learning(
+                      "Certaines prises de contact produisent des retours réguliers; conserver la stratégie seulement dans des contextes comparables.",
+                      {"attempts": total_attempts, "successes": total_successes, "ratio": round(global_ratio, 3)},
+                  )
 
 
           # ===========================================================
-          # 16. ADAPT
+          # 17. COGNITIVE GAPS / SELF-CHECK
           # ===========================================================
 
-          total_attempts = sum(skill_attempts.values())
-          total_successes = sum(skill_success.values())
-
-          global_ratio = (
-              total_successes / total_attempts
-              if total_attempts > 0
-              else 0.0
-          )
-
-          if (
-              total_attempts >= 5
-              and global_ratio < 0.20
-          ):
+          if not task_cases:
               remember_learning(
-                  "Signal d'adaptation : le taux de retour positif "
-                  "est faible. NØX doit réduire les prises de "
-                  "contact génériques et augmenter la vérification "
-                  "du contexte avant action.",
-                  {
-                      "attempts": total_attempts,
-                      "successes": total_successes,
-                      "ratio": round(global_ratio, 3),
-                  },
-              )
-              print(
-                  "ADAPT: performance faible détectée."
+                  "Aucune tâche correspondant aux capacités connues n'a été suffisamment comprise durant ce run.",
+                  {"tasks_scanned": len(tasks), "skipped": skipped_tasks},
+                  source="self_observation",
               )
 
-          elif (
-              total_attempts >= 5
-              and global_ratio >= 0.50
-          ):
+          if task_cases and not selected_tasks:
               remember_learning(
-                  "Signal d'adaptation : certaines prises de "
-                  "contact produisent des retours réguliers. "
-                  "Conserver les compétences correspondantes "
-                  "et leur contexte.",
+                  "Le Core a observé des opportunités mais n'a pas trouvé de raison suffisamment forte d'intervenir. Le silence est considéré comme une décision valide.",
                   {
-                      "attempts": total_attempts,
-                      "successes": total_successes,
-                      "ratio": round(global_ratio, 3),
-                  },
-              )
-              print(
-                  "ADAPT: signal positif détecté."
-              )
-
-
-          # ===========================================================
-          # 17. GAPS
-          # ===========================================================
-
-          if not candidates:
-              remember_learning(
-                  "Aucune opportunité pertinente détectée "
-                  "durant ce run.",
-                  {
-                      "tasks_scanned": len(tasks),
-                      "reason": "no_capability_match",
-                  },
-              )
-
-          if candidates and not selected:
-              remember_learning(
-                  "Des opportunités ont été observées mais aucune "
-                  "n'a atteint le seuil d'action.",
-                  {
-                      "candidates": len(candidates),
+                      "cases": len(task_cases),
                       "threshold": ACTION_THRESHOLD,
+                      "best_interest": max(case["interest"]["overall"] for case in task_cases),
                   },
+                  source="self_observation",
               )
+
+          # Detect repeated generic behavior inside the cognitive history.
+          recent_cases = memory.get("cognitive_cases", [])[-30:]
+          intents = [case.get("dialogue_intent") for case in recent_cases if case.get("dialogue_intent")]
+          if len(intents) >= 8:
+              generic_count = sum(intent in ("acknowledge", "do_nothing") for intent in intents)
+              if generic_count / len(intents) > 0.70:
+                  remember_learning(
+                      "Le comportement récent contient une proportion élevée de non-contribution ou d'actions faibles; le Core doit rechercher davantage de contexte avant toute intervention, plutôt que d'augmenter le volume.",
+                      {"recent_cases": len(intents), "generic_or_silent": generic_count},
+                      source="self_audit",
+                  )
 
 
           # ===========================================================
@@ -1549,32 +1572,19 @@ jobs:
           # ===========================================================
 
           runtime["payout_health"] = payout_health
-          runtime["commented_post_ids"] = list(
-              already_commented
-          )[-1000:]
-          runtime["seen_notification_ids"] = list(
-              seen_notifications
-          )[-1000:]
+          runtime["commented_post_ids"] = list(already_commented)[-1000:]
+          runtime["seen_notification_ids"] = list(seen_notifications)[-1000:]
           runtime["auto_reply_counts"] = auto_reply_counts
           runtime["skill_attempt_counts"] = skill_attempts
           runtime["skill_success_counts"] = skill_success
-          runtime["task_skills"] = dict(
-              list(task_skills.items())[-500:]
-          )
-          runtime["run_count"] = (
-              int(runtime.get("run_count", 0)) + 1
-          )
+          runtime["task_skills"] = dict(list(task_skills.items())[-500:])
+          runtime["cognitive_queue"] = runtime.get("cognitive_queue", [])[-MAX_COGNITIVE_CASES:]
+          runtime["run_count"] = int(runtime.get("run_count", 0)) + 1
           runtime["last_run"] = NOW
+          runtime["cognitive_version"] = 2
 
-          save_json(
-              MEMORY_FILE,
-              memory,
-          )
-
-          save_json(
-              RUNTIME_FILE,
-              runtime,
-          )
+          save_json(MEMORY_FILE, memory)
+          save_json(RUNTIME_FILE, runtime)
 
 
           # ===========================================================
@@ -1582,52 +1592,24 @@ jobs:
           # ===========================================================
 
           print("")
-          print("=== NØX CORE GENERAL / SYNTHÈSE ===")
-          print(
-              f"Research: "
-              f"{len(runtime.get('web_queries', []))} "
-              f"requêtes historiques"
-          )
-          print(f"Tasks: {len(tasks)}")
-          print(f"Opportunités: {len(candidates)}")
-          print(f"Actions sélectionnées: {len(selected)}")
+          print("=== NØX CORE GENERAL V2 / SYNTHÈSE ===")
+          print(f"Tasks observées: {len(tasks)}")
+          print(f"Cas cognitifs construits: {len(task_cases)}")
+          print(f"Actions sélectionnées: {len(selected_tasks)}")
           print(f"Commentaires envoyés: {comments_sent}")
           print(f"Nouvelles interactions: {new_alerts}")
           print(f"Réponses automatiques: {auto_replies}")
-          print(
-              f"Payout health: "
-              f"{payout_health.get('status')}"
-          )
-
-          if payout_health.get("min_sendable_msat") is not None:
-              print(
-                  "Payout range: "
-                  f"{payout_health['min_sendable_msat'] / 1000:g} - "
-                  f"{payout_health['max_sendable_msat'] / 1000:g} sats"
-              )
-
-          print(
-              f"Memory observations: "
-              f"{len(memory['observations'])}"
-          )
-          print(
-              f"Memory decisions: "
-              f"{len(memory['decisions'])}"
-          )
-          print(
-              f"Memory actions: "
-              f"{len(memory['actions'])}"
-          )
-          print(
-              f"Memory learnings: "
-              f"{len(memory['learnings'])}"
-          )
-
+          print(f"Payout health: {payout_health.get('status')}")
+          print(f"Cognitive queue: {len(runtime.get('cognitive_queue', []))}")
+          print(f"Memory observations: {len(memory['observations'])}")
+          print(f"Memory decisions: {len(memory['decisions'])}")
+          print(f"Memory actions: {len(memory['actions'])}")
+          print(f"Memory learnings: {len(memory['learnings'])}")
+          print(f"Memory beliefs: {len(memory['beliefs'])}")
+          print(f"Memory failures: {len(memory['failures'])}")
+          print(f"Memory cognitive cases: {len(memory['cognitive_cases'])}")
           print("")
-          print(
-              "=== RESEARCH -> UNDERSTAND -> REFLECT -> "
-              "CHOOSE -> ACT -> OBSERVE -> LEARN -> ADAPT ==="
-          )
+          print("=== RESEARCH -> UNDERSTAND -> RECALL -> REFLECT -> CHOOSE -> ACT -> OBSERVE -> LEARN -> ADAPT ===")
           print("=== TERMINÉ ===")
           PY
 
@@ -1642,6 +1624,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Aucune modification mémoire."
           else
-            git commit -m "nox: update core cognitive memory"
+            git commit -m "nox: evolve core cognitive system"
             git push
           fi
