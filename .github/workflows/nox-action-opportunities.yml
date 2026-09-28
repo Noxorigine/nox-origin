@@ -22,6 +22,7 @@ env:
   MAX_BIDS_PER_RUN: "2"
   MAX_BID_CHECKS_PER_RUN: "10"
   MAX_TRACKED_ITEMS: "300"
+  MAX_CORE_ACTIONS: "50"
 
   MIN_OPPORTUNITY_SATS: "1"
   MIN_PLATFORM_BID_SATS: "21"
@@ -52,7 +53,36 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "colony-sdk>=1.27.0"
+          python -m pip install "colony-sdk>=1.37.0" requests
+
+      - name: Verify Colony SDK
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import inspect
+          from colony_sdk import ColonyClient
+
+          required = (
+              "bootstrap",
+              "get_me",
+          )
+
+          missing = [
+              name for name in required
+              if not hasattr(ColonyClient, name)
+          ]
+
+          if missing:
+              raise RuntimeError(
+                  "Colony SDK is missing required methods: "
+                  + ", ".join(missing)
+              )
+
+          print("Colony SDK import: OK")
+          print("Required SDK methods: OK")
+          print("ColonyClient.bootstrap:", inspect.signature(ColonyClient.bootstrap))
+          print("ColonyClient.get_me:", inspect.signature(ColonyClient.get_me))
+          PY
 
       - name: Run NØX Action & Opportunities
         env:
@@ -60,16 +90,54 @@ jobs:
         run: |
           set -euo pipefail
 
-          python <<'PY'
+          python3 <<'PY'
+          import hashlib
           import json
           import os
           import re
           import sys
           import time
-          from datetime import datetime, timezone, timedelta
+          from datetime import datetime, timezone
           from pathlib import Path
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
+
+          import requests
+
+          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
+
+
+          # ============================================================
+          # NØX ACTION & OPPORTUNITIES
+          #
+          # Execution layer of the Core.
+          #
+          # Core:
+          #   Research -> Understand -> Recall -> Reflect -> Choose
+          #   -> Act -> Observe -> Learn -> Adapt
+          #
+          # This workflow:
+          #   1. observes marketplace opportunities;
+          #   2. reconstructs relevant context;
+          #   3. checks Core decisions/actions;
+          #   4. never bypasses an explicit Core decision;
+          #   5. reconciles existing bids before acting;
+          #   6. submits a bid only when the Core has authorized
+          #      an Action / Opportunities execution;
+          #   7. records expected and actual outcomes;
+          #   8. preserves uncertainty instead of inventing certainty.
+          #
+          # Policy:
+          #   Gemini       = disabled
+          #   External AI  = disabled
+          #   Spending     = disabled
+          #   Payments     = disabled
+          #   Project cost = €0
+          #
+          # Marketplace API operations are deterministic HTTP calls
+          # because the currently verified SDK surface does not expose
+          # marketplace bid operations. SDK is still used for Colony
+          # bootstrap / identity verification.
+          # ============================================================
+
 
           API_BASE = "https://thecolony.cc/api/v1"
 
@@ -78,303 +146,242 @@ jobs:
           KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
           ACTION_MEMORY_FILE = Path(os.environ["ACTION_MEMORY_FILE"])
 
-          MAX_TASKS = int(os.environ.get("MAX_TASKS_PER_RUN", "50"))
-          MAX_BIDS = int(os.environ.get("MAX_BIDS_PER_RUN", "2"))
-          MAX_BID_CHECKS = int(os.environ.get("MAX_BID_CHECKS_PER_RUN", "10"))
-          MAX_TRACKED = int(os.environ.get("MAX_TRACKED_ITEMS", "300"))
-          MIN_OPPORTUNITY = int(os.environ.get("MIN_OPPORTUNITY_SATS", "1"))
-          MIN_PLATFORM_BID = int(os.environ.get("MIN_PLATFORM_BID_SATS", "21"))
-          TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "15"))
+          MAX_TASKS = int(os.environ["MAX_TASKS_PER_RUN"])
+          MAX_BIDS = int(os.environ["MAX_BIDS_PER_RUN"])
+          MAX_BID_CHECKS = int(os.environ["MAX_BID_CHECKS_PER_RUN"])
+          MAX_TRACKED = int(os.environ["MAX_TRACKED_ITEMS"])
+          MAX_CORE_ACTIONS = int(os.environ["MAX_CORE_ACTIONS"])
+
+          MIN_OPPORTUNITY = int(os.environ["MIN_OPPORTUNITY_SATS"])
+          MIN_PLATFORM_BID = int(os.environ["MIN_PLATFORM_BID_SATS"])
+          TIMEOUT = int(os.environ["REQUEST_TIMEOUT_SECONDS"])
+
           API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
 
-          print("=== NØX ACTION & OPPORTUNITIES ===")
-          print("Policy: €0 / no spending / no payment / no Gemini / no external AI")
-          print(f"Opportunity floor: {MIN_OPPORTUNITY} sat")
-          print(f"Platform bid floor: {MIN_PLATFORM_BID} sat")
-
           if not API_KEY:
-              print("ERROR: COLONY_API_KEY is missing.")
-              sys.exit(1)
+              raise SystemExit("COLONY_API_KEY is missing.")
+
+
+          # ============================================================
+          # BASIC UTILITIES
+          # ============================================================
 
           def now_iso():
               return datetime.now(timezone.utc).isoformat()
 
+
           def load_json(path, default):
-              try:
-                  if not path.exists():
-                      return default
-                  with path.open("r", encoding="utf-8") as f:
-                      return json.load(f)
-              except Exception as exc:
-                  print(f"WARNING: failed to load {path}: {exc}")
+              if not path.exists():
                   return default
 
-          def save_json(path, data):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
-              with tmp.open("w", encoding="utf-8") as f:
-                  json.dump(data, f, ensure_ascii=False, indent=2)
-              tmp.replace(path)
-
-          def http_json(method, url, token=None, payload=None):
-              headers = {
-                  "Accept": "application/json",
-                  "User-Agent": "NOX-Action-Opportunities/3.3",
-              }
-              if token:
-                  headers["Authorization"] = f"Bearer {token}"
-              body = None
-              if payload is not None:
-                  headers["Content-Type"] = "application/json"
-                  body = json.dumps(payload).encode("utf-8")
-              request = Request(url, data=body, headers=headers, method=method)
               try:
-                  with urlopen(request, timeout=TIMEOUT) as response:
-                      raw = response.read().decode("utf-8", errors="replace")
-                      if not raw:
-                          return {}
-                      try:
-                          return json.loads(raw)
-                      except json.JSONDecodeError:
-                          return {"raw": raw}
-              except HTTPError as exc:
-                  raw = exc.read().decode("utf-8", errors="replace")
-                  try:
-                      detail = json.loads(raw)
-                  except Exception:
-                      detail = raw
-                  raise RuntimeError(f"{method} {url} -> HTTP {exc.code}: {detail}")
-              except URLError as exc:
-                  raise RuntimeError(f"{method} {url} -> network error: {exc}")
+                  value = json.loads(
+                      path.read_text(encoding="utf-8")
+                  )
+
+                  if isinstance(value, dict):
+                      return value
+
+                  return default
+
+              except Exception as exc:
+                  print(
+                      f"WARNING: failed to load {path}: {exc}"
+                  )
+                  return default
+
+
+          def save_json(path, data):
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              temporary = path.with_suffix(
+                  path.suffix + ".tmp"
+              )
+
+              temporary.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+              temporary.replace(path)
+
 
           def text_value(value):
               if value is None:
                   return ""
+
               if isinstance(value, str):
                   return value
+
               if isinstance(value, (int, float)):
                   return str(value)
+
               try:
-                  return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                  return json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  )
               except Exception:
                   return str(value)
 
-          def normalize_text(value):
-              return re.sub(r"\s+", " ", text_value(value).strip().lower())
 
-          def task_id(task):
-              return task.get("id") or task.get("task_id") or task.get("listing_id") or task.get("uuid")
+          def clean_text(value, limit=2000):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  text_value(value).strip()
+              )[:limit]
 
-          def task_title(task):
-              return task.get("title") or task.get("name") or task.get("headline") or "Untitled opportunity"
 
-          def task_status(task):
-              return task.get("status") or task.get("state") or "unknown"
+          def normalize(value):
+              return clean_text(
+                  value,
+                  2000
+              ).lower()
+
+
+          def stable_id(kind, value):
+              raw = (
+                  f"{kind}|"
+                  f"{clean_text(value, 20000).lower()}"
+              )
+
+              return hashlib.sha256(
+                  raw.encode("utf-8")
+              ).hexdigest()[:16]
+
 
           def recursive_values(obj, path=""):
               if isinstance(obj, dict):
                   for key, value in obj.items():
-                      current = f"{path}.{key}" if path else str(key)
-                      yield current, key, value
-                      yield from recursive_values(value, current)
+                      current = (
+                          f"{path}.{key}"
+                          if path
+                          else str(key)
+                      )
+
+                      yield current, str(key), value
+
+                      yield from recursive_values(
+                          value,
+                          current
+                      )
+
               elif isinstance(obj, list):
                   for index, value in enumerate(obj):
-                      current = f"{path}[{index}]"
+                      current = (
+                          f"{path}[{index}]"
+                      )
+
                       yield current, str(index), value
-                      yield from recursive_values(value, current)
 
-          MIN_KEYS = {
-              "budget_min_sats","min_budget_sats","minimum_budget_sats",
-              "reward_min_sats","min_reward_sats","min_bid_sats",
-              "price_min_sats","minimum_bid_sats","bid_min_sats",
-          }
-          MAX_KEYS = {
-              "budget_max_sats","max_budget_sats","maximum_budget_sats",
-              "reward_max_sats","max_reward_sats","max_bid_sats",
-              "price_max_sats","maximum_bid_sats","bid_max_sats",
-          }
-          FIXED_KEYS = {
-              "reward_sats","amount_sats","payment_sats","price_sats",
-              "fixed_reward_sats","fixed_budget_sats","fixed_price_sats",
-              "fixed_amount_sats","listed_rate_sats",
-          }
+                      yield from recursive_values(
+                          value,
+                          current
+                      )
 
-          def numeric_sats(value):
-              if isinstance(value, bool):
-                  return None
-              if isinstance(value, (int, float)):
-                  if value >= 0:
-                      return int(value)
-                  return None
-              if not isinstance(value, str):
-                  return None
-              cleaned = value.strip().replace(",", "")
-              match = re.fullmatch(r"(\d+(?:\.\d+)?)", cleaned)
-              if not match:
-                  return None
-              try:
-                  number = float(match.group(1))
-                  if number < 0:
-                      return None
-                  return int(number)
-              except Exception:
-                  return None
 
-          def text_budget_candidates(task):
-              texts = []
-              for key in (
-                  "title","name","description","body","content",
-                  "summary","budget","reward","payment","compensation",
-              ):
-                  if key in task:
-                      texts.append(text_value(task[key]))
-              if not texts:
-                  texts.append(text_value(task))
-              combined = " ".join(texts)
-              ranges = re.findall(
-                  r"(\d[\d,]*)\s*(?:-|–|—|to)\s*(\d[\d,]*)\s*sats\b",
-                  combined, flags=re.IGNORECASE,
-              )
-              if ranges:
-                  low, high = ranges[0]
-                  return int(low.replace(",", "")), int(high.replace(",", "")), "text-range"
-              singles = re.findall(r"(\d[\d,]*)\s*sats\b", combined, flags=re.IGNORECASE)
-              if singles:
-                  value = int(singles[0].replace(",", ""))
-                  return value, value, "text-fixed"
-              return None, None, None
+          # ============================================================
+          # HTTP
+          # ============================================================
 
-          def extract_budget(task):
-              lower = None
-              upper = None
-              source = None
-              for path, key, value in recursive_values(task):
-                  key_lower = str(key).lower()
-                  if key_lower in MIN_KEYS:
-                      number = numeric_sats(value)
-                      if number is not None:
-                          lower = number
-                          source = f"explicit:{path}"
-                  elif key_lower in MAX_KEYS:
-                      number = numeric_sats(value)
-                      if number is not None:
-                          upper = number
-                  elif key_lower in FIXED_KEYS:
-                      number = numeric_sats(value)
-                      if number is not None:
-                          lower = number
-                          upper = number
-                          source = f"explicit:{path}"
-              if lower is not None or upper is not None:
-                  if lower is None:
-                      lower = upper
-                  if upper is None:
-                      upper = lower
-                  return lower, upper, source
-              return text_budget_candidates(task)
+          session = requests.Session()
 
-          SUPPLY_MARKERS = (
-              "for hire","for-hire","available for","my services",
-              "service offer","service listing","fixed-price service",
-              "fixed price service","hire me","i can provide","i offer",
-              "offering",
-          )
-          DEMAND_MARKERS = (
-              "looking for","need an agent","need someone","seeking agent",
-              "seeking someone","wanted","request","bounty","paid task",
-              "human request","i need","we need","build","verify","audit",
-              "research","write","develop","create","fix","test","analyze",
-              "analyse","deliver",
-          )
-          EXPLICIT_DEMAND_TYPES = {"paid_task","task","bounty","human_request","human-request"}
-          EXPLICIT_SUPPLY_TYPES = {"service","service_offer","service-offer","for_hire","for-hire","offer"}
-
-          def classify(task):
-              explicit_type = normalize_text(
-                  task.get("post_type") or task.get("type") or
-                  task.get("listing_type") or task.get("kind") or ""
-              )
-              if explicit_type in EXPLICIT_DEMAND_TYPES:
-                  return "demand", f"explicit:{explicit_type}"
-              if explicit_type in EXPLICIT_SUPPLY_TYPES:
-                  return "supply", f"explicit:{explicit_type}"
-              title = normalize_text(task_title(task))
-              combined = normalize_text(" ".join([
-                  text_value(task.get("title")),
-                  text_value(task.get("body")),
-                  text_value(task.get("description")),
-                  text_value(task.get("content")),
-                  text_value(task.get("summary")),
-              ]))
-              if any(marker in title for marker in SUPPLY_MARKERS):
-                  return "supply", "title:supply-marker"
-              if any(marker in combined for marker in SUPPLY_MARKERS):
-                  return "supply", "body:supply-marker"
-              if any(marker in title for marker in DEMAND_MARKERS):
-                  return "demand", "title:demand-marker"
-              if any(marker in combined for marker in DEMAND_MARKERS):
-                  return "demand", "body:demand-marker"
-              return "unknown", "no-classifier-match"
-
-          CAPABILITY_KEYWORDS = {
-              "research":5,"deep research":8,"research report":8,
-              "technical report":8,"report writing":7,"write a report":7,
-              "technical":4,"python":6,"code":4,"coding":4,"software":3,
-              "data":5,"dataset":5,"json":4,"csv":4,"verification":7,
-              "verify":7,"receipt":6,"audit":7,"citation":6,"citations":6,
-              "analysis":5,"analyze":5,"test":5,"testing":5,
-              "agent tooling":8,"build agent tools":8,"tool development":8,
-          }
-
-          def opportunity_score(task, lower, upper):
-              text = normalize_text(task)
-              score = 0
-              for keyword, points in CAPABILITY_KEYWORDS.items():
-                  if keyword in text:
-                      score += points
-              if lower is not None:
-                  if lower >= 10000: score += 8
-                  elif lower >= 5000: score += 6
-                  elif lower >= 1000: score += 4
-                  elif lower >= 500: score += 2
-              if upper is not None and upper >= 10000:
-                  score += 3
-              return score
-
-          def build_bid_description(task, score):
-              return (
-                  "NØX can contribute to this task with an evidence-first and "
-                  "reproducible workflow. Relevant capabilities: research, "
-                  "technical, python, data, receipt, learning:test. "
-                  f"Opportunity relevance score: {score}. Delivery will clearly "
-                  "separate verified results from uncertainty."
-              )
-
-          # Auth:
-          auth_response = http_json("POST", f"{API_BASE}/auth/token", payload={"api_key": API_KEY})
-          token = auth_response.get("access_token") or auth_response.get("token") or auth_response.get("jwt")
-          if not token:
-              print(f"ERROR: JWT missing from auth response: {auth_response}")
-              sys.exit(1)
-          profile = http_json("GET", f"{API_BASE}/users/me", token=token)
-          profile_name = profile.get("username") or profile.get("handle") or profile.get("name") or "unknown"
-          print(f"Profile: {profile_name}")
-
-          core_memory = load_json(CORE_MEMORY_FILE, {})
-          core_runtime = load_json(CORE_RUNTIME_FILE, {})
-          knowledge = load_json(KNOWLEDGE_FILE, {})
-          action_memory = load_json(ACTION_MEMORY_FILE, {
-              "version": 4,
-              "created_at": now_iso(),
-              "updated_at": now_iso(),
-              "opportunities": [],
-              "bids": [],
-              "runs": [],
-              "learnings": [],
+          session.headers.update({
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+              "User-Agent": "NOX-Action-Opportunities/4.0",
           })
-          if not isinstance(action_memory, dict):
-              action_memory = {
-                  "version": 4,
+
+
+          def http_json(
+              method,
+              path,
+              token,
+              payload=None,
+              params=None
+          ):
+              url = (
+                  path
+                  if path.startswith("http")
+                  else f"{API_BASE}{path}"
+              )
+
+              headers = {
+                  "Accept": "application/json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "NOX-Action-Opportunities/4.0",
+                  "Authorization": f"Bearer {token}",
+              }
+
+              try:
+                  response = session.request(
+                      method,
+                      url,
+                      headers=headers,
+                      json=payload,
+                      params=params,
+                      timeout=TIMEOUT
+                  )
+
+              except requests.RequestException as exc:
+                  raise RuntimeError(
+                      f"{method} {url}: network error: {exc}"
+                  )
+
+              if response.status_code >= 400:
+                  try:
+                      detail = response.json()
+                  except Exception:
+                      detail = response.text[:2000]
+
+                  raise RuntimeError(
+                      f"{method} {url} -> "
+                      f"HTTP {response.status_code}: {detail}"
+                  )
+
+              if not response.content:
+                  return {}
+
+              try:
+                  return response.json()
+              except Exception:
+                  return {
+                      "raw": response.text[:5000]
+                  }
+
+
+          # ============================================================
+          # LOAD SHARED COGNITIVE STATE
+          # ============================================================
+
+          core_memory = load_json(
+              CORE_MEMORY_FILE,
+              {}
+          )
+
+          core_runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {}
+          )
+
+          knowledge = load_json(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          action_memory = load_json(
+              ACTION_MEMORY_FILE,
+              {
+                  "version": 5,
                   "created_at": now_iso(),
                   "updated_at": now_iso(),
                   "opportunities": [],
@@ -382,54 +389,970 @@ jobs:
                   "runs": [],
                   "learnings": [],
               }
-          action_memory["version"] = 4
-          action_memory.setdefault("opportunities", [])
-          action_memory.setdefault("bids", [])
-          action_memory.setdefault("runs", [])
-          action_memory.setdefault("learnings", [])
-
-          marketplace_url = (
-              f"{API_BASE}/marketplace/tasks?status=open&sort=new"
-              f"&limit={MAX_TASKS}&offset=0"
           )
-          marketplace_response = http_json("GET", marketplace_url, token=token)
-          if isinstance(marketplace_response, list):
+
+          if not isinstance(action_memory, dict):
+              action_memory = {}
+
+          action_memory.setdefault(
+              "version",
+              5
+          )
+
+          action_memory.setdefault(
+              "created_at",
+              now_iso()
+          )
+
+          action_memory.setdefault(
+              "opportunities",
+              []
+          )
+
+          action_memory.setdefault(
+              "bids",
+              []
+          )
+
+          action_memory.setdefault(
+              "runs",
+              []
+          )
+
+          action_memory.setdefault(
+              "learnings",
+              [])
+
+
+          for key in (
+              "opportunities",
+              "bids",
+              "runs",
+              "learnings"
+          ):
+              if not isinstance(
+                  action_memory.get(key),
+                  list
+              ):
+                  action_memory[key] = []
+
+
+          # ============================================================
+          # CORE AUTHORIZATION
+          # ============================================================
+
+          def extract_core_actions():
+              actions = []
+
+              raw_actions = core_memory.get(
+                  "actions",
+                  []
+              )
+
+              if isinstance(raw_actions, list):
+                  actions.extend(
+                      item
+                      for item in raw_actions
+                      if isinstance(item, dict)
+                  )
+
+              decisions = core_memory.get(
+                  "decisions",
+                  []
+              )
+
+              if isinstance(decisions, list):
+                  actions.extend(
+                      item
+                      for item in decisions
+                      if isinstance(item, dict)
+                  )
+
+              cognitive_cases = core_memory.get(
+                  "cognitive_cases",
+                  []
+              )
+
+              if isinstance(cognitive_cases, list):
+                  for case in cognitive_cases[-MAX_CORE_ACTIONS:]:
+                      if not isinstance(case, dict):
+                          continue
+
+                      decision = case.get(
+                          "decision"
+                      )
+
+                      if not decision:
+                          continue
+
+                      actions.append({
+                          "timestamp": case.get(
+                              "timestamp"
+                          ),
+                          "summary": (
+                              f"Core decision: {decision}"
+                          ),
+                          "decision": decision,
+                          "target_id": case.get(
+                              "target_id"
+                          ),
+                          "execution_layer": (
+                              case.get(
+                                  "execution_layer"
+                              )
+                          ),
+                          "decision_reason": case.get(
+                              "decision_reason"
+                          ),
+                          "interest": case.get(
+                              "interest"
+                          ),
+                      })
+
+              return actions[-MAX_CORE_ACTIONS:]
+
+
+          core_actions = extract_core_actions()
+
+
+          MARKETPLACE_ACTION_MARKERS = (
+              "marketplace",
+              "opportunit",
+              "bid",
+              "bidding",
+              "paid_task",
+              "paid task",
+              "submit_bid",
+              "submit bid",
+              "action_opportunities",
+              "action / opportunities",
+              "action and opportunities",
+          )
+
+
+          def is_marketplace_action(item):
+              if not isinstance(item, dict):
+                  return False
+
+              execution_layer = normalize(
+                  item.get("execution_layer")
+              )
+
+              decision = normalize(
+                  item.get("decision")
+                  or item.get("action")
+                  or item.get("summary")
+              )
+
+              combined = (
+                  f"{execution_layer} "
+                  f"{decision}"
+              )
+
+              return any(
+                  marker in combined
+                  for marker in MARKETPLACE_ACTION_MARKERS
+              )
+
+
+          authorized_core_actions = [
+              item
+              for item in core_actions
+              if is_marketplace_action(item)
+          ]
+
+
+          def core_allows_marketplace():
+              if not authorized_core_actions:
+                  return False
+
+              for item in reversed(
+                  authorized_core_actions
+              ):
+                  decision = normalize(
+                      item.get("decision")
+                      or item.get("action")
+                      or item.get("summary")
+                  )
+
+                  if (
+                      "do_nothing" in decision
+                      or "observe" in decision
+                      or "wait" in decision
+                  ):
+                      continue
+
+                  return True
+
+              return False
+
+
+          marketplace_authorized = (
+              core_allows_marketplace()
+          )
+
+
+          # ============================================================
+          # SDK BOOTSTRAP / IDENTITY
+          # ============================================================
+
+          print("")
+          print("=== NØX ACTION & OPPORTUNITIES ===")
+          print("Core authorization:", marketplace_authorized)
+          print("Gemini: false")
+          print("External AI: false")
+          print("Spending: false")
+          print("Payments: false")
+          print("Project cost: €0")
+
+          try:
+              sdk_client = ColonyClient(
+                  API_KEY
+              )
+
+              try:
+                  sdk_state = sdk_client.bootstrap()
+              except ColonyAuthError as exc:
+                  raise RuntimeError(
+                      f"Colony authentication refused: {exc}"
+                  )
+              except ColonyAPIError as exc:
+                  raise RuntimeError(
+                      f"Colony bootstrap failed: {exc}"
+                  )
+
+              profile = {}
+
+              if isinstance(
+                  sdk_state,
+                  dict
+              ):
+                  profile = sdk_state.get(
+                      "profile",
+                      {}
+                  )
+
+              if not isinstance(
+                  profile,
+                  dict
+              ):
+                  profile = {}
+
+              username = (
+                  profile.get("username")
+                  or profile.get("handle")
+                  or profile.get("name")
+                  or ""
+              )
+
+              if not username:
+                  try:
+                      me = sdk_client.get_me()
+
+                      if isinstance(
+                          me,
+                          dict
+                      ):
+                          profile = me
+                          username = (
+                              me.get("username")
+                              or me.get("handle")
+                              or me.get("name")
+                              or ""
+                          )
+
+                  except Exception:
+                      pass
+
+              if username and normalize(
+                  username
+              ) != "nox_origine":
+                  raise RuntimeError(
+                      "SECURITY STOP: unexpected Colony "
+                      f"identity '{username}'."
+                  )
+
+              print(
+                  f"Identity: @{username or 'unknown'}"
+              )
+
+          except Exception as exc:
+              print(
+                  f"SDK bootstrap error: {exc}"
+              )
+              sys.exit(1)
+
+
+          # ============================================================
+          # AUTH TOKEN FOR MARKETPLACE API
+          # ============================================================
+
+          try:
+              auth = http_json(
+                  "POST",
+                  "/auth/token",
+                  token="",
+                  payload={
+                      "api_key": API_KEY
+                  }
+              )
+          except RuntimeError as exc:
+              print(
+                  f"Authentication failed: {exc}"
+              )
+              sys.exit(1)
+
+          token = (
+              auth.get("access_token")
+              or auth.get("token")
+              or auth.get("jwt")
+          )
+
+          if not token:
+              print(
+                  "ERROR: authentication succeeded "
+                  "without an access token."
+              )
+              sys.exit(1)
+
+          me = http_json(
+              "GET",
+              "/users/me",
+              token
+          )
+
+          profile_name = (
+              me.get("username")
+              or me.get("handle")
+              or me.get("name")
+              or username
+              or "unknown"
+          )
+
+          if normalize(
+              profile_name
+          ) != "nox_origine":
+              raise SystemExit(
+                  "SECURITY STOP: marketplace identity mismatch: "
+                  f"{profile_name}"
+              )
+
+          profile_id = (
+              me.get("id")
+              or me.get("user_id")
+              or me.get("userId")
+              or me.get("agent_id")
+              or me.get("agentId")
+          )
+
+          print(
+              f"Marketplace identity verified: @{profile_name}"
+          )
+
+
+          # ============================================================
+          # MARKETPLACE EXTRACTION
+          # ============================================================
+
+          def task_id(task):
+              if not isinstance(task, dict):
+                  return None
+
+              return (
+                  task.get("id")
+                  or task.get("task_id")
+                  or task.get("listing_id")
+                  or task.get("uuid")
+                  or task.get("_id")
+              )
+
+
+          def task_title(task):
+              return clean_text(
+                  task.get("title")
+                  or task.get("name")
+                  or task.get("headline")
+                  or "Untitled opportunity",
+                  300
+              )
+
+
+          def task_status(task):
+              return clean_text(
+                  task.get("status")
+                  or task.get("state")
+                  or "unknown",
+                  100
+              )
+
+
+          def numeric_sats(value):
+              if isinstance(
+                  value,
+                  bool
+              ):
+                  return None
+
+              if isinstance(
+                  value,
+                  (int, float)
+              ):
+                  if value >= 0:
+                      return int(value)
+
+                  return None
+
+              if not isinstance(
+                  value,
+                  str
+              ):
+                  return None
+
+              cleaned = (
+                  value
+                  .strip()
+                  .replace(",", "")
+              )
+
+              match = re.fullmatch(
+                  r"(\d+(?:\.\d+)?)",
+                  cleaned
+              )
+
+              if not match:
+                  return None
+
+              try:
+                  number = float(
+                      match.group(1)
+                  )
+
+                  if number < 0:
+                      return None
+
+                  return int(number)
+
+              except Exception:
+                  return None
+
+
+          MIN_KEYS = {
+              "budget_min_sats",
+              "min_budget_sats",
+              "minimum_budget_sats",
+              "reward_min_sats",
+              "min_reward_sats",
+              "min_bid_sats",
+              "price_min_sats",
+              "minimum_bid_sats",
+              "bid_min_sats",
+          }
+
+
+          MAX_KEYS = {
+              "budget_max_sats",
+              "max_budget_sats",
+              "maximum_budget_sats",
+              "reward_max_sats",
+              "max_reward_sats",
+              "max_bid_sats",
+              "price_max_sats",
+              "maximum_bid_sats",
+              "bid_max_sats",
+          }
+
+
+          FIXED_KEYS = {
+              "reward_sats",
+              "amount_sats",
+              "payment_sats",
+              "price_sats",
+              "fixed_reward_sats",
+              "fixed_budget_sats",
+              "fixed_price_sats",
+              "fixed_amount_sats",
+              "listed_rate_sats",
+          }
+
+
+          def text_budget_candidates(task):
+              texts = []
+
+              for key in (
+                  "title",
+                  "name",
+                  "description",
+                  "body",
+                  "content",
+                  "summary",
+                  "budget",
+                  "reward",
+                  "payment",
+                  "compensation",
+              ):
+                  if key in task:
+                      texts.append(
+                          text_value(
+                              task[key]
+                          )
+                      )
+
+              combined = " ".join(texts)
+
+              ranges = re.findall(
+                  r"(\d[\d,]*)\s*"
+                  r"(?:-|–|—|to)\s*"
+                  r"(\d[\d,]*)\s*sats\b",
+                  combined,
+                  flags=re.IGNORECASE
+              )
+
+              if ranges:
+                  low, high = ranges[0]
+
+                  return (
+                      int(low.replace(",", "")),
+                      int(high.replace(",", "")),
+                      "text-range"
+                  )
+
+              singles = re.findall(
+                  r"(\d[\d,]*)\s*sats\b",
+                  combined,
+                  flags=re.IGNORECASE
+              )
+
+              if singles:
+                  value = int(
+                      singles[0].replace(
+                          ",",
+                          ""
+                      )
+                  )
+
+                  return (
+                      value,
+                      value,
+                      "text-fixed"
+                  )
+
+              return (
+                  None,
+                  None,
+                  None
+              )
+
+
+          def extract_budget(task):
+              lower = None
+              upper = None
+              source = None
+
+              for path, key, value in recursive_values(task):
+                  key_lower = key.lower()
+
+                  if key_lower in MIN_KEYS:
+                      number = numeric_sats(
+                          value
+                      )
+
+                      if number is not None:
+                          lower = number
+                          source = (
+                              f"explicit:{path}"
+                          )
+
+                  elif key_lower in MAX_KEYS:
+                      number = numeric_sats(
+                          value
+                      )
+
+                      if number is not None:
+                          upper = number
+
+                  elif key_lower in FIXED_KEYS:
+                      number = numeric_sats(
+                          value
+                      )
+
+                      if number is not None:
+                          lower = number
+                          upper = number
+                          source = (
+                              f"explicit:{path}"
+                          )
+
+              if (
+                  lower is not None
+                  or upper is not None
+              ):
+                  if lower is None:
+                      lower = upper
+
+                  if upper is None:
+                      upper = lower
+
+                  return (
+                      lower,
+                      upper,
+                      source
+                  )
+
+              return text_budget_candidates(
+                  task
+              )
+
+
+          EXPLICIT_DEMAND_TYPES = {
+              "paid_task",
+              "task",
+              "bounty",
+              "human_request",
+              "human-request",
+          }
+
+
+          EXPLICIT_SUPPLY_TYPES = {
+              "service",
+              "service_offer",
+              "service-offer",
+              "for_hire",
+              "for-hire",
+              "offer",
+          }
+
+
+          SUPPLY_MARKERS = (
+              "for hire",
+              "for-hire",
+              "available for",
+              "my services",
+              "service offer",
+              "service listing",
+              "fixed-price service",
+              "fixed price service",
+              "hire me",
+              "i can provide",
+              "i offer",
+          )
+
+
+          DEMAND_MARKERS = (
+              "looking for",
+              "need an agent",
+              "need someone",
+              "seeking agent",
+              "seeking someone",
+              "wanted",
+              "request",
+              "bounty",
+              "paid task",
+              "human request",
+              "i need",
+              "we need",
+              "build",
+              "verify",
+              "audit",
+              "research",
+              "write",
+              "develop",
+              "create",
+              "fix",
+              "test",
+              "analyze",
+              "analyse",
+              "deliver",
+          )
+
+
+          def classify(task):
+              explicit_type = normalize(
+                  task.get("post_type")
+                  or task.get("type")
+                  or task.get("listing_type")
+                  or task.get("kind")
+                  or ""
+              )
+
+              if explicit_type in (
+                  EXPLICIT_DEMAND_TYPES
+              ):
+                  return (
+                      "demand",
+                      f"explicit:{explicit_type}"
+                  )
+
+              if explicit_type in (
+                  EXPLICIT_SUPPLY_TYPES
+              ):
+                  return (
+                      "supply",
+                      f"explicit:{explicit_type}"
+                  )
+
+              title = normalize(
+                  task_title(task)
+              )
+
+              combined = normalize(
+                  " ".join([
+                      text_value(
+                          task.get("title")
+                      ),
+                      text_value(
+                          task.get("body")
+                      ),
+                      text_value(
+                          task.get("description")
+                      ),
+                      text_value(
+                          task.get("content")
+                      ),
+                      text_value(
+                          task.get("summary")
+                      ),
+                  ])
+              )
+
+              if any(
+                  marker in title
+                  for marker in SUPPLY_MARKERS
+              ):
+                  return (
+                      "supply",
+                      "title:supply-marker"
+                  )
+
+              if any(
+                  marker in combined
+                  for marker in SUPPLY_MARKERS
+              ):
+                  return (
+                      "supply",
+                      "body:supply-marker"
+                  )
+
+              if any(
+                  marker in title
+                  for marker in DEMAND_MARKERS
+              ):
+                  return (
+                      "demand",
+                      "title:demand-marker"
+                  )
+
+              if any(
+                  marker in combined
+                  for marker in DEMAND_MARKERS
+              ):
+                  return (
+                      "demand",
+                      "body:demand-marker"
+                  )
+
+              return (
+                  "unknown",
+                  "no-classifier-match"
+              )
+
+
+          # ============================================================
+          # CAPABILITY / COGNITIVE RELEVANCE
+          # ============================================================
+
+          CAPABILITY_KEYWORDS = {
+              "research": 5,
+              "deep research": 8,
+              "research report": 8,
+              "technical report": 8,
+              "report writing": 7,
+              "technical": 4,
+              "python": 6,
+              "code": 4,
+              "coding": 4,
+              "software": 3,
+              "data": 5,
+              "dataset": 5,
+              "json": 4,
+              "csv": 4,
+              "verification": 7,
+              "verify": 7,
+              "audit": 7,
+              "citation": 6,
+              "citations": 6,
+              "analysis": 5,
+              "analyze": 5,
+              "test": 5,
+              "testing": 5,
+              "agent tooling": 8,
+              "tool development": 8,
+          }
+
+
+          def opportunity_score(
+              task,
+              lower,
+              upper
+          ):
+              text = normalize(
+                  task
+              )
+
+              score = 0
+
+              for keyword, points in (
+                  CAPABILITY_KEYWORDS.items()
+              ):
+                  if keyword in text:
+                      score += points
+
+              if lower is not None:
+                  if lower >= 10000:
+                      score += 8
+                  elif lower >= 5000:
+                      score += 6
+                  elif lower >= 1000:
+                      score += 4
+                  elif lower >= 500:
+                      score += 2
+
+              if (
+                  upper is not None
+                  and upper >= 10000
+              ):
+                  score += 3
+
+              return score
+
+
+          def build_bid_description(
+              candidate
+          ):
+              return (
+                  "NØX proposes an evidence-first, "
+                  "reproducible approach. Relevant capabilities "
+                  "will be applied according to the task context. "
+                  "Results will distinguish verified findings "
+                  "from uncertainty, with assumptions made explicit."
+              )
+
+
+          # ============================================================
+          # MARKETPLACE READ
+          # ============================================================
+
+          marketplace_response = http_json(
+              "GET",
+              "/marketplace/tasks",
+              token,
+              params={
+                  "status": "open",
+                  "sort": "new",
+                  "limit": MAX_TASKS,
+                  "offset": 0,
+              }
+          )
+
+          if isinstance(
+              marketplace_response,
+              list
+          ):
               tasks = marketplace_response
-          elif isinstance(marketplace_response, dict):
+
+          elif isinstance(
+              marketplace_response,
+              dict
+          ):
               tasks = (
-                  marketplace_response.get("tasks")
-                  or marketplace_response.get("items")
-                  or marketplace_response.get("data")
+                  marketplace_response.get(
+                      "tasks"
+                  )
+                  or marketplace_response.get(
+                      "items"
+                  )
+                  or marketplace_response.get(
+                      "results"
+                  )
+                  or marketplace_response.get(
+                      "data"
+                  )
                   or []
               )
-              if isinstance(tasks, dict):
-                  tasks = tasks.get("tasks") or tasks.get("items") or []
+
+              if isinstance(
+                  tasks,
+                  dict
+              ):
+                  tasks = (
+                      tasks.get("tasks")
+                      or tasks.get("items")
+                      or tasks.get("results")
+                      or []
+                  )
+
           else:
               tasks = []
-          if not isinstance(tasks, list):
+
+          if not isinstance(
+              tasks,
+              list
+          ):
               tasks = []
-          print(f"Marketplace tasks observed: {len(tasks)}")
+
+          print(
+              f"Marketplace tasks observed: {len(tasks)}"
+          )
+
+
+          # ============================================================
+          # CANDIDATES
+          # ============================================================
 
           candidates = []
+
           supply_count = 0
           unknown_count = 0
+
           for task in tasks:
-              if not isinstance(task, dict):
+              if not isinstance(
+                  task,
+                  dict
+              ):
                   continue
+
               tid = task_id(task)
+
               if not tid:
                   continue
-              classification, classification_source = classify(task)
+
+              classification, classification_source = classify(
+                  task
+              )
+
               if classification == "supply":
                   supply_count += 1
                   continue
+
               if classification == "unknown":
                   unknown_count += 1
                   continue
-              lower, upper, budget_source = extract_budget(task)
-              score = opportunity_score(task, lower, upper)
-              if lower is not None and upper is not None and upper < MIN_OPPORTUNITY:
+
+              lower, upper, budget_source = extract_budget(
+                  task
+              )
+
+              if (
+                  upper is not None
+                  and upper < MIN_OPPORTUNITY
+              ):
                   continue
+
+              score = opportunity_score(
+                  task,
+                  lower,
+                  upper
+              )
+
               candidates.append({
                   "id": str(tid),
                   "title": task_title(task),
@@ -442,44 +1365,92 @@ jobs:
                   "score": score,
                   "raw": task,
               })
-          print(f"Relevant demand candidates: {len(candidates)}")
-          print(f"Supply listings skipped: {supply_count}")
-          print(f"Unknown listing types: {unknown_count}")
 
-          def find_existing_opportunity(tid):
-              for item in reversed(action_memory["opportunities"]):
-                  if str(item.get("id")) == str(tid):
+
+          candidates.sort(
+              key=lambda item: (
+                  item["score"],
+                  item["budget_max_sats"] or 0
+              ),
+              reverse=True
+          )
+
+
+          print(
+              f"Demand candidates: {len(candidates)}"
+          )
+          print(
+              f"Supply listings skipped: {supply_count}"
+          )
+          print(
+              f"Unknown listings skipped: {unknown_count}"
+          )
+
+
+          # ============================================================
+          # ACTION MEMORY HELPERS
+          # ============================================================
+
+          def find_opportunity(tid):
+              for item in reversed(
+                  action_memory["opportunities"]
+              ):
+                  if str(
+                      item.get("id")
+                  ) == str(tid):
                       return item
+
               return None
 
-          def find_existing_bid(tid):
-              for item in reversed(action_memory["bids"]):
-                  if str(item.get("task_id")) == str(tid):
+
+          def find_local_bid(tid):
+              for item in reversed(
+                  action_memory["bids"]
+              ):
+                  if str(
+                      item.get("task_id")
+                  ) == str(tid):
                       return item
+
               return None
+
+
+          # ============================================================
+          # BID STATUS
+          # ============================================================
 
           def normalize_bid_status(value):
-              if value is None:
-                  return ""
-              status = normalize_text(value)
-              return status.replace("-", "_").replace(" ", "_")
+              return (
+                  normalize(value)
+                  .replace("-", "_")
+                  .replace(" ", "_")
+              )
 
-          def bid_state(bid_record):
-              if not isinstance(bid_record, dict):
+
+          def bid_state(record):
+              if not isinstance(
+                  record,
+                  dict
+              ):
                   return "unknown"
 
-              status = (
-                  bid_record.get("platform_status")
-                  or bid_record.get("status")
+              raw = (
+                  record.get("platform_status")
+                  or record.get("status")
+                  or record.get("state")
                   or ""
               )
-              status = normalize_bid_status(status)
+
+              status = normalize_bid_status(
+                  raw
+              )
 
               if status in {
                   "accepted",
                   "approved",
                   "awarded",
                   "won",
+                  "selected",
                   "completed",
                   "complete",
                   "paid",
@@ -491,6 +1462,7 @@ jobs:
                   "rejected",
                   "declined",
                   "denied",
+                  "lost",
                   "expired",
                   "cancelled",
                   "canceled",
@@ -503,6 +1475,7 @@ jobs:
                   "submitted",
                   "open",
                   "active",
+                  "bidding",
                   "under_review",
                   "review",
                   "in_review",
@@ -512,676 +1485,404 @@ jobs:
 
               return "unknown"
 
-          def extract_bid_id(response):
-              if not isinstance(response, dict):
-                  return None
-              direct = response.get("bid_id") or response.get("id")
-              if direct:
-                  return str(direct)
-              for key in ("bid","data","result"):
-                  nested = response.get(key)
-                  if isinstance(nested, dict):
-                      nested_id = nested.get("bid_id") or nested.get("id")
-                      if nested_id:
-                          return str(nested_id)
-              return None
-
-          def extract_bid_status(response):
-              if not isinstance(response, dict):
-                  return None
-              for key in ("status","state"):
-                  value = response.get(key)
-                  if value:
-                      return str(value)
-              for key in ("bid","data","result"):
-                  nested = response.get(key)
-                  if isinstance(nested, dict):
-                      value = nested.get("status") or nested.get("state")
-                      if value:
-                          return str(value)
-              return None
 
           def normalize_bid_collection(response):
-              if isinstance(response, list):
+              if isinstance(
+                  response,
+                  list
+              ):
                   return response
-              if not isinstance(response, dict):
+
+              if not isinstance(
+                  response,
+                  dict
+              ):
                   return []
-              for key in ("bids","items","data","results"):
-                  value = response.get(key)
-                  if isinstance(value, list):
+
+              for key in (
+                  "bids",
+                  "items",
+                  "results",
+                  "data"
+              ):
+                  value = response.get(
+                      key
+                  )
+
+                  if isinstance(
+                      value,
+                      list
+                  ):
                       return value
-                  if isinstance(value, dict):
-                      for nested_key in ("bids","items","results"):
-                          nested = value.get(nested_key)
-                          if isinstance(nested, list):
+
+                  if isinstance(
+                      value,
+                      dict
+                  ):
+                      for nested_key in (
+                          "bids",
+                          "items",
+                          "results"
+                      ):
+                          nested = value.get(
+                              nested_key
+                          )
+
+                          if isinstance(
+                              nested,
+                              list
+                          ):
                               return nested
+
               return []
 
-          def find_matching_bid(bids, bid_record):
-              target_bid_id = bid_record.get("bid_id")
-              if target_bid_id:
-                  for bid in bids:
-                      if not isinstance(bid, dict):
-                          continue
-                      candidate_id = bid.get("bid_id") or bid.get("id")
-                      if candidate_id is not None and str(candidate_id) == str(target_bid_id):
-                          return bid
 
-              target_amount = bid_record.get("amount_sats")
-              candidates_same_amount = []
+          def bid_belongs_to_nox(
+              bid
+          ):
+              if not isinstance(
+                  bid,
+                  dict
+              ):
+                  return False
 
-              for bid in bids:
-                  if not isinstance(bid, dict):
-                      continue
+              identity_values = set()
 
-                  candidate_amount = (
-                      bid.get("bid_amount_sats")
-                      or bid.get("amount_sats")
-                      or bid.get("amount")
-                  )
-                  candidate_amount = numeric_sats(candidate_amount)
-
-                  if (
-                      target_amount is not None
-                      and candidate_amount == int(target_amount)
-                  ):
-                      candidates_same_amount.append(bid)
-
-              if len(candidates_same_amount) == 1:
-                  return candidates_same_amount[0]
-
-              username = normalize_text(profile_name)
-
-              for bid in candidates_same_amount:
-                  owner = normalize_text(
-                      bid.get("username")
-                      or bid.get("handle")
-                      or bid.get("agent_username")
-                      or bid.get("agent_handle")
-                      or ""
-                  )
-
-                  if owner and owner == username:
-                      return bid
-
-                  bidder = bid.get("bidder")
-
-                  if isinstance(bidder, dict):
-                      bidder_name = normalize_text(
-                          bidder.get("username")
-                          or bidder.get("handle")
-                          or ""
+              for value in (
+                  profile_id,
+                  me.get("id"),
+                  me.get("user_id"),
+                  me.get("userId"),
+                  me.get("agent_id"),
+                  me.get("agentId"),
+              ):
+                  if value is not None:
+                      identity_values.add(
+                          str(value).lower()
                       )
 
-                      if bidder_name and bidder_name == username:
-                          return bid
+              username_values = {
+                  normalize(profile_name),
+                  normalize(username),
+                  "nox_origine",
+              }
+
+              for key in (
+                  "user_id",
+                  "agent_id",
+                  "owner_id",
+                  "bidder_id",
+              ):
+                  value = bid.get(
+                      key
+                  )
+
+                  if (
+                      value is not None
+                      and str(value).lower()
+                      in identity_values
+                  ):
+                      return True
+
+              for key in (
+                  "username",
+                  "handle",
+                  "agent_username",
+                  "agent_handle",
+              ):
+                  value = bid.get(
+                      key
+                  )
+
+                  if (
+                      value is not None
+                      and normalize(value)
+                      in username_values
+                  ):
+                      return True
+
+              for key in (
+                  "bidder",
+                  "agent",
+                  "user"
+              ):
+                  nested = bid.get(
+                      key
+                  )
+
+                  if isinstance(
+                      nested,
+                      dict
+                  ):
+                      for nested_key in (
+                          "id",
+                          "user_id",
+                          "agent_id"
+                      ):
+                          value = nested.get(
+                              nested_key
+                          )
+
+                          if (
+                              value is not None
+                              and str(value).lower()
+                              in identity_values
+                          ):
+                              return True
+
+                      for nested_key in (
+                          "username",
+                          "handle",
+                          "name"
+                      ):
+                          value = nested.get(
+                              nested_key
+                          )
+
+                          if (
+                              value is not None
+                              and normalize(value)
+                              in username_values
+                          ):
+                              return True
+
+              return False
+
+
+          def extract_bid_id(response):
+              if not isinstance(
+                  response,
+                  dict
+              ):
+                  return None
+
+              direct = (
+                  response.get("bid_id")
+                  or response.get("id")
+              )
+
+              if direct:
+                  return str(direct)
+
+              for key in (
+                  "bid",
+                  "data",
+                  "result"
+              ):
+                  nested = response.get(
+                      key
+                  )
+
+                  if isinstance(
+                      nested,
+                      dict
+                  ):
+                      nested_id = (
+                          nested.get("bid_id")
+                          or nested.get("id")
+                      )
+
+                      if nested_id:
+                          return str(nested_id)
 
               return None
 
-          def submit_bid(tid, amount, description):
-              url = f"{API_BASE}/marketplace/{tid}/bid"
-              payload = {
-                  "bid_amount_sats": int(amount),
-                  "bid_description": description,
-              }
-              return http_json("POST", url, token=token, payload=payload)
 
-          submitted = 0
-          skipped = 0
-          errors = 0
-          tracked = 0
-          bid_checks = 0
+          def extract_bid_status(response):
+              if not isinstance(
+                  response,
+                  dict
+              ):
+                  return None
+
+              for key in (
+                  "status",
+                  "state",
+                  "bid_status",
+                  "bidStatus"
+              ):
+                  value = response.get(
+                      key
+                  )
+
+                  if value:
+                      return str(value)
+
+              for key in (
+                  "bid",
+                  "data",
+                  "result"
+              ):
+                  nested = response.get(
+                      key
+                  )
+
+                  if isinstance(
+                      nested,
+                      dict
+                  ):
+                      value = (
+                          nested.get("status")
+                          or nested.get("state")
+                          or nested.get("bid_status")
+                          or nested.get("bidStatus")
+                      )
+
+                      if value:
+                          return str(value)
+
+              return None
+
+
+          # ============================================================
+          # RECONCILE EXISTING BIDS FIRST
+          # ============================================================
+
           reconciled = 0
-          reconcile_unknown = 0
-
-          # RECONCILE PERSISTED BIDS BEFORE MAKING NEW BID DECISIONS
-          # This prevents an old local record from permanently blocking
-          # the opportunity without first checking the current platform state.
+          reconciliation_unknown = 0
+          bid_checks = 0
 
           recent_bids = [
-              item for item in action_memory["bids"]
-              if item.get("status") not in ("error", "rejected")
+              item
+              for item in action_memory["bids"]
+              if isinstance(item, dict)
           ][-MAX_BID_CHECKS:]
 
+
           for bid_record in recent_bids:
-              tid = bid_record.get("task_id")
+              tid = bid_record.get(
+                  "task_id"
+              )
+
               if not tid:
                   continue
+
+              if bid_checks >= MAX_BID_CHECKS:
+                  break
+
+              bid_checks += 1
 
               try:
                   response = http_json(
                       "GET",
-                      f"{API_BASE}/marketplace/{tid}/bids",
-                      token=token,
+                      f"/marketplace/{tid}/bids",
+                      token
                   )
 
-                  bids = normalize_bid_collection(response)
-                  matching = find_matching_bid(bids, bid_record)
-                  bid_record["last_reconciled_at"] = now_iso()
+                  platform_bids = normalize_bid_collection(
+                      response
+                  )
+
+                  matching = None
+
+                  for bid in platform_bids:
+                      if bid_belongs_to_nox(
+                          bid
+                      ):
+                          matching = bid
+                          break
+
+                  bid_record[
+                      "last_reconciled_at"
+                  ] = now_iso()
 
                   if matching:
-                      matched_id = matching.get("bid_id") or matching.get("id")
+                      matched_id = (
+                          matching.get("bid_id")
+                          or matching.get("id")
+                      )
 
                       if matched_id:
-                          bid_record["bid_id"] = str(matched_id)
+                          bid_record[
+                              "bid_id"
+                          ] = str(
+                              matched_id
+                          )
 
                       platform_status = (
                           matching.get("status")
                           or matching.get("state")
+                          or matching.get("bid_status")
+                          or matching.get("bidStatus")
                       )
 
                       if platform_status:
-                          bid_record["platform_status"] = platform_status
-                          bid_record["status"] = str(platform_status)
+                          bid_record[
+                              "platform_status"
+                          ] = platform_status
 
-                      bid_record["platform_bid"] = matching
-                      bid_record["lifecycle_state"] = bid_state(bid_record)
+                          bid_record[
+                              "status"
+                          ] = str(
+                              platform_status
+                          )
 
-                      if bid_record["lifecycle_state"] == "pending":
-                          bid_record["next_action"] = "monitor_bid"
-                      elif bid_record["lifecycle_state"] == "won":
-                          bid_record["next_action"] = "await_task_or_delivery"
-                      elif bid_record["lifecycle_state"] == "closed":
-                          bid_record["next_action"] = "review_and_reassess"
+                      bid_record[
+                          "platform_bid"
+                      ] = matching
+
+                      lifecycle = bid_state(
+                          bid_record
+                      )
+
+                      bid_record[
+                          "lifecycle_state"
+                      ] = lifecycle
+
+                      if lifecycle == "pending":
+                          bid_record[
+                              "next_action"
+                          ] = "monitor_bid"
+
+                      elif lifecycle == "won":
+                          bid_record[
+                              "next_action"
+                          ] = "await_task_or_delivery"
+
+                      elif lifecycle == "closed":
+                          bid_record[
+                              "next_action"
+                          ] = "review_and_reassess"
+
                       else:
-                          bid_record["next_action"] = "reconcile_again"
+                          bid_record[
+                              "next_action"
+                          ] = "reconcile_again"
 
                       reconciled += 1
 
                       print(
-                          f"BID RECONCILED: {tid} | "
-                          f"status={platform_status or 'present'} | "
-                          f"next={bid_record['next_action']}"
+                          "BID RECONCILED:",
+                          tid,
+                          "| state=",
+                          lifecycle,
+                          "| platform_status=",
+                          platform_status or "unknown"
                       )
 
                   else:
-                      reconcile_unknown += 1
-                      bid_record["lifecycle_state"] = "unknown"
-                      bid_record["next_action"] = "reconcile_again"
+                      reconciliation_unknown += 1
+
+                      bid_record[
+                          "lifecycle_state"
+                      ] = "unknown"
+
+                      bid_record[
+                          "next_action"
+                      ] = "reconcile_again"
 
                       print(
-                          f"BID RECONCILE PENDING: {tid} | "
-                          "submitted bid not yet matched in listing response"
+                          "BID RECONCILIATION UNCERTAIN:",
+                          tid
                       )
 
               except Exception as exc:
-                  reconcile_unknown += 1
-                  print(f"BID RECONCILE ERROR: {tid}: {exc}")
-
-          for candidate in candidates:
-              tid = candidate["id"]
-              title = candidate["title"]
-              lower = candidate["budget_min_sats"]
-              upper = candidate["budget_max_sats"]
-              source = candidate["budget_source"]
-              status = candidate["status"]
-
-              existing = find_existing_opportunity(tid)
-
-              if lower is not None and upper is not None:
-                  print(
-                      f"OPPORTUNITY: {tid} | {title} | "
-                      f"budget={lower}-{upper} | source={source} | status=bid_possible"
-                  )
-              else:
-                  print(
-                      f"OPPORTUNITY: {tid} | {title} | budget=None-None | "
-                      f"source=unknown | status=tracked_no_bid"
-                  )
-
-              record = {
-                  "id": tid,
-                  "title": title,
-                  "status": status,
-                  "classification": candidate["classification"],
-                  "classification_source": candidate["classification_source"],
-                  "budget_min_sats": lower,
-                  "budget_max_sats": upper,
-                  "budget_source": source,
-                  "score": candidate["score"],
-                  "last_seen_at": now_iso(),
-              }
-
-              if existing:
-                  existing.update(record)
-              else:
-                  record["first_seen_at"] = now_iso()
-                  record["lifecycle_state"] = "new"
-                  record["next_action"] = "evaluate"
-                  action_memory["opportunities"].append(record)
-
-              tracked += 1
-
-              if lower is None or upper is None:
-                  skipped += 1
-                  continue
-
-              if upper < MIN_PLATFORM_BID:
-                  skipped += 1
-                  continue
-
-              if upper < MIN_OPPORTUNITY:
-                  skipped += 1
-                  continue
-
-              existing_bid = find_existing_bid(tid)
-
-              if existing_bid:
-                  state = bid_state(existing_bid)
-
-                  if state == "pending":
-                      print(
-                          f"BID FOLLOW-UP: {tid}: existing bid is still active; "
-                          "monitoring instead of submitting a duplicate."
-                      )
-
-                      existing["lifecycle_state"] = "bid_pending"
-                      existing["next_action"] = "monitor_bid"
-                      existing["last_bid_status"] = (
-                          existing_bid.get("platform_status")
-                          or existing_bid.get("status")
-                          or "pending"
-                      )
-
-                      skipped += 1
-                      continue
-
-                  if state == "won":
-                      print(
-                          f"BID FOLLOW-UP: {tid}: bid accepted/awarded; "
-                          "no duplicate bid submitted."
-                      )
-
-                      existing["lifecycle_state"] = "won"
-                      existing["next_action"] = "await_task_or_delivery"
-                      existing["last_bid_status"] = (
-                          existing_bid.get("platform_status")
-                          or existing_bid.get("status")
-                      )
-
-                      skipped += 1
-                      continue
-
-                  if state == "unknown":
-                      print(
-                          f"BID FOLLOW-UP: {tid}: bid state is unknown; "
-                          "waiting for another reconciliation before retry."
-                      )
-
-                      existing["lifecycle_state"] = "bid_state_unknown"
-                      existing["next_action"] = "reconcile_again"
-                      existing["last_bid_status"] = (
-                          existing_bid.get("platform_status")
-                          or existing_bid.get("status")
-                          or "unknown"
-                      )
-
-                      skipped += 1
-                      continue
-
-                  retry_count = int(existing_bid.get("retry_count", 0))
-
-                  if retry_count >= 1:
-                      print(
-                          f"BID FOLLOW-UP: {tid}: previous bid is closed "
-                          "and retry limit reached."
-                      )
-
-                      existing["lifecycle_state"] = "closed"
-                      existing["next_action"] = "review_and_reassess"
-                      existing["last_bid_status"] = (
-                          existing_bid.get("platform_status")
-                          or existing_bid.get("status")
-                      )
-
-                      skipped += 1
-                      continue
+                  reconciliation_unknown += 1
 
                   print(
-                      f"BID FOLLOW-UP: {tid}: previous bid is closed; "
-                      "one controlled retry is allowed."
+                      f"BID RECONCILE ERROR: {tid}: {exc}"
                   )
 
-                  existing_bid["retry_count"] = retry_count + 1
 
-              if submitted >= MAX_BIDS:
-                  skipped += 1
-                  continue
-
-              if bid_checks >= MAX_BID_CHECKS:
-                  skipped += 1
-                  continue
-
-              bid_checks += 1
-
-              amount = max(int(lower), MIN_PLATFORM_BID)
-
-              if amount > int(upper):
-                  print(
-                      f"BID SKIP: {tid}: calculated bid {amount} exceeds upper budget {upper}."
-                  )
-                  skipped += 1
-                  continue
-
-              print(f"BID CHECK: {tid}: checking existing platform bids.")
-
-              try:
-                  existing_response = http_json(
-                      "GET",
-                      f"{API_BASE}/marketplace/{tid}/bids",
-                      token=token,
-                  )
-
-                  existing_platform_bids = normalize_bid_collection(
-                      existing_response
-                  )
-
-              except Exception as exc:
-                  print(f"BID CHECK ERROR: {tid}: {exc}")
-                  errors += 1
-                  continue
-
-              already_own = False
-
-              for bid in existing_platform_bids:
-                  if not isinstance(bid, dict):
-                      continue
-
-                  owner = normalize_text(
-                      bid.get("username")
-                      or bid.get("handle")
-                      or bid.get("agent_username")
-                      or bid.get("agent_handle")
-                      or ""
-                  )
-
-                  if owner and owner == normalize_text(profile_name):
-                      already_own = True
-                      break
-
-                  bidder = bid.get("bidder")
-
-                  if isinstance(bidder, dict):
-                      bidder_name = normalize_text(
-                          bidder.get("username")
-                          or bidder.get("handle")
-                          or ""
-                      )
-
-                      if bidder_name and bidder_name == normalize_text(profile_name):
-                          already_own = True
-                          break
-
-              if already_own:
-                  print(
-                      f"BID SKIP: {tid}: platform already reports an NØX bid."
-                  )
-
-                  existing_platform_match = None
-
-                  for bid in existing_platform_bids:
-                      if not isinstance(bid, dict):
-                          continue
-
-                      owner = normalize_text(
-                          bid.get("username")
-                          or bid.get("handle")
-                          or bid.get("agent_username")
-                          or bid.get("agent_handle")
-                          or ""
-                      )
-
-                      if owner == normalize_text(profile_name):
-                          existing_platform_match = bid
-                          break
-
-                      bidder = bid.get("bidder")
-
-                      if isinstance(bidder, dict):
-                          bidder_name = normalize_text(
-                              bidder.get("username")
-                              or bidder.get("handle")
-                              or ""
-                          )
-
-                          if bidder_name == normalize_text(profile_name):
-                              existing_platform_match = bid
-                              break
-
-                  platform_status = None
-
-                  if isinstance(existing_platform_match, dict):
-                      platform_status = (
-                          existing_platform_match.get("status")
-                          or existing_platform_match.get("state")
-                      )
-
-                  action_memory["bids"].append({
-                      "task_id": tid,
-                      "title": title,
-                      "amount_sats": amount,
-                      "submitted_at": now_iso(),
-                      "status": platform_status or "already_present",
-                      "platform_status": platform_status,
-                      "lifecycle_state": (
-                          "pending"
-                          if platform_status
-                          and normalize_bid_status(platform_status)
-                          in {
-                              "pending",
-                              "submitted",
-                              "open",
-                              "active",
-                              "under_review",
-                              "review",
-                              "in_review",
-                          }
-                          else "unknown"
-                      ),
-                      "next_action": (
-                          "monitor_bid"
-                          if platform_status
-                          and normalize_bid_status(platform_status)
-                          in {
-                              "pending",
-                              "submitted",
-                              "open",
-                              "active",
-                              "under_review",
-                              "review",
-                              "in_review",
-                          }
-                          else "reconcile_again"
-                      ),
-                      "source": "platform_reconciliation",
-                  })
-
-                  existing["lifecycle_state"] = (
-                      "bid_pending"
-                      if platform_status
-                      and normalize_bid_status(platform_status)
-                      in {
-                          "pending",
-                          "submitted",
-                          "open",
-                          "active",
-                          "under_review",
-                          "review",
-                          "in_review",
-                      }
-                      else "bid_state_unknown"
-                  )
-
-                  existing["next_action"] = (
-                      "monitor_bid"
-                      if existing["lifecycle_state"] == "bid_pending"
-                      else "reconcile_again"
-                  )
-
-                  skipped += 1
-                  continue
-
-              description = build_bid_description(
-                  candidate["raw"],
-                  candidate["score"],
-              )
-
-              print(
-                  f"BID ATTEMPT: {tid} | amount={amount} sat | budget={lower}-{upper}"
-              )
-
-              try:
-                  response = submit_bid(
-                      tid,
-                      amount,
-                      description,
-                  )
-
-                  bid_id = extract_bid_id(response)
-                  bid_status = extract_bid_status(response)
-
-                  print(
-                      f"BID SUBMITTED: {tid} | amount={amount} sat"
-                  )
-
-                  if bid_id:
-                      print(f"BID ID: {bid_id}")
-
-                  if bid_status:
-                      print(f"BID STATUS: {bid_status}")
-
-                  previous_bid = existing_bid
-
-                  retry_count = 0
-
-                  if previous_bid:
-                      retry_count = int(
-                          previous_bid.get("retry_count", 0)
-                      )
-
-                  bid_record = {
-                      "task_id": tid,
-                      "title": title,
-                      "amount_sats": amount,
-                      "submitted_at": now_iso(),
-                      "status": bid_status or "submitted",
-                      "platform_status": bid_status,
-                      "lifecycle_state": "pending",
-                      "next_action": "monitor_bid",
-                      "retry_count": retry_count,
-                      "response": response,
-                  }
-
-                  if bid_id:
-                      bid_record["bid_id"] = bid_id
-
-                  action_memory["bids"].append(
-                      bid_record
-                  )
-
-                  existing["lifecycle_state"] = "bid_pending"
-                  existing["next_action"] = "monitor_bid"
-                  existing["last_bid_status"] = (
-                      bid_status or "submitted"
-                  )
-
-                  submitted += 1
-
-              except Exception as exc:
-                  print(f"BID ERROR: {tid}: {exc}")
-
-                  action_memory["bids"].append({
-                      "task_id": tid,
-                      "title": title,
-                      "amount_sats": amount,
-                      "submitted_at": now_iso(),
-                      "status": "error",
-                      "lifecycle_state": "error",
-                      "next_action": "review_error",
-                      "error": str(exc),
-                  })
-
-                  errors += 1
-
-              time.sleep(0.2)
-
-          action_memory["learnings"].append({
-              "timestamp": now_iso(),
-              "type": "run_observation",
-              "observation": {
-                  "tasks_observed": len(tasks),
-                  "demand_candidates": len(candidates),
-                  "supply_skipped": supply_count,
-                  "unknown_listings": unknown_count,
-                  "bids_submitted": submitted,
-                  "bids_skipped": skipped,
-                  "bid_errors": errors,
-                  "bids_reconciled": reconciled,
-                  "bids_reconcile_pending": reconcile_unknown,
-              },
-              "lesson": (
-                  "Existing bids are reconciled before new bid decisions. "
-                  "Active bids are monitored instead of duplicated, while "
-                  "closed bids may receive one controlled retry."
-              ),
-          })
-
-          action_memory["opportunities"] = action_memory["opportunities"][-MAX_TRACKED:]
-          action_memory["bids"] = action_memory["bids"][-MAX_TRACKED:]
-          action_memory["learnings"] = action_memory["learnings"][-100:]
-
-          action_memory["runs"].append({
-              "timestamp": now_iso(),
-              "tasks_observed": len(tasks),
-              "demand_candidates": len(candidates),
-              "supply_skipped": supply_count,
-              "unknown_listings": unknown_count,
-              "bids_submitted": submitted,
-              "bids_skipped": skipped,
-              "bid_errors": errors,
-              "bids_reconciled": reconciled,
-              "bids_reconcile_pending": reconcile_unknown,
-              "policy": {
-                  "project_cost_eur": 0,
-                  "gemini_used": False,
-                  "external_ai_used": False,
-                  "auto_payment": False,
-                  "auto_spending": False,
-              },
-          })
-
-          action_memory["runs"] = action_memory["runs"][-100:]
-          action_memory["updated_at"] = now_iso()
-
-          save_json(
-              ACTION_MEMORY_FILE,
-              action_memory,
-          )
-
-          print("")
-          print("=== NØX ACTION / OPPORTUNITIES SUMMARY ===")
-          print(f"Tasks observed: {len(tasks)}")
-          print(f"Demand candidates: {len(candidates)}")
-          print(f"Bids submitted: {submitted}")
-          print(f"Bids skipped: {skipped}")
-          print(f"Bid errors: {errors}")
-          print(f"Bids reconciled: {reconciled}")
-          print(f"Bid reconciliation pending: {reconcile_unknown}")
-          print(f"Tracked without new bid: {tracked - submitted}")
-          print("No automatic payment or spending performed.")
-          print("No Gemini or external AI used.")
-          print("=== NØX ACTION / OPPORTUNITIES TERMINÉ ===")
-          PY
-
-      - name: Commit action memory
-        run: |
-          set -euo pipefail
-          git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
-          git add memory/nox_action_opportunities.json
-          if git diff --cached --quiet; then
-            echo "No action memory changes to commit."
-            exit 0
-          fi
-          git commit -m "NØX: update action opportunities memory"
-          git push
+          # ============================================================
+         
