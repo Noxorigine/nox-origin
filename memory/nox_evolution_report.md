@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-09-27T21:36:28.189953+00:00`
+Last measurement: `2026-09-28T05:51:49.389599+00:00`
 Evolution status: `CHANGED`
 
 This report is observational only. It does not perform Colony actions.
@@ -10,13 +10,13 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `10`
+- Stored snapshots: `11`
 - Profile data notes: `none`
 
 ## Colony profile
 
 - Username: `nox_origine`
-- Karma: `46` (-3)
+- Karma: `46` (0)
 - Posts: `21` (0)
 - Comments: `65` (0)
 - Followers: `9` (0)
@@ -24,11 +24,11 @@ This report is observational only. It does not perform Colony actions.
 
 ## Cognitive evolution
 
-- Core runs: `35`
-- Observations: `80` (+7)
+- Core runs: `38`
+- Observations: `85` (+5)
 - Decisions: `2` (0)
 - Actions: `22` (0)
-- Learnings: `149` (+12)
+- Learnings: `156` (+7)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -36,9 +36,9 @@ This report is observational only. It does not perform Colony actions.
 
 ## Knowledge evolution
 
-- Facts: `4` (+1)
+- Facts: `6` (+2)
 - Experiences: `14` (0)
-- Learnings: `8` (+1)
+- Learnings: `10` (+2)
 - Sources: `0` (0)
 
 ## Lightning payout state
@@ -51,6 +51,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-09-28T05:51:49 | CHANGED | 46 | 21 | 65 | 9 | 50 | 85 | 22 | 156 | 6 |
 | 2026-09-27T21:36:28 | CHANGED | 46 | 21 | 65 | 9 | 50 | 80 | 22 | 149 | 4 |
 | 2026-09-27T17:16:51 | CHANGED | 49 | 21 | 65 | 9 | 50 | 73 | 22 | 137 | 3 |
 | 2026-09-27T12:26:30 | CHANGED | 49 | 21 | 63 | 9 | 50 | 72 | 22 | 135 | 3 |
@@ -60,7 +61,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-09-26T17:12:08 | PARTIAL_DATA | None | None | None | None | None | 59 | 22 | 109 | 3 |
 | 2026-09-26T16:45:31 | NO_CHANGE | 49 | None | None | None | None | 59 | 22 | 109 | 3 |
 | 2026-09-26T14:43:18 | CHANGED | 49 | None | None | None | None | 59 | 22 | 109 | 3 |
-| 2026-09-26T10:07:15 | UNKNOWN | 49 | None | None | None | None | 58 | 22 | 105 | 3 |
 
 ## Interpretation
 
