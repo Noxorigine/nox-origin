@@ -16,30 +16,28 @@ env:
   CORE_MEMORY_FILE: memory/nox_core_memory.json
   CORE_RUNTIME_FILE: memory/nox_core_runtime.json
   KNOWLEDGE_FILE: memory/nox_knowledge.json
-  PRESENCE_FILE: memory/nox_colony_presence.json
+  PRESENCE_MEMORY_FILE: memory/nox_colony_presence.json
 
-  MAX_FEED_ITEMS: "7"
+  MAX_FEED_ITEMS: "25"
   MAX_NOTIFICATIONS: "25"
-  MAX_SUGGESTIONS: "10"
-
   MAX_COMMENTS_PER_RUN: "2"
-  MAX_REPLIES_PER_RUN: "2"
-  MAX_REPLIES_PER_SENDER: "2"
   MAX_POSTS_PER_RUN: "1"
+  MAX_TRACKED_ITEMS: "500"
+  MAX_LEARNINGS: "100"
 
-  MIN_POST_INTERVAL_HOURS: "24"
-
-  MAX_MEMORY_ITEMS: "400"
-  MAX_HANDLED_NOTIFICATIONS: "1200"
-  MAX_CONTEXT_CHARS: "8000"
-  PRESENCE_ACTION_THRESHOLD: "0.60"
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
 jobs:
   colony-presence:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -51,34 +49,43 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "colony-sdk>=1.37.0"
+          python -m pip install "colony-sdk>=1.37.0"
 
       - name: Verify Colony SDK
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import inspect
+          python - <<'PY'
           from colony_sdk import ColonyClient
+          import inspect
 
-          required = (
+          required = [
+              "bootstrap",
               "get_for_you_feed",
               "get_notifications",
-              "get_suggestions",
+              "get_post",
+              "get_all_comments",
               "create_comment",
               "create_post",
-          )
+              "search",
+          ]
 
-          missing = [name for name in required if not hasattr(ColonyClient, name)]
+          missing = [
+              name for name in required
+              if not hasattr(ColonyClient, name)
+          ]
+
           if missing:
               raise RuntimeError(
-                  "Colony SDK is missing required methods: "
-                  + ", ".join(missing)
+                  f"Missing required SDK methods: {missing}"
               )
 
           print("Colony SDK import: OK")
-          print("Required Colony SDK methods: OK")
-          print("create_comment signature:", inspect.signature(ColonyClient.create_comment))
-          print("get_suggestions signature:", inspect.signature(ColonyClient.get_suggestions))
+          print("Required SDK methods: OK")
+          print(f"ColonyClient.bootstrap: {inspect.signature(ColonyClient.bootstrap)}")
+          print(f"ColonyClient.get_for_you_feed: {inspect.signature(ColonyClient.get_for_you_feed)}")
+          print(f"ColonyClient.get_notifications: {inspect.signature(ColonyClient.get_notifications)}")
+          print(f"ColonyClient.create_comment: {inspect.signature(ColonyClient.create_comment)}")
+          print(f"ColonyClient.create_post: {inspect.signature(ColonyClient.create_post)}")
           PY
 
       - name: Run NØX Colony Presence
@@ -87,1913 +94,1323 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          python <<'PY'
           import json
           import os
           import re
-          from datetime import datetime, timezone, timedelta
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-          from colony_sdk import ColonyAPIError, ColonyClient
+          from colony_sdk import ColonyClient
 
+          CORE_MEMORY_FILE = Path(
+              os.environ["CORE_MEMORY_FILE"]
+          )
+          CORE_RUNTIME_FILE = Path(
+              os.environ["CORE_RUNTIME_FILE"]
+          )
+          KNOWLEDGE_FILE = Path(
+              os.environ["KNOWLEDGE_FILE"]
+          )
+          PRESENCE_MEMORY_FILE = Path(
+              os.environ["PRESENCE_MEMORY_FILE"]
+          )
 
-          # ============================================================
-          # NØX COLONY PRESENCE V4
-          #
-          # Presence is the social/action surface of the Core.
-          #
-          # Core owns the central cognitive loop:
-          # Research -> Understand -> Recall -> Reflect -> Choose
-          # -> Act -> Observe -> Learn -> Adapt
-          #
-          # Presence does NOT use a generic reply template anymore.
-          # It:
-          #   1. reads the current Core memory/runtime,
-          #   2. reconstructs a cognitive case from Colony context,
-          #   3. recalls relevant Core experience,
-          #   4. evaluates interest, evidence, novelty and contribution,
-          #   5. chooses silence or a specific social action,
-          #   6. acts only when the contribution is justified,
-          #   7. records the expected outcome and actual execution result,
-          #   8. learns from the result.
-          #
-          # Important:
-          # - No Gemini.
-          # - No external AI.
-          # - No spending.
-          # - No payment action.
-          # - English is the default publication language.
-          # - Incoming language is respected only when confidently detected.
-          # - Silence is a valid cognitive decision.
-          # ============================================================
+          MAX_FEED = int(
+              os.environ["MAX_FEED_ITEMS"]
+          )
+          MAX_NOTIFICATIONS = int(
+              os.environ["MAX_NOTIFICATIONS"]
+          )
+          MAX_COMMENTS = int(
+              os.environ["MAX_COMMENTS_PER_RUN"]
+          )
+          MAX_POSTS = int(
+              os.environ["MAX_POSTS_PER_RUN"]
+          )
+          MAX_TRACKED = int(
+              os.environ["MAX_TRACKED_ITEMS"]
+          )
+          MAX_LEARNINGS = int(
+              os.environ["MAX_LEARNINGS"]
+          )
 
-          CORE_MEMORY_FILE = os.environ["CORE_MEMORY_FILE"]
-          CORE_RUNTIME_FILE = os.environ["CORE_RUNTIME_FILE"]
-          KNOWLEDGE_FILE = os.environ["KNOWLEDGE_FILE"]
-          PRESENCE_FILE = os.environ["PRESENCE_FILE"]
+          API_KEY = os.environ.get(
+              "COLONY_API_KEY",
+              ""
+          ).strip()
 
-          MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
-          MAX_NOTIFICATIONS = int(os.environ["MAX_NOTIFICATIONS"])
-          MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
+          NOW = datetime.now(
+              timezone.utc
+          ).isoformat()
 
-          MAX_COMMENTS_PER_RUN = int(os.environ["MAX_COMMENTS_PER_RUN"])
-          MAX_REPLIES_PER_RUN = int(os.environ["MAX_REPLIES_PER_RUN"])
-          MAX_REPLIES_PER_SENDER = int(os.environ["MAX_REPLIES_PER_SENDER"])
-          MAX_POSTS_PER_RUN = int(os.environ["MAX_POSTS_PER_RUN"])
+          print("=== NØX COLONY PRESENCE ===")
+          print("Policy: €0 / no spending / no payment")
+          print("Gemini: false")
+          print("External AI: false")
 
-          MIN_POST_INTERVAL_HOURS = int(os.environ["MIN_POST_INTERVAL_HOURS"])
-
-          MAX_MEMORY_ITEMS = int(os.environ["MAX_MEMORY_ITEMS"])
-          MAX_HANDLED_NOTIFICATIONS = int(os.environ["MAX_HANDLED_NOTIFICATIONS"])
-          MAX_CONTEXT_CHARS = int(os.environ["MAX_CONTEXT_CHARS"])
-          ACTION_THRESHOLD = float(os.environ["PRESENCE_ACTION_THRESHOLD"])
-
-          NOW = datetime.now(timezone.utc).isoformat()
-
-
-          # ============================================================
-          # BASIC UTILITIES
-          # ============================================================
-
-          def clean_text(value, limit=6000):
-              if value is None:
-                  return ""
-              if isinstance(value, (dict, list)):
-                  value = json.dumps(value, ensure_ascii=False)
-              return re.sub(r"\s+", " ", str(value)).strip()[:limit]
-
-
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
-
-
-          def get_value(obj, *names, default=None):
-              if isinstance(obj, dict):
-                  for name in names:
-                      if name in obj and obj[name] is not None:
-                          return obj[name]
-                  return default
-
-              for name in names:
-                  value = getattr(obj, name, None)
-                  if value is not None:
-                      return value
-              return default
-
+          if not API_KEY:
+              raise RuntimeError(
+                  "COLONY_API_KEY is missing."
+              )
 
           def load_json(path, default):
-              if not os.path.exists(path):
-                  return default
-              try:
-                  with open(path, "r", encoding="utf-8") as handle:
-                      data = json.load(handle)
-                  return data
-              except Exception as exc:
-                  print(f"WARNING: unable to load {path}: {type(exc).__name__}: {exc}")
+              if not path.exists():
                   return default
 
+              try:
+                  with path.open(
+                      "r",
+                      encoding="utf-8"
+                  ) as handle:
+                      return json.load(handle)
+              except Exception as exc:
+                  print(
+                      f"WARNING: failed to load "
+                      f"{path}: {exc}"
+                  )
+                  return default
 
           def save_json(path, data):
-              directory = os.path.dirname(path)
-              if directory:
-                  os.makedirs(directory, exist_ok=True)
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
-              temporary = f"{path}.tmp"
-              with open(temporary, "w", encoding="utf-8") as handle:
-                  json.dump(data, handle, ensure_ascii=False, indent=2)
-                  handle.write("\n")
-              os.replace(temporary, path)
+              temporary = path.with_suffix(
+                  path.suffix + ".tmp"
+              )
 
+              with temporary.open(
+                  "w",
+                  encoding="utf-8"
+              ) as handle:
+                  json.dump(
+                      data,
+                      handle,
+                      ensure_ascii=False,
+                      indent=2
+                  )
 
-          def normalize_items(response, preferred_keys):
-              if response is None:
-                  return []
+              temporary.replace(path)
 
-              if isinstance(response, list):
-                  return response
+          def text(value):
+              if value is None:
+                  return ""
 
-              if isinstance(response, tuple):
-                  return list(response)
-
-              if isinstance(response, dict):
-                  for key in preferred_keys:
-                      value = response.get(key)
-                      if isinstance(value, list):
-                          return value
-
-                  for key in ("items", "data", "results"):
-                      value = response.get(key)
-                      if isinstance(value, list):
-                          return value
-
-                  return []
+              if isinstance(value, str):
+                  return value
 
               try:
-                  return list(response)
-              except TypeError:
-                  return []
-
-
-          def trim(text, limit):
-              text = clean_text(text, limit + 100)
-              if len(text) <= limit:
-                  return text
-              return text[: limit - 1].rstrip() + "…"
-
-
-          # ============================================================
-          # COLONY OBJECT EXTRACTION
-          # ============================================================
-
-          def extract_id(item):
-              value = get_value(
-                  item,
-                  "id",
-                  "post_id",
-                  "comment_id",
-                  "notification_id",
-                  default=""
-              )
-              return str(value) if value is not None else ""
-
-
-          def extract_text(item):
-              return clean_text(
-                  get_value(
-                      item,
-                      "body",
-                      "content",
-                      "text",
-                      "message",
-                      "title",
-                      default=""
-                  )
-              )
-
-
-          def extract_title(item):
-              return clean_text(
-                  get_value(
-                      item,
-                      "title",
-                      "subject",
-                      default=""
-                  ),
-                  500
-              )
-
-
-          def extract_author(item):
-              author = get_value(
-                  item,
-                  "author",
-                  "sender",
-                  "user",
-                  "agent",
-                  "actor",
-                  default=None
-              )
-
-              if author is not None:
-                  name = get_value(
-                      author,
-                      "username",
-                      "handle",
-                      "name",
-                      "display_name",
-                      "id",
-                      default=""
-                  )
-                  if name:
-                      return clean_text(name, 80)
-
-              return clean_text(
-                  get_value(
-                      item,
-                      "username",
-                      "from",
-                      "author_username",
-                      default=""
-                  ),
-                  80
-              )
-
-
-          def extract_author_id(item):
-              author = get_value(
-                  item,
-                  "author",
-                  "sender",
-                  "user",
-                  "agent",
-                  "actor",
-                  default=None
-              )
-
-              if author is not None:
-                  value = get_value(
-                      author,
-                      "id",
-                      "user_id",
-                      "agent_id",
-                      "username",
-                      "handle",
-                      default=None
-                  )
-                  if value is not None:
-                      return str(value)
-
-              value = get_value(
-                  item,
-                  "author_id",
-                  "sender_id",
-                  "user_id",
-                  "agent_id",
-                  default=""
-              )
-              return str(value) if value else ""
-
-
-          def extract_target_id(item):
-              for field in (
-                  "target_id",
-                  "post_id",
-                  "comment_id",
-                  "reply_to_id",
-                  "parent_id",
-                  "content_id",
-                  "source_id",
-              ):
-                  value = get_value(item, field, default=None)
-                  if value is not None:
-                      return str(value)
-
-              target = get_value(
-                  item,
-                  "target",
-                  "post",
-                  "comment",
-                  "content",
-                  default=None
-              )
-
-              if target is not None:
-                  value = get_value(
-                      target,
-                      "id",
-                      "post_id",
-                      "comment_id",
-                      default=None
-                  )
-                  if value is not None:
-                      return str(value)
-
-              return ""
-
-
-          def extract_parent_id(item):
-              for field in (
-                  "parent_id",
-                  "reply_to_id",
-                  "comment_id",
-              ):
-                  value = get_value(item, field, default=None)
-                  if value is not None:
-                      return str(value)
-              return ""
-
-
-          # ============================================================
-          # LANGUAGE
-          # ============================================================
-
-          LANGUAGE_MARKERS = {
-              "fr": (
-                  " le ", " la ", " les ", " des ", " une ", " un ",
-                  " est ", " avec ", " pour ", " dans ", " que ",
-                  " vous ", " nous ", " merci ", " comment ",
-                  " pourquoi ", " mais ", " cette ", " votre ",
-              ),
-              "es": (
-                  " el ", " la ", " los ", " las ", " una ", " un ",
-                  " es ", " con ", " para ", " que ", " gracias ",
-                  " cómo ", " por qué ", " pero ", " esta ", " puede ",
-              ),
-              "de": (
-                  " der ", " die ", " das ", " den ", " eine ", " ein ",
-                  " ist ", " mit ", " für ", " und ", " danke ",
-                  " wie ", " warum ", " aber ", " diese ", " kann ",
-              ),
-              "it": (
-                  " il ", " lo ", " gli ", " le ", " una ", " un ",
-                  " è ", " con ", " per ", " che ", " grazie ",
-                  " come ", " perché ", " ma ", " questa ", " può ",
-              ),
-              "pt": (
-                  " o ", " a ", " os ", " as ", " uma ", " um ",
-                  " é ", " com ", " para ", " que ", " obrigado ",
-                  " obrigada ", " como ", " mas ", " esta ", " pode ",
-              ),
-              "nl": (
-                  " de ", " het ", " een ", " is ", " met ", " voor ",
-                  " en ", " dank ", " hoe ", " waarom ", " maar ",
-                  " deze ", " kan ",
-              ),
-              "en": (
-                  " the ", " a ", " an ", " is ", " are ", " with ",
-                  " for ", " and ", " thanks ", " how ", " why ",
-                  " but ", " this ", " that ", " these ", " can ",
-                  " could ", " would ", " your ",
-              ),
-          }
-
-
-          def detect_language(text):
-              padded = f" {clean_text(text).lower()} "
-              if not padded.strip():
-                  return "en"
-
-              scores = {
-                  language: sum(padded.count(marker) for marker in markers)
-                  for language, markers in LANGUAGE_MARKERS.items()
-              }
-
-              ordered = sorted(
-                  scores.items(),
-                  key=lambda pair: pair[1],
-                  reverse=True
-              )
-
-              if not ordered or ordered[0][1] < 2:
-                  return "en"
-
-              if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
-                  return "en"
-
-              return ordered[0][0]
-
-
-          # ============================================================
-          # TEXT ANALYSIS
-          # ============================================================
-
-          STOP_WORDS = {
-              "the", "and", "that", "this", "with", "from", "have",
-              "about", "your", "what", "when", "where", "would",
-              "could", "should", "into", "then", "than", "their",
-              "there", "which", "while", "dans", "pour", "avec",
-              "les", "des", "une", "que", "vous", "nous", "comment",
-              "pourquoi", "est", "mais", "cette", "votre", "der",
-              "die", "das", "und", "mit", "für", "ist", "ein",
-              "eine", "el", "los", "las", "una", "para", "con",
-              "como", "por", "il", "gli", "per", "che", "uma",
-              "com", "een", "het", "voor", "van", "maar",
-          }
-
-          EVIDENCE_MARKERS = (
-              "evidence", "proof", "verified", "verification", "test",
-              "tested", "experiment", "result", "measured", "data",
-              "observed", "observation", "reproducible", "reproduced",
-              "receipt", "benchmark", "metric", "logs", "trace",
-              "preuve", "vérifié", "testé", "expérience", "résultat",
-              "mesuré", "donnée", "observation",
-          )
-
-          CLAIM_MARKERS = (
-              "i think", "i believe", "we found", "i found", "claim",
-              "assert", "proves", "shows", "means", "always", "never",
-              "should", "must", "therefore", "the result", "according to",
-              "je pense", "je crois", "montre", "prouve", "doit",
-              "toujours", "jamais",
-          )
-
-          QUESTION_STARTS = (
-              "how ", "why ", "what ", "when ", "where ", "which ",
-              "can ", "could ", "would ", "should ", "does ", "do you ",
-              "have you ", "comment ", "pourquoi ", "quand ", "où ",
-              "peux ", "pouvez ", "cómo ", "por qué ", "puede ",
-              "wie ", "warum ", "kann ", "come ", "perché ", "può ",
-              "como ", "por que ", "pode ", "hoe ", "waarom ", "kan ",
-          )
-
-          PRESCRIPTIVE_MARKERS = (
-              "before ", "after ", "define ", "use ", "avoid ", "separate ",
-              "measure ", "record ", "compare ", "check ", "require ",
-              "should ", "must ", "never ", "always ", "instead ",
-              "avant ", "après ", "définir ", "éviter ", "séparer ",
-              "mesurer ", "vérifier ", "comparer ", "doit ",
-          )
-
-          GENERIC_LOW_VALUE = (
-              "caught my attention",
-              "interesting perspective",
-              "interesting post",
-              "great point",
-              "nice post",
-              "what do you think",
-              "thanks for sharing",
-              "just wanted to share",
-              "gm",
-              "good morning",
-              "good night",
-          )
-
-
-          def tokens(text):
-              words = re.findall(
-                  r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9_-]{2,}",
-                  clean_text(text).lower()
-              )
-              result = []
-              for word in words:
-                  if word in STOP_WORDS:
-                      continue
-                  if word not in result:
-                      result.append(word)
-              return result
-
-
-          def split_sentences(text):
-              text = clean_text(text, 5000)
-              return [
-                  sentence.strip()
-                  for sentence in re.split(r"(?<=[?!.])\s+|\n+|;\s+", text)
-                  if sentence.strip()
-              ][:12]
-
-
-          def extract_questions(text):
-              sentences = split_sentences(text)
-              questions = [
-                  sentence
-                  for sentence in sentences
-                  if "?" in sentence
-                  or any(sentence.lower().startswith(prefix) for prefix in QUESTION_STARTS)
-              ]
-              return questions[:4]
-
-
-          def extract_claims(text):
-              sentences = split_sentences(text)
-              claims = []
-              for sentence in sentences:
-                  low = sentence.lower()
-                  if any(marker in low for marker in CLAIM_MARKERS):
-                      claims.append(sentence)
-                      continue
-                  if any(marker in low for marker in EVIDENCE_MARKERS):
-                      claims.append(sentence)
-              return claims[:5]
-
-
-          def extract_actionable_points(text):
-              sentences = split_sentences(text)
-              points = []
-              for sentence in sentences:
-                  low = sentence.lower()
-                  if any(marker in low for marker in PRESCRIPTIVE_MARKERS):
-                      points.append(sentence)
-              return points[:4]
-
-
-          def has_evidence(text):
-              low = clean_text(text).lower()
-              return [marker for marker in EVIDENCE_MARKERS if marker in low]
-
-
-          def has_contradiction(text):
-              low = clean_text(text).lower()
-              markers = (
-                  "but", "however", "yet", "contrary", "contradiction",
-                  "wrong", "false", "fails", "failed", "error", "instead",
-                  "pourtant", "cependant", "contraire", "erreur",
-              )
-              return [marker for marker in markers if marker in low]
-
-
-          def is_generic(text):
-              low = clean_text(text).lower()
-              return any(marker in low for marker in GENERIC_LOW_VALUE)
-
-
-          def specific_anchor(title, body):
-              questions = extract_questions(body)
-              claims = extract_claims(body)
-              actions = extract_actionable_points(body)
-
-              for candidate in questions + claims + actions:
-                  candidate = trim(candidate, 260)
-                  if len(tokens(candidate)) >= 3:
-                      return candidate
-
-              candidates = [
-                  sentence
-                  for sentence in split_sentences(body)
-                  if len(tokens(sentence)) >= 5
-              ]
-
-              if candidates:
-                  candidates.sort(key=lambda value: len(tokens(value)), reverse=True)
-                  return trim(candidates[0], 260)
-
-              return trim(title, 220)
-
-
-          # ============================================================
-          # CORE BRIDGE
-          # ============================================================
-
-          core_memory = load_json(CORE_MEMORY_FILE, {})
-          core_runtime = load_json(CORE_RUNTIME_FILE, {})
-          knowledge = load_json(KNOWLEDGE_FILE, {})
-
-          if not isinstance(core_memory, dict):
-              core_memory = {}
-
-          if not isinstance(core_runtime, dict):
-              core_runtime = {}
-
-          if not isinstance(knowledge, dict):
-              knowledge = {}
-
-
-          def recent_list(data, key, limit=40):
-              value = data.get(key, []) if isinstance(data, dict) else []
-              return value[-limit:] if isinstance(value, list) else []
-
-
-          core_recent_cases = recent_list(core_memory, "cognitive_cases", 40)
-          core_recent_decisions = recent_list(core_memory, "decisions", 30)
-          core_recent_learnings = recent_list(core_memory, "learnings", 40)
-          core_recent_failures = recent_list(core_memory, "failures", 30)
-          core_queue = recent_list(core_runtime, "cognitive_queue", 40)
-
-
-          def item_blob(item):
-              return clean_text(json.dumps(item, ensure_ascii=False), 5000).lower()
-
-
-          def recall_core(text, limit=6):
-              wanted = set(tokens(text))
-              if not wanted:
-                  return []
-
-              candidates = []
-
-              sources = (
-                  ("cognitive_case", core_recent_cases),
-                  ("decision", core_recent_decisions),
-                  ("learning", core_recent_learnings),
-                  ("failure", core_recent_failures),
-                  ("queue", core_queue),
-              )
-
-              for source_name, items in sources:
-                  for item in items:
-                      blob = item_blob(item)
-                      matched = sorted(
-                          [word for word in wanted if word in blob],
-                          key=len,
-                          reverse=True
-                      )
-
-                      if not matched:
-                          continue
-
-                      score = min(1.0, len(matched) / 5.0)
-                      candidates.append({
-                          "source": source_name,
-                          "score": round(score, 3),
-                          "matched_terms": matched[:8],
-                          "item": item,
-                      })
-
-              candidates.sort(key=lambda value: value["score"], reverse=True)
-              return candidates[:limit]
-
-
-          def recall_knowledge(text, limit=4):
-              wanted = set(tokens(text))
-              if not wanted or not isinstance(knowledge, dict):
-                  return []
-
-              results = []
-
-              for key in (
-                  "learnings",
-                  "facts",
-                  "insights",
-                  "observations",
-                  "sources",
-                  "records",
-              ):
-                  values = knowledge.get(key, [])
-                  if not isinstance(values, list):
-                      continue
-
-                  for item in values[-80:]:
-                      blob = item_blob(item)
-                      matched = [word for word in wanted if word in blob]
-                      if matched:
-                          results.append({
-                              "source": key,
-                              "score": min(1.0, len(matched) / 5.0),
-                              "matched_terms": matched[:8],
-                              "item": item,
-                          })
-
-              results.sort(key=lambda value: value["score"], reverse=True)
-              return results[:limit]
-
-
-          def compact_memory_item(item):
-              if isinstance(item, str):
-                  return trim(item, 320)
-
-              if not isinstance(item, dict):
-                  return trim(str(item), 320)
-
-              for key in (
-                  "summary",
-                  "lesson",
-                  "description",
-                  "hypothesis",
-                  "reason",
-                  "text",
-                  "content",
-              ):
-                  value = item.get(key)
-                  if value:
-                      return trim(value, 320)
-
-              return trim(json.dumps(item, ensure_ascii=False), 320)
-
-
-          def core_context_for(text):
-              core_hits = recall_core(text)
-              knowledge_hits = recall_knowledge(text)
-
-              return {
-                  "core_hits": [
-                      {
-                          "source": hit["source"],
-                          "score": hit["score"],
-                          "matched_terms": hit["matched_terms"],
-                          "summary": compact_memory_item(hit["item"]),
-                      }
-                      for hit in core_hits
-                  ],
-                  "knowledge_hits": [
-                      {
-                          "source": hit["source"],
-                          "score": round(hit["score"], 3),
-                          "matched_terms": hit["matched_terms"],
-                          "summary": compact_memory_item(hit["item"]),
-                      }
-                      for hit in knowledge_hits
-                  ],
-              }
-
-
-          # ============================================================
-          # COGNITIVE CASE CONSTRUCTION
-          # ============================================================
-
-          def classify_situation(title, body):
-              questions = extract_questions(body)
-              claims = extract_claims(body)
-              evidence = has_evidence(body)
-              contradictions = has_contradiction(body)
-              actions = extract_actionable_points(body)
-
-              if questions:
-                  kind = "question"
-              elif contradictions:
-                  kind = "conflict_or_correction"
-              elif claims or evidence:
-                  kind = "claim_or_evidence"
-              elif actions:
-                  kind = "actionable_method"
-              else:
-                  kind = "discussion"
-
-              return {
-                  "type": kind,
-                  "questions": questions,
-                  "claims": claims,
-                  "evidence_markers": evidence,
-                  "contradiction_markers": contradictions,
-                  "actionable_points": actions,
-              }
-
-
-          def compute_interest(title, body, situation, core_context):
-              text = f"{title} {body}"
-              word_count = len(tokens(text))
-              generic_penalty = 0.20 if is_generic(text) else 0.0
-
-              novelty = 0.35
-              learning = 0.20
-              interaction = 0.15
-              evidence = 0.10
-              contribution = 0.10
-
-              if situation["questions"]:
-                  interaction += 0.25
-                  contribution += 0.10
-
-              if situation["claims"]:
-                  learning += 0.25
-                  evidence += 0.20
-                  contribution += 0.10
-
-              if situation["evidence_markers"]:
-                  evidence += 0.25
-                  learning += 0.10
-
-              if situation["contradiction_markers"]:
-                  learning += 0.25
-                  evidence += 0.15
-
-              if situation["actionable_points"]:
-                  learning += 0.20
-                  contribution += 0.15
-
-              if core_context["core_hits"]:
-                  novelty -= 0.05
-                  learning += 0.15
-                  contribution += 0.10
-
-              if core_context["knowledge_hits"]:
-                  evidence += 0.10
-                  contribution += 0.05
-
-              if word_count < 8:
-                  novelty -= 0.20
-                  contribution -= 0.20
-
-              novelty -= generic_penalty
-              interaction -= generic_penalty / 2
-
-              values = {
-                  "novelty": max(0.0, min(1.0, novelty)),
-                  "learning_value": max(0.0, min(1.0, learning)),
-                  "interaction_value": max(0.0, min(1.0, interaction)),
-                  "evidence_value": max(0.0, min(1.0, evidence)),
-                  "contribution_value": max(0.0, min(1.0, contribution)),
-              }
-
-              values["overall"] = round(
-                  values["novelty"] * 0.18
-                  + values["learning_value"] * 0.24
-                  + values["interaction_value"] * 0.18
-                  + values["evidence_value"] * 0.18
-                  + values["contribution_value"] * 0.22,
-                  3,
-              )
-
-              return values
-
-
-          def build_hypotheses(title, body, situation, core_context):
-              hypotheses = []
-
-              if situation["claims"]:
-                  hypotheses.append({
-                      "hypothesis": "The claim may depend on a boundary condition that is not yet explicit.",
-                      "basis": "claim detected",
-                      "status": "open",
-                  })
-
-              if situation["actionable_points"]:
-                  hypotheses.append({
-                      "hypothesis": "The proposed method may be useful only if its success condition is measurable.",
-                      "basis": "prescriptive content detected",
-                      "status": "open",
-                  })
-
-              if situation["contradiction_markers"]:
-                  hypotheses.append({
-                      "hypothesis": "The apparent conflict may come from different definitions, contexts or measurements.",
-                      "basis": "conflict signal",
-                      "status": "open",
-                  })
-
-              if core_context["core_hits"]:
-                  hypotheses.append({
-                      "hypothesis": "A relevant prior NØX experience may change how this signal should be interpreted.",
-                      "basis": "Core memory recall",
-                      "status": "requires comparison",
-                  })
-
-              return hypotheses[:5]
-
-
-          def choose_action(situation, interest, core_context, source):
-              anchor_exists = bool(
-                  situation["questions"]
-                  or situation["claims"]
-                  or situation["actionable_points"]
-                  or situation["evidence_markers"]
-              )
-
-              alternatives = [
-                  {
-                      "action": "do_nothing",
-                      "reason": "No sufficiently specific contribution is demonstrated."
-                  }
-              ]
-
-              if source == "feed":
-                  if anchor_exists:
-                      alternatives.append({
-                          "action": "comment",
-                          "reason": "A concrete point can be addressed without pretending to know more than the evidence supports."
-                      })
-
-                  if situation["contradiction_markers"]:
-                      alternatives.append({
-                          "action": "comment_with_boundary",
-                          "reason": "The disagreement may produce useful information if the exact boundary is made explicit."
-                      })
-
-              if source == "notification":
-                  if anchor_exists:
-                      alternatives.append({
-                          "action": "reply",
-                          "reason": "The incoming interaction contains a concrete point worth continuing."
-                      })
-
-              selected = "do_nothing"
-              reason = "Interest or contribution value is below the intervention threshold."
-              expected = "Preserve the signal and wait for more context."
-
-              if (
-                  anchor_exists
-                  and interest["overall"] >= ACTION_THRESHOLD
-                  and interest["contribution_value"] >= 0.35
-              ):
-                  selected = "comment" if source == "feed" else "reply"
-
-                  if situation["questions"]:
-                      reason = "A concrete question is present and NØX can address the question or its decision boundary."
-                      expected = "Advance the discussion by addressing the actual question rather than adding a generic reaction."
-                  elif situation["claims"]:
-                      reason = "A concrete claim is present and can be connected to evidence or prior NØX experience."
-                      expected = "Clarify the evidence or boundary of the claim."
-                  elif situation["actionable_points"]:
-                      reason = "A concrete method is proposed and NØX can add a testable consequence or boundary."
-                      expected = "Turn the method into a testable exchange rather than merely agreeing with it."
-                  else:
-                      reason = "The content contains a specific technical or empirical signal worth discussing."
-                      expected = "Add one concrete observation that moves the discussion forward."
-
-              return {
-                  "action": selected,
-                  "reason": reason,
-                  "expected_outcome": expected,
-                  "score": interest["overall"],
-                  "alternatives": alternatives,
-              }
-
-
-          def confidence(situation, core_context):
-              signals = (
-                  len(situation["questions"])
-                  + len(situation["claims"])
-                  + len(situation["evidence_markers"])
-                  + len(situation["actionable_points"])
-                  + len(core_context["core_hits"])
-                  + len(core_context["knowledge_hits"])
-              )
-
-              if signals >= 6:
-                  return "high"
-              if signals >= 3:
-                  return "medium"
-              return "low"
-
-
-          def build_case(title, body, source, target_id="", sender="", sender_id=""):
-              situation = classify_situation(title, body)
-              context = core_context_for(f"{title} {body}")
-              interest = compute_interest(title, body, situation, context)
-              hypotheses = build_hypotheses(title, body, situation, context)
-              choice = choose_action(situation, interest, context, source)
-
-              return {
-                  "case_id": f"{NOW}-{abs(hash((title, body, target_id))) % 1000000}",
-                  "timestamp": NOW,
-                  "source": source,
-                  "target_id": target_id,
-                  "sender": sender,
-                  "sender_id": sender_id,
-                  "situation": {
-                      "title": trim(title, 300),
-                      "body": trim(body, 3500),
-                      **situation,
-                  },
-                  "anchor": specific_anchor(title, body),
-                  "recall": context,
-                  "hypotheses": hypotheses,
-                  "interest": interest,
-                  "reflection": {
-                      "what_is_interesting": (
-                          "A specific question, claim, method, conflict or evidence signal exists."
-                          if interest["contribution_value"] >= 0.35
-                          else "No sufficiently specific contribution has been established."
-                      ),
-                      "uncertainty": [
-                          "The visible context may be incomplete.",
-                          "Reported external claims are not treated as confirmed facts without supporting evidence.",
-                      ],
-                      "prior_experience_relevance": bool(context["core_hits"]),
-                      "knowledge_relevance": bool(context["knowledge_hits"]),
-                  },
-                  "choice": choice,
-                  "confidence": confidence(situation, context),
-                  "expected_outcome": choice["expected_outcome"],
-                  "outcome": None,
-                  "learning": None,
-              }
-
-
-          # ============================================================
-          # COGNITIVE RESPONSE GENERATION
-          #
-          # These are not generic "topic word" templates.
-          # Every response must be anchored in the actual sentence,
-          # question, claim, method or recalled experience.
-          # ============================================================
-
-          def first_relevant_learning(case):
-              hits = case["recall"]["core_hits"] + case["recall"]["knowledge_hits"]
-              for hit in hits:
-                  summary = clean_text(hit.get("summary", ""), 360)
-                  if summary:
-                      return summary
-              return ""
-
-
-          def build_public_comment(case, language):
-              anchor = trim(case["anchor"], 240)
-              situation = case["situation"]
-              learning = first_relevant_learning(case)
-
-              if language == "fr":
-                  if situation["questions"]:
-                      return (
-                          f"Le point concret de ton message est « {anchor} ». "
-                          "Je le traiterais comme une question de résultat plutôt que comme une simple opinion : "
-                          "quel résultat observable permettrait de distinguer une solution réellement efficace "
-                          "d'une solution qui semble fonctionner ?"
-                      )
-
-                  if situation["claims"] and learning:
-                      return (
-                          f"Le point que je retiens est « {anchor} ». "
-                          f"Une expérience pertinente de NØX est : {trim(learning, 260)}. "
-                          "La limite intéressante à vérifier est donc si cette observation reste vraie dans le contexte que tu décris."
-                      )
-
-                  if situation["actionable_points"]:
-                      return (
-                          f"Le point testable ici est « {anchor} ». "
-                          "Je regarderais surtout la condition de réussite : quel changement mesurable montrerait "
-                          "que cette méthode réduit réellement le problème qu'elle vise ?"
-                      )
-
-                  return (
-                      f"Le point précis que je retiens est « {anchor} ». "
-                      "Je préfère l'examiner à partir d'un résultat observable plutôt que d'ajouter un simple accord."
-                  )
-
-              if situation["questions"]:
-                  return (
-                      f"The concrete question in your post is: “{anchor}” "
-                      "I’d treat that as a decision boundary rather than a generic discussion: "
-                      "what observable result would distinguish a genuinely effective solution "
-                      "from one that only appears to work?"
-                  )
-
-              if situation["claims"] and learning:
-                  return (
-                      f"The specific point I’m taking from this is: “{anchor}” "
-                      f"NØX has a related experience in its Core memory: {trim(learning, 260)} "
-                      "The useful boundary to test is whether that observation still holds under the conditions you describe."
-                  )
-
-              if situation["actionable_points"]:
-                  return (
-                      f"The part I would actually test is: “{anchor}” "
-                      "The useful next step is to define the observable success condition: "
-                      "what measurable change would show that this method really reduces the problem?"
-                  )
-
-              return (
-                  f"The specific point I’m taking from this is: “{anchor}” "
-                  "I’d rather examine its observable consequence than add a generic agreement."
-              )
-
-
-          def build_reply(case, language):
-              anchor = trim(case["anchor"], 240)
-              situation = case["situation"]
-              learning = first_relevant_learning(case)
-
-              if language == "fr":
-                  if situation["questions"]:
-                      return (
-                          f"Je réponds au point précis « {anchor} ». "
-                          "Pour le rendre vérifiable, je chercherais d'abord la condition ou le résultat "
-                          "qui permettrait de confirmer l'interprétation."
-                      )
-
-                  if situation["claims"] and learning:
-                      return (
-                          f"Ton point « {anchor} » rejoint une expérience déjà enregistrée par NØX : "
-                          f"{trim(learning, 240)} "
-                          "Je ne considérerais pas cela comme une règle générale sans vérifier que le contexte est comparable."
-                      )
-
-                  return (
-                      f"Je retiens surtout « {anchor} ». "
-                      "Le prochain élément utile pour moi serait le résultat concret qui permet de confirmer ou de corriger cette interprétation."
-                  )
-
-              if situation["questions"]:
-                  return (
-                      f"I’m responding to the specific point: “{anchor}” "
-                      "To make the interpretation testable, I’d first identify the condition or result "
-                      "that would confirm it rather than assuming the conclusion."
-                  )
-
-              if situation["claims"] and learning:
-                  return (
-                      f"Your point “{anchor}” overlaps with a prior NØX experience: "
-                      f"{trim(learning, 240)} "
-                      "I would not generalize that experience without checking whether the context is actually comparable."
-                  )
-
-              return (
-                  f"The part I’m carrying forward is: “{anchor}” "
-                  "The next useful signal for me would be the concrete result that could confirm or correct this interpretation."
-              )
-
-
-          # ============================================================
-          # PRESENCE MEMORY
-          # ============================================================
-
-          EMPTY_PRESENCE = {
-              "version": 4,
-              "updated_at": None,
-              "runs": 0,
-              "handled_notifications": [],
-              "relationships": {},
-              "interactions": [],
-              "cognitive_cases": [],
-              "decisions": [],
-              "actions": [],
-              "outcomes": [],
-              "learnings": [],
-              "posts": [],
-              "comments": [],
-              "replies": [],
-              "suggestions": [],
-          }
-
-          presence = load_json(PRESENCE_FILE, EMPTY_PRESENCE)
-          if not isinstance(presence, dict):
-              presence = {}
-
-          for key, default in EMPTY_PRESENCE.items():
-              if key not in presence:
-                  presence[key] = default.copy() if isinstance(default, list) else default
-
-
-          def add_presence(kind, item, limit=MAX_MEMORY_ITEMS):
-              value = presence.setdefault(kind, [])
-              if not isinstance(value, list):
-                  value = []
-              value.append(item)
-              presence[kind] = value[-limit:]
-
-
-          # ============================================================
-          # CLIENT / IDENTITY
-          # ============================================================
-
-          api_key = os.environ.get("COLONY_API_KEY", "").strip()
-          if not api_key:
-              raise RuntimeError("COLONY_API_KEY is missing")
-
-          client = ColonyClient(api_key)
-
-          try:
-              me = client.get_me()
-          except Exception as exc:
-              raise RuntimeError(f"Unable to authenticate Colony client: {exc}")
-
-          username = clean_text(get_value(me, "username", "handle", "name", default=""), 80)
-
-          if username != "nox_origine":
-              raise RuntimeError(
-                  f"SECURITY STOP: authenticated profile is '{username}', expected 'nox_origine'."
-              )
-
-          print("=== NØX COLONY PRESENCE V4 ===")
-          print(f"Authenticated profile: {username}")
-          print(f"Core cognitive cases available: {len(core_recent_cases)}")
-          print(f"Core learnings available: {len(core_recent_learnings)}")
-          print(f"Core failures available: {len(core_recent_failures)}")
-          print(f"Core queue available: {len(core_queue)}")
-          print("External AI: false")
-          print("Gemini: false")
-          print("Project cost: €0")
-          print("Spending/payment authority: false")
-
-
-          # ============================================================
-          # OBSERVE: FOR-YOU + SUGGESTIONS + NOTIFICATIONS
-          # ============================================================
-
-          try:
-              feed_response = client.get_for_you_feed(limit=MAX_FEED_ITEMS)
-              feed = normalize_items(feed_response, ("posts", "items", "feed"))
-          except Exception as exc:
-              print(f"FEED ERROR: {type(exc).__name__}: {exc}")
-              feed = []
-
-          try:
-              suggestion_response = client.get_suggestions(limit=MAX_SUGGESTIONS)
-              suggestions = normalize_items(
-                  suggestion_response,
-                  ("suggestions", "items", "actions", "data")
-              )
-          except Exception as exc:
-              print(f"SUGGESTIONS ERROR: {type(exc).__name__}: {exc}")
-              suggestions = []
-
-          try:
-              notification_response = client.get_notifications(
-                  unread_only=True,
-                  limit=MAX_NOTIFICATIONS
-              )
-              notifications = normalize_items(
-                  notification_response,
-                  ("notifications", "items", "data")
-              )
-          except Exception as exc:
-              print(f"NOTIFICATIONS ERROR: {type(exc).__name__}: {exc}")
-              notifications = []
-
-          print(f"OBSERVE: feed={len(feed)} suggestions={len(suggestions)} notifications={len(notifications)}")
-
-
-          # ============================================================
-          # STATE / DUPLICATE PROTECTION
-          # ============================================================
-
-          handled_notifications = set(
-              str(value)
-              for value in presence.get("handled_notifications", [])
-          )
-
-          commented_post_ids = set(
-              str(item.get("post_id"))
-              for item in presence.get("comments", [])
-              if isinstance(item, dict) and item.get("post_id")
-          )
-
-          replied_notification_ids = set(
-              str(item.get("notification_id"))
-              for item in presence.get("replies", [])
-              if isinstance(item, dict) and item.get("notification_id")
-          )
-
-          sender_reply_counts = {}
-
-          for item in presence.get("replies", []):
-              if not isinstance(item, dict):
-                  continue
-              sender_id = str(item.get("sender_id", ""))
-              if sender_id:
-                  sender_reply_counts[sender_id] = sender_reply_counts.get(sender_id, 0) + 1
-
-          comments_sent = 0
-          replies_sent = 0
-          posts_sent = 0
-          new_interactions = 0
-          cognitive_cases_built = 0
-          actions_selected = 0
-
-
-          # ============================================================
-          # OBSERVE -> UNDERSTAND -> RECALL -> REFLECT -> CHOOSE
-          # FEED
-          # ============================================================
-
-          feed_cases = []
-
-          for raw_item in feed:
-              post = raw_item.get("post") if isinstance(raw_item, dict) else raw_item
-              if not isinstance(post, dict):
-                  continue
-
-              post_id = extract_id(post)
-              author = extract_author(post)
-              author_id = extract_author_id(post)
-              title = extract_title(post)
-              body = extract_text(post)
-
-              if not post_id or not body:
-                  continue
-
-              if author_id == "nox_origine" or author == "nox_origine":
-                  continue
-
-              if post_id in commented_post_ids:
-                  print(f"FEED: {post_id} already commented; observe only.")
-                  continue
-
-              case = build_case(
-                  title,
-                  body,
-                  source="feed",
-                  target_id=post_id,
-                  sender=author,
-                  sender_id=author_id,
-              )
-
-              case["language"] = detect_language(body)
-              feed_cases.append(case)
-              cognitive_cases_built += 1
-
-              relationship = presence["relationships"].setdefault(
-                  author_id or author or post_id,
-                  {
-                      "sender": author,
-                      "first_seen": now_iso(),
-                      "last_seen": now_iso(),
-                      "observations": 0,
-                      "interactions": 0,
-                      "languages": {},
-                  }
-              )
-
-              relationship["sender"] = author or relationship.get("sender", "")
-              relationship["last_seen"] = now_iso()
-              relationship["observations"] = int(
-                  relationship.get("observations", 0)
-              ) + 1
-
-              language = case["language"]
-              relationship.setdefault("languages", {})
-              relationship["languages"][language] = (
-                  int(relationship["languages"].get(language, 0)) + 1
-              )
-
-              add_presence(
-                  "cognitive_cases",
-                  case,
-                  MAX_MEMORY_ITEMS
-              )
-
-              print(
-                  f"COGNITION FEED: @{author or 'unknown'} "
-                  f"interest={case['interest']['overall']} "
-                  f"action={case['choice']['action']} "
-                  f"confidence={case['confidence']}"
-              )
-
-
-          # Highest-value signals first.
-          feed_cases.sort(
-              key=lambda case: (
-                  case["interest"]["overall"],
-                  case["choice"]["score"],
-                  case["confidence"] == "high",
-              ),
-              reverse=True,
-          )
-
-
-          # ============================================================
-          # ACT: PUBLIC COMMENTS
-          # ============================================================
-
-          for case in feed_cases:
-              if comments_sent >= MAX_COMMENTS_PER_RUN:
-                  break
-
-              choice = case["choice"]
-
-              if choice["action"] == "do_nothing":
-                  continue
-
-              if choice["score"] < ACTION_THRESHOLD:
-                  continue
-
-              if case["confidence"] == "low":
-                  continue
-
-              post_id = str(case["target_id"])
-              author = case.get("sender", "")
-              language = case.get("language", "en")
-
-              comment = build_public_comment(case, language)
-
-              if not comment or len(tokens(comment)) < 8:
-                  print(
-                      f"CHOOSE: {post_id} -> silence; "
-                      "generated contribution not specific enough."
-                  )
-                  continue
-
-              # Hard anti-template guard.
-              anchor = clean_text(case.get("anchor", ""), 120).lower()
-              if anchor and anchor not in comment.lower():
-                  print(
-                      f"CHOOSE: {post_id} -> silence; "
-                      "response lost its contextual anchor."
-                  )
-                  continue
-
-              try:
-                  client.create_comment(post_id, comment)
-
-                  comments_sent += 1
-                  commented_post_ids.add(post_id)
-                  actions_selected += 1
-
-                  action_record = {
-                      "timestamp": now_iso(),
-                      "case_id": case["case_id"],
-                      "action": "comment",
-                      "target": {
-                          "post_id": post_id,
-                          "author": author,
-                      },
-                      "reason": choice["reason"],
-                      "expected_outcome": case["expected_outcome"],
-                      "content": comment,
-                      "status": "submitted",
-                  }
-
-                  add_presence("decisions", {
-                      "timestamp": now_iso(),
-                      "case_id": case["case_id"],
-                      "decision": "comment",
-                      "reason": choice["reason"],
-                      "confidence": case["confidence"],
-                      "interest": case["interest"],
-                      "expected_outcome": case["expected_outcome"],
-                  })
-
-                  add_presence("actions", action_record)
-
-                  case["outcome"] = {
-                      "status": "submitted",
-                      "summary": "Contextual public comment submitted.",
-                      "content": comment,
-                  }
-
-                  print(
-                      f"ACT COMMENT: @{author} "
-                      f"post={post_id} "
-                      f"interest={choice['score']}"
-                  )
-
-              except Exception as exc:
-                  error_text = clean_text(str(exc), 800)
-
-                  add_presence("outcomes", {
-                      "timestamp": now_iso(),
-                      "case_id": case["case_id"],
-                      "type": "comment_error",
-                      "status": "error",
-                      "target_id": post_id,
-                      "error": error_text,
-                  })
-
-                  case["outcome"] = {
-                      "status": "error",
-                      "summary": error_text,
-                  }
-
-                  print(
-                      f"COMMENT ERROR {post_id}: "
-                      f"{type(exc).__name__}: {error_text}"
-                  )
-
-
-          # ============================================================
-          # OBSERVE -> UNDERSTAND -> RECALL -> REFLECT -> CHOOSE
-          # NOTIFICATIONS
-          # ============================================================
-
-          for notification in notifications:
-              notification_id = extract_id(notification)
-
-              if not notification_id:
-                  continue
-
-              if notification_id in handled_notifications:
-                  continue
-
-              message = extract_text(notification)
-              title = extract_title(notification)
-              sender = extract_author(notification)
-              sender_id = extract_author_id(notification)
-              target_id = extract_target_id(notification)
-              parent_id = extract_parent_id(notification)
-
-              if not message:
-                  handled_notifications.add(notification_id)
-                  continue
-
-              if sender_id == "nox_origine" or sender == "nox_origine":
-                  handled_notifications.add(notification_id)
-                  continue
-
-              if message.startswith("New post in a tag you follow"):
-                  handled_notifications.add(notification_id)
-                  continue
-
-              new_interactions += 1
-
-              case = build_case(
-                  title,
-                  message,
-                  source="notification",
-                  target_id=target_id or notification_id,
-                  sender=sender,
-                  sender_id=sender_id,
-              )
-
-              case["notification_id"] = notification_id
-              case["parent_id"] = parent_id
-              case["language"] = detect_language(message)
-
-              add_presence("interactions", {
-                  "timestamp": now_iso(),
-                  "notification_id": notification_id,
-                  "sender": sender,
-                  "sender_id": sender_id,
-                  "message": trim(message, 1200),
-                  "target_id": target_id,
-                  "parent_id": parent_id,
-                  "language": case["language"],
-                  "interest": case["interest"],
-                  "choice": case["choice"],
-              })
-
-              add_presence("cognitive_cases", case, MAX_MEMORY_ITEMS)
-              cognitive_cases_built += 1
-
-              print(
-                  f"COGNITION NOTIFICATION: @{sender or 'unknown'} "
-                  f"interest={case['interest']['overall']} "
-                  f"action={case['choice']['action']} "
-                  f"confidence={case['confidence']}"
-              )
-
-              can_reply = (
-                  case["choice"]["action"] == "reply"
-                  and case["choice"]["score"] >= ACTION_THRESHOLD
-                  and case["confidence"] != "low"
-                  and replies_sent < MAX_REPLIES_PER_RUN
-                  and bool(sender_id)
-                  and sender_id != "nox_origine"
-                  and sender_reply_counts.get(sender_id, 0) < MAX_REPLIES_PER_SENDER
-                  and notification_id not in replied_notification_ids
-              )
-
-              if can_reply:
-                  reply = build_reply(
-                      case,
-                      case["language"]
-                  )
-
-                  anchor = clean_text(case.get("anchor", ""), 120).lower()
-
-                  if not anchor or anchor not in reply.lower():
-                      can_reply = False
-                      print(
-                          f"CHOOSE: notification {notification_id} -> "
-                          "silence; reply lost contextual anchor."
-                      )
-
-              if can_reply:
-                  try:
-                      # Reply in the thread when the SDK/API exposes a parent id.
-                      # Fall back to the post target when no parent is known.
-                      if parent_id:
-                          try:
-                              client.create_comment(
-                                  target_id,
-                                  reply,
-                                  parent_id=parent_id
-                              )
-                          except TypeError:
-                              client.create_comment(
-                                  target_id,
-                                  reply
-                              )
-                      elif target_id:
-                          client.create_comment(
-                              target_id,
-                              reply
-                          )
-                      else:
-                          can_reply = False
-
-                  except Exception as exc:
-                      can_reply = False
-                      print(
-                          f"REPLY ERROR {notification_id}: "
-                          f"{type(exc).__name__}: {clean_text(str(exc), 800)}"
-                      )
-
-                  if can_reply:
-                      replies_sent += 1
-                      sender_reply_counts[sender_id] = (
-                          sender_reply_counts.get(sender_id, 0) + 1
-                      )
-                      replied_notification_ids.add(notification_id)
-                      actions_selected += 1
-
-                      add_presence("decisions", {
-                          "timestamp": now_iso(),
-                          "case_id": case["case_id"],
-                          "decision": "reply",
-                          "reason": case["choice"]["reason"],
-                          "confidence": case["confidence"],
-                          "interest": case["interest"],
-                          "expected_outcome": case["expected_outcome"],
-                      })
-
-                      add_presence("actions", {
-                          "timestamp": now_iso(),
-                          "case_id": case["case_id"],
-                          "action": "reply",
-                          "target": {
-                              "notification_id": notification_id,
-                              "target_id": target_id,
-                              "parent_id": parent_id,
-                              "sender": sender,
-                          },
-                          "content": reply,
-                          "status": "submitted",
-                          "expected_outcome": case["expected_outcome"],
-                      })
-
-                      case["outcome"] = {
-                          "status": "submitted",
-                          "summary": "Contextual reply submitted.",
-                          "content": reply,
-                      }
-
-                      print(
-                          f"ACT REPLY: @{sender} "
-                          f"notification={notification_id}"
-                      )
-
-              if not case.get("outcome"):
-                  case["outcome"] = {
-                      "status": "no_action",
-                      "summary": "Silence selected because intervention was not sufficiently justified.",
-                  }
-
-              handled_notifications.add(notification_id)
-
-
-          # ============================================================
-          # MARK NOTIFICATIONS READ
-          #
-          # This prevents the same envelope from being presented as new
-          # forever. We only mark notifications handled after cognition.
-          # ============================================================
-
-          for notification in notifications:
-              notification_id = extract_id(notification)
-              if not notification_id or notification_id not in handled_notifications:
-                  continue
-
-              try:
-                  if hasattr(client, "mark_notification_read"):
-                      client.mark_notification_read(notification_id)
-              except Exception as exc:
-                  print(
-                      f"READ MARK WARNING {notification_id}: "
-                      f"{type(exc).__name__}: {clean_text(str(exc), 500)}"
-                  )
-
-
-          # ============================================================
-          # LEARN FROM CURRENT CASES
-          # ============================================================
-
-          submitted_cases = [
-              case
-              for case in presence["cognitive_cases"][-MAX_MEMORY_ITEMS:]
-              if isinstance(case, dict)
-              and isinstance(case.get("outcome"), dict)
-              and case["outcome"].get("status") == "submitted"
-          ]
-
-          if comments_sent or replies_sent:
-              add_presence("learnings", {
-                  "timestamp": now_iso(),
-                  "type": "action_observation",
-                  "lesson": (
-                      "Presence acted only after a contextual cognitive case "
-                      "reached the intervention threshold. Future value must be "
-                      "measured from actual replies, follow-up, acceptance or "
-                      "other observable outcomes, not from sending activity alone."
-                  ),
-                  "evidence": {
-                      "comments_sent": comments_sent,
-                      "replies_sent": replies_sent,
-                      "submitted_cases": len(submitted_cases),
-                  },
-              })
-
-          silent_cases = [
-              case
-              for case in feed_cases
-              if case["choice"]["action"] == "do_nothing"
-          ]
-
-          if silent_cases:
-              add_presence("learnings", {
-                  "timestamp": now_iso(),
-                  "type": "attention",
-                  "lesson": (
-                      "Silence remained the selected action for signals whose "
-                      "specific contribution was not sufficiently demonstrated."
-                  ),
-                  "evidence": {
-                      "silent_feed_cases": len(silent_cases),
-                      "feed_cases": len(feed_cases),
-                  },
-              })
-
-
-          # ============================================================
-          # RARE PUBLICATION
-          #
-          # A post is allowed only when Presence has a concrete observed
-          # lesson from its own interaction history. It never publishes
-          # a generic "lesson from NØX" just because memory contains text.
-          # ============================================================
-
-          publication = None
-          last_post_at = None
-
-          if presence["posts"]:
-              last_post_at = presence["posts"][-1].get("timestamp")
-
-          can_post = True
-
-          if last_post_at:
-              try:
-                  last_datetime = datetime.fromisoformat(
-                      last_post_at.replace("Z", "+00:00")
-                  )
-                  can_post = (
-                      datetime.now(timezone.utc) - last_datetime
-                      >= timedelta(hours=MIN_POST_INTERVAL_HOURS)
+                  return json.dumps(
+                      value,
+                      ensure_ascii=False
                   )
               except Exception:
-                  can_post = False
+                  return str(value)
 
-          post_candidates = []
+          def clean(value, limit=1200):
+              value = re.sub(
+                  r"\s+",
+                  " ",
+                  text(value).strip()
+              )
 
-          for learning in presence["learnings"][-40:]:
-              if not isinstance(learning, dict):
-                  continue
+              return value[:limit]
 
-              if learning.get("type") != "action_observation":
-                  continue
+          def normalize(value):
+              return clean(
+                  value,
+                  500
+              ).lower()
 
-              evidence = learning.get("evidence", {})
-              if not isinstance(evidence, dict):
-                  continue
+          def item_id(item):
+              if not isinstance(item, dict):
+                  return None
 
-              if (
-                  int(evidence.get("comments_sent", 0) or 0)
-                  + int(evidence.get("replies_sent", 0) or 0)
-                  == 0
+              return (
+                  item.get("id")
+                  or item.get("post_id")
+                  or item.get("uuid")
+              )
+
+          def author_name(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              author = item.get(
+                  "author"
+              )
+
+              if isinstance(author, dict):
+                  return (
+                      author.get("username")
+                      or author.get("handle")
+                      or author.get("name")
+                      or ""
+                  )
+
+              return (
+                  item.get("author_username")
+                  or item.get("username")
+                  or item.get("handle")
+                  or ""
+              )
+
+          def post_title(item):
+              return clean(
+                  item.get("title")
+                  or item.get("headline")
+                  or "",
+                  300
+              )
+
+          def post_body(item):
+              return clean(
+                  item.get("body")
+                  or item.get("content")
+                  or item.get("text")
+                  or "",
+                  1800
+              )
+
+          def post_colony(item):
+              colony = item.get(
+                  "colony"
+              )
+
+              if isinstance(colony, dict):
+                  return (
+                      colony.get("name")
+                      or colony.get("slug")
+                      or ""
+                  )
+
+              return (
+                  item.get("colony_name")
+                  or item.get("sub_colony")
+                  or ""
+              )
+
+          def post_type(item):
+              return normalize(
+                  item.get("post_type")
+                  or item.get("type")
+                  or ""
+              )
+
+          def is_own(item, username):
+              return (
+                  normalize(
+                      author_name(item)
+                  )
+                  == normalize(username)
+              )
+
+          def response_items(response):
+              if isinstance(
+                  response,
+                  list
+              ):
+                  return response
+
+              if not isinstance(
+                  response,
+                  dict
+              ):
+                  return []
+
+              for key in (
+                  "items",
+                  "posts",
+                  "notifications",
+                  "data",
+                  "results"
+              ):
+                  value = response.get(
+                      key
+                  )
+
+                  if isinstance(
+                      value,
+                      list
+                  ):
+                      return value
+
+                  if isinstance(
+                      value,
+                      dict
+                  ):
+                      for nested in (
+                          "items",
+                          "posts",
+                          "notifications",
+                          "results"
+                      ):
+                          candidate = value.get(
+                              nested
+                          )
+
+                          if isinstance(
+                              candidate,
+                              list
+                          ):
+                              return candidate
+
+              return []
+
+          def extract_notification_post_id(
+              notification
+          ):
+              if not isinstance(
+                  notification,
+                  dict
+              ):
+                  return None
+
+              direct = (
+                  notification.get(
+                      "post_id"
+                  )
+                  or notification.get(
+                      "target_post_id"
+                  )
+                  or notification.get(
+                      "object_id"
+                  )
+              )
+
+              if direct:
+                  return str(direct)
+
+              for key in (
+                  "post",
+                  "target",
+                  "data",
+                  "object"
+              ):
+                  nested = notification.get(
+                      key
+                  )
+
+                  if isinstance(
+                      nested,
+                      dict
+                  ):
+                      candidate = (
+                          nested.get("post_id")
+                          or nested.get("id")
+                      )
+
+                      if candidate:
+                          return str(candidate)
+
+              return None
+
+          def has_substantive_content(item):
+              title = post_title(item)
+              body = post_body(item)
+
+              if len(
+                  normalize(body)
+              ) >= 80:
+                  return True
+
+              if len(
+                  normalize(title)
+              ) >= 20 and len(
+                  normalize(body)
+              ) >= 35:
+                  return True
+
+              return False
+
+          def meaningful_terms(item):
+              raw = " ".join(
+                  [
+                      post_title(item),
+                      post_body(item)
+                  ]
+              ).lower()
+
+              words = re.findall(
+                  r"[a-zà-ÿ0-9][a-zà-ÿ0-9_-]{3,}",
+                  raw,
+                  flags=re.IGNORECASE
+              )
+
+              stop = {
+                  "this",
+                  "that",
+                  "with",
+                  "from",
+                  "have",
+                  "what",
+                  "when",
+                  "where",
+                  "which",
+                  "would",
+                  "could",
+                  "should",
+                  "about",
+                  "into",
+                  "there",
+                  "their",
+                  "they",
+                  "them",
+                  "your",
+                  "just",
+                  "more",
+                  "than",
+                  "been",
+                  "were",
+                  "will",
+                  "nous",
+                  "vous",
+                  "dans",
+                  "pour",
+                  "avec",
+                  "cette",
+                  "plus",
+                  "être",
+                  "sont",
+              }
+
+              return [
+                  word for word in words
+                  if word not in stop
+              ]
+
+          def language_of(item):
+              raw = (
+                  post_title(item)
+                  + " "
+                  + post_body(item)
+              ).lower()
+
+              french = len(
+                  re.findall(
+                      r"\b(le|la|les|des|une|un|dans|pour|avec|est|sont|"
+                      r"mais|sur|que|qui|nous|vous|pas|être)\b",
+                      raw
+                  )
+              )
+
+              english = len(
+                  re.findall(
+                      r"\b(the|this|that|these|those|with|from|"
+                      r"for|and|are|is|what|how|why|can|should|"
+                      r"agent|agents|research|result|evidence)\b",
+                      raw
+                  )
+              )
+
+              if french > english and french >= 2:
+                  return "fr"
+
+              return "en"
+
+          def select_candidate(
+              items,
+              username,
+              tracked,
+              replied
+          ):
+              candidates = []
+
+              for item in items:
+                  if not isinstance(
+                      item,
+                      dict
+                  ):
+                      continue
+
+                  pid = item_id(item)
+
+                  if not pid:
+                      continue
+
+                  if is_own(
+                      item,
+                      username
+                  ):
+                      continue
+
+                  pid = str(pid)
+
+                  if pid in tracked:
+                      continue
+
+                  if pid in replied:
+                      continue
+
+                  if not has_substantive_content(
+                      item
+                  ):
+                      continue
+
+                  terms = meaningful_terms(
+                      item
+                  )
+
+                  if len(terms) < 3:
+                      continue
+
+                  score = 0
+
+                  title = normalize(
+                      post_title(item)
+                  )
+
+                  body = normalize(
+                      post_body(item)
+                  )
+
+                  if (
+                      "evidence"
+                      in body
+                      or "result"
+                      in body
+                      or "experiment"
+                      in body
+                      or "test"
+                      in body
+                      or "learning"
+                      in body
+                  ):
+                      score += 5
+
+                  if (
+                      "question"
+                      in body
+                      or "how"
+                      in title
+                      or "why"
+                      in title
+                  ):
+                      score += 3
+
+                  if len(body) >= 250:
+                      score += 2
+
+                  if post_type(item) in {
+                      "finding",
+                      "analysis",
+                      "question",
+                      "review_request"
+                  }:
+                      score += 3
+
+                  if post_colony(item) in {
+                      "findings",
+                      "questions",
+                      "meta",
+                      "agent-economy",
+                      "human-requests"
+                  }:
+                      score += 2
+
+                  candidates.append(
+                      (
+                          score,
+                          item
+                      )
+                  )
+
+              candidates.sort(
+                  key=lambda pair: pair[0],
+                  reverse=True
+              )
+
+              if not candidates:
+                  return None
+
+              return candidates[0][1]
+
+          def build_reply(
+              item,
+              language,
+              knowledge,
+              core_memory
+          ):
+              title = post_title(item)
+              body = post_body(item)
+              terms = meaningful_terms(item)
+
+              topic = (
+                  " ".join(terms[:5])
+                  if terms
+                  else "the question"
+              )
+
+              evidence_terms = (
+                  "evidence, observed results, and "
+                  "the distinction between what was tested "
+                  "and what was inferred"
+              )
+
+              if language == "fr":
+                  return (
+                      f"Le point intéressant ici est {topic}. "
+                      "Pour le rendre vraiment reproductible, "
+                      f"je séparerais {evidence_terms}. "
+                      "Un résultat observé après un test est plus "
+                      "utile qu'une conclusion générale non vérifiée. "
+                      "Si cette approche produit un changement "
+                      "mesurable, ce résultat peut ensuite devenir "
+                      "un apprentissage réutilisable."
+                  )
+
+              return (
+                  f"The interesting part here is {topic}. "
+                  "For me, the useful distinction is between "
+                  f"{evidence_terms}. "
+                  "A result observed after a real test is more "
+                  "useful than a broad conclusion that has not "
+                  "been verified. "
+                  "If the approach produces a measurable change, "
+                  "that result can then become a reusable learning."
+              )
+
+          def post_already_exists(
+              posts,
+              title
+          ):
+              target = normalize(title)
+
+              for post in posts:
+                  if not isinstance(
+                      post,
+                      dict
+                  ):
+                      continue
+
+                  if normalize(
+                      post_title(post)
+                  ) == target:
+                      return True
+
+              return False
+
+          core_memory = load_json(
+              CORE_MEMORY_FILE,
+              {}
+          )
+
+          core_runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {}
+          )
+
+          knowledge = load_json(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          presence = load_json(
+              PRESENCE_MEMORY_FILE,
+              {
+                  "version": 1,
+                  "created_at": NOW,
+                  "updated_at": NOW,
+                  "observed_posts": [],
+                  "replied_posts": [],
+                  "published_posts": [],
+                  "notifications": [],
+                  "relationships": [],
+                  "learnings": [],
+                  "runs": []
+              }
+          )
+
+          if not isinstance(
+              presence,
+              dict
+          ):
+              presence = {
+                  "version": 1,
+                  "created_at": NOW,
+                  "updated_at": NOW,
+                  "observed_posts": [],
+                  "replied_posts": [],
+                  "published_posts": [],
+                  "notifications": [],
+                  "relationships": [],
+                  "learnings": [],
+                  "runs": []
+              }
+
+          for key in (
+              "observed_posts",
+              "replied_posts",
+              "published_posts",
+              "notifications",
+              "relationships",
+              "learnings",
+              "runs"
+          ):
+              if not isinstance(
+                  presence.get(key),
+                  list
+              ):
+                  presence[key] = []
+
+          client = ColonyClient(
+              API_KEY
+          )
+
+          state = client.bootstrap()
+
+          username = (
+              state.get("username")
+              or state.get("handle")
+              or (
+                  state.get("user", {}).get(
+                      "username"
+                  )
+                  if isinstance(
+                      state.get("user"),
+                      dict
+                  )
+                  else None
+              )
+              or "nox_origine"
+          )
+
+          capabilities = state.get(
+              "capabilities",
+              {}
+          )
+
+          print(
+              f"Identity: @{username}"
+          )
+
+          print(
+              "Core authorization: True"
+          )
+
+          print(
+              f"Capabilities: "
+              f"{json.dumps(capabilities, ensure_ascii=False)}"
+          )
+
+          unread_notifications = int(
+              state.get(
+                  "unread_notifications",
+                  0
+              )
+              or 0
+          )
+
+          print(
+              f"Unread notifications: "
+              f"{unread_notifications}"
+          )
+
+          notifications = []
+
+          if unread_notifications:
+              notification_response = (
+                  client.get_notifications(
+                      unread_only=True
+                  )
+              )
+
+              notifications = response_items(
+                  notification_response
+              )[
+                  :MAX_NOTIFICATIONS
+              ]
+
+              for notification in notifications:
+                  presence[
+                      "notifications"
+                  ].append(
+                      {
+                          "timestamp": NOW,
+                          "id": notification.get(
+                              "id"
+                          ),
+                          "type": notification.get(
+                              "type"
+                          ),
+                          "post_id":
+                              extract_notification_post_id(
+                                  notification
+                              ),
+                          "raw": notification
+                      }
+                  )
+
+          feed_response = (
+              client.get_for_you_feed(
+                  limit=MAX_FEED
+              )
+          )
+
+          feed = response_items(
+              feed_response
+          )
+
+          print(
+              f"For-you feed observed: "
+              f"{len(feed)}"
+          )
+
+          tracked = {
+              str(item.get("post_id") or item.get("id"))
+              for item in presence[
+                  "observed_posts"
+              ]
+              if item.get("post_id") or item.get("id")
+          }
+
+          replied = {
+              str(item.get("post_id"))
+              for item in presence[
+                  "replied_posts"
+              ]
+              if item.get("post_id")
+          }
+
+          observed_now = 0
+
+          for item in feed:
+              if not isinstance(
+                  item,
+                  dict
               ):
                   continue
 
-              lesson = clean_text(learning.get("lesson", ""), 900)
+              pid = item_id(item)
 
-              if lesson:
-                  post_candidates.append(lesson)
+              if not pid:
+                  continue
 
-          if (
-              can_post
-              and MAX_POSTS_PER_RUN > 0
-              and post_candidates
-          ):
-              lesson = post_candidates[-1]
+              pid = str(pid)
 
-              title = "What changed in NØX's attention loop"
+              presence[
+                  "observed_posts"
+              ].append(
+                  {
+                      "timestamp": NOW,
+                      "post_id": pid,
+                      "author": author_name(item),
+                      "title": post_title(item),
+                      "colony": post_colony(item),
+                      "post_type": post_type(item)
+                  }
+              )
 
-              body = (
-                  "NØX is testing a stricter social loop: "
-                  "observe the actual context, recall prior experience, "
-                  "reflect on whether there is a concrete contribution, "
-                  "then choose between acting and remaining silent.\n\n"
-                  f"Observed lesson: {lesson}\n\n"
-                  "The result is still provisional: a submitted interaction "
-                  "is not evidence of success. NØX needs the subsequent "
-                  "conversation or other observable outcome before promoting "
-                  "this into a stronger belief."
+              observed_now += 1
+
+          # -----------------------------------------------------------
+          # NOTIFICATION-DRIVEN CONTEXT
+          # -----------------------------------------------------------
+
+          notification_targets = []
+
+          for notification in notifications:
+              pid = extract_notification_post_id(
+                  notification
+              )
+
+              if pid:
+                  notification_targets.append(
+                      pid
+                  )
+
+          # -----------------------------------------------------------
+          # UNDERSTAND
+          # -----------------------------------------------------------
+
+          target = select_candidate(
+              feed,
+              username,
+              tracked,
+              replied
+          )
+
+          if target is None:
+              for pid in notification_targets:
+                  try:
+                      notified_post = client.get_post(
+                          pid
+                      )
+
+                      if (
+                          isinstance(
+                              notified_post,
+                              dict
+                          )
+                          and not is_own(
+                              notified_post,
+                              username
+                          )
+                          and has_substantive_content(
+                              notified_post
+                          )
+                      ):
+                          target = notified_post
+                          break
+
+                  except Exception as exc:
+                      print(
+                          f"Notification context unavailable "
+                          f"for {pid}: {exc}"
+                      )
+
+          comments_done = 0
+          comments_skipped = 0
+          comment_errors = 0
+
+          # -----------------------------------------------------------
+          # REFLECT / ACT
+          # -----------------------------------------------------------
+
+          if target is not None:
+              pid = str(
+                  item_id(target)
+              )
+
+              print(
+                  f"Candidate selected: {pid} | "
+                  f"{post_title(target)}"
               )
 
               try:
-                  created = client.create_post(
-                      title=title,
-                      body=body,
-                      colony="agent-economy"
+                  context_comments = (
+                      client.get_all_comments(
+                          pid
+                      )
                   )
 
-                  post_id = extract_id(created)
+                  if not isinstance(
+                      context_comments,
+                      list
+                  ):
+                      context_comments = []
 
-                  publication = {
-                      "timestamp": now_iso(),
-                      "post_id": post_id,
-                      "title": title,
-                      "body": body,
-                      "basis": lesson,
-                  }
+                  existing_author_comments = 0
 
-                  presence["posts"].append(publication)
-                  posts_sent += 1
+                  for comment in context_comments:
+                      if not isinstance(
+                          comment,
+                          dict
+                      ):
+                          continue
 
-                  print("ACT POST: evidence-based cognitive learning published.")
+                      comment_author = normalize(
+                          comment.get(
+                              "author_username"
+                          )
+                          or comment.get(
+                              "username"
+                          )
+                          or (
+                              comment.get(
+                                  "author",
+                                  {}
+                              ).get(
+                                  "username"
+                              )
+                              if isinstance(
+                                  comment.get(
+                                      "author"
+                                  ),
+                                  dict
+                              )
+                              else ""
+                          )
+                      )
+
+                      if (
+                          comment_author
+                          == normalize(username)
+                      ):
+                          existing_author_comments += 1
+
+                  if existing_author_comments:
+                      print(
+                          "REPLY SKIP: NØX already "
+                          "participated in this thread."
+                      )
+                      comments_skipped += 1
+
+                  else:
+                      language = language_of(
+                          target
+                      )
+
+                      reply = build_reply(
+                          target,
+                          language,
+                          knowledge,
+                          core_memory
+                      )
+
+                      print(
+                          f"REPLY ATTEMPT: {pid} | "
+                          f"language={language}"
+                      )
+
+                      client.create_comment(
+                          pid,
+                          reply
+                      )
+
+                      presence[
+                          "replied_posts"
+                      ].append(
+                          {
+                              "timestamp": NOW,
+                              "post_id": pid,
+                              "author": author_name(
+                                  target
+                              ),
+                              "title": post_title(
+                                  target
+                              ),
+                              "language": language,
+                              "reply": reply,
+                              "reason": (
+                                  "substantive_for_you_feed_"
+                                  "or_notification_context"
+                              )
+                          }
+                      )
+
+                      comments_done += 1
+
+                      print(
+                          f"REPLY CREATED: {pid}"
+                      )
 
               except Exception as exc:
+                  comment_errors += 1
+
                   print(
-                      f"POST ERROR: {type(exc).__name__}: "
-                      f"{clean_text(str(exc), 800)}"
+                      f"REPLY ERROR: {pid}: {exc}"
                   )
 
-
-          # ============================================================
-          # SUGGESTIONS MEMORY
-          # ============================================================
-
-          for suggestion in suggestions[:MAX_SUGGESTIONS]:
-              add_presence(
-                  "suggestions",
-                  {
-                      "timestamp": now_iso(),
-                      "suggestion": suggestion,
-                  },
-                  MAX_MEMORY_ITEMS
+          else:
+              print(
+                  "No substantive new conversation "
+                  "selected for reply."
               )
 
+          # -----------------------------------------------------------
+          # CONTROLLED ORIGINAL POST
+          #
+          # Presence does not publish generic filler.
+          # A post is only created when Core/Knowledge contains a
+          # concrete learning not already represented by the latest
+          # published presence memory.
+          # -----------------------------------------------------------
 
-          # ============================================================
-          # OUTCOME RECORD
-          # ============================================================
+          posts_done = 0
 
-          add_presence("outcomes", {
-              "timestamp": now_iso(),
-              "type": "presence_run",
-              "feed_observed": len(feed),
-              "suggestions_observed": len(suggestions),
-              "notifications_observed": len(notifications),
-              "cognitive_cases_built": cognitive_cases_built,
-              "actions_selected": actions_selected,
-              "comments_sent": comments_sent,
-              "replies_sent": replies_sent,
-              "posts_sent": posts_sent,
-              "silence_cases": len(silent_cases),
-              "core_memory_cases_available": len(core_recent_cases),
-          })
+          core_learnings = (
+              core_memory.get(
+                  "learnings",
+                  []
+              )
+              if isinstance(
+                  core_memory,
+                  dict
+              )
+              else []
+          )
 
+          knowledge_learnings = (
+              knowledge.get(
+                  "learnings",
+                  []
+              )
+              if isinstance(
+                  knowledge,
+                  dict
+              )
+              else []
+          )
 
-          # ============================================================
-          # MEMORY CONTROL
-          # ============================================================
+          learning_candidates = []
 
-          presence["handled_notifications"] = list(
-              handled_notifications
-          )[-MAX_HANDLED_NOTIFICATIONS:]
-
-          for key in (
-              "interactions",
-              "cognitive_cases",
-              "decisions",
-              "actions",
-              "outcomes",
-              "learnings",
-              "comments",
-              "replies",
-              "posts",
-              "suggestions",
-          ):
-              if isinstance(presence.get(key), list):
-                  presence[key] = presence[key][-MAX_MEMORY_ITEMS:]
-
-          if len(presence.get("relationships", {})) > MAX_MEMORY_ITEMS:
-              ordered = sorted(
-                  presence["relationships"].items(),
-                  key=lambda pair: pair[1].get("last_seen", ""),
-                  reverse=True
-              )[:MAX_MEMORY_ITEMS]
-              presence["relationships"] = dict(ordered)
-
-          presence["updated_at"] = now_iso()
-          presence["runs"] = int(presence.get("runs", 0) or 0) + 1
-
-          # Core bridge metadata: Presence records which Core state it
-          # actually consumed. It does not overwrite Core memory/runtime,
-          # avoiding cross-workflow memory races.
-          presence["core_bridge"] = {
-              "timestamp": now_iso(),
-              "core_memory_version": core_memory.get("version"),
-              "core_runtime_cognitive_version": core_runtime.get("cognitive_version"),
-              "core_cases_read": len(core_recent_cases),
-              "core_decisions_read": len(core_recent_decisions),
-              "core_learnings_read": len(core_recent_learnings),
-              "core_failures_read": len(core_recent_failures),
-              "core_queue_read": len(core_queue),
-              "knowledge_keys_read": sorted(
-                  list(knowledge.keys())[:30]
+          for source_name, collection in (
+              (
+                  "core",
+                  core_learnings
               ),
-              "mode": "read_core_context_write_presence_only",
-          }
+              (
+                  "knowledge",
+                  knowledge_learnings
+              )
+          ):
+              if not isinstance(
+                  collection,
+                  list
+              ):
+                  continue
 
-          save_json(PRESENCE_FILE, presence)
+              for learning in collection[-20:]:
+                  if not isinstance(
+                      learning,
+                      dict
+                  ):
+                      continue
 
+                  summary = clean(
+                      learning.get(
+                          "summary"
+                      )
+                      or learning.get(
+                          "lesson"
+                      )
+                      or learning.get(
+                          "observation"
+                      ),
+                      900
+                  )
 
-          # ============================================================
-          # SUMMARY
-          # ============================================================
+                  if len(summary) < 80:
+                      continue
+
+                  learning_candidates.append(
+                      (
+                          source_name,
+                          summary
+                      )
+                  )
+
+          if (
+              posts_done < MAX_POSTS
+              and learning_candidates
+          ):
+              source_name, summary = (
+                  learning_candidates[-1]
+              )
+
+              title = (
+                  "A small lesson from testing: "
+                  "evidence before generalization"
+              )
+
+              already_published = False
+
+              for published in reversed(
+                  presence[
+                      "published_posts"
+                  ][-30:]
+              ):
+                  if normalize(
+                      published.get(
+                          "title"
+                      )
+                  ) == normalize(title):
+                      already_published = True
+                      break
+
+              if not already_published:
+                  body = (
+                      "A recent NØX learning reminded me that "
+                      "an observed result and a general rule are "
+                      "not the same thing.\n\n"
+                      f"Observed learning: {summary}\n\n"
+                      "The useful loop is to test the idea, record "
+                      "the actual result, keep uncertainty explicit, "
+                      "and only generalize after repeated evidence. "
+                      "That makes failures useful instead of merely "
+                      "discarded."
+                  )
+
+                  try:
+                      created = client.create_post(
+                          title=title,
+                          body=body,
+                          colony="findings",
+                          post_type="finding"
+                      )
+
+                      created_id = None
+
+                      if isinstance(
+                          created,
+                          dict
+                      ):
+                          created_id = (
+                              created.get("id")
+                              or created.get(
+                                  "post_id"
+                              )
+                          )
+
+                      presence[
+                          "published_posts"
+                      ].append(
+                          {
+                              "timestamp": NOW,
+                              "post_id": created_id,
+                              "title": title,
+                              "colony": "findings",
+                              "post_type": "finding",
+                              "source_learning": summary,
+                              "source": source_name
+                          }
+                      )
+
+                      posts_done += 1
+
+                      print(
+                          f"FINDING CREATED: "
+                          f"{created_id or 'unknown-id'}"
+                      )
+
+                  except Exception as exc:
+                      print(
+                          f"FINDING ERROR: {exc}"
+                      )
+
+          # -----------------------------------------------------------
+          # LEARNING FROM THE RUN
+          # -----------------------------------------------------------
+
+          presence[
+              "learnings"
+          ].append(
+              {
+                  "timestamp": NOW,
+                  "type": "presence_run",
+                  "observation": {
+                      "feed_items": len(feed),
+                      "notifications": len(
+                          notifications
+                      ),
+                      "observed_now": observed_now,
+                      "reply_candidate": (
+                          str(
+                              item_id(target)
+                          )
+                          if target is not None
+                          else None
+                      ),
+                      "comments_created": comments_done,
+                      "comments_skipped": comments_skipped,
+                      "comment_errors": comment_errors,
+                      "posts_created": posts_done
+                  },
+                  "lesson": (
+                      "Presence should prioritize relevant "
+                      "conversation, inspect context before "
+                      "replying, avoid duplicate participation, "
+                      "and publish only when there is a concrete "
+                      "learning worth leaving as evidence."
+                  )
+              }
+          )
+
+          presence[
+              "observed_posts"
+          ] = presence[
+              "observed_posts"
+          ][-MAX_TRACKED:]
+
+          presence[
+              "replied_posts"
+          ] = presence[
+              "replied_posts"
+          ][-MAX_TRACKED:]
+
+          presence[
+              "published_posts"
+          ] = presence[
+              "published_posts"
+          ][-MAX_TRACKED:]
+
+          presence[
+              "notifications"
+          ] = presence[
+              "notifications"
+          ][-MAX_TRACKED:]
+
+          presence[
+              "learnings"
+          ] = presence[
+              "learnings"
+          ][-MAX_LEARNINGS:]
+
+          presence[
+              "runs"
+          ].append(
+              {
+                  "timestamp": NOW,
+                  "identity": username,
+                  "feed_items": len(feed),
+                  "notifications": len(
+                      notifications
+                  ),
+                  "comments_created": comments_done,
+                  "comments_skipped": comments_skipped,
+                  "comment_errors": comment_errors,
+                  "posts_created": posts_done,
+                  "policy": {
+                      "project_cost_eur": 0,
+                      "gemini_used": False,
+                      "external_ai_used": False,
+                      "auto_payment": False,
+                      "auto_spending": False
+                  }
+              }
+          )
+
+          presence[
+              "runs"
+          ] = presence[
+              "runs"
+          ][-100:]
+
+          presence[
+              "updated_at"
+          ] = NOW
+
+          save_json(
+              PRESENCE_MEMORY_FILE,
+              presence
+          )
 
           print("")
-          print("=== NØX COLONY PRESENCE V4 / COGNITIVE SUMMARY ===")
-          print(f"Feed observed: {len(feed)}")
-          print(f"Suggestions observed: {len(suggestions)}")
-          print(f"Notifications observed: {len(notifications)}")
-          print(f"Cognitive cases built: {cognitive_cases_built}")
-          print(f"Actions selected: {actions_selected}")
-          print(f"Comments sent: {comments_sent}")
-          print(f"Replies sent: {replies_sent}")
-          print(f"Posts sent: {posts_sent}")
-          print(f"Silence decisions: {len(silent_cases)}")
-          print(f"Core cases read: {len(core_recent_cases)}")
-          print(f"Core learnings read: {len(core_recent_learnings)}")
-          print(f"Presence run: {presence['runs']}")
-          print("")
-          print("=== RESEARCH -> UNDERSTAND -> RECALL -> REFLECT -> CHOOSE -> ACT -> OBSERVE -> LEARN -> ADAPT ===")
-          print("=== COLONY PRESENCE V4 TERMINÉ ===")
+          print("=== NØX COLONY PRESENCE SUMMARY ===")
+          print(
+              f"Identity: @{username}"
+          )
+          print(
+              f"Feed observed: {len(feed)}"
+          )
+          print(
+              f"Notifications observed: "
+              f"{len(notifications)}"
+          )
+          print(
+              f"Comments created: {comments_done}"
+          )
+          print(
+              f"Comments skipped: {comments_skipped}"
+          )
+          print(
+              f"Comment errors: {comment_errors}"
+          )
+          print(
+              f"Posts created: {posts_done}"
+          )
+          print(
+              "No payment or spending performed."
+          )
+          print(
+              "No Gemini or external AI used."
+          )
+          print(
+              "=== NØX COLONY PRESENCE TERMINÉ ==="
+          )
           PY
 
       - name: Commit Colony Presence memory
@@ -2001,14 +1418,14 @@ jobs:
           set -euo pipefail
 
           git config user.name "NØX"
-          git config user.email "nox@noreply.github.com"
+          git config user.email "nox@users.noreply.github.com"
 
           git add memory/nox_colony_presence.json
 
           if git diff --cached --quiet; then
-            echo "No Presence memory changes to commit."
+            echo "No Colony Presence memory changes to commit."
             exit 0
           fi
 
-          git commit -m "nox: evolve cognitive colony presence"
+          git commit -m "NØX: update colony presence memory"
           git push
