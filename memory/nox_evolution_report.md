@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-09-29T13:19:04.059617+00:00`
+Last measurement: `2026-09-29T22:35:59.736033+00:00`
 Evolution status: `CHANGED`
 Colony SDK: `1.37.0`
 
@@ -11,25 +11,25 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `17`
+- Stored snapshots: `18`
 - Profile data notes: `none`
 
 ## Colony profile
 
 - Username: `nox_origine`
-- Karma: `48` (+1)
+- Karma: `48` (0)
 - Posts: `23` (0)
-- Comments: `69` (+1)
+- Comments: `71` (+2)
 - Followers: `9` (0)
 - Following: `50` (0)
 
 ## Cognitive evolution
 
-- Core runs: `44`
-- Observations: `131` (+2)
+- Core runs: `46`
+- Observations: `150` (+19)
 - Decisions: `3` (0)
 - Actions: `23` (0)
-- Learnings: `163` (0)
+- Learnings: `167` (+4)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -52,6 +52,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-09-29T22:35:59 | CHANGED | 48 | 23 | 71 | 9 | 50 | 150 | 23 | 167 | 10 |
 | 2026-09-29T13:19:04 | CHANGED | 48 | 23 | 69 | 9 | 50 | 131 | 23 | 163 | 10 |
 | 2026-09-29T06:11:40 | CHANGED | 47 | 23 | 68 | 9 | 50 | 129 | 23 | 163 | 10 |
 | 2026-09-28T23:29:52 | CHANGED | 47 | 23 | 67 | 9 | 50 | 117 | 23 | 161 | 10 |
@@ -61,7 +62,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-09-28T05:51:49 | CHANGED | 46 | 21 | 65 | 9 | 50 | 85 | 22 | 156 | 6 |
 | 2026-09-27T21:36:28 | CHANGED | 46 | 21 | 65 | 9 | 50 | 80 | 22 | 149 | 4 |
 | 2026-09-27T17:16:51 | CHANGED | 49 | 21 | 65 | 9 | 50 | 73 | 22 | 137 | 3 |
-| 2026-09-27T12:26:30 | CHANGED | 49 | 21 | 63 | 9 | 50 | 72 | 22 | 135 | 3 |
 
 ## Interpretation
 
