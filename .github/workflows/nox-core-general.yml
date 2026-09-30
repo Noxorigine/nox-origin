@@ -15,26 +15,23 @@ concurrency:
 env:
   MEMORY_FILE: memory/nox_core_memory.json
   RUNTIME_FILE: memory/nox_core_runtime.json
+  WORK_FILE: memory/nox_work_factory.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
   LEGACY_MEMORY_FILE: memory/nox_colony_state.json
   MAX_FEED_ITEMS: "12"
-  MAX_SUGGESTIONS: "10"
   MAX_NOTIFICATIONS: "20"
   MAX_DMS: "10"
+  MAX_SUGGESTIONS: "10"
   MAX_CASES_PER_RUN: "12"
   MAX_MEMORY_ITEMS: "300"
   MAX_COGNITIVE_CASES: "150"
-  MAX_ACTIONS_PER_RUN: "2"
-  MAX_WEB_RESULTS: "5"
-  WEB_TIMEOUT_SECONDS: "12"
-  ACTION_THRESHOLD: "0.60"
-  ENABLE_WEB_RESEARCH: "true"
-  ENABLE_PUBLIC_ACTIONS: "false"
+  MAX_PENDING_ACTIONS: "20"
+  MAX_WORK_REQUESTS: "20"
   ENABLE_LIGHTNING_CHECK: "true"
 
 jobs:
   core-general:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,9 +44,9 @@ jobs:
       - name: Install Colony SDK
         run: |
           python -m pip install --upgrade pip
-          pip install colony-sdk
+          pip install "colony-sdk>=1.37.0,<2.0.0"
 
-      - name: Run NØX Core General
+      - name: Run NØX Core
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
@@ -60,1498 +57,484 @@ jobs:
           import urllib.parse
           import urllib.request
           from datetime import datetime, timezone
+          from hashlib import sha256
           from pathlib import Path
 
-          from colony_sdk import (
-              ColonyAPIError,
-              ColonyAuthError,
-              ColonyClient,
-          )
+          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
 
           API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
           if not API_KEY:
               raise SystemExit("COLONY_API_KEY manquant.")
 
+          NOW = datetime.now(timezone.utc).isoformat()
           MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
           RUNTIME_FILE = Path(os.environ["RUNTIME_FILE"])
-          LEGACY_MEMORY_FILE = Path(os.environ["LEGACY_MEMORY_FILE"])
-
-          MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
-          MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
+          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
+          LEGACY_FILE = Path(os.environ["LEGACY_MEMORY_FILE"])
+          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
           MAX_NOTIFICATIONS = int(os.environ["MAX_NOTIFICATIONS"])
           MAX_DMS = int(os.environ["MAX_DMS"])
+          MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
           MAX_CASES = int(os.environ["MAX_CASES_PER_RUN"])
-          MAX_MEMORY_ITEMS = int(os.environ["MAX_MEMORY_ITEMS"])
-          MAX_COGNITIVE_CASES = int(os.environ["MAX_COGNITIVE_CASES"])
-          MAX_ACTIONS = int(os.environ["MAX_ACTIONS_PER_RUN"])
-          MAX_WEB_RESULTS = int(os.environ["MAX_WEB_RESULTS"])
-          WEB_TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
-          ACTION_THRESHOLD = float(os.environ["ACTION_THRESHOLD"])
-
-          ENABLE_WEB = os.environ["ENABLE_WEB_RESEARCH"].lower() == "true"
-          ENABLE_PUBLIC_ACTIONS = (
-              os.environ["ENABLE_PUBLIC_ACTIONS"].lower() == "true"
-          )
-          ENABLE_LIGHTNING = (
-              os.environ["ENABLE_LIGHTNING_CHECK"].lower() == "true"
-          )
-
-          NOW = datetime.now(timezone.utc).isoformat()
+          MAX_MEMORY = int(os.environ["MAX_MEMORY_ITEMS"])
+          MAX_CASES_MEMORY = int(os.environ["MAX_COGNITIVE_CASES"])
+          MAX_PENDING = int(os.environ["MAX_PENDING_ACTIONS"])
+          MAX_WORK = int(os.environ["MAX_WORK_REQUESTS"])
+          ENABLE_LIGHTNING = os.environ["ENABLE_LIGHTNING_CHECK"].lower() == "true"
 
           EMPTY_MEMORY = {
-              "version": 5,
-              "observations": [],
-              "questions": [],
-              "hypotheses": [],
-              "decisions": [],
-              "actions": [],
-              "results": [],
-              "learnings": [],
-              "failures": [],
-              "relationships": [],
-              "cognitive_cases": [],
+              "version": 6,
+              "observations": [], "questions": [], "hypotheses": [],
+              "decisions": [], "actions": [], "results": [], "learnings": [],
+              "failures": [], "relationships": [], "cognitive_cases": []
           }
-
           EMPTY_RUNTIME = {
-              "run_count": 0,
-              "last_run": None,
-              "seen_event_ids": [],
-              "processed_post_ids": [],
-              "processed_suggestion_ids": [],
-              "action_count_total": 0,
-              "last_rate_limit": None,
-              "payout_health": None,
-              "cognitive_version": 5,
+              "version": 6, "run_count": 0, "last_run": None,
+              "seen_event_ids": [], "processed_post_ids": [],
+              "processed_suggestion_ids": [], "action_count_total": 0,
+              "last_rate_limit": None, "payout_health": None,
+              "pending_actions": [], "work_requests": [],
+              "consumed_work_result_ids": [], "consumed_presence_outcome_ids": [],
+              "last_cycle": None
           }
 
-          def load_json(path, default):
+          def load(path, default):
               if not path.exists():
-                  return default
-
+                  return json.loads(json.dumps(default))
               try:
-                  value = json.loads(
-                      path.read_text(encoding="utf-8")
-                  )
-                  return value if isinstance(value, dict) else default
+                  value = json.loads(path.read_text(encoding="utf-8"))
+                  return value if isinstance(value, dict) else json.loads(json.dumps(default))
               except Exception as exc:
-                  print(f"WARNING: lecture impossible {path}: {exc}")
-                  return default
+                  print(f"WARNING: cannot read {path}: {exc}")
+                  return json.loads(json.dumps(default))
 
-          def save_json(path, data):
+          def save(path, value):
               path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(
-                  json.dumps(
-                      data,
-                      ensure_ascii=False,
-                      indent=2,
-                  ),
-                  encoding="utf-8",
-              )
+              path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
-          def normalize_memory(data):
-              memory = dict(EMPTY_MEMORY)
+          def clean(value, limit=3000):
+              return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
 
-              if isinstance(data, dict):
-                  try:
-                      memory["version"] = max(
-                          5,
-                          int(data.get("version", 1) or 1),
-                      )
-                  except Exception:
-                      memory["version"] = 5
+          def blob(value):
+              return clean(json.dumps(value, ensure_ascii=False), 12000).lower()
 
-                  for key in memory:
-                      if key == "version":
-                          continue
+          def stable(prefix, *parts):
+              raw = "|".join(clean(p, 5000) for p in parts)
+              return f"{prefix}-{sha256(raw.encode('utf-8')).hexdigest()[:20]}"
 
-                      value = data.get(key, [])
-                      memory[key] = (
-                          value if isinstance(value, list) else []
-                      )
+          def ensure(memory, key):
+              if not isinstance(memory.get(key), list):
+                  memory[key] = []
+              return memory[key]
 
-              return memory
+          def add(memory, key, item, limit=MAX_MEMORY):
+              values = ensure(memory, key)
+              values.append(item)
+              del values[:-limit]
 
-          def normalize_runtime(data):
-              runtime = dict(EMPTY_RUNTIME)
-
-              if isinstance(data, dict):
-                  runtime.update(data)
-
-              for key in (
-                  "seen_event_ids",
-                  "processed_post_ids",
-                  "processed_suggestion_ids",
-              ):
-                  if not isinstance(runtime.get(key), list):
-                      runtime[key] = []
-
-              return runtime
-
-          memory = normalize_memory(
-              load_json(MEMORY_FILE, EMPTY_MEMORY)
-          )
-
-          runtime = normalize_runtime(
-              load_json(RUNTIME_FILE, EMPTY_RUNTIME)
-          )
-
-          # -----------------------------------------------------------
-          # Legacy migration.
-          # The old execution model is not restored.
-          # -----------------------------------------------------------
-          if not MEMORY_FILE.exists() and LEGACY_MEMORY_FILE.exists():
-              legacy = load_json(LEGACY_MEMORY_FILE, {})
-
-              memory["observations"].append({
-                  "timestamp": NOW,
-                  "source": "legacy_migration",
-                  "summary": (
-                      "Legacy Colony memory imported into Core v5."
-                  ),
-                  "evidence": {
-                      "commented_post_ids": len(
-                          legacy.get("commented_post_ids", [])
-                      ),
-                      "seen_notification_ids": len(
-                          legacy.get("seen_notification_ids", [])
-                      ),
-                      "skill_attempt_counts": legacy.get(
-                          "skill_attempt_counts", {}
-                      ),
-                      "skill_success_counts": legacy.get(
-                          "skill_success_counts", {}
-                      ),
-                  },
+          def remember(memory, key, summary, evidence=None, source="core"):
+              add(memory, key, {
+                  "timestamp": NOW, "summary": clean(summary, 1000),
+                  "evidence": evidence or {}, "source": source
               })
 
-              runtime["processed_post_ids"] = list(
-                  legacy.get("commented_post_ids", [])
-              )[-1000:]
+          memory = load(MEMORY_FILE, EMPTY_MEMORY)
+          runtime = load(RUNTIME_FILE, EMPTY_RUNTIME)
+          work = load(WORK_FILE, {"version": 1, "history": [], "completed": []})
+          presence = load(PRESENCE_FILE, {"version": 1, "runs": [], "outcomes": []})
 
-              runtime["seen_event_ids"] = list(
-                  legacy.get("seen_notification_ids", [])
-              )[-1000:]
+          for key, value in EMPTY_MEMORY.items():
+              if key != "version" and not isinstance(memory.get(key), list):
+                  memory[key] = []
+          for key, value in EMPTY_RUNTIME.items():
+              if key not in runtime:
+                  runtime[key] = json.loads(json.dumps(value))
+          memory["version"] = max(6, int(memory.get("version", 1) or 1))
+          runtime["version"] = 6
 
-              print("LEGACY MEMORY MIGRATED")
+          if not MEMORY_FILE.exists() and LEGACY_FILE.exists():
+              legacy = load(LEGACY_FILE, {})
+              remember(memory, "observations", "Legacy Colony memory imported into Core.", {
+                  "commented_post_ids": len(legacy.get("commented_post_ids", [])),
+                  "seen_notification_ids": len(legacy.get("seen_notification_ids", []))
+              }, "legacy_migration")
 
-          def add_memory(kind, item, limit=MAX_MEMORY_ITEMS):
-              memory.setdefault(kind, [])
-              memory[kind].append(item)
-              memory[kind] = memory[kind][-limit:]
-
-          def remember(
-              kind,
-              summary,
-              evidence=None,
-              source="core",
-          ):
-              add_memory(
-                  kind,
-                  {
-                      "timestamp": NOW,
-                      "summary": summary,
-                      "evidence": evidence or {},
-                      "source": source,
-                  },
-              )
-
-          def clean(value, limit=2000):
-              return re.sub(
-                  r"\s+",
-                  " ",
-                  str(value or ""),
-              ).strip()[:limit]
-
-          def text_blob(obj):
-              return clean(
-                  json.dumps(
-                      obj,
-                      ensure_ascii=False,
-                  ),
-                  12000,
-              ).lower()
-
-          def extract_items(response, keys):
-              if isinstance(response, list):
-                  return response
-
-              if isinstance(response, dict):
+          def extract(value, keys):
+              if isinstance(value, list):
+                  return value
+              if isinstance(value, dict):
                   for key in keys:
-                      value = response.get(key)
-                      if isinstance(value, list):
-                          return value
-
+                      if isinstance(value.get(key), list):
+                          return value[key]
               return []
 
-          def record_rate_limit(client):
+          def rate_limit(client):
               rl = getattr(client, "last_rate_limit", None)
-
               if rl is None:
                   return None
-
               result = {}
-
-              for name in (
-                  "limit",
-                  "remaining",
-                  "reset",
-                  "retry_after",
-              ):
+              for name in ("limit", "remaining", "reset", "retry_after"):
                   try:
                       value = getattr(rl, name)
-
                       if value is not None:
-                          result[name] = (
-                              value.isoformat()
-                              if hasattr(value, "isoformat")
-                              else value
-                          )
+                          result[name] = value.isoformat() if hasattr(value, "isoformat") else value
                   except Exception:
                       pass
-
               return result or None
 
-          # -----------------------------------------------------------
-          # Colony connection.
-          # bootstrap() is the official SDK opening handshake.
-          # -----------------------------------------------------------
-          client = ColonyClient(API_KEY)
+          def terms(text):
+              words = re.findall(r"[a-zA-ZÀ-ÿ0-9_-]{4,}", clean(text, 5000).lower())
+              stop = {"this","that","with","from","have","what","when","where","which","would","could","about","your","their","they","there","into","then","than","just","pour","avec","dans","nous","vous","cela","cette","comme","mais","plus","faire","être","sont","pourquoi","comment"}
+              out = []
+              for word in words:
+                  if word not in stop and word not in out:
+                      out.append(word)
+              return out[:30]
 
+          def recall(memory, text, limit=6):
+              wanted = set(terms(text))
+              scored = []
+              for kind, values in memory.items():
+                  if kind == "version" or not isinstance(values, list):
+                      continue
+                  for item in values:
+                      score = sum(1 for term in wanted if term in blob(item))
+                      if score:
+                          scored.append({"kind": kind, "score": score, "item": item})
+              scored.sort(key=lambda x: x["score"], reverse=True)
+              return scored[:limit]
+
+          client = ColonyClient(API_KEY)
           try:
               state = client.bootstrap()
           except ColonyAuthError as exc:
-              raise SystemExit(
-                  f"Authentification Colony refusée: {exc}"
-              )
+              raise SystemExit(f"Authentification Colony refusée: {exc}")
           except ColonyAPIError as exc:
-              raise SystemExit(
-                  f"Erreur Colony au bootstrap: {exc}"
-              )
+              raise SystemExit(f"Erreur Colony au bootstrap: {exc}")
 
-          profile = (
-              state.get("profile", {})
-              if isinstance(state, dict)
-              else {}
-          )
-
-          username = clean(
-              profile.get("username"),
-              100,
-          )
-
+          profile = state.get("profile", {}) if isinstance(state, dict) else {}
+          username = clean(profile.get("username"), 100)
           if username and username != "nox_origine":
-              raise SystemExit(
-                  f"SECURITY STOP: profil inattendu '{username}'."
-              )
+              raise SystemExit(f"SECURITY STOP: profil inattendu '{username}'.")
+          runtime["last_rate_limit"] = rate_limit(client)
 
-          capabilities = (
-              state.get("capabilities", {})
-              if isinstance(state, dict)
-              else {}
-          )
+          remember(memory, "observations", "Colony bootstrap completed.", {
+              "username": username, "karma": profile.get("karma"),
+              "capabilities": state.get("capabilities", {}) if isinstance(state, dict) else {},
+              "unread_notifications": state.get("unread_notifications", 0) if isinstance(state, dict) else 0,
+              "unread_direct_messages": state.get("unread_direct_messages", 0) if isinstance(state, dict) else 0
+          }, "colony_bootstrap")
 
-          unread_dms = int(
-              state.get("unread_direct_messages", 0) or 0
-          ) if isinstance(state, dict) else 0
-
-          unread_notifications = int(
-              state.get("unread_notifications", 0) or 0
-          ) if isinstance(state, dict) else 0
-
-          member_colonies = (
-              state.get("member_colonies", [])
-              if isinstance(state, dict)
-              else []
-          )
-
-          print("=== NØX CORE GENERAL V5 ===")
-          print(f"Profile: {username or 'unknown'}")
-          print(f"Karma: {profile.get('karma', 'unknown')}")
-          print(f"Unread DMs: {unread_dms}")
-          print(f"Unread notifications: {unread_notifications}")
-          print(
-              f"Capabilities: {clean(capabilities, 1200)}"
-          )
-
-          remember(
-              "observations",
-              "Colony bootstrap completed.",
-              {
-                  "username": username,
-                  "karma": profile.get("karma"),
-                  "capabilities": capabilities,
-                  "unread_direct_messages": unread_dms,
-                  "unread_notifications": unread_notifications,
-                  "member_colonies": member_colonies,
-              },
-              "colony_bootstrap",
-          )
-
-          runtime["last_rate_limit"] = record_rate_limit(client)
-
-          # -----------------------------------------------------------
-          # Lightning health check.
-          # Read-only. No payment and no callback execution.
-          # -----------------------------------------------------------
-          payout_health = {
-              "status": "NOT_CHECKED",
-              "lightning_address": None,
-              "error": None,
-          }
-
+          payout = {"status": "NOT_CHECKED", "lightning_address": None}
           if ENABLE_LIGHTNING:
               try:
                   me = client.get_me()
-
-                  lightning = (
-                      clean(
-                          me.get("lightning_address"),
-                          300,
-                      )
-                      if isinstance(me, dict)
-                      else ""
-                  )
-
-                  payout_health["lightning_address"] = (
-                      lightning or None
-                  )
-
-                  if (
-                      not lightning
-                      or lightning.count("@") != 1
-                  ):
-                      payout_health["status"] = (
-                          "PAYOUT_UNAVAILABLE"
-                      )
-                      payout_health["error"] = (
-                          "missing_or_invalid_lightning_address"
-                      )
+                  lightning = clean(me.get("lightning_address") if isinstance(me, dict) else "", 300)
+                  payout["lightning_address"] = lightning or None
+                  if lightning.count("@") != 1:
+                      payout["status"] = "PAYOUT_UNAVAILABLE"
                   else:
                       local, host = lightning.split("@", 1)
-
-                      endpoint = (
-                          f"https://{host}/.well-known/lnurlp/"
-                          f"{urllib.parse.quote(local, safe='')}"
-                      )
-
-                      request = urllib.request.Request(
-                          endpoint,
-                          headers={
-                              "Accept": "application/json",
-                              "User-Agent": "NOX-Core/5",
-                          },
-                      )
-
-                      with urllib.request.urlopen(
-                          request,
-                          timeout=WEB_TIMEOUT,
-                      ) as response:
-                          payload = json.loads(
-                              response.read().decode(
-                                  "utf-8",
-                                  errors="replace",
-                              )
-                          )
-
-                      if payload.get("tag") != "payRequest":
-                          raise ValueError(
-                              "LNURL tag is not payRequest"
-                          )
-
-                      callback = str(
-                          payload.get("callback", "")
-                      )
-
-                      if not callback.startswith(
-                          ("https://", "http://")
-                      ):
-                          raise ValueError(
-                              "LNURL callback missing or invalid"
-                          )
-
-                      payout_health["status"] = "PAYOUT_READY"
-                      payout_health["endpoint"] = endpoint
-                      payout_health["min_sendable_msat"] = (
-                          payload.get("minSendable")
-                      )
-                      payout_health["max_sendable_msat"] = (
-                          payload.get("maxSendable")
-                      )
-
-                      remember(
-                          "observations",
-                          (
-                              "NØX Lightning address resolved "
-                              "successfully; no payment was initiated."
-                          ),
-                          {
-                              "lightning_address": lightning,
-                              "min_sendable_msat": payload.get(
-                                  "minSendable"
-                              ),
-                              "max_sendable_msat": payload.get(
-                                  "maxSendable"
-                              ),
-                          },
-                          "lightning",
-                      )
-
+                      endpoint = f"https://{host}/.well-known/lnurlp/{urllib.parse.quote(local, safe='')}"
+                      req = urllib.request.Request(endpoint, headers={"Accept":"application/json","User-Agent":"NOX-Core/6"})
+                      with urllib.request.urlopen(req, timeout=12) as response:
+                          payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                      callback = str(payload.get("callback", ""))
+                      if payload.get("tag") != "payRequest" or not callback.startswith(("https://", "http://")):
+                          raise ValueError("invalid LNURL pay metadata")
+                      payout.update({"status":"PAYOUT_READY", "min_sendable_msat":payload.get("minSendable"), "max_sendable_msat":payload.get("maxSendable")})
               except Exception as exc:
-                  payout_health["status"] = (
-                      "PAYOUT_UNAVAILABLE"
-                  )
-                  payout_health["error"] = clean(
-                      exc,
-                      500,
-                  )
+                  payout = {"status":"PAYOUT_UNAVAILABLE", "lightning_address":payout.get("lightning_address"), "error":clean(exc,500)}
+          runtime["payout_health"] = payout
 
-          runtime["payout_health"] = payout_health
-
-          # -----------------------------------------------------------
-          # Notifications.
-          #
-          # IMPORTANT:
-          # The official SDK does NOT expose client.since().
-          # We therefore use the documented unread notification API.
-          # No fake cursor and no undocumented endpoint.
-          # -----------------------------------------------------------
           notifications = []
-
-          if unread_notifications > 0:
+          if int(state.get("unread_notifications", 0) or 0) > 0:
               try:
-                  notification_response = client.get_notifications(
-                      unread_only=True
-                  )
-
-                  notifications = extract_items(
-                      notification_response,
-                      (
-                          "items",
-                          "notifications",
-                      ),
-                  )[:MAX_NOTIFICATIONS]
-
-                  runtime["last_rate_limit"] = (
-                      record_rate_limit(client)
-                  )
-
+                  notifications = extract(client.get_notifications(unread_only=True), ("items","notifications"))[:MAX_NOTIFICATIONS]
               except Exception as exc:
-                  print(
-                      f"NOTIFICATIONS unavailable: {exc}"
-                  )
+                  remember(memory, "failures", "Unread notifications could not be read.", {"error":clean(exc,500)}, "colony_notifications")
 
-                  remember(
-                      "failures",
-                      (
-                          "Unread Colony notifications could not "
-                          "be read through the documented SDK surface."
-                      ),
-                      {
-                          "error": clean(exc, 500),
-                      },
-                      "colony_notifications",
-                  )
-
-          # -----------------------------------------------------------
-          # Direct messages.
-          #
-          # The SDK exposes list_conversations() and
-          # get_conversation(username), not a since() cursor.
-          #
-          # We inspect only conversations that appear unread when
-          # possible. No messages are marked read here because Core
-          # foundation mode is observation-only.
-          # -----------------------------------------------------------
           messages = []
-
-          if unread_dms > 0:
+          if int(state.get("unread_direct_messages", 0) or 0) > 0:
               try:
-                  conversations_response = (
-                      client.list_conversations()
-                  )
-
-                  conversations = extract_items(
-                      conversations_response,
-                      (
-                          "items",
-                          "conversations",
-                      ),
-                  )
-
+                  conversations = extract(client.list_conversations(), ("items","conversations"))
                   for conversation in conversations:
-                      if len(messages) >= MAX_DMS:
+                      if len(messages) >= MAX_DMS or not isinstance(conversation, dict):
                           break
-
-                      if not isinstance(conversation, dict):
+                      unread = int(conversation.get("unread_count", conversation.get("unread", 0)) or 0)
+                      other = conversation.get("username") or conversation.get("other_username") or conversation.get("with_username")
+                      if unread <= 0 or not other:
                           continue
-
-                      unread = int(
-                          conversation.get(
-                              "unread_count",
-                              conversation.get(
-                                  "unread",
-                                  0,
-                              ),
-                          )
-                          or 0
-                      )
-
-                      username_other = (
-                          conversation.get("username")
-                          or conversation.get(
-                              "other_username"
-                          )
-                          or conversation.get(
-                              "recipient_username"
-                          )
-                          or conversation.get(
-                              "with_username"
-                          )
-                      )
-
-                      if unread <= 0 or not username_other:
-                          continue
-
                       try:
-                          conversation_detail = (
-                              client.get_conversation(
-                                  str(username_other)
-                              )
-                          )
-
-                          detail_items = extract_items(
-                              conversation_detail,
-                              (
-                                  "items",
-                                  "messages",
-                              ),
-                          )
-
-                          if detail_items:
-                              messages.extend(
-                                  detail_items[-MAX_DMS:]
-                              )
-                          elif isinstance(
-                              conversation_detail,
-                              list,
-                          ):
-                              messages.extend(
-                                  conversation_detail[
-                                      -MAX_DMS:
-                                  ]
-                              )
-
+                          detail = extract(client.get_conversation(str(other)), ("items","messages"))
+                          messages.extend(detail[-MAX_DMS:])
                       except Exception as exc:
-                          print(
-                              "CONVERSATION unavailable "
-                              f"for {username_other}: {exc}"
-                          )
-
+                          remember(memory, "failures", "A conversation could not be inspected.", {"username":other,"error":clean(exc,500)}, "colony_messages")
                   messages = messages[:MAX_DMS]
-
-                  runtime["last_rate_limit"] = (
-                      record_rate_limit(client)
-                  )
-
               except Exception as exc:
-                  print(
-                      f"DM LIST unavailable: {exc}"
-                  )
+                  remember(memory, "failures", "Conversation list could not be read.", {"error":clean(exc,500)}, "colony_messages")
 
-                  remember(
-                      "failures",
-                      (
-                          "Unread Colony conversations could not "
-                          "be inspected through the documented SDK surface."
-                      ),
-                      {
-                          "error": clean(exc, 500),
-                      },
-                      "colony_messages",
-                  )
-
-          # -----------------------------------------------------------
-          # For-you feed.
-          # Official SDK recommendation for relevant content.
-          # -----------------------------------------------------------
           try:
-              feed_response = client.get_for_you_feed(
-                  limit=MAX_FEED_ITEMS
-              )
-
-              feed_items = extract_items(
-                  feed_response,
-                  (
-                      "items",
-                      "posts",
-                      "feed",
-                  ),
-              )
-
+              feed = extract(client.get_for_you_feed(limit=MAX_FEED), ("items","posts","feed"))
           except Exception as exc:
-              feed_items = []
+              feed = []
+              remember(memory, "failures", "For-you feed could not be read.", {"error":clean(exc,500)}, "colony_feed")
 
-              print(
-                  f"FOR-YOU unavailable: {exc}"
-              )
-
-          # -----------------------------------------------------------
-          # Suggestions.
-          # Suggestions are perception only.
-          # They never directly trigger action.
-          # -----------------------------------------------------------
           try:
-              suggestion_response = client.get_suggestions(
-                  limit=MAX_SUGGESTIONS
-              )
-
-              suggestions = extract_items(
-                  suggestion_response,
-                  (
-                      "items",
-                      "suggestions",
-                  ),
-              )
-
+              suggestions = extract(client.get_suggestions(limit=MAX_SUGGESTIONS), ("items","suggestions"))
           except Exception as exc:
               suggestions = []
+              print(f"SUGGESTIONS unavailable: {exc}")
 
-              print(
-                  f"SUGGESTIONS unavailable: {exc}"
-              )
+          def item_id(item):
+              return str(item.get("id") or item.get("post_id") or item.get("notification_id") or item.get("message_id") or "") if isinstance(item, dict) else ""
 
-          # -----------------------------------------------------------
-          # Cognitive functions.
-          # Deterministic foundation.
-          # No external model.
-          # No fabricated reasoning.
-          # -----------------------------------------------------------
-          def keywords(value):
-              words = re.findall(
-                  r"[a-zA-ZÀ-ÿ0-9_-]{4,}",
-                  clean(value, 4000).lower(),
-              )
+          def title(item):
+              return clean(item.get("title") or item.get("subject") or "", 300) if isinstance(item, dict) else ""
 
-              stop = {
-                  "this",
-                  "that",
-                  "with",
-                  "from",
-                  "have",
-                  "what",
-                  "when",
-                  "where",
-                  "which",
-                  "would",
-                  "could",
-                  "about",
-                  "your",
-                  "their",
-                  "they",
-                  "there",
-                  "into",
-                  "dans",
-                  "pour",
-                  "avec",
-                  "nous",
-                  "vous",
-                  "cela",
-                  "cette",
-                  "comme",
-                  "mais",
-                  "être",
-                  "plus",
-                  "faire",
-              }
+          def body(item):
+              return clean(item.get("body") or item.get("content") or item.get("message") or item.get("text") or "", 3000) if isinstance(item, dict) else clean(item,3000)
 
-              return [
-                  word
-                  for word in words
-                  if word not in stop
-              ][:20]
-
-          def recall(terms, limit=5):
-              term_set = set(
-                  keywords(" ".join(terms))
-              )
-
-              scored = []
-
-              for kind, items in memory.items():
-                  if (
-                      kind == "version"
-                      or not isinstance(items, list)
-                  ):
-                      continue
-
-                  for item in items:
-                      blob = text_blob(item)
-
-                      score = sum(
-                          1
-                          for term in term_set
-                          if term in blob
-                      )
-
-                      if score:
-                          scored.append(
-                              {
-                                  "kind": kind,
-                                  "score": score,
-                                  "item": item,
-                              }
-                          )
-
-              scored.sort(
-                  key=lambda item: item["score"],
-                  reverse=True,
-              )
-
-              return scored[:limit]
-
-          def analyze(item, source):
+          def author(item):
               if not isinstance(item, dict):
-                  item = {
-                      "content": str(item)
-                  }
+                  return ""
+              a = item.get("author")
+              if isinstance(a, dict):
+                  return clean(a.get("username") or a.get("display_name"), 100)
+              return clean(item.get("author_username") or item.get("username"), 100)
 
-              title = clean(
-                  item.get("title")
-                  or item.get("subject")
-                  or item.get("name")
-                  or "",
-                  300,
-              )
-
-              body = clean(
-                  item.get("body")
-                  or item.get("content")
-                  or item.get("message")
-                  or item.get("text")
-                  or "",
-                  2500,
-              )
-
-              combined = f"{title}\n{body}"
-              low = combined.lower()
-
-              questions = [
-                  sentence.strip()
-                  for sentence in re.split(
-                      r"(?<=[?])\s+",
-                      combined,
-                  )
-                  if "?" in sentence
-              ][:4]
-
-              evidence = [
-                  marker
-                  for marker in (
-                      "evidence",
-                      "proof",
-                      "test",
-                      "result",
-                      "data",
-                      "verified",
-                      "research",
-                      "preuve",
-                      "testé",
-                      "résultat",
-                      "données",
-                      "vérifié",
-                  )
-                  if marker in low
-              ]
-
-              contradiction = [
-                  marker
-                  for marker in (
-                      "but",
-                      "however",
-                      "yet",
-                      "wrong",
-                      "false",
-                      "failed",
-                      "contradiction",
-                      "pourtant",
-                      "cependant",
-                      "erreur",
-                      "faux",
-                      "échec",
-                  )
-                  if marker in low
-              ]
-
-              social = [
-                  marker
-                  for marker in (
-                      "thank",
-                      "thanks",
-                      "friend",
-                      "community",
-                      "journey",
-                      "grateful",
-                      "merci",
-                      "communauté",
-                      "ami",
-                  )
-                  if marker in low
-              ]
-
-              terms = keywords(combined)
-              recalled = recall(terms)
-
-              interest = 0.25
-
-              if questions:
-                  interest += 0.20
-
-              if evidence:
-                  interest += 0.20
-
-              if contradiction:
-                  interest += 0.20
-
-              if social:
-                  interest += 0.05
-
-              if recalled:
-                  interest += 0.10
-
-              if source == "suggestion":
-                  interest += 0.05
-
-              interest = min(
-                  1.0,
-                  round(interest, 3),
-              )
-
-              if contradiction:
+          def classify(item, source):
+              text = f"{title(item)}\n{body(item)}"
+              low = text.lower()
+              qs = re.findall(r"[^.!?]{5,}\?", text)[:4]
+              evidence = [x for x in ("evidence","proof","data","test","result","verified","research","preuve","données","testé","résultat","vérifié") if x in low]
+              conflicts = [x for x in ("however","but","yet","contradiction","failed","wrong","false","pourtant","cependant","contradiction","échec","faux") if x in low]
+              memory_hits = recall(memory, text)
+              has_substance = len(body(item)) >= 120 or bool(qs) or bool(evidence) or bool(conflicts)
+              if not has_substance:
+                  return None
+              if conflicts:
                   intent = "reconcile_conflict"
+              elif qs:
+                  intent = "answer_or_research_question"
               elif evidence:
-                  intent = "verify_or_request_evidence"
-              elif questions:
-                  intent = "answer_question"
-              elif social:
-                  intent = "social_exchange"
+                  intent = "verify_claim"
               else:
-                  intent = "observe_only"
-
-              hypotheses = []
-              uncertainties = [
-                  "Le contexte fourni peut être incomplet."
-              ]
-
-              if evidence:
-                  hypotheses.append(
-                      "The claim may require evidence or a "
-                      "reproducible test before being treated "
-                      "as confirmed."
-                  )
-
-              if contradiction:
-                  hypotheses.append(
-                      "The apparent disagreement may come "
-                      "from different definitions, contexts, "
-                      "or measurements."
-                  )
-
-              if recalled:
-                  hypotheses.append(
-                      "A previous NØX observation may be relevant, "
-                      "but it is not automatically a rule."
-                  )
-
-              if intent == "observe_only":
-                  action = "do_nothing"
-                  reason = (
-                      "No concrete contribution is demonstrated "
-                      "from the available context."
-                  )
-
-              elif intent == "answer_question":
-                  action = "understand_context_before_reply"
-                  reason = (
-                      "A question exists, but the full context "
-                      "must be reconstructed before any response."
-                  )
-
-              elif intent == "verify_or_request_evidence":
-                  action = "request_or_check_evidence"
-                  reason = (
-                      "A concrete claim or evidence signal exists; "
-                      "NØX should distinguish reported information "
-                      "from confirmed results."
-                  )
-
-              elif intent == "reconcile_conflict":
-                  action = "reconstruct_conflict"
-                  reason = (
-                      "The disagreement should be reconstructed "
-                      "before choosing a side or response."
-                  )
-
-              else:
-                  action = "contextual_social_response"
-                  reason = (
-                      "A social exchange may be useful only if "
-                      "NØX has something specific to contribute."
-                  )
-
+                  intent = "contextual_observation"
               return {
-                  "title": title,
-                  "body": body,
-                  "source": source,
-                  "target_id": str(
-                      item.get("id")
-                      or item.get("post_id")
-                      or item.get("comment_id")
-                      or item.get("notification_id")
-                      or item.get("message_id")
-                      or ""
-                  ),
-                  "interest": interest,
-                  "intent": intent,
-                  "candidate_action": action,
-                  "reason": reason,
-                  "questions": questions,
-                  "evidence_signals": evidence,
-                  "contradiction_signals": contradiction,
-                  "social_signals": social,
-                  "hypotheses": hypotheses,
-                  "uncertainties": uncertainties,
-                  "recall": recalled,
-                  "observed_item": item,
+                  "id": stable("case", source, item_id(item), title(item), body(item)[:700]),
+                  "source": source, "target_id": item_id(item), "title": title(item), "body": body(item),
+                  "author": author(item), "intent": intent, "questions": qs,
+                  "evidence_signals": evidence, "conflict_signals": conflicts,
+                  "terms": terms(text), "memory_hits": memory_hits,
+                  "uncertainty": ["The available context may be incomplete."],
+                  "created_at": item.get("created_at") if isinstance(item, dict) else None
               }
 
-          # -----------------------------------------------------------
-          # Build cognitive cases.
-          # -----------------------------------------------------------
-          candidates = []
-
+          raw_cases = []
+          for item in feed:
+              case = classify(item, "for_you")
+              if case: raw_cases.append(case)
           for item in notifications:
-              candidates.append(
-                  analyze(
-                      item,
-                      "event_notification",
-                  )
-              )
-
+              case = classify(item, "notification")
+              if case: raw_cases.append(case)
           for item in messages:
-              candidates.append(
-                  analyze(
-                      item,
-                      "event_dm",
-                  )
-              )
-
-          for item in feed_items:
-              candidates.append(
-                  analyze(
-                      item,
-                      "for_you",
-                  )
-              )
-
+              case = classify(item, "dm")
+              if case: raw_cases.append(case)
           for item in suggestions:
-              candidates.append(
-                  analyze(
-                      item,
-                      "suggestion",
-                  )
-              )
+              case = classify(item, "suggestion")
+              if case: raw_cases.append(case)
 
-          unique = {}
-
-          for case in candidates:
-              key = (
-                  case["source"],
-                  case["target_id"],
-                  case["title"],
-              )
-
-              if (
-                  key not in unique
-                  or case["interest"]
-                  > unique[key]["interest"]
-              ):
-                  unique[key] = case
-
-          cases = sorted(
-              unique.values(),
-              key=lambda case: case["interest"],
-              reverse=True,
-          )[:MAX_CASES]
+          seen = set(runtime.get("seen_event_ids", []))
+          processed = set(runtime.get("processed_post_ids", []))
+          unique = []
+          for case in raw_cases:
+              key = case["target_id"] or case["id"]
+              if key in seen and case["source"] in ("notification","dm"):
+                  continue
+              if key in processed and case["source"] == "for_you":
+                  continue
+              if case["author"] == "nox_origine":
+                  continue
+              unique.append(case)
+          cases = unique[:MAX_CASES]
 
           # -----------------------------------------------------------
-          # Optional read-only web research.
+          # Close the previous cycle first: factory results and social
+          # execution outcomes become inputs to the next decision.
           # -----------------------------------------------------------
-          def web_search(query):
-              if not ENABLE_WEB or not query:
-                  return []
-
-              url = (
-                  "https://html.duckduckgo.com/html/?"
-                  + urllib.parse.urlencode(
-                      {
-                          "q": clean(
-                              query,
-                              400,
-                          )
-                      }
-                  )
-              )
-
-              request = urllib.request.Request(
-                  url,
-                  headers={
-                      "User-Agent": (
-                          "Mozilla/5.0 "
-                          "(compatible; NOX-Core/5)"
-                      )
-                  },
-              )
-
-              try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=WEB_TIMEOUT,
-                  ) as response:
-                      html = response.read().decode(
-                          "utf-8",
-                          errors="ignore",
-                      )
-
-              except Exception as exc:
-                  print(
-                      f"WEB unavailable: {exc}"
-                  )
-                  return []
-
-              results = []
-
-              blocks = re.findall(
-                  r'<div[^>]+class="result[^\"]*".*?</div>\s*</div>',
-                  html,
-                  flags=re.I | re.S,
-              )
-
-              for block in blocks:
-                  if len(results) >= MAX_WEB_RESULTS:
+          consumed_work = set(runtime.get("consumed_work_result_ids", []))
+          history = work.get("history", []) if isinstance(work, dict) else []
+          for result in history:
+              if not isinstance(result, dict):
+                  continue
+              rid = result.get("id")
+              if not rid or rid in consumed_work:
+                  continue
+              request_id = result.get("request_id")
+              matched = None
+              for case in memory.get("cognitive_cases", []):
+                  if isinstance(case, dict) and case.get("case_id") == request_id:
+                      matched = case
                       break
-
-                  title_match = re.search(
-                      r'class="result__a"[^>]*>(.*?)</a>',
-                      block,
-                      flags=re.I | re.S,
-                  )
-
-                  url_match = re.search(
-                      r'class="result__a"[^>]*href="([^"]+)"',
-                      block,
-                      flags=re.I,
-                  )
-
-                  snippet_match = re.search(
-                      r'class="result__snippet"[^>]*>(.*?)</',
-                      block,
-                      flags=re.I | re.S,
-                  )
-
-                  if not title_match:
-                      continue
-
-                  results.append(
-                      {
-                          "title": clean(
-                              re.sub(
-                                  r"<[^>]+>",
-                                  "",
-                                  title_match.group(1),
-                              ),
-                              200,
-                          ),
-                          "url": (
-                              urllib.parse.unquote(
-                                  url_match.group(1)
-                              )[:500]
-                              if url_match
-                              else ""
-                          ),
-                          "snippet": (
-                              clean(
-                                  re.sub(
-                                      r"<[^>]+>",
-                                      "",
-                                      snippet_match.group(1),
-                                  ),
-                                  500,
-                              )
-                              if snippet_match
-                              else ""
-                          ),
-                      }
-                  )
-
-              return results
-
-          for case in cases:
-              if (
-                  case["interest"] >= 0.65
-                  and (
-                      case["evidence_signals"]
-                      or case["questions"]
-                  )
-              ):
-                  case["research"] = web_search(
-                      f"{case['title']} "
-                      f"{case['body'][:500]}"
-                  )
+              if matched:
+                  matched["research_result"] = result
+                  matched["outcome"] = "research_returned"
+                  matched["learning"] = None
               else:
-                  case["research"] = []
+                  add(memory, "results", {
+                      "timestamp": NOW, "type":"research_result", "request_id":request_id,
+                      "result_id":rid, "evidence_status":result.get("evidence_status"),
+                      "conclusion":result.get("conclusion"), "sources":result.get("sources",[])[:8]
+                  })
+              consumed_work.add(rid)
+          runtime["consumed_work_result_ids"] = list(consumed_work)[-500:]
+
+          consumed_presence = set(runtime.get("consumed_presence_outcome_ids", []))
+          outcomes = presence.get("outcomes", []) if isinstance(presence, dict) else []
+          for outcome in outcomes:
+              if not isinstance(outcome, dict):
+                  continue
+              oid = outcome.get("id")
+              if not oid or oid in consumed_presence:
+                  continue
+              for case in memory.get("cognitive_cases", []):
+                  if isinstance(case, dict) and case.get("case_id") == outcome.get("case_id"):
+                      case["outcome"] = outcome.get("status")
+                      case["outcome_detail"] = outcome
+                      if outcome.get("status") == "executed":
+                          add(memory, "results", {"timestamp":NOW,"type":"public_action","case_id":case.get("case_id"),"action_id":outcome.get("action_id"),"target_id":outcome.get("target_id"),"status":"executed"})
+                      elif outcome.get("status") in ("error","skipped"):
+                          add(memory, "failures", {"timestamp":NOW,"summary":"A planned presence action did not execute.","evidence":outcome}, MAX_MEMORY)
+                      break
+              consumed_presence.add(oid)
+          runtime["consumed_presence_outcome_ids"] = list(consumed_presence)[-500:]
+
+          # Remove actions already resolved by Presence.
+          pending = []
+          resolved_action_ids = {o.get("action_id") for o in outcomes if isinstance(o,dict) and o.get("status") in ("executed","error","skipped")}
+          for action in runtime.get("pending_actions", []):
+              if isinstance(action, dict) and action.get("action_id") not in resolved_action_ids:
+                  pending.append(action)
+          runtime["pending_actions"] = pending[-MAX_PENDING:]
 
           # -----------------------------------------------------------
-          # CHOOSE.
-          # Core decides whether an action is justified.
-          # No Colony suggestion bypasses Core reasoning.
+          # Decide. No generic social action is created. A public action
+          # needs a concrete contribution and a traceable target.
           # -----------------------------------------------------------
-          chosen = []
-
+          new_actions = []
+          new_work = []
           for case in cases:
-              if case["interest"] < ACTION_THRESHOLD:
-                  case["decision"] = "do_nothing"
-                  case["decision_reason"] = (
-                      "Below the current intervention threshold."
-                  )
-                  continue
+              text = f"{case['title']}\n{case['body']}"
+              memory_context = [x["item"] for x in case["memory_hits"][:4]]
+              decision = "do_nothing"
+              reason = "No concrete contribution is justified by the available context."
+              action_kind = None
 
-              if case["candidate_action"] == "do_nothing":
-                  case["decision"] = "do_nothing"
-                  case["decision_reason"] = case["reason"]
-                  continue
-
-              if (
-                  case["source"] == "suggestion"
-                  and not ENABLE_PUBLIC_ACTIONS
-              ):
-                  case["decision"] = "observe_suggestion"
-                  case["decision_reason"] = (
-                      "Suggestion recorded, but public actions "
-                      "are disabled in Core foundation mode."
-                  )
-                  continue
-
-              case["decision"] = case["candidate_action"]
-              case["decision_reason"] = case["reason"]
-
-              chosen.append(case)
-
-              if len(chosen) >= MAX_ACTIONS:
-                  break
-
-          # -----------------------------------------------------------
-          # ACT.
-          #
-          # Foundation mode deliberately executes zero public actions.
-          # Core records decisions for the future execution layers.
-          # -----------------------------------------------------------
-          executed = 0
-
-          for case in chosen:
-              remember(
-                  "decisions",
-                  f"Core selected {case['decision']}.",
-                  {
-                      "case_id": case["target_id"],
-                      "source": case["source"],
-                      "interest": case["interest"],
-                      "reason": case["decision_reason"],
-                  },
-              )
-
-              remember(
-                  "actions",
-                  f"Action candidate: {case['decision']}",
-                  {
-                      "target_id": case["target_id"],
-                      "execution_layer": (
-                          "colony_presence_or_action"
-                      ),
-                      "status": "queued_not_executed",
-                  },
-              )
-
-              executed += 1
-
-          # -----------------------------------------------------------
-          # OBSERVE / LEARN.
-          #
-          # No result is invented. Public execution remains zero.
-          # -----------------------------------------------------------
-          for case in cases:
-              if case["source"] in (
-                  "event_notification",
-                  "event_dm",
-              ):
-                  remember(
-                      "observations",
-                      (
-                          "New Colony event observed: "
-                          f"{case['intent']}."
-                      ),
-                      {
-                          "source": case["source"],
-                          "target_id": case["target_id"],
-                          "title": case["title"],
-                          "interest": case["interest"],
-                      },
-                      "colony_event",
-                  )
-
-              if case["research"]:
-                  remember(
-                      "observations",
-                      (
-                          "Read-only web research produced "
-                          "candidate sources for a cognitive case."
-                      ),
-                      {
-                          "target_id": case["target_id"],
-                          "result_count": len(
-                              case["research"]
-                          ),
-                          "sources": [
-                              result["url"]
-                              for result in case["research"]
-                              if result.get("url")
-                          ][:5],
-                      },
-                      "web_research",
-                  )
+              if case["intent"] == "answer_or_research_question" and case["questions"]:
+                  question = case["questions"][0]
+                  decision = "research_before_reply"
+                  reason = "The post contains a concrete question; research is required before asserting an answer."
+                  action_kind = "research"
+                  work_id = stable("work", case["id"], question)
+                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                      new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"created_at":NOW,"status":"pending"})
+              elif case["intent"] == "verify_claim" and case["evidence_signals"]:
+                  decision = "research_claim"
+                  reason = "The claim uses evidence language; NØX will separate reported information from independently checked evidence."
+                  action_kind = "research"
+                  question = case["questions"][0] if case["questions"] else f"What evidence supports or contradicts: {case['title']}"
+                  work_id = stable("work", case["id"], question)
+                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                      new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"created_at":NOW,"status":"pending"})
+              elif case["intent"] == "reconcile_conflict" and case["conflict_signals"]:
+                  decision = "reconstruct_before_reply"
+                  reason = "The text contains a potential disagreement; NØX should reconstruct the claims before taking a position."
+                  action_kind = "research"
+                  question = case["questions"][0] if case["questions"] else f"What are the competing claims in: {case['title']}"
+                  work_id = stable("work", case["id"], question)
+                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                      new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"created_at":NOW,"status":"pending"})
+              elif case["intent"] == "contextual_observation" and case["memory_hits"] and len(case["body"]) >= 180:
+                  decision = "contextual_reply"
+                  reason = "A specific memory/context overlap exists and can support a concrete contribution."
+                  action_kind = "reply"
 
               case_record = {
-                  "timestamp": NOW,
-                  "source": case["source"],
-                  "target_id": case["target_id"],
-                  "title": case["title"],
-                  "intent": case["intent"],
-                  "interest": case["interest"],
-                  "questions": case["questions"],
-                  "hypotheses": case["hypotheses"],
-                  "uncertainties": case["uncertainties"],
-                  "decision": case.get(
-                      "decision",
-                      "do_nothing",
-                  ),
-                  "decision_reason": case.get(
-                      "decision_reason",
-                      "",
-                  ),
-                  "research": case["research"],
-                  "outcome": None,
-                  "learning": None,
+                  "timestamp":NOW,"case_id":case["id"],"source":case["source"],"target_id":case["target_id"],
+                  "title":case["title"],"author":case["author"],"body":case["body"],"intent":case["intent"],
+                  "questions":case["questions"],"evidence_signals":case["evidence_signals"],"conflict_signals":case["conflict_signals"],
+                  "memory_hits":memory_context,"uncertainties":case["uncertainty"],"decision":decision,"decision_reason":reason,
+                  "action_kind":action_kind,"outcome":None,"learning":None
               }
+              add(memory,"cognitive_cases",case_record,MAX_CASES_MEMORY)
+              remember(memory,"decisions",f"Decision: {decision}.",{"case_id":case["id"],"target_id":case["target_id"],"reason":reason,"action_kind":action_kind},"cognitive_decision")
 
-              add_memory(
-                  "cognitive_cases",
-                  case_record,
-                  MAX_COGNITIVE_CASES,
-              )
+              if action_kind == "reply":
+                  action_id = stable("action", case["id"], "reply")
+                  if not any(isinstance(a,dict) and a.get("action_id") == action_id for a in runtime["pending_actions"]):
+                      new_actions.append({"action_id":action_id,"case_id":case["id"],"kind":"reply","target_id":case["target_id"],"title":case["title"],"body":case["body"],"author":case["author"],"reason":reason,"created_at":NOW})
+              elif action_kind == "research":
+                  pass
 
-          # -----------------------------------------------------------
-          # Self-observation.
-          # -----------------------------------------------------------
-          if cases and not chosen:
-              remember(
-                  "learnings",
-                  (
-                      "Core observed relevant signals but deliberately "
-                      "took no public action; insufficient justification "
-                      "is treated as a valid decision."
-                  ),
-                  {
-                      "cases": len(cases),
-                      "threshold": ACTION_THRESHOLD,
-                  },
-                  "self_observation",
-              )
+          runtime["work_requests"] = (runtime.get("work_requests", []) + new_work)[-MAX_WORK:]
+          runtime["pending_actions"] = (runtime.get("pending_actions", []) + new_actions)[-MAX_PENDING:]
 
+          # A completed research result unlocks a reply action. It is created
+          # only when the result belongs to a live cognitive case.
+          for case in memory.get("cognitive_cases", []):
+              if not isinstance(case, dict) or not case.get("research_result"):
+                  continue
+              result = case["research_result"]
+              status = result.get("evidence_status")
+              if status not in ("multi_source_support","partial_support","insufficient_verification","no_evidence"):
+                  continue
+              action_id = stable("action", case.get("case_id"), "research_reply")
+              if any(isinstance(a,dict) and a.get("action_id") == action_id for a in runtime["pending_actions"]):
+                  continue
+              if case.get("outcome") not in (None, "research_returned"):
+                  continue
+              runtime["pending_actions"].append({
+                  "action_id":action_id,"case_id":case.get("case_id"),"kind":"research_reply",
+                  "target_id":case.get("target_id"),"title":case.get("title"),"body":case.get("body"),
+                  "author":case.get("author"),"reason":"Research completed; Presence may now make a bounded, evidence-aware contribution.",
+                  "research_result":result,"created_at":NOW
+              })
+              case["decision"] = "reply_after_research"
+              case["action_kind"] = "research_reply"
+
+          # Housekeeping: do not manufacture learnings. A learning requires
+          # an observed result or a concrete failure.
           if cases:
-              high_uncertainty = sum(
-                  1
-                  for case in cases
-                  if case["uncertainties"]
-              )
+              remember(memory,"observations","Core completed a decision cycle.",{"cases":len(cases),"new_work":len(new_work),"new_actions":len(new_actions)},"core_cycle")
 
-              remember(
-                  "learnings",
-                  (
-                      "Core separates observation from interpretation "
-                      "and keeps uncertainty explicit."
-                  ),
-                  {
-                      "cases": len(cases),
-                      "cases_with_uncertainty": high_uncertainty,
-                  },
-                  "self_observation",
-              )
-
-          # -----------------------------------------------------------
-          # Persist compact runtime state.
-          #
-          # There is intentionally NO since_cursor.
-          # The official SDK does not expose client.since().
-          # -----------------------------------------------------------
-          runtime["run_count"] = (
-              int(runtime.get("run_count", 0)) + 1
-          )
-
+          runtime["run_count"] = int(runtime.get("run_count",0)) + 1
           runtime["last_run"] = NOW
+          runtime["last_cycle"] = {"cases":len(cases),"new_work":len(new_work),"new_actions":len(new_actions),"feed":len(feed),"notifications":len(notifications),"dms":len(messages)}
+          runtime["processed_post_ids"] = list(dict.fromkeys(runtime.get("processed_post_ids",[]) + [c["target_id"] for c in cases if c["source"]=="for_you" and c["target_id"]]))[-1000:]
+          runtime["seen_event_ids"] = list(dict.fromkeys(runtime.get("seen_event_ids",[]) + [c["target_id"] for c in cases if c["source"] in ("notification","dm") and c["target_id"]]))[-1000:]
 
-          runtime["action_count_total"] = (
-              int(runtime.get("action_count_total", 0))
-              + executed
-          )
+          save(MEMORY_FILE,memory)
+          save(RUNTIME_FILE,runtime)
 
-          runtime["processed_post_ids"] = list(
-              dict.fromkeys(
-                  runtime.get(
-                      "processed_post_ids",
-                      [],
-                  )
-                  + [
-                      case["target_id"]
-                      for case in cases
-                      if case["target_id"]
-                      and case["source"] == "for_you"
-                  ]
-              )
-          )[-1000:]
-
-          runtime["processed_suggestion_ids"] = list(
-              dict.fromkeys(
-                  runtime.get(
-                      "processed_suggestion_ids",
-                      [],
-                  )
-                  + [
-                      case["target_id"]
-                      for case in cases
-                      if (
-                          case["source"] == "suggestion"
-                          and case["target_id"]
-                      )
-                  ]
-              )
-          )[-500:]
-
-          runtime["seen_event_ids"] = list(
-              dict.fromkeys(
-                  runtime.get(
-                      "seen_event_ids",
-                      [],
-                  )
-                  + [
-                      case["target_id"]
-                      for case in cases
-                      if (
-                          case["source"]
-                          in (
-                              "event_notification",
-                              "event_dm",
-                          )
-                          and case["target_id"]
-                      )
-                  ]
-              )
-          )[-1000:]
-
-          runtime["cognitive_version"] = 5
-
-          runtime["last_observation"] = {
-              "feed_items": len(feed_items),
-              "suggestions": len(suggestions),
-              "notifications": len(notifications),
-              "messages": len(messages),
-              "cases": len(cases),
-              "chosen": len(chosen),
-              "public_actions": 0,
-          }
-
-          save_json(
-              MEMORY_FILE,
-              memory,
-          )
-
-          save_json(
-              RUNTIME_FILE,
-              runtime,
-          )
-
-          print("")
-          print("=== NØX CORE GENERAL V5 / SUMMARY ===")
-          print(f"Feed: {len(feed_items)}")
-          print(f"Suggestions: {len(suggestions)}")
-          print(
-              f"Unread notifications inspected: "
-              f"{len(notifications)}"
-          )
-          print(
-              f"Unread DMs inspected: "
-              f"{len(messages)}"
-          )
-          print(f"Cognitive cases: {len(cases)}")
-          print(f"Chosen: {len(chosen)}")
-          print(
-              "Executed publicly: 0 (foundation mode)"
-          )
-          print(
-              f"Lightning: "
-              f"{payout_health.get('status')}"
-          )
-          print(
-              f"Memory observations: "
-              f"{len(memory['observations'])}"
-          )
-          print(
-              f"Memory decisions: "
-              f"{len(memory['decisions'])}"
-          )
-          print(
-              f"Memory actions: "
-              f"{len(memory['actions'])}"
-          )
-          print(
-              f"Memory results: "
-              f"{len(memory['results'])}"
-          )
-          print(
-              f"Memory learnings: "
-              f"{len(memory['learnings'])}"
-          )
-          print(
-              f"Memory failures: "
-              f"{len(memory['failures'])}"
-          )
-          print(
-              f"Memory cognitive cases: "
-              f"{len(memory['cognitive_cases'])}"
-          )
-          print(
-              "=== RESEARCH -> UNDERSTAND -> RECALL -> "
-              "REFLECT -> CHOOSE -> ACT -> OBSERVE -> "
-              "LEARN -> ADAPT ==="
-          )
+          print("=== NØX CORE GENERAL V6 ===")
+          print(f"Feed={len(feed)} Notifications={len(notifications)} DMs={len(messages)}")
+          print(f"Cases={len(cases)} New work={len(new_work)} Pending actions={len(runtime['pending_actions'])}")
+          print(f"Lightning={payout.get('status')}")
+          print("Cycle: OBSERVE -> UNDERSTAND -> RECALL -> DECIDE -> WORK/PRESENCE -> OBSERVE OUTCOME -> LEARN")
           PY
 
-      - name: Commit Core memory
+      - name: Commit Core state
         run: |
-          git config user.name "NOX"
+          set -euo pipefail
+          git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
           git add memory/nox_core_memory.json memory/nox_core_runtime.json
           if git diff --cached --quiet; then
-            echo "Aucune modification mémoire."
-          else
-            git commit -m "nox: update core cognitive memory"
-            git push
+            echo "No Core changes."
+            exit 0
           fi
+          git commit -m "NØX: update cognitive core"
+          git pull --rebase origin main
+          git push
