@@ -39,13 +39,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install search dependency
+      - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install --upgrade ddgs
+          python -m pip install --upgrade ddgs colony-sdk
 
       - name: Run NØX Work Factory
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -59,12 +61,26 @@ jobs:
           from urllib.parse import urlparse
 
           from ddgs import DDGS
+          from colony_sdk import (
+              ColonyAPIError,
+              ColonyClient,
+              ColonyNetworkError,
+              ColonyRateLimitError,
+          )
 
 
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
+          CORE_MEMORY_FILE = Path(
+              os.environ["CORE_MEMORY_FILE"]
+          )
+          CORE_RUNTIME_FILE = Path(
+              os.environ["CORE_RUNTIME_FILE"]
+          )
+          KNOWLEDGE_FILE = Path(
+              os.environ["KNOWLEDGE_FILE"]
+          )
+          WORK_FILE = Path(
+              os.environ["WORK_FILE"]
+          )
 
           MAX_WORK_ITEMS_PER_RUN = int(
               os.environ["MAX_WORK_ITEMS_PER_RUN"]
@@ -85,6 +101,15 @@ jobs:
               os.environ["MAX_HISTORY_ITEMS"]
           )
 
+          COLONY_API_KEY = os.environ.get(
+              "COLONY_API_KEY",
+              ""
+          )
+
+
+          # ==========================================================
+          # BASIC IO
+          # ==========================================================
 
           def now_iso():
               return datetime.now(
@@ -117,11 +142,11 @@ jobs:
                   exist_ok=True
               )
 
-              temp_path = path.with_suffix(
+              temporary = path.with_suffix(
                   path.suffix + ".tmp"
               )
 
-              with temp_path.open(
+              with temporary.open(
                   "w",
                   encoding="utf-8"
               ) as handle:
@@ -133,7 +158,7 @@ jobs:
                   )
                   handle.write("\n")
 
-              temp_path.replace(path)
+              temporary.replace(path)
 
 
           def ensure_list(container, key):
@@ -146,18 +171,20 @@ jobs:
               return container[key]
 
 
-          def clean_text(value):
+          def clean_text(value, limit=None):
               if value is None:
                   return ""
 
-              value = str(value)
-              value = re.sub(
+              text = re.sub(
                   r"\s+",
                   " ",
-                  value
-              )
+                  str(value)
+              ).strip()
 
-              return value.strip()
+              if limit:
+                  text = text[:limit]
+
+              return text
 
 
           def stable_id(prefix, value):
@@ -174,9 +201,22 @@ jobs:
               return f"{prefix}-{digest}"
 
 
-          def normalize_work_item(item, source):
-              if isinstance(item, str):
-                  question = item.strip()
+          # ==========================================================
+          # WORK DISCOVERY
+          # ==========================================================
+
+          def normalize_work_item(
+              item,
+              source
+          ):
+              if isinstance(
+                  item,
+                  str
+              ):
+                  question = clean_text(
+                      item,
+                      600
+                  )
 
                   if not question:
                       return None
@@ -188,10 +228,14 @@ jobs:
                       ),
                       "question": question,
                       "priority": 0,
-                      "source": source
+                      "source": source,
+                      "original": item
                   }
 
-              if not isinstance(item, dict):
+              if not isinstance(
+                  item,
+                  dict
+              ):
                   return None
 
               question = ""
@@ -212,7 +256,10 @@ jobs:
                       isinstance(value, str)
                       and value.strip()
                   ):
-                      question = value.strip()
+                      question = clean_text(
+                          value,
+                          600
+                      )
                       break
 
               if not question:
@@ -283,25 +330,23 @@ jobs:
                               normalized
                           )
 
-              cognitive_cases = (
-                  core_memory.get(
-                      "cognitive_cases",
-                      []
-                  )
+              cases = core_memory.get(
+                  "cognitive_cases",
+                  []
               )
 
               if isinstance(
-                  cognitive_cases,
+                  cases,
                   list
               ):
-                  for case in cognitive_cases:
+                  for case in cases:
                       if not isinstance(
                           case,
                           dict
                       ):
                           continue
 
-                      status = str(
+                      status = clean_text(
                           case.get(
                               "status",
                               ""
@@ -331,23 +376,20 @@ jobs:
               deduped = {}
 
               for candidate in candidates:
-                  request_id = (
-                      candidate[
-                          "request_id"
-                      ]
+                  request_id = candidate[
+                      "request_id"
+                  ]
+
+                  existing = deduped.get(
+                      request_id
                   )
 
-                  if request_id not in deduped:
+                  if existing is None:
                       deduped[
                           request_id
                       ] = candidate
-                      continue
 
-                  existing = deduped[
-                      request_id
-                  ]
-
-                  if (
+                  elif (
                       candidate[
                           "priority"
                       ]
@@ -363,6 +405,216 @@ jobs:
                   deduped.values()
               )
 
+
+          # ==========================================================
+          # COGNITIVE CLASSIFICATION
+          #
+          # Classification happens BEFORE selecting a tool.
+          #
+          # RESEARCH:
+          #   information-seeking work.
+          #
+          # VERIFY:
+          #   explicit checking/verification.
+          #
+          # ACTION:
+          #   explicit Colony action.
+          #
+          # UNKNOWN:
+          #   insufficiently clear. No tool is executed.
+          # ==========================================================
+
+          ACTION_PATTERNS = (
+              r"^\s*join\s+(?:c/)?([a-z0-9][a-z0-9_-]*)\s*$",
+              r"^\s*join\s+colony\s+([a-z0-9][a-z0-9_-]*)\s*$",
+          )
+
+          VERIFY_PATTERNS = (
+              r"\bverify\b",
+              r"\bverification\b",
+              r"\bcheck whether\b",
+              r"\bcheck if\b",
+              r"\bvalidate\b",
+              r"\bvalidation\b",
+              r"\bconfirm whether\b",
+              r"\bconfirm if\b",
+              r"\bcitation checker\b",
+              r"\bcheck the paper\b",
+              r"\bcheck the source\b",
+          )
+
+          RESEARCH_PATTERNS = (
+              r"\bresearch\b",
+              r"\bfind out\b",
+              r"\binvestigate\b",
+              r"\blook up\b",
+              r"\bwhat is\b",
+              r"\bwhat are\b",
+              r"\bhow does\b",
+              r"\bhow do\b",
+              r"\bwhy does\b",
+              r"\bwhy do\b",
+              r"\bwhich\b",
+              r"\bwho is\b",
+              r"\bcompare\b",
+              r"\bpaper\b",
+              r"\bdata\b",
+              r"\bevidence\b",
+              r"\bsource\b",
+          )
+
+
+          def classify_work(
+              question,
+              original,
+              source
+          ):
+              text = clean_text(
+                  question
+              )
+
+              lowered = text.lower()
+
+              # ------------------------------------------------------
+              # Explicit structured type has priority over text.
+              # ------------------------------------------------------
+
+              if isinstance(
+                  original,
+                  dict
+              ):
+                  explicit_type = clean_text(
+                      original.get(
+                          "type"
+                      )
+                      or original.get(
+                          "work_type"
+                      )
+                      or original.get(
+                          "kind"
+                      )
+                  ).lower()
+
+                  aliases = {
+                      "research": "research",
+                      "research_request": "research",
+                      "web_query": "research",
+                      "verify": "verify",
+                      "verification": "verify",
+                      "action": "action",
+                      "colony_action": "action",
+                  }
+
+                  if explicit_type in aliases:
+                      work_type = aliases[
+                          explicit_type
+                      ]
+
+                      return {
+                          "type": work_type,
+                          "confidence": "explicit",
+                          "reason": (
+                              "Explicit work type "
+                              "provided by source."
+                          ),
+                          "tool": (
+                              "web"
+                              if work_type
+                              in {
+                                  "research",
+                                  "verify"
+                              }
+                              else "colony_sdk"
+                          )
+                      }
+
+              # ------------------------------------------------------
+              # Exact safe Colony action recognition.
+              #
+              # We deliberately keep this narrow.
+              # Unknown actions are NOT guessed.
+              # ------------------------------------------------------
+
+              for pattern in ACTION_PATTERNS:
+                  match = re.search(
+                      pattern,
+                      lowered
+                  )
+
+                  if match:
+                      colony = match.group(
+                          1
+                      )
+
+                      return {
+                          "type": "action",
+                          "confidence": "high",
+                          "reason": (
+                              "Explicit Colony "
+                              "join action."
+                          ),
+                          "tool": "colony_sdk",
+                          "action": "join_colony",
+                          "colony": colony
+                      }
+
+              # ------------------------------------------------------
+              # Verification takes precedence over generic research.
+              # ------------------------------------------------------
+
+              for pattern in VERIFY_PATTERNS:
+                  if re.search(
+                      pattern,
+                      lowered
+                  ):
+                      return {
+                          "type": "verify",
+                          "confidence": "high",
+                          "reason": (
+                              "Explicit verification "
+                              "intent detected."
+                          ),
+                          "tool": "web"
+                      }
+
+              # ------------------------------------------------------
+              # Generic research.
+              # ------------------------------------------------------
+
+              for pattern in RESEARCH_PATTERNS:
+                  if re.search(
+                      pattern,
+                      lowered
+                  ):
+                      return {
+                          "type": "research",
+                          "confidence": "medium",
+                          "reason": (
+                              "Information-seeking "
+                              "intent detected."
+                          ),
+                          "tool": "web"
+                      }
+
+              # ------------------------------------------------------
+              # Source names are not sufficient evidence of research.
+              # Do not turn arbitrary Colony tasks into web queries.
+              # ------------------------------------------------------
+
+              return {
+                  "type": "unknown",
+                  "confidence": "low",
+                  "reason": (
+                      "No supported work type "
+                      "could be determined safely."
+                  ),
+                  "tool": "none"
+              }
+
+
+          # ==========================================================
+          # KNOWLEDGE CONTEXT
+          # ==========================================================
 
           def build_knowledge_context(
               knowledge
@@ -399,21 +651,27 @@ jobs:
                           dict
                       ):
                           text = (
-                              item.get("text")
-                              or item.get("content")
-                              or item.get("summary")
-                              or item.get("claim")
-                              or item.get("learning")
+                              item.get(
+                                  "text"
+                              )
+                              or item.get(
+                                  "content"
+                              )
+                              or item.get(
+                                  "summary"
+                              )
+                              or item.get(
+                                  "claim"
+                              )
+                              or item.get(
+                                  "learning"
+                              )
                               or ""
                           )
 
-                          if not isinstance(
-                              text,
-                              str
-                          ):
-                              text = str(text)
-
-                          text = text.strip()
+                          text = clean_text(
+                              text
+                          )
 
                       else:
                           continue
@@ -437,6 +695,10 @@ jobs:
               return context
 
 
+          # ==========================================================
+          # WEB SEARCH
+          # ==========================================================
+
           def normalize_search_result(
               result
           ):
@@ -447,20 +709,30 @@ jobs:
                   return None
 
               title = clean_text(
-                  result.get("title")
+                  result.get(
+                      "title"
+                  )
               )
 
               url = (
-                  result.get("href")
-                  or result.get("url")
+                  result.get(
+                      "href"
+                  )
+                  or result.get(
+                      "url"
+                  )
                   or ""
               )
 
               url = str(url).strip()
 
               snippet = clean_text(
-                  result.get("body")
-                  or result.get("snippet")
+                  result.get(
+                      "body"
+                  )
+                  or result.get(
+                      "snippet"
+                  )
                   or ""
               )
 
@@ -532,7 +804,7 @@ jobs:
               ):
                   print(
                       "WEB SEARCH INVALID: "
-                      "backend did not return a list"
+                      "expected result list"
                   )
                   return []
 
@@ -554,13 +826,19 @@ jobs:
                   if not result:
                       continue
 
-                  url = result["url"]
+                  url = result[
+                      "url"
+                  ]
 
                   if url in seen_urls:
                       continue
 
-                  seen_urls.add(url)
-                  results.append(result)
+                  seen_urls.add(
+                      url
+                  )
+                  results.append(
+                      result
+                  )
 
                   if (
                       len(results)
@@ -585,6 +863,10 @@ jobs:
 
               return results
 
+
+          # ==========================================================
+          # EVIDENCE
+          # ==========================================================
 
           def tokens(text):
               return set(
@@ -615,11 +897,14 @@ jobs:
               if not question_tokens:
                   return 0.0
 
-              return len(
-                  question_tokens.intersection(
-                      result_tokens
+              return round(
+                  len(
+                      question_tokens
+                      & result_tokens
                   )
-              ) / len(question_tokens)
+                  / len(question_tokens),
+                  3
+              )
 
 
           def evidence_assessment(
@@ -627,9 +912,13 @@ jobs:
               results
           ):
               domains = {
-                  result.get("domain")
+                  result.get(
+                      "domain"
+                  )
                   for result in results
-                  if result.get("domain")
+                  if result.get(
+                      "domain"
+                  )
               }
 
               strong_matches = [
@@ -653,7 +942,9 @@ jobs:
                   len(domains) >= 2
                   and strong_matches
               ):
-                  status = "partial_support"
+                  status = (
+                      "partial_support"
+                  )
 
               elif results:
                   status = (
@@ -679,6 +970,217 @@ jobs:
                   )
               }
 
+
+          # ==========================================================
+          # COLONY ACTION
+          #
+          # Only explicitly supported, non-financial action is
+          # executed here.
+          #
+          # No payment / bid / settlement operation is implemented.
+          # ==========================================================
+
+          def execute_colony_action(
+              classification
+          ):
+              action = classification.get(
+                  "action"
+              )
+
+              colony = classification.get(
+                  "colony"
+              )
+
+              if action != "join_colony":
+                  return {
+                      "status": "action_not_supported",
+                      "success": False,
+                      "action": action
+                  }
+
+              if not colony:
+                  return {
+                      "status": "missing_colony",
+                      "success": False,
+                      "action": action
+                  }
+
+              if not COLONY_API_KEY:
+                  return {
+                      "status": (
+                          "missing_colony_api_key"
+                      ),
+                      "success": False,
+                      "action": action,
+                      "colony": colony
+                  }
+
+              print(
+                  f"COLONY ACTION: "
+                  f"join_colony({colony})"
+              )
+
+              try:
+                  client = ColonyClient(
+                      COLONY_API_KEY
+                  )
+
+                  state = client.bootstrap()
+
+                  print(
+                      "COLONY BOOTSTRAP: "
+                      "success"
+                  )
+
+                  member_colonies = (
+                      state.get(
+                          "member_colonies",
+                          []
+                      )
+                      if isinstance(
+                          state,
+                          dict
+                      )
+                      else []
+                  )
+
+                  # --------------------------------------------------
+                  # Do not call join if the server already reports
+                  # the colony as an approved membership.
+                  # --------------------------------------------------
+
+                  existing_names = set()
+
+                  if isinstance(
+                      member_colonies,
+                      list
+                  ):
+                      for item in (
+                          member_colonies
+                      ):
+                          if isinstance(
+                              item,
+                              str
+                          ):
+                              existing_names.add(
+                                  item.lower()
+                              )
+
+                          elif isinstance(
+                              item,
+                              dict
+                          ):
+                              for key in (
+                                  "name",
+                                  "slug",
+                                  "colony",
+                                  "id"
+                              ):
+                                  value = item.get(
+                                      key
+                                  )
+
+                                  if value:
+                                      existing_names.add(
+                                          str(
+                                              value
+                                          ).lower()
+                                      )
+
+                  if (
+                      colony.lower()
+                      in existing_names
+                  ):
+                      print(
+                          "COLONY ACTION: "
+                          "already a member"
+                      )
+
+                      return {
+                          "status": (
+                              "already_member"
+                          ),
+                          "success": True,
+                          "action": action,
+                          "colony": colony
+                      }
+
+                  result = client.join_colony(
+                      colony
+                  )
+
+                  print(
+                      "COLONY ACTION: "
+                      "join request sent"
+                  )
+
+                  return {
+                      "status": (
+                          "join_requested"
+                      ),
+                      "success": True,
+                      "action": action,
+                      "colony": colony,
+                      "response": result
+                  }
+
+              except ColonyRateLimitError as exc:
+                  return {
+                      "status": "rate_limited",
+                      "success": False,
+                      "action": action,
+                      "colony": colony,
+                      "retry_after": getattr(
+                          exc,
+                          "retry_after",
+                          None
+                      )
+                  }
+
+              except ColonyNetworkError as exc:
+                  return {
+                      "status": "network_error",
+                      "success": False,
+                      "action": action,
+                      "colony": colony,
+                      "error": str(exc)
+                  }
+
+              except ColonyAPIError as exc:
+                  return {
+                      "status": "colony_api_error",
+                      "success": False,
+                      "action": action,
+                      "colony": colony,
+                      "status_code": getattr(
+                          exc,
+                          "status",
+                          None
+                      ),
+                      "code": getattr(
+                          exc,
+                          "code",
+                          None
+                      ),
+                      "error": str(exc)
+                  }
+
+              except Exception as exc:
+                  return {
+                      "status": "unexpected_error",
+                      "success": False,
+                      "action": action,
+                      "colony": colony,
+                      "error": (
+                          f"{type(exc).__name__}: "
+                          f"{exc}"
+                      )
+                  }
+
+
+          # ==========================================================
+          # LOAD STATE
+          # ==========================================================
 
           core_memory = load_json(
               CORE_MEMORY_FILE,
@@ -762,6 +1264,10 @@ jobs:
               "history"
           )
 
+          # ==========================================================
+          # DISCOVER AND SELECT WORK
+          # ==========================================================
+
           candidates = collect_candidates(
               core_memory,
               core_runtime
@@ -828,6 +1334,11 @@ jobs:
 
           completed_now = 0
           retry_now = 0
+          unknown_now = 0
+
+          # ==========================================================
+          # EXECUTION LOOP
+          # ==========================================================
 
           for work in selected:
               request_id = work[
@@ -843,102 +1354,199 @@ jobs:
                   f"WORK START: {question}"
               )
 
-              results = search_web(
+              classification = classify_work(
                   question,
-                  MAX_WEB_RESULTS_PER_QUERY
-              )
-
-              if (
-                  len(results)
-                  > MAX_TOTAL_WEB_RESULTS
-              ):
-                  results = results[
-                      :MAX_TOTAL_WEB_RESULTS
-                  ]
-
-              evidence = (
-                  evidence_assessment(
-                      question,
-                      results
+                  work.get(
+                      "original"
+                  ),
+                  work.get(
+                      "source"
                   )
               )
 
-              status = evidence[
-                  "status"
+              work_type = classification[
+                  "type"
               ]
 
-              if (
-                  status
-                  == "multi_source_support"
-              ):
-                  conclusion = (
-                      "The available search "
-                      "evidence supports the "
-                      "research question across "
-                      "multiple independent "
-                      "domains."
+              print(
+                  "WORK CLASSIFICATION: "
+                  f"{work_type} | "
+                  f"confidence="
+                  f"{classification['confidence']} | "
+                  f"tool="
+                  f"{classification['tool']}"
+              )
+
+              result = None
+              terminal = False
+
+              # ------------------------------------------------------
+              # UNKNOWN
+              # ------------------------------------------------------
+
+              if work_type == "unknown":
+                  unknown_now += 1
+
+                  result = {
+                      "status": "unknown",
+                      "success": False,
+                      "reason": (
+                          classification[
+                              "reason"
+                          ]
+                      )
+                  }
+
+                  print(
+                      "WORK DEFERRED: "
+                      "unknown work type"
                   )
 
-                  next_step = (
-                      "Consolidate the supported "
-                      "finding into Memory & "
-                      "Knowledge after source "
-                      "review."
+              # ------------------------------------------------------
+              # RESEARCH / VERIFY
+              # ------------------------------------------------------
+
+              elif work_type in {
+                  "research",
+                  "verify"
+              }:
+                  results = search_web(
+                      question,
+                      MAX_WEB_RESULTS_PER_QUERY
                   )
 
-              elif (
-                  status
-                  == "partial_support"
-              ):
-                  conclusion = (
-                      "The search found relevant "
-                      "evidence, but the result "
-                      "is not fully verified "
-                      "across independent sources."
+                  if (
+                      len(results)
+                      > MAX_TOTAL_WEB_RESULTS
+                  ):
+                      results = results[
+                          :MAX_TOTAL_WEB_RESULTS
+                      ]
+
+                  evidence = (
+                      evidence_assessment(
+                          question,
+                          results
+                      )
                   )
 
-                  next_step = (
-                      "Keep the work open and "
-                      "seek additional independent "
-                      "evidence before treating "
-                      "the finding as confirmed."
+                  status = evidence[
+                      "status"
+                  ]
+
+                  if (
+                      status
+                      == "multi_source_support"
+                  ):
+                      conclusion = (
+                          "The available search "
+                          "evidence supports the "
+                          "question across multiple "
+                          "independent domains."
+                      )
+
+                      next_step = (
+                          "Review the underlying "
+                          "sources before promoting "
+                          "the finding to confirmed "
+                          "knowledge."
+                      )
+
+                  elif (
+                      status
+                      == "partial_support"
+                  ):
+                      conclusion = (
+                          "Relevant evidence was "
+                          "found, but independent "
+                          "source coverage remains "
+                          "limited."
+                      )
+
+                      next_step = (
+                          "Keep the work open and "
+                          "seek additional evidence."
+                      )
+
+                  elif (
+                      status
+                      == "insufficient_verification"
+                  ):
+                      conclusion = (
+                          "Search results were found, "
+                          "but the available evidence "
+                          "is insufficient for reliable "
+                          "verification."
+                      )
+
+                      next_step = (
+                          "Keep the work open; do not "
+                          "promote the result to a "
+                          "confirmed fact."
+                      )
+
+                  else:
+                      conclusion = (
+                          "No usable search evidence "
+                          "was retrieved."
+                      )
+
+                      next_step = (
+                          "Retry later or refine the "
+                          "research question."
+                      )
+
+                  result = {
+                      "status": status,
+                      "success": (
+                          status
+                          in {
+                              "multi_source_support",
+                              "partial_support"
+                          }
+                      ),
+                      "evidence": evidence,
+                      "sources": results,
+                      "conclusion": conclusion,
+                      "next_step": next_step
+                  }
+
+                  if status in {
+                      "multi_source_support",
+                      "partial_support"
+                  }:
+                      terminal = True
+                  else:
+                      retry_now += 1
+
+              # ------------------------------------------------------
+              # ACTION
+              # ------------------------------------------------------
+
+              elif work_type == "action":
+                  result = execute_colony_action(
+                      classification
                   )
 
-              elif (
-                  status
-                  == "insufficient_verification"
-              ):
-                  conclusion = (
-                      "Search results were found, "
-                      "but the available evidence "
-                      "is insufficient for reliable "
-                      "verification."
-                  )
+                  if result.get(
+                      "success"
+                  ):
+                      terminal = True
+                      completed_now += 1
+                  else:
+                      retry_now += 1
 
-                  next_step = (
-                      "Retry with broader or more "
-                      "specific research before "
-                      "considering the work resolved."
-                  )
-
-              else:
-                  conclusion = (
-                      "No usable search evidence "
-                      "was retrieved for this work "
-                      "item."
-                  )
-
-                  next_step = (
-                      "Retry the research later; "
-                      "the absence of evidence is "
-                      "not treated as a completed "
-                      "result."
-                  )
+              # ------------------------------------------------------
+              # Persist the observed work result.
+              # ------------------------------------------------------
 
               result_id = stable_id(
                   "result",
-                  f"{request_id}:"
-                  f"{now_iso()}"
+                  (
+                      request_id
+                      + "|"
+                      + now_iso()
+                  )
               )
 
               work_result = {
@@ -953,48 +1561,62 @@ jobs:
                       "priority",
                       0
                   ),
-                  "evidence": evidence,
-                  "sources": results,
+                  "classification": classification,
+                  "result": result,
                   "knowledge_context_used": (
                       knowledge_context
-                  ),
-                  "conclusion": conclusion,
-                  "next_step": next_step,
-                  "status": status
+                  )
               }
 
               history.append(
                   work_result
               )
 
-              if status in {
-                  "multi_source_support",
-                  "partial_support"
-              }:
+              # ------------------------------------------------------
+              # Only terminally successful work becomes completed.
+              # Unknown and failed work remains retryable.
+              # ------------------------------------------------------
+
+              if terminal:
                   completed.append(
                       {
-                          "request_id": (
-                              request_id
-                          ),
+                          "request_id": request_id,
                           "timestamp": now_iso(),
-                          "status": "completed",
-                          "result_id": result_id
+                          "status": (
+                              result.get(
+                                  "status",
+                                  "completed"
+                              )
+                              if isinstance(
+                                  result,
+                                  dict
+                              )
+                              else "completed"
+                          ),
+                          "result_id": result_id,
+                          "work_type": work_type
                       }
                   )
 
-                  completed_now += 1
+                  if work_type in {
+                      "research",
+                      "verify"
+                  }:
+                      completed_now += 1
 
-              else:
-                  retry_now += 1
+              elif work_type == "unknown":
+                  pass
 
               print(
                   "WORK RESULT: "
-                  f"{status} | "
-                  f"sources="
-                  f"{evidence['source_count']} | "
-                  f"domains="
-                  f"{evidence['domain_count']}"
+                  f"type={work_type} | "
+                  f"status="
+                  f"{result.get('status') if isinstance(result, dict) else 'none'}"
               )
+
+          # ==========================================================
+          # LIMIT HISTORY
+          # ==========================================================
 
           if len(history) > MAX_HISTORY_ITEMS:
               history[:] = history[
@@ -1006,18 +1628,27 @@ jobs:
                   -MAX_HISTORY_ITEMS:
               ]
 
-          work_state["version"] = 4
+          work_state[
+              "version"
+          ] = 5
 
-          work_state["last_run"] = now_iso()
+          work_state[
+              "last_run"
+          ] = now_iso()
 
-          work_state["run_count"] = int(
+          work_state[
+              "run_count"
+          ] = int(
               work_state.get(
                   "run_count",
                   0
               )
           ) + 1
 
-          work_state["last_summary"] = {
+          work_state[
+              "last_summary"
+          ] = {
+              "timestamp": now_iso(),
               "candidates": len(
                   candidates
               ),
@@ -1026,15 +1657,25 @@ jobs:
               ),
               "completed": completed_now,
               "retry_pending": retry_now,
+              "unknown_deferred": unknown_now,
               "history_size": len(
                   history
               )
           }
 
+          # ----------------------------------------------------------
+          # The factory owns only its own state.
+          # Memory & Knowledge remains the consolidation layer.
+          # ----------------------------------------------------------
+
           save_json(
               WORK_FILE,
               work_state
           )
+
+          # ==========================================================
+          # SUMMARY
+          # ==========================================================
 
           print("")
           print(
@@ -1062,14 +1703,21 @@ jobs:
           )
 
           print(
+              f"Work unknown/deferred: "
+              f"{unknown_now}"
+          )
+
+          print(
               f"History size: "
               f"{len(history)}"
           )
 
           print("")
           print(
-              "=== QUESTION -> RESEARCH "
-              "-> EVIDENCE -> RESULT ==="
+              "=== CLASSIFY -> "
+              "CHOOSE TOOL -> "
+              "EXECUTE -> "
+              "OBSERVE -> RESULT ==="
           )
 
           print(
@@ -1091,5 +1739,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "NØX: update work factory"
+          git commit -m "NØX: evolve work factory classification"
           git push
