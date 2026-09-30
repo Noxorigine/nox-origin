@@ -22,7 +22,7 @@ env:
   MAX_WEB_RESULTS_PER_QUERY: "5"
   MAX_TOTAL_WEB_RESULTS: "12"
   MAX_KNOWLEDGE_CONTEXT: "20"
-  WEB_TIMEOUT_SECONDS: "12"
+  WEB_TIMEOUT_SECONDS: "15"
   MAX_HISTORY_ITEMS: "100"
 
 jobs:
@@ -39,35 +39,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade ddgs colony-sdk
-
       - name: Run NØX Work Factory
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           set -euo pipefail
 
           python3 <<'PY'
           import hashlib
+          import html
           import json
           import os
           import re
+          import urllib.parse
+          import urllib.request
           from datetime import datetime, timezone
           from pathlib import Path
-          from urllib.parse import urlparse
-
-          from ddgs import DDGS
-
-          from colony_sdk import (
-              ColonyAPIError,
-              ColonyClient,
-              ColonyNetworkError,
-              ColonyRateLimitError,
-          )
 
 
           # ==========================================================
@@ -114,22 +99,9 @@ jobs:
               os.environ["MAX_HISTORY_ITEMS"]
           )
 
-          COLONY_API_KEY = os.environ.get(
-              "COLONY_API_KEY",
-              ""
-          )
-
-
-          # ==========================================================
-          # TIME
-          # ==========================================================
-
-          def now_iso():
-              return (
-                  datetime.now(timezone.utc)
-                  .replace(microsecond=0)
-                  .isoformat()
-              )
+          NOW = datetime.now(
+              timezone.utc
+          ).isoformat()
 
 
           # ==========================================================
@@ -146,12 +118,10 @@ jobs:
                       encoding="utf-8"
                   ) as handle:
                       return json.load(handle)
-
               except Exception as exc:
                   print(
-                      f"LOAD FAILED: {path} | {exc}"
+                      f"WARNING: cannot read {path}: {exc}"
                   )
-
                   return default
 
 
@@ -176,9 +146,47 @@ jobs:
                       indent=2
                   )
 
-                  handle.write("\n")
-
               temporary.replace(path)
+
+
+          def clean_text(value, limit=1200):
+              if value is None:
+                  return ""
+
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  str(value)
+              ).strip()
+
+              return text[:limit]
+
+
+          def stable_id(kind, value):
+              raw = (
+                  f"{kind}|{value}"
+                  .strip()
+                  .lower()
+              )
+
+              return hashlib.sha256(
+                  raw.encode("utf-8")
+              ).hexdigest()[:20]
+
+
+          def first_value(item, keys):
+              if not isinstance(item, dict):
+                  return ""
+
+              for key in keys:
+                  value = clean_text(
+                      item.get(key)
+                  )
+
+                  if value:
+                      return value
+
+              return ""
 
 
           def ensure_list(container, key):
@@ -191,105 +199,242 @@ jobs:
               return container[key]
 
 
-          def clean_text(
-              value,
-              limit=None
+          # ==========================================================
+          # LOAD STATE
+          # ==========================================================
+
+          core_memory = load_json(
+              CORE_MEMORY_FILE,
+              {}
+          )
+
+          if not isinstance(
+              core_memory,
+              dict
           ):
-              if value is None:
-                  return ""
-
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  str(value)
-              ).strip()
-
-              if limit:
-                  return text[:limit]
-
-              return text
+              core_memory = {}
 
 
-          def stable_id(
-              prefix,
-              value
+          core_runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {}
+          )
+
+          if not isinstance(
+              core_runtime,
+              dict
           ):
-              normalized = re.sub(
-                  r"\s+",
-                  " ",
-                  str(value).strip().lower()
+              core_runtime = {}
+
+
+          knowledge = load_json(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          if not isinstance(
+              knowledge,
+              dict
+          ):
+              knowledge = {}
+
+
+          work_state = load_json(
+              WORK_FILE,
+              {}
+          )
+
+          if not isinstance(
+              work_state,
+              dict
+          ):
+              work_state = {}
+
+
+          for key in (
+              "observations",
+              "decisions",
+              "actions",
+              "learnings",
+              "cognitive_cases",
+              "beliefs",
+              "failures"
+          ):
+              ensure_list(
+                  core_memory,
+                  key
               )
 
-              digest = hashlib.sha256(
-                  normalized.encode("utf-8")
-              ).hexdigest()[:16]
 
-              return f"{prefix}-{digest}"
+          for key in (
+              "observations",
+              "facts",
+              "experiences",
+              "hypotheses",
+              "results",
+              "learnings",
+              "sources"
+          ):
+              ensure_list(
+                  knowledge,
+                  key
+              )
+
+
+          for key in (
+              "completed",
+              "history"
+          ):
+              ensure_list(
+                  work_state,
+                  key
+              )
 
 
           # ==========================================================
-          # WORK DISCOVERY
+          # WORK TYPE CLASSIFICATION
+          #
+          # IMPORTANT:
+          # The Work Factory is a research/evidence subsystem.
+          #
+          # It MUST NOT consume ordinary Colony actions such as:
+          #   - reply
+          #   - follow
+          #   - join
+          #   - vote
+          #   - DM
+          #
+          # Those belong to the action/presence layer.
           # ==========================================================
 
-          def first_nonempty(
-              item,
-              keys
-          ):
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  return ""
-
-              for key in keys:
-                  value = item.get(key)
-
-                  if (
-                      isinstance(value, str)
-                      and value.strip()
-                  ):
-                      return clean_text(
-                          value,
-                          800
-                      )
-
-              return ""
+          RESEARCH_TYPES = {
+              "research",
+              "research_request",
+              "web_research",
+              "verification",
+              "verify",
+              "question",
+              "analysis",
+              "fact_check",
+              "factcheck",
+              "investigation"
+          }
 
 
-          def normalize_work_item(
-              item,
-              source
-          ):
-              if isinstance(
-                  item,
-                  str
-              ):
-                  question = clean_text(
+          ACTION_TYPES = {
+              "action",
+              "reply",
+              "comment",
+              "follow",
+              "join",
+              "vote",
+              "dm",
+              "message",
+              "post",
+              "publish",
+              "react",
+              "echo",
+              "social"
+          }
+
+
+          ACTION_PREFIXES = (
+              "reply ",
+              "reply to ",
+              "answer @",
+              "follow ",
+              "join ",
+              "vote ",
+              "dm ",
+              "send message ",
+              "comment on ",
+              "react to ",
+              "echo "
+          )
+
+
+          RESEARCH_PREFIXES = (
+              "research ",
+              "verify ",
+              "verification ",
+              "fact check ",
+              "fact-check ",
+              "investigate ",
+              "check whether ",
+              "check if ",
+              "determine whether ",
+              "determine if ",
+              "find out whether ",
+              "find out if "
+          )
+
+
+          def normalize_type(value):
+              return clean_text(
+                  value,
+                  80
+              ).lower().replace(
+                  "-",
+                  "_"
+              ).replace(
+                  " ",
+                  "_"
+              )
+
+
+          def looks_like_action_text(text):
+              lowered = clean_text(
+                  text,
+                  500
+              ).lower()
+
+              return any(
+                  lowered.startswith(prefix)
+                  for prefix in ACTION_PREFIXES
+              )
+
+
+          def looks_like_research_text(text):
+              lowered = clean_text(
+                  text,
+                  500
+              ).lower()
+
+              return any(
+                  lowered.startswith(prefix)
+                  for prefix in RESEARCH_PREFIXES
+              )
+
+
+          def classify_work(item, source_type):
+              explicit_type = normalize_type(
+                  first_value(
                       item,
-                      800
+                      (
+                          "work_type",
+                          "task_type",
+                          "intent",
+                          "type",
+                          "kind"
+                      )
+                  )
+              )
+
+              if explicit_type in ACTION_TYPES:
+                  return (
+                      "action",
+                      "high",
+                      "non_research_action"
                   )
 
-                  if not question:
-                      return None
+              if explicit_type in RESEARCH_TYPES:
+                  return (
+                      explicit_type,
+                      "high",
+                      "explicit_research"
+                  )
 
-                  return {
-                      "request_id": stable_id(
-                          "work",
-                          question
-                      ),
-                      "question": question,
-                      "priority": 0,
-                      "source": source,
-                      "original": item,
-                  }
-
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  return None
-
-              question = first_nonempty(
+              question = first_value(
                   item,
                   (
                       "question",
@@ -297,745 +442,433 @@ jobs:
                       "query",
                       "problem",
                       "objective",
-                      "task",
-                      "title",
-                      "description",
-                      "text",
+                      "task"
+                  )
+              )
+
+              if looks_like_action_text(question):
+                  return (
+                      "action",
+                      "high",
+                      "action_language"
+                  )
+
+              if looks_like_research_text(question):
+                  return (
+                      "research",
+                      "medium",
+                      "research_language"
+                  )
+
+              # A cognitive case is accepted only when it explicitly
+              # declares that it requires research.
+              if source_type == "cognitive_case":
+                  research_flag = str(
+                      item.get(
+                          "needs_research",
+                          ""
+                      )
+                  ).lower()
+
+                  if research_flag in {
+                      "true",
+                      "1",
+                      "yes"
+                  }:
+                      return (
+                          "research",
+                          "high",
+                          "explicit_case_research"
+                      )
+
+              return (
+                  "unknown",
+                  "low",
+                  "no_explicit_research_intent"
+              )
+
+
+          # ==========================================================
+          # CANDIDATE DISCOVERY
+          # ==========================================================
+
+          candidates = []
+
+
+          def add_candidate(
+              item,
+              source_type
+          ):
+              if isinstance(item, dict):
+                  question = first_value(
+                      item,
+                      (
+                          "question",
+                          "research_question",
+                          "query",
+                          "problem",
+                          "objective",
+                          "task"
+                      )
+                  )
+
+                  if not question:
+                      return
+
+                  work_id = clean_text(
+                      item.get("id"),
+                      200
+                  )
+
+                  priority = item.get(
+                      "priority",
+                      0
+                  )
+
+                  try:
+                      priority = int(
+                          priority or 0
+                      )
+                  except Exception:
+                      priority = 0
+
+                  work_type, confidence, reason = (
+                      classify_work(
+                          item,
+                          source_type
+                      )
+                  )
+
+                  candidates.append(
+                      {
+                          "question": clean_text(
+                              question,
+                              500
+                          ),
+                          "source_type": source_type,
+                          "source_id": work_id,
+                          "priority": priority,
+                          "work_type": work_type,
+                          "confidence": confidence,
+                          "classification_reason": reason,
+                          "context": item
+                      }
+                  )
+
+              else:
+                  question = clean_text(
+                      item,
+                      500
+                  )
+
+                  if not question:
+                      return
+
+                  temporary = {
+                      "question": question
+                  }
+
+                  work_type, confidence, reason = (
+                      classify_work(
+                          temporary,
+                          source_type
+                      )
+                  )
+
+                  candidates.append(
+                      {
+                          "question": question,
+                          "source_type": source_type,
+                          "source_id": "",
+                          "priority": 0,
+                          "work_type": work_type,
+                          "confidence": confidence,
+                          "classification_reason": reason,
+                          "context": {}
+                      }
+                  )
+
+
+          def consume_collection(
+              value,
+              source_type
+          ):
+              if not isinstance(
+                  value,
+                  list
+              ):
+                  return
+
+              for item in value:
+                  add_candidate(
+                      item,
+                      source_type
+                  )
+
+
+          consume_collection(
+              core_runtime.get(
+                  "work_requests"
+              ),
+              "work_request"
+          )
+
+          consume_collection(
+              core_runtime.get(
+                  "research_requests"
+              ),
+              "research_request"
+          )
+
+          consume_collection(
+              core_runtime.get(
+                  "web_queries"
+              ),
+              "web_query"
+          )
+
+
+          # ==========================================================
+          # COGNITIVE CASES
+          # ==========================================================
+
+          for case in reversed(
+              core_memory.get(
+                  "cognitive_cases",
+                  []
+              )
+          ):
+              if not isinstance(
+                  case,
+                  dict
+              ):
+                  continue
+
+              status = clean_text(
+                  case.get(
+                      "status",
+                      ""
+                  )
+              ).lower()
+
+              if status in {
+                  "closed",
+                  "completed",
+                  "resolved",
+                  "discarded"
+              }:
+                  continue
+
+              question = first_value(
+                  case,
+                  (
+                      "question",
+                      "research_question",
+                      "problem",
+                      "query"
                   )
               )
 
               if not question:
-                  return None
+                  continue
 
-              request_id = (
-                  item.get("request_id")
-                  or item.get("id")
-                  or stable_id(
-                      "work",
-                      question
-                  )
+              add_candidate(
+                  case,
+                  "cognitive_case"
               )
 
-              try:
-                  priority = int(
-                      item.get(
-                          "priority",
-                          0
-                      )
-                  )
-              except Exception:
-                  priority = 0
 
-              return {
-                  "request_id": str(
-                      request_id
-                  ),
-                  "question": question,
-                  "priority": priority,
-                  "source": source,
-                  "original": item,
-              }
+          # ==========================================================
+          # COMPLETION / RETRY STATE
+          # ==========================================================
 
-
-          def collect_candidates(
-              core_memory,
-              core_runtime
-          ):
-              candidates = []
-
-              for key in (
-                  "work_requests",
-                  "research_requests",
-                  "web_queries",
-              ):
-                  values = core_runtime.get(
-                      key,
-                      []
-                  )
-
-                  if not isinstance(
-                      values,
-                      list
-                  ):
-                      continue
-
-                  for item in values:
-                      normalized = (
-                          normalize_work_item(
-                              item,
-                              key
-                          )
-                      )
-
-                      if normalized:
-                          candidates.append(
-                              normalized
-                          )
-
-              cases = core_memory.get(
-                  "cognitive_cases",
-                  []
-              )
-
-              if isinstance(
-                  cases,
-                  list
-              ):
-                  for case in cases:
-                      if not isinstance(
-                          case,
-                          dict
-                      ):
-                          continue
-
-                      status = clean_text(
-                          case.get(
-                              "status",
-                              ""
-                          )
-                      ).lower()
-
-                      if status in {
-                          "closed",
-                          "completed",
-                          "resolved",
-                          "discarded",
-                      }:
-                          continue
-
-                      normalized = (
-                          normalize_work_item(
-                              case,
-                              "cognitive_case"
-                          )
-                      )
-
-                      if normalized:
-                          candidates.append(
-                              normalized
-                          )
-
-              deduped = {}
-
-              for candidate in candidates:
-                  request_id = candidate[
+          completed_ids = {
+              clean_text(
+                  item.get(
                       "request_id"
-                  ]
-
-                  existing = deduped.get(
-                      request_id
                   )
-
-                  if existing is None:
-                      deduped[
-                          request_id
-                      ] = candidate
-
-                  elif (
-                      candidate["priority"]
-                      > existing["priority"]
-                  ):
-                      deduped[
-                          request_id
-                      ] = candidate
-
-              return list(
-                  deduped.values()
               )
-
-
-          # ==========================================================
-          # STRUCTURED ACTION EXTRACTION
-          #
-          # ACTIONS ARE TESTED BEFORE RESEARCH/VERIFY.
-          #
-          # This is critical:
-          #
-          # "Follow #verification"
-          #
-          # contains the word "verification", but the leading intent
-          # is FOLLOW_TAG. It must NEVER reach the Web classifier.
-          # ==========================================================
-
-          def extract_explicit_action(
-              text,
-              original
-          ):
-              lowered = clean_text(
-                  text
-              ).lower()
-
-              # ------------------------------------------------------
-              # Explicit structured type from Core.
-              # ------------------------------------------------------
-
+              for item in work_state["completed"]
               if isinstance(
-                  original,
+                  item,
                   dict
-              ):
-                  explicit_type = clean_text(
-                      original.get("type")
-                      or original.get("work_type")
-                      or original.get("kind")
-                      or original.get("action")
-                  ).lower()
-
-                  aliases = {
-                      "action": "action",
-                      "colony_action": "action",
-                      "join": "join_colony",
-                      "join_colony": "join_colony",
-                      "follow": "follow_user",
-                      "follow_user": "follow_user",
-                      "follow_tag": "follow_tag",
-                      "reply": "reply",
-                      "comment": "comment",
-                      "create_comment": "comment",
-                      "post": "create_post",
-                      "create_post": "create_post",
-                  }
-
-                  if explicit_type in aliases:
-                      action = aliases[
-                          explicit_type
-                      ]
-
-                      if action == "action":
-                          action = ""
-
-                      if action:
-                          return action
-
-              # ------------------------------------------------------
-              # JOIN COLONY
-              # ------------------------------------------------------
-
-              if re.fullmatch(
-                  r"join\s+(?:c/)?"
-                  r"[a-z0-9][a-z0-9_-]*",
-                  lowered
-              ):
-                  return "join_colony"
-
-              if re.fullmatch(
-                  r"join\s+colony\s+"
-                  r"[a-z0-9][a-z0-9_-]*",
-                  lowered
-              ):
-                  return "join_colony"
-
-              # ------------------------------------------------------
-              # FOLLOW TAG
-              #
-              # "Follow #verification"
-              # "follow tag #verification"
-              # ------------------------------------------------------
-
-              if re.fullmatch(
-                  r"follow\s+#?[a-z0-9_-]+",
-                  lowered
-              ):
-                  return "follow_tag"
-
-              if re.fullmatch(
-                  r"follow\s+tag\s+#?[a-z0-9_-]+",
-                  lowered
-              ):
-                  return "follow_tag"
-
-              # ------------------------------------------------------
-              # FOLLOW USER
-              #
-              # "Follow @agent"
-              # "follow user @agent"
-              # ------------------------------------------------------
-
-              if re.fullmatch(
-                  r"follow\s+@[a-z0-9_-]+",
-                  lowered
-              ):
-                  return "follow_user"
-
-              if re.fullmatch(
-                  r"follow\s+user\s+@[a-z0-9_-]+",
-                  lowered
-              ):
-                  return "follow_user"
-
-              # ------------------------------------------------------
-              # REPLY / COMMENT
-              #
-              # Textual replies are actions, not research.
-              # Execution requires an identifiable target and body.
-              # ------------------------------------------------------
-
-              if re.search(
-                  r"^\s*reply\b",
-                  lowered
-              ):
-                  return "reply"
-
-              if re.search(
-                  r"^\s*respond\b",
-                  lowered
-              ):
-                  return "reply"
-
-              if re.search(
-                  r"^\s*comment\b",
-                  lowered
-              ):
-                  return "comment"
-
-              # ------------------------------------------------------
-              # CREATE POST
-              # ------------------------------------------------------
-
-              if re.search(
-                  r"^\s*(create|write|publish|make)"
-                  r"\s+(a\s+)?post\b",
-                  lowered
-              ):
-                  return "create_post"
-
-              if re.search(
-                  r"^\s*post\s+to\b",
-                  lowered
-              ):
-                  return "create_post"
-
-              return None
+              )
+          }
 
 
           # ==========================================================
-          # RESEARCH CLASSIFICATION
+          # NORMALIZE / DEDUPLICATE
           # ==========================================================
 
-          VERIFY_PATTERNS = (
-              r"\bverify\s+whether\b",
-              r"\bverify\s+if\b",
-              r"\bverify\s+that\b",
-              r"\bverification\s+of\b",
-              r"\bcheck\s+whether\b",
-              r"\bcheck\s+if\b",
-              r"\bcheck\s+that\b",
-              r"\bvalidate\s+whether\b",
-              r"\bvalidate\s+if\b",
-              r"\bconfirm\s+whether\b",
-              r"\bconfirm\s+if\b",
-              r"\bconfirm\s+that\b",
-              r"\bcheck\s+the\s+paper\b",
-              r"\bcheck\s+the\s+source\b",
-              r"\bcheck\s+the\s+claim\b",
-              r"\bcitation\s+accuracy\b",
-              r"^verify\b",
+          unique = {}
+
+          for candidate in candidates:
+              work_id = stable_id(
+                  "work",
+                  candidate["question"]
+              )
+
+              if work_id in completed_ids:
+                  continue
+
+              candidate["id"] = work_id
+
+              existing = unique.get(
+                  work_id
+              )
+
+              if (
+                  existing is None
+                  or candidate["priority"]
+                  > existing["priority"]
+              ):
+                  unique[work_id] = candidate
+
+
+          ordered = sorted(
+              unique.values(),
+              key=lambda item: (
+                  -item["priority"],
+                  item["id"]
+              )
           )
 
 
-          RESEARCH_PATTERNS = (
-              r"^research\b",
-              r"\bresearch\s+whether\b",
-              r"\bresearch\s+how\b",
-              r"\bresearch\s+why\b",
-              r"\binvestigate\b",
-              r"\bfind\s+out\b",
-              r"\blook\s+up\b",
-              r"\bwhat\s+is\b",
-              r"\bwhat\s+are\b",
-              r"\bhow\s+does\b",
-              r"\bhow\s+do\b",
-              r"\bwhy\s+does\b",
-              r"\bwhy\s+do\b",
-              r"\bcompare\b",
-              r"\bfind\s+evidence\b",
+          # ==========================================================
+          # SELECT ONLY RESEARCH WORK
+          #
+          # Actions and unknown intents are deliberately excluded.
+          # They are not failures of the factory.
+          # ==========================================================
+
+          research_candidates = [
+              item
+              for item in ordered
+              if item["work_type"]
+              in RESEARCH_TYPES
+              or item["work_type"] == "research"
+          ]
+
+
+          deferred_actions = [
+              item
+              for item in ordered
+              if item["work_type"] == "action"
+          ]
+
+
+          deferred_unknown = [
+              item
+              for item in ordered
+              if item["work_type"] == "unknown"
+          ]
+
+
+          work_items = research_candidates[
+              :MAX_WORK_ITEMS
+          ]
+
+
+          print(
+              f"Work candidates: "
+              f"{len(candidates)}"
           )
 
+          print(
+              f"Research candidates: "
+              f"{len(research_candidates)}"
+          )
 
-          def classify_work(
-              question,
-              original,
-              source
-          ):
-              text = clean_text(
-                  question,
-                  800
-              )
+          print(
+              f"Research selected: "
+              f"{len(work_items)}"
+          )
 
-              lowered = text.lower()
+          print(
+              f"Actions deferred: "
+              f"{len(deferred_actions)}"
+          )
 
-              # ------------------------------------------------------
-              # 1. ACTIONS FIRST.
-              #
-              # This prevents words such as "verification" inside
-              # tags/usernames from hijacking the classification.
-              # ------------------------------------------------------
-
-              action = extract_explicit_action(
-                  text,
-                  original
-              )
-
-              if action:
-                  action_details = {
-                      "type": "action",
-                      "action": action,
-                      "confidence": "high",
-                      "tool": "colony_sdk",
-                      "reason": (
-                          "Explicit Colony/social "
-                          "action detected before "
-                          "research classification."
-                      ),
-                  }
-
-                  # Extract action parameters.
-                  if action == "join_colony":
-                      match = re.search(
-                          r"join(?:\s+colony)?\s+"
-                          r"(?:c/)?"
-                          r"([a-z0-9][a-z0-9_-]*)",
-                          lowered
-                      )
-
-                      if match:
-                          action_details[
-                              "colony"
-                          ] = match.group(1)
-
-                  elif action == "follow_tag":
-                      match = re.search(
-                          r"(?:follow(?:\s+tag)?)\s+"
-                          r"#?([a-z0-9_-]+)",
-                          lowered
-                      )
-
-                      if match:
-                          action_details[
-                              "tag"
-                          ] = match.group(1)
-
-                  elif action == "follow_user":
-                      match = re.search(
-                          r"(?:follow(?:\s+user)?)\s+"
-                          r"@([a-z0-9_-]+)",
-                          lowered
-                      )
-
-                      if match:
-                          action_details[
-                              "username"
-                          ] = match.group(1)
-
-                  return action_details
-
-              # ------------------------------------------------------
-              # 2. Only now inspect research language.
-              #
-              # A bare "#verification" no longer qualifies.
-              # ------------------------------------------------------
-
-              for pattern in VERIFY_PATTERNS:
-                  if re.search(
-                      pattern,
-                      lowered
-                  ):
-                      return {
-                          "type": "verify",
-                          "confidence": "high",
-                          "tool": "web",
-                          "reason": (
-                              "Explicit verification "
-                              "intent detected."
-                          ),
-                      }
-
-              for pattern in RESEARCH_PATTERNS:
-                  if re.search(
-                      pattern,
-                      lowered
-                  ):
-                      return {
-                          "type": "research",
-                          "confidence": "medium",
-                          "tool": "web",
-                          "reason": (
-                              "Explicit information-"
-                              "seeking intent detected."
-                          ),
-                      }
-
-              # ------------------------------------------------------
-              # 3. Unknown is safer than guessing.
-              # ------------------------------------------------------
-
-              return {
-                  "type": "unknown",
-                  "confidence": "low",
-                  "tool": "none",
-                  "reason": (
-                      "No supported work intent "
-                      "could be established safely."
-                  ),
-              }
+          print(
+              f"Unknown deferred: "
+              f"{len(deferred_unknown)}"
+          )
 
 
           # ==========================================================
           # KNOWLEDGE CONTEXT
+          #
+          # Existing knowledge is contextual evidence only.
+          # It is never treated as proof.
           # ==========================================================
 
-          def build_knowledge_context(
-              knowledge
+          context_items = []
+
+          for kind in (
+              "facts",
+              "experiences",
+              "hypotheses",
+              "results",
+              "learnings"
           ):
-              context = []
-
-              for category in (
-                  "facts",
-                  "experiences",
-                  "hypotheses",
-                  "results",
-                  "learnings",
+              for item in reversed(
+                  knowledge.get(kind, [])
               ):
-                  values = knowledge.get(
-                      category,
-                      []
-                  )
-
                   if not isinstance(
-                      values,
-                      list
+                      item,
+                      dict
                   ):
                       continue
 
-                  for item in values:
-                      if isinstance(
-                          item,
-                          str
-                      ):
-                          text = clean_text(
-                              item
-                          )
-
-                      elif isinstance(
-                          item,
-                          dict
-                      ):
-                          text = clean_text(
-                              item.get(
-                                  "summary"
-                              )
-                              or item.get(
-                                  "text"
-                              )
-                              or item.get(
-                                  "content"
-                              )
-                              or item.get(
-                                  "claim"
-                              )
-                              or item.get(
-                                  "learning"
-                              )
-                              or ""
-                          )
-
-                      else:
-                          continue
-
-                      if not text:
-                          continue
-
-                      context.append(
-                          {
-                              "type": category,
-                              "text": text,
-                          }
-                      )
-
-                      if (
-                          len(context)
-                          >= MAX_KNOWLEDGE_CONTEXT
-                      ):
-                          return context
-
-              return context
-
-
-          # ==========================================================
-          # WEB SEARCH
-          # ==========================================================
-
-          def normalize_search_result(
-              result
-          ):
-              if not isinstance(
-                  result,
-                  dict
-              ):
-                  return None
-
-              title = clean_text(
-                  result.get(
-                      "title"
-                  )
-              )
-
-              url = (
-                  result.get(
-                      "href"
-                  )
-                  or result.get(
-                      "url"
-                  )
-                  or ""
-              )
-
-              url = str(url).strip()
-
-              snippet = clean_text(
-                  result.get(
-                      "body"
-                  )
-                  or result.get(
-                      "snippet"
-                  )
-                  or ""
-              )
-
-              if not title or not url:
-                  return None
-
-              if not url.startswith(
-                  (
-                      "http://",
-                      "https://",
-                  )
-              ):
-                  return None
-
-              try:
-                  domain = urlparse(
-                      url
-                  ).netloc.lower()
-
-                  if domain.startswith(
-                      "www."
-                  ):
-                      domain = domain[4:]
-
-              except Exception:
-                  domain = ""
-
-              return {
-                  "title": title,
-                  "url": url,
-                  "snippet": snippet,
-                  "domain": domain,
-              }
-
-
-          def search_web(
-              query
-          ):
-              print(
-                  f"WEB QUERY: {query}"
-              )
-
-              try:
-                  client = DDGS(
-                      timeout=WEB_TIMEOUT
-                  )
-
-                  raw_results = client.text(
-                      query=query,
-                      region="us-en",
-                      safesearch="moderate",
-                      max_results=(
-                          MAX_RESULTS_PER_QUERY
-                      ),
-                      page=1,
-                      backend="auto",
-                  )
-
-              except Exception as exc:
-                  print(
-                      "WEB SEARCH FAILED: "
-                      f"{type(exc).__name__}: "
-                      f"{exc}"
-                  )
-
-                  return []
-
-              if not isinstance(
-                  raw_results,
-                  list
-              ):
-                  print(
-                      "WEB SEARCH INVALID"
-                  )
-
-                  return []
-
-              print(
-                  "WEB RAW RESULTS: "
-                  f"{len(raw_results)}"
-              )
-
-              results = []
-              seen = set()
-
-              for raw in raw_results:
-                  result = (
-                      normalize_search_result(
-                          raw
+                  summary = first_value(
+                      item,
+                      (
+                          "summary",
+                          "result",
+                          "lesson",
+                          "learning",
+                          "action"
                       )
                   )
 
-                  if not result:
+                  if not summary:
                       continue
 
-                  if result["url"] in seen:
-                      continue
-
-                  seen.add(
-                      result["url"]
+                  context_items.append(
+                      {
+                          "kind": kind,
+                          "summary": summary,
+                          "evidence": item.get(
+                              "evidence",
+                              {}
+                          )
+                      }
                   )
 
-                  results.append(
-                      result
-                  )
-
-                  if len(results) >= (
-                      MAX_RESULTS_PER_QUERY
+                  if (
+                      len(context_items)
+                      >= MAX_KNOWLEDGE_CONTEXT
                   ):
                       break
 
-              print(
-                  "WEB NORMALIZED RESULTS: "
-                  f"{len(results)}"
-              )
-
-              for index, result in enumerate(
-                  results,
-                  start=1
+              if (
+                  len(context_items)
+                  >= MAX_KNOWLEDGE_CONTEXT
               ):
-                  print(
-                      f"WEB SOURCE {index}: "
-                      f"{result['domain']} | "
-                      f"{result['title']}"
-                  )
-
-              return results
+                  break
 
 
           # ==========================================================
-          # EVIDENCE
+          # TOKENIZATION
           # ==========================================================
 
           def tokens(text):
               return set(
-                  re.findall(
+                  word.lower()
+                  for word in re.findall(
                       r"[a-zà-ÿ0-9_-]{4,}",
-                      str(text).lower()
+                      text,
+                      flags=re.IGNORECASE
                   )
               )
 
@@ -1044,54 +877,377 @@ jobs:
               question,
               result
           ):
-              q = tokens(
+              question_tokens = tokens(
                   question
               )
 
-              r = tokens(
-                  (
-                      result.get(
-                          "title",
-                          ""
-                      )
-                      + " "
-                      + result.get(
-                          "snippet",
-                          ""
-                      )
+              result_text = (
+                  result.get(
+                      "title",
+                      ""
+                  )
+                  + " "
+                  + result.get(
+                      "snippet",
+                      ""
                   )
               )
 
-              if not q:
+              result_tokens = tokens(
+                  result_text
+              )
+
+              if (
+                  not question_tokens
+                  or not result_tokens
+              ):
                   return 0.0
 
               return round(
-                  len(q & r) / len(q),
+                  len(
+                      question_tokens
+                      & result_tokens
+                  )
+                  / len(question_tokens),
                   3
               )
 
+
+          # ==========================================================
+          # SEARCH QUERY BUILDING
+          #
+          # Never turn a social action into a web query.
+          # ==========================================================
+
+          def build_queries(work):
+              question = clean_text(
+                  work["question"],
+                  500
+              )
+
+              context = work.get(
+                  "context",
+                  {}
+              )
+
+              queries = []
+
+              explicit_queries = context.get(
+                  "search_queries"
+              )
+
+              if isinstance(
+                  explicit_queries,
+                  list
+              ):
+                  for query in explicit_queries:
+                      query = clean_text(
+                          query,
+                          500
+                      )
+
+                      if query:
+                          queries.append(
+                              query
+                          )
+
+              if question:
+                  queries.append(
+                      question
+                  )
+
+              # A verification request benefits from an exact
+              # phrase search when the requester supplied one.
+              claim = first_value(
+                  context,
+                  (
+                      "claim",
+                      "claim_text",
+                      "target",
+                      "paper_title",
+                      "source_title"
+                  )
+              )
+
+              if claim:
+                  queries.append(
+                      claim
+                  )
+
+              unique = []
+
+              seen = set()
+
+              for query in queries:
+                  key = query.lower()
+
+                  if key in seen:
+                      continue
+
+                  seen.add(key)
+                  unique.append(query)
+
+              return unique[:3]
+
+
+          # ==========================================================
+          # DUCKDUCKGO HTML SEARCH
+          # ==========================================================
+
+          def web_search(query):
+              encoded = urllib.parse.urlencode(
+                  {
+                      "q": query
+                  }
+              )
+
+              url = (
+                  "https://html.duckduckgo.com/html/?"
+                  + encoded
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": (
+                          "Mozilla/5.0 "
+                          "(compatible; "
+                          "NOX-Work-Factory/2.0)"
+                      ),
+                      "Accept": (
+                          "text/html,"
+                          "application/xhtml+xml"
+                      )
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=WEB_TIMEOUT
+                  ) as response:
+                      status_code = response.status
+
+                      html_body = response.read().decode(
+                          "utf-8",
+                          errors="ignore"
+                      )
+
+                  print(
+                      f"WEB QUERY: {query}"
+                  )
+
+                  print(
+                      f"WEB HTTP: "
+                      f"{status_code} "
+                      f"bytes={len(html_body)}"
+                  )
+
+              except Exception as exc:
+                  print(
+                      f"WEB SEARCH FAILED: {exc}"
+                  )
+                  return []
+
+              # DuckDuckGo challenge / non-result pages
+              # must never be interpreted as evidence.
+              challenge_markers = (
+                  "anomaly",
+                  "captcha",
+                  "challenge",
+                  "robot",
+                  "unusual traffic"
+              )
+
+              lower_html = html_body.lower()
+
+              if any(
+                  marker in lower_html
+                  for marker in challenge_markers
+              ):
+                  print(
+                      "WEB SEARCH: possible challenge "
+                      "page; ignoring response"
+                  )
+                  return []
+
+              blocks = re.findall(
+                  r'<div[^>]+class="result[^"]*"'
+                  r'.*?</div>\s*</div>',
+                  html_body,
+                  flags=(
+                      re.IGNORECASE
+                      | re.DOTALL
+                  )
+              )
+
+              results = []
+
+              seen_urls = set()
+
+              for block in blocks:
+                  if (
+                      len(results)
+                      >= MAX_RESULTS_PER_QUERY
+                  ):
+                      break
+
+                  title_match = re.search(
+                      r'class="result__a"'
+                      r'[^>]*>(.*?)</a>',
+                      block,
+                      flags=(
+                          re.IGNORECASE
+                          | re.DOTALL
+                      )
+                  )
+
+                  url_match = re.search(
+                      r'class="result__a"'
+                      r'[^>]*href="([^"]+)"',
+                      block,
+                      flags=re.IGNORECASE
+                  )
+
+                  snippet_match = re.search(
+                      r'class="result__snippet"'
+                      r'[^>]*>(.*?)</',
+                      block,
+                      flags=(
+                          re.IGNORECASE
+                          | re.DOTALL
+                      )
+                  )
+
+                  if (
+                      not title_match
+                      or not url_match
+                  ):
+                      continue
+
+                  title = clean_text(
+                      html.unescape(
+                          re.sub(
+                              r"<[^>]+>",
+                              "",
+                              title_match.group(1)
+                          )
+                      ),
+                      300
+                  )
+
+                  snippet = ""
+
+                  if snippet_match:
+                      snippet = clean_text(
+                          html.unescape(
+                              re.sub(
+                                  r"<[^>]+>",
+                                  "",
+                                  snippet_match.group(1)
+                              )
+                          ),
+                          600
+                      )
+
+                  result_url = urllib.parse.unquote(
+                      url_match.group(1)
+                  )
+
+                  if not result_url.startswith(
+                      (
+                          "http://",
+                          "https://"
+                      )
+                  ):
+                      continue
+
+                  if result_url in seen_urls:
+                      continue
+
+                  seen_urls.add(
+                      result_url
+                  )
+
+                  parsed = urllib.parse.urlparse(
+                      result_url
+                  )
+
+                  domain = (
+                      parsed.netloc
+                      .lower()
+                      .split("@")[-1]
+                      .split(":")[0]
+                  )
+
+                  if domain.startswith(
+                      "www."
+                  ):
+                      domain = domain[4:]
+
+                  results.append(
+                      {
+                          "title": title,
+                          "url": clean_text(
+                              result_url,
+                              600
+                          ),
+                          "snippet": snippet,
+                          "domain": domain
+                      }
+                  )
+
+              print(
+                  f"WEB RESULTS: "
+                  f"{len(results)}"
+              )
+
+              return results
+
+
+          # ==========================================================
+          # EVIDENCE ASSESSMENT
+          #
+          # This does NOT establish truth.
+          # It measures search coverage only.
+          # ==========================================================
 
           def evidence_assessment(
               question,
               results
           ):
               domains = {
-                  result.get(
+                  item.get(
                       "domain"
                   )
-                  for result in results
-                  if result.get(
+                  for item in results
+                  if item.get(
                       "domain"
                   )
               }
 
+              scored = []
+
+              for item in results:
+                  copy = dict(item)
+
+                  copy["query_overlap"] = (
+                      overlap_score(
+                          question,
+                          item
+                      )
+                  )
+
+                  scored.append(
+                      copy
+                  )
+
               strong = [
-                  result
-                  for result in results
-                  if overlap_score(
-                      question,
-                      result
-                  ) >= 0.20
+                  item
+                  for item in scored
+                  if item[
+                      "query_overlap"
+                  ] >= 0.20
               ]
 
               if (
@@ -1123,1260 +1279,394 @@ jobs:
                   "source_count": len(
                       results
                   ),
-                  "domain_count": len(
+                  "unique_domains": len(
                       domains
                   ),
-                  "strong_match_count": len(
+                  "strong_matches": len(
                       strong
                   ),
-                  "domains": sorted(
-                      domains
-                  ),
+                  "results": scored
               }
 
 
           # ==========================================================
-          # COLONY CLIENT
+          # EXECUTE RESEARCH
           # ==========================================================
-
-          def get_client():
-              if not COLONY_API_KEY:
-                  return None
-
-              return ColonyClient(
-                  COLONY_API_KEY
-              )
-
-
-          # ==========================================================
-          # ACTION PARAMETER EXTRACTION
-          # ==========================================================
-
-          def original_value(
-              original,
-              keys
-          ):
-              if not isinstance(
-                  original,
-                  dict
-              ):
-                  return ""
-
-              for key in keys:
-                  value = original.get(
-                      key
-                  )
-
-                  if value is not None:
-                      text = clean_text(
-                          value
-                      )
-
-                      if text:
-                          return text
-
-              return ""
-
-
-          def resolve_action_parameters(
-              classification,
-              question,
-              original
-          ):
-              action = classification.get(
-                  "action"
-              )
-
-              params = {}
-
-              if action == "join_colony":
-                  colony = (
-                      classification.get(
-                          "colony"
-                      )
-                      or original_value(
-                          original,
-                          (
-                              "colony",
-                              "colony_name",
-                          )
-                      )
-                  )
-
-                  if colony:
-                      params[
-                          "colony"
-                      ] = colony
-
-              elif action == "follow_tag":
-                  tag = (
-                      classification.get(
-                          "tag"
-                      )
-                      or original_value(
-                          original,
-                          (
-                              "tag",
-                              "topic",
-                          )
-                      )
-                  )
-
-                  if tag:
-                      params[
-                          "tag"
-                      ] = tag.lstrip("#")
-
-              elif action == "follow_user":
-                  username = (
-                      classification.get(
-                          "username"
-                      )
-                      or original_value(
-                          original,
-                          (
-                              "username",
-                              "handle",
-                              "user",
-                          )
-                      )
-                  )
-
-                  if username:
-                      params[
-                          "username"
-                      ] = username.lstrip("@")
-
-              elif action in {
-                  "reply",
-                  "comment",
-              }:
-                  post_id = original_value(
-                      original,
-                      (
-                          "post_id",
-                          "parent_id",
-                          "target_post_id",
-                      )
-                  )
-
-                  body = original_value(
-                      original,
-                      (
-                          "body",
-                          "reply",
-                          "response",
-                          "comment",
-                          "message",
-                          "content",
-                      )
-                  )
-
-                  params[
-                      "post_id"
-                  ] = post_id
-
-                  params[
-                      "body"
-                  ] = body
-
-              elif action == "create_post":
-                  title = original_value(
-                      original,
-                      (
-                          "title",
-                      )
-                  )
-
-                  body = original_value(
-                      original,
-                      (
-                          "body",
-                          "content",
-                          "text",
-                      )
-                  )
-
-                  colony = original_value(
-                      original,
-                      (
-                          "colony",
-                          "colony_name",
-                      )
-                  )
-
-                  params[
-                      "title"
-                  ] = title
-
-                  params[
-                      "body"
-                  ] = body
-
-                  params[
-                      "colony"
-                  ] = colony
-
-              return params
-
-
-          # ==========================================================
-          # COLONY ACTION EXECUTION
-          #
-          # No guessed endpoints.
-          # No raw HTTP.
-          # No payment/bid/settlement.
-          # ==========================================================
-
-          def execute_action(
-              classification,
-              question,
-              original
-          ):
-              action = classification.get(
-                  "action"
-              )
-
-              params = resolve_action_parameters(
-                  classification,
-                  question,
-                  original
-              )
-
-              # ------------------------------------------------------
-              # Missing API key.
-              # ------------------------------------------------------
-
-              if not COLONY_API_KEY:
-                  return {
-                      "status": (
-                          "missing_colony_api_key"
-                      ),
-                      "success": False,
-                      "terminal": False,
-                      "action": action,
-                  }
-
-              # ------------------------------------------------------
-              # JOIN
-              # ------------------------------------------------------
-
-              if action == "join_colony":
-                  colony = params.get(
-                      "colony"
-                  )
-
-                  if not colony:
-                      return {
-                          "status": (
-                              "missing_colony"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                      }
-
-                  try:
-                      client = get_client()
-
-                      state = client.bootstrap()
-
-                      member_colonies = (
-                          state.get(
-                              "member_colonies",
-                              []
-                          )
-                          if isinstance(
-                              state,
-                              dict
-                          )
-                          else []
-                      )
-
-                      names = set()
-
-                      if isinstance(
-                          member_colonies,
-                          list
-                      ):
-                          for item in (
-                              member_colonies
-                          ):
-                              if isinstance(
-                                  item,
-                                  str
-                              ):
-                                  names.add(
-                                      item.lower()
-                                  )
-
-                              elif isinstance(
-                                  item,
-                                  dict
-                              ):
-                                  for key in (
-                                      "name",
-                                      "slug",
-                                      "colony",
-                                      "id",
-                                  ):
-                                      value = (
-                                          item.get(
-                                              key
-                                          )
-                                      )
-
-                                      if value:
-                                          names.add(
-                                              str(
-                                                  value
-                                              ).lower()
-                                          )
-
-                      if (
-                          colony.lower()
-                          in names
-                      ):
-                          return {
-                              "status": (
-                                  "already_member"
-                              ),
-                              "success": True,
-                              "terminal": True,
-                              "action": action,
-                              "colony": colony,
-                          }
-
-                      response = (
-                          client.join_colony(
-                              colony
-                          )
-                      )
-
-                      return {
-                          "status": (
-                              "join_requested"
-                          ),
-                          "success": True,
-                          "terminal": True,
-                          "action": action,
-                          "colony": colony,
-                          "response": response,
-                      }
-
-                  except ColonyRateLimitError as exc:
-                      return {
-                          "status": "rate_limited",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "colony": colony,
-                          "retry_after": getattr(
-                              exc,
-                              "retry_after",
-                              None
-                          ),
-                      }
-
-                  except ColonyNetworkError as exc:
-                      return {
-                          "status": "network_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "error": str(exc),
-                      }
-
-                  except ColonyAPIError as exc:
-                      return {
-                          "status": "colony_api_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "status_code": getattr(
-                              exc,
-                              "status",
-                              None
-                          ),
-                          "code": getattr(
-                              exc,
-                              "code",
-                              None
-                          ),
-                          "error": str(exc),
-                      }
-
-              # ------------------------------------------------------
-              # FOLLOW TAG
-              # ------------------------------------------------------
-
-              if action == "follow_tag":
-                  tag = params.get(
-                      "tag"
-                  )
-
-                  if not tag:
-                      return {
-                          "status": (
-                              "missing_tag"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                      }
-
-                  try:
-                      client = get_client()
-
-                      response = (
-                          client.follow_tag(
-                              tag
-                          )
-                      )
-
-                      return {
-                          "status": (
-                              "tag_followed"
-                          ),
-                          "success": True,
-                          "terminal": True,
-                          "action": action,
-                          "tag": tag,
-                          "response": response,
-                      }
-
-                  except ColonyRateLimitError as exc:
-                      return {
-                          "status": "rate_limited",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "retry_after": getattr(
-                              exc,
-                              "retry_after",
-                              None
-                          ),
-                      }
-
-                  except ColonyAPIError as exc:
-                      return {
-                          "status": "colony_api_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "status_code": getattr(
-                              exc,
-                              "status",
-                              None
-                          ),
-                          "code": getattr(
-                              exc,
-                              "code",
-                              None
-                          ),
-                          "error": str(exc),
-                      }
-
-              # ------------------------------------------------------
-              # FOLLOW USER
-              # ------------------------------------------------------
-
-              if action == "follow_user":
-                  username = params.get(
-                      "username"
-                  )
-
-                  if not username:
-                      return {
-                          "status": (
-                              "missing_username"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                      }
-
-                  try:
-                      client = get_client()
-
-                      response = (
-                          client.follow_by_username(
-                              username
-                          )
-                      )
-
-                      return {
-                          "status": (
-                              "user_followed"
-                          ),
-                          "success": True,
-                          "terminal": True,
-                          "action": action,
-                          "username": username,
-                          "response": response,
-                      }
-
-                  except ColonyRateLimitError as exc:
-                      return {
-                          "status": "rate_limited",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "retry_after": getattr(
-                              exc,
-                              "retry_after",
-                              None
-                          ),
-                      }
-
-                  except ColonyAPIError as exc:
-                      return {
-                          "status": "colony_api_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "status_code": getattr(
-                              exc,
-                              "status",
-                              None
-                          ),
-                          "code": getattr(
-                              exc,
-                              "code",
-                              None
-                          ),
-                          "error": str(exc),
-                      }
-
-              # ------------------------------------------------------
-              # COMMENT / REPLY
-              #
-              # The official SDK uses create_comment(post_id, body).
-              #
-              # We do NOT guess a target from a username or free text.
-              # ------------------------------------------------------
-
-              if action in {
-                  "reply",
-                  "comment",
-              }:
-                  post_id = params.get(
-                      "post_id"
-                  )
-
-                  body = params.get(
-                      "body"
-                  )
-
-                  if not post_id:
-                      return {
-                          "status": (
-                              "missing_post_id"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "reason": (
-                              "A reply target "
-                              "must be supplied "
-                              "explicitly."
-                          ),
-                      }
-
-                  if not body:
-                      return {
-                          "status": (
-                              "missing_reply_body"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "reason": (
-                              "Reply content must "
-                              "be supplied explicitly."
-                          ),
-                      }
-
-                  try:
-                      client = get_client()
-
-                      response = (
-                          client.create_comment(
-                              post_id,
-                              body
-                          )
-                      )
-
-                      return {
-                          "status": (
-                              "comment_created"
-                          ),
-                          "success": True,
-                          "terminal": True,
-                          "action": action,
-                          "post_id": post_id,
-                          "response": response,
-                      }
-
-                  except ColonyRateLimitError as exc:
-                      return {
-                          "status": "rate_limited",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "retry_after": getattr(
-                              exc,
-                              "retry_after",
-                              None
-                          ),
-                      }
-
-                  except ColonyAPIError as exc:
-                      return {
-                          "status": "colony_api_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "status_code": getattr(
-                              exc,
-                              "status",
-                              None
-                          ),
-                          "code": getattr(
-                              exc,
-                              "code",
-                              None
-                          ),
-                          "error": str(exc),
-                      }
-
-              # ------------------------------------------------------
-              # CREATE POST
-              #
-              # Supported by the official SDK, but only execute when
-              # all required content is explicitly available.
-              # ------------------------------------------------------
-
-              if action == "create_post":
-                  title = params.get(
-                      "title"
-                  )
-
-                  body = params.get(
-                      "body"
-                  )
-
-                  colony = params.get(
-                      "colony"
-                  )
-
-                  if not title or not body:
-                      return {
-                          "status": (
-                              "missing_post_content"
-                          ),
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "reason": (
-                              "Title and body "
-                              "must be supplied "
-                              "explicitly."
-                          ),
-                      }
-
-                  try:
-                      client = get_client()
-
-                      kwargs = {
-                          "title": title,
-                          "body": body,
-                      }
-
-                      if colony:
-                          kwargs[
-                              "colony"
-                          ] = colony
-
-                      response = (
-                          client.create_post(
-                              **kwargs
-                          )
-                      )
-
-                      return {
-                          "status": (
-                              "post_created"
-                          ),
-                          "success": True,
-                          "terminal": True,
-                          "action": action,
-                          "response": response,
-                      }
-
-                  except ColonyRateLimitError as exc:
-                      return {
-                          "status": "rate_limited",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "retry_after": getattr(
-                              exc,
-                              "retry_after",
-                              None
-                          ),
-                      }
-
-                  except ColonyAPIError as exc:
-                      return {
-                          "status": "colony_api_error",
-                          "success": False,
-                          "terminal": False,
-                          "action": action,
-                          "status_code": getattr(
-                              exc,
-                              "status",
-                              None
-                          ),
-                          "code": getattr(
-                              exc,
-                              "code",
-                              None
-                          ),
-                          "error": str(exc),
-                      }
-
-              # ------------------------------------------------------
-              # Nothing supported.
-              # ------------------------------------------------------
-
-              return {
-                  "status": (
-                      "unsupported_action"
-                  ),
-                  "success": False,
-                  "terminal": False,
-                  "action": action,
-              }
-
-
-          # ==========================================================
-          # LOAD STATE
-          # ==========================================================
-
-          core_memory = load_json(
-              CORE_MEMORY_FILE,
-              {}
-          )
-
-          core_runtime = load_json(
-              CORE_RUNTIME_FILE,
-              {}
-          )
-
-          knowledge = load_json(
-              KNOWLEDGE_FILE,
-              {}
-          )
-
-          work_state = load_json(
-              WORK_FILE,
-              {}
-          )
-
-          if not isinstance(
-              core_memory,
-              dict
-          ):
-              core_memory = {}
-
-          if not isinstance(
-              core_runtime,
-              dict
-          ):
-              core_runtime = {}
-
-          if not isinstance(
-              knowledge,
-              dict
-          ):
-              knowledge = {}
-
-          if not isinstance(
-              work_state,
-              dict
-          ):
-              work_state = {}
-
-          for key in (
-              "observations",
-              "decisions",
-              "actions",
-              "learnings",
-              "cognitive_cases",
-              "beliefs",
-              "failures",
-          ):
-              ensure_list(
-                  core_memory,
-                  key
-              )
-
-          for key in (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "results",
-              "learnings",
-              "sources",
-          ):
-              ensure_list(
-                  knowledge,
-                  key
-              )
-
-          completed = ensure_list(
-              work_state,
-              "completed"
-          )
-
-          history = ensure_list(
-              work_state,
-              "history"
-          )
-
-
-          # ==========================================================
-          # SELECT WORK
-          # ==========================================================
-
-          candidates = collect_candidates(
-              core_memory,
-              core_runtime
-          )
-
-          completed_ids = {
-              str(
-                  item.get(
-                      "request_id"
-                  )
-              )
-              for item in completed
-              if (
-                  isinstance(
-                      item,
-                      dict
-                  )
-                  and item.get(
-                      "request_id"
-                  )
-              )
-          }
-
-          pending = [
-              item
-              for item in candidates
-              if item[
-                  "request_id"
-              ] not in completed_ids
-          ]
-
-          pending.sort(
-              key=lambda item: (
-                  -item.get(
-                      "priority",
-                      0
-                  ),
-                  item.get(
-                      "request_id",
-                      ""
-                  )
-              )
-          )
-
-          selected = pending[
-              :MAX_WORK_ITEMS
-          ]
-
-          knowledge_context = (
-              build_knowledge_context(
-                  knowledge
-              )
-          )
-
-
-          print(
-              f"Work candidates: "
-              f"{len(candidates)}"
-          )
-
-          print(
-              f"Work selected: "
-              f"{len(selected)}"
-          )
-
 
           completed_now = 0
-          retry_now = 0
-          unknown_now = 0
-          deferred_now = 0
+          retry_pending_now = 0
 
 
-          # ==========================================================
-          # EXECUTION LOOP
-          # ==========================================================
-
-          for work in selected:
-              request_id = work[
-                  "request_id"
-              ]
-
-              question = work[
-                  "question"
-              ]
-
-              original = work.get(
-                  "original"
-              )
+          for work in work_items:
+              work_id = work["id"]
+              question = work["question"]
 
               print("")
               print(
                   f"WORK START: {question}"
               )
 
-              classification = (
-                  classify_work(
-                      question,
-                      original,
-                      work.get(
-                          "source"
-                      )
-                  )
-              )
-
-              work_type = classification[
-                  "type"
-              ]
-
               print(
                   "WORK CLASSIFICATION: "
-                  f"{work_type}"
-                  + (
-                      f" / {classification.get('action')}"
-                      if classification.get(
-                          "action"
-                      )
-                      else ""
+                  f"{work['work_type']} | "
+                  f"confidence={work['confidence']}"
+              )
+
+              queries = build_queries(
+                  work
+              )
+
+              if not queries:
+                  print(
+                      "WORK DEFERRED: "
+                      "missing research query"
                   )
-                  + " | "
-                  f"confidence="
-                  f"{classification['confidence']} | "
-                  f"tool="
-                  f"{classification['tool']}"
+
+                  work_state["history"].append(
+                      {
+                          "id": stable_id(
+                              "deferred",
+                              work_id
+                          ),
+                          "request_id": work_id,
+                          "timestamp": NOW,
+                          "question": question,
+                          "type": work[
+                              "work_type"
+                          ],
+                          "status": "deferred",
+                          "reason": (
+                              "missing_research_query"
+                          )
+                      }
+                  )
+
+                  retry_pending_now += 1
+                  continue
+
+
+              results = []
+              seen_urls = set()
+
+              for query in queries:
+                  query_results = web_search(
+                      query
+                  )
+
+                  for result in query_results:
+                      url = result["url"]
+
+                      if url in seen_urls:
+                          continue
+
+                      seen_urls.add(
+                          url
+                      )
+
+                      result["query"] = query
+
+                      results.append(
+                          result
+                      )
+
+                      if (
+                          len(results)
+                          >= MAX_TOTAL_RESULTS
+                      ):
+                          break
+
+                  if (
+                      len(results)
+                      >= MAX_TOTAL_RESULTS
+                  ):
+                      break
+
+
+              evidence = evidence_assessment(
+                  question,
+                  results
               )
 
 
-              result = None
-              terminal = False
-
-
-              # ======================================================
-              # UNKNOWN
-              # ======================================================
-
-              if work_type == "unknown":
-                  unknown_now += 1
-
-                  result = {
-                      "status": "unknown",
-                      "success": False,
-                      "reason": classification[
-                          "reason"
-                      ],
+              source_domains = sorted(
+                  {
+                      item.get(
+                          "domain"
+                      )
+                      for item in results
+                      if item.get(
+                          "domain"
+                      )
                   }
+              )
 
 
-                  print(
-                      "WORK DEFERRED: "
-                      "unknown intent"
+              if (
+                  evidence["status"]
+                  == "multi_source_support"
+              ):
+                  conclusion = (
+                      "Multiple independent domains "
+                      "returned evidence relevant to "
+                      "the research question. This "
+                      "measures evidence coverage only "
+                      "and does not establish truth."
                   )
 
-
-              # ======================================================
-              # ACTION
-              # ======================================================
-
-              elif work_type == "action":
-                  result = execute_action(
-                      classification,
-                      question,
-                      original
+                  next_step = (
+                      "Inspect the underlying sources "
+                      "directly and compare their claims "
+                      "before recording a confirmed fact."
                   )
 
-                  terminal = bool(
-                      result.get(
-                          "terminal"
-                      )
+                  terminal = True
+
+              elif (
+                  evidence["status"]
+                  == "partial_support"
+              ):
+                  conclusion = (
+                      "Relevant evidence was found, "
+                      "but independent source coverage "
+                      "is limited."
                   )
 
-                  if terminal:
-                      completed_now += 1
-
-                  else:
-                      deferred_now += 1
-                      retry_now += 1
-
-
-              # ======================================================
-              # RESEARCH / VERIFY
-              # ======================================================
-
-              elif work_type in {
-                  "research",
-                  "verify",
-              }:
-                  results = search_web(
-                      question
+                  next_step = (
+                      "Collect additional independent "
+                      "sources or perform a targeted test."
                   )
 
-                  if len(results) > (
-                      MAX_TOTAL_RESULTS
-                  ):
-                      results = results[
-                          :MAX_TOTAL_RESULTS
-                      ]
+                  terminal = False
 
-                  evidence = (
-                      evidence_assessment(
-                          question,
-                          results
-                      )
+              elif (
+                  evidence["status"]
+                  == "insufficient_verification"
+              ):
+                  conclusion = (
+                      "Search results were found, but "
+                      "the evidence is insufficient to "
+                      "verify the research question."
                   )
 
-                  status = evidence[
-                      "status"
-                  ]
+                  next_step = (
+                      "Do not promote this result to a "
+                      "confirmed fact."
+                  )
 
-                  if (
-                      status
-                      == "multi_source_support"
-                  ):
-                      conclusion = (
-                          "Relevant evidence "
-                          "was found across "
-                          "multiple independent "
-                          "domains."
-                      )
+                  terminal = False
 
-                      next_step = (
-                          "Inspect the underlying "
-                          "sources before treating "
-                          "the claim as confirmed."
-                      )
+              else:
+                  conclusion = (
+                      "No usable web evidence was "
+                      "retrieved."
+                  )
 
-                  elif (
-                      status
-                      == "partial_support"
-                  ):
-                      conclusion = (
-                          "Relevant evidence "
-                          "was found, but "
-                          "independent coverage "
-                          "remains limited."
-                      )
+                  next_step = (
+                      "Refine the research question or "
+                      "retry the research later."
+                  )
 
-                      next_step = (
-                          "Seek additional "
-                          "independent evidence."
-                      )
+                  terminal = False
 
-                  elif (
-                      status
-                      == "insufficient_verification"
-                  ):
-                      conclusion = (
-                          "Search results were "
-                          "found, but they are "
-                          "insufficient for reliable "
-                          "verification."
-                      )
-
-                      next_step = (
-                          "Keep the work unresolved."
-                      )
-
-                  else:
-                      conclusion = (
-                          "No usable Web evidence "
-                          "was retrieved."
-                      )
-
-                      next_step = (
-                          "Retry later or refine "
-                          "the research question."
-                      )
-
-                  result = {
-                      "status": status,
-                      "success": (
-                          status
-                          in {
-                              "multi_source_support",
-                              "partial_support",
-                          }
-                      ),
-                      "evidence": evidence,
-                      "sources": results,
-                      "conclusion": conclusion,
-                      "next_step": next_step,
-                  }
-
-                  if status in {
-                      "multi_source_support",
-                      "partial_support",
-                  }:
-                      terminal = True
-                      completed_now += 1
-
-                  else:
-                      retry_now += 1
-
-
-              # ======================================================
-              # OBSERVATION RECORD
-              # ======================================================
 
               result_id = stable_id(
                   "result",
-                  (
-                      request_id
-                      + "|"
-                      + now_iso()
+                  work_id
+                  + "|"
+                  + json.dumps(
+                      evidence,
+                      ensure_ascii=False,
+                      sort_keys=True
                   )
               )
 
+
               work_result = {
-                  "result_id": result_id,
-                  "request_id": request_id,
-                  "timestamp": now_iso(),
+                  "id": result_id,
+                  "request_id": work_id,
+                  "timestamp": NOW,
                   "question": question,
-                  "source": work.get(
-                      "source"
+                  "type": work[
+                      "work_type"
+                  ],
+                  "confidence": work[
+                      "confidence"
+                  ],
+                  "source_type": work[
+                      "source_type"
+                  ],
+                  "source_id": work[
+                      "source_id"
+                  ],
+                  "queries": queries,
+                  "evidence_status": evidence[
+                      "status"
+                  ],
+                  "source_count": evidence[
+                      "source_count"
+                  ],
+                  "unique_domains": evidence[
+                      "unique_domains"
+                  ],
+                  "sources": results,
+                  "conclusion": conclusion,
+                  "uncertainty": (
+                      "Web search results and snippets "
+                      "are discovery evidence only. "
+                      "This workflow does not promote "
+                      "claims to verified facts."
                   ),
-                  "priority": work.get(
-                      "priority",
-                      0
-                  ),
-                  "classification": classification,
-                  "result": result,
-                  "knowledge_context_used": (
-                      knowledge_context
-                  ),
+                  "next_step": next_step
               }
 
-              history.append(
+
+              work_state["history"].append(
                   work_result
               )
 
 
-              # ======================================================
-              # COMPLETION RULE
-              #
-              # A deferred/unknown/failed action is NOT completed.
-              # A successful action is completed.
-              # A research result is completed only when evidence
-              # crossed the current deterministic threshold.
-              # ======================================================
-
               if terminal:
-                  completed.append(
+                  work_state["completed"].append(
                       {
-                          "request_id": request_id,
-                          "timestamp": now_iso(),
-                          "status": (
-                              result.get(
-                                  "status",
-                                  "completed"
-                              )
-                              if isinstance(
-                                  result,
-                                  dict
-                              )
-                              else "completed"
-                          ),
-                          "result_id": result_id,
-                          "work_type": work_type,
+                          "request_id": work_id,
+                          "timestamp": NOW,
+                          "status": evidence[
+                              "status"
+                          ],
+                          "result_id": result_id
                       }
                   )
+
+                  completed_now += 1
+
+              else:
+                  retry_pending_now += 1
 
 
               print(
                   "WORK RESULT: "
-                  f"type={work_type} | "
-                  f"status="
-                  f"{result.get('status') if isinstance(result, dict) else 'none'}"
+                  f"type={work['work_type']} | "
+                  f"status={evidence['status']} | "
+                  f"sources={len(results)} | "
+                  f"domains={len(source_domains)}"
               )
 
 
           # ==========================================================
-          # HISTORY LIMIT
+          # RECORD DEFERRED ACTIONS / UNKNOWN WORK
+          #
+          # They are recorded for observability, but never marked
+          # completed and never sent to the web researcher.
           # ==========================================================
 
-          if len(history) > MAX_HISTORY:
-              history[:] = history[
-                  -MAX_HISTORY:
-              ]
+          for item in (
+              deferred_actions
+              + deferred_unknown
+          ):
+              status = (
+                  "action_deferred"
+                  if item["work_type"]
+                  == "action"
+                  else "unknown_deferred"
+              )
 
-          if len(completed) > MAX_HISTORY:
-              completed[:] = completed[
-                  -MAX_HISTORY:
-              ]
+              work_state["history"].append(
+                  {
+                      "id": stable_id(
+                          "deferred",
+                          item["id"]
+                          + "|"
+                          + status
+                      ),
+                      "request_id": item["id"],
+                      "timestamp": NOW,
+                      "question": item[
+                          "question"
+                      ],
+                      "type": item[
+                          "work_type"
+                      ],
+                      "confidence": item[
+                          "confidence"
+                      ],
+                      "status": status,
+                      "reason": item[
+                          "classification_reason"
+                      ]
+                  }
+              )
+
+              print("")
+              print(
+                  f"WORK DEFERRED: "
+                  f"{item['question']}"
+              )
+
+              print(
+                  f"WORK DEFERRED REASON: "
+                  f"{item['classification_reason']}"
+              )
+
+
+          # ==========================================================
+          # LIMIT HISTORY
+          # ==========================================================
+
+          work_state["history"] = (
+              work_state["history"]
+              [-MAX_HISTORY:]
+          )
+
+          work_state["completed"] = (
+              work_state["completed"]
+              [-MAX_HISTORY:]
+          )
 
 
           # ==========================================================
           # STATE
           # ==========================================================
 
-          work_state[
-              "version"
-          ] = 6
+          work_state["version"] = 2
 
-          work_state[
-              "last_run"
-          ] = now_iso()
+          work_state["last_run"] = NOW
 
-          work_state[
-              "run_count"
-          ] = int(
-              work_state.get(
-                  "run_count",
-                  0
+          work_state["run_count"] = (
+              int(
+                  work_state.get(
+                      "run_count",
+                      0
+                  )
               )
-          ) + 1
+              + 1
+          )
 
-          work_state[
-              "last_summary"
-          ] = {
-              "timestamp": now_iso(),
-              "candidates": len(
+          work_state["last_summary"] = {
+              "timestamp": NOW,
+              "work_candidates": len(
                   candidates
               ),
-              "selected": len(
-                  selected
+              "research_candidates": len(
+                  research_candidates
               ),
-              "completed": completed_now,
-              "retry_pending": retry_now,
-              "unknown_deferred": unknown_now,
-              "action_deferred": deferred_now,
-              "history_size": len(
-                  history
+              "research_selected": len(
+                  work_items
               ),
+              "work_completed": completed_now,
+              "work_retry_pending": retry_pending_now,
+              "actions_deferred": len(
+                  deferred_actions
+              ),
+              "unknown_deferred": len(
+                  deferred_unknown
+              )
           }
 
 
           # ==========================================================
-          # FACTORY OWNS ONLY ITS OWN STATE
+          # PERSIST ONLY FACTORY STATE
+          #
+          # Memory & Knowledge remains the consolidation layer.
           # ==========================================================
 
           save_json(
@@ -2386,7 +1676,7 @@ jobs:
 
 
           # ==========================================================
-          # SUMMARY
+          # FINAL SUMMARY
           # ==========================================================
 
           print("")
@@ -2400,8 +1690,8 @@ jobs:
           )
 
           print(
-              f"Work selected: "
-              f"{len(selected)}"
+              f"Research selected: "
+              f"{len(work_items)}"
           )
 
           print(
@@ -2411,30 +1701,30 @@ jobs:
 
           print(
               f"Work retry pending: "
-              f"{retry_now}"
+              f"{retry_pending_now}"
           )
 
           print(
-              f"Work unknown/deferred: "
-              f"{unknown_now}"
+              f"Actions deferred: "
+              f"{len(deferred_actions)}"
           )
 
           print(
-              f"Work action deferred: "
-              f"{deferred_now}"
+              f"Unknown deferred: "
+              f"{len(deferred_unknown)}"
           )
 
           print(
               f"History size: "
-              f"{len(history)}"
+              f"{len(work_state['history'])}"
           )
 
           print("")
           print(
               "=== CLASSIFY -> "
-              "CHOOSE TOOL -> "
-              "EXECUTE -> "
-              "OBSERVE -> RESULT ==="
+              "RESEARCH ONLY -> "
+              "WEB EVIDENCE -> "
+              "RESULT ==="
           )
 
           print(
@@ -2456,5 +1746,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "NØX: fix work action classification"
+          git commit -m "NØX: update work factory"
           git push
