@@ -8,8 +8,11 @@ on:
 permissions:
   contents: write
 
+# Presence, Core et Work Factory écrivent tous dans le même état Git.
+# Le même groupe empêche deux workflows de modifier simultanément
+# les fichiers mémoire/runtime.
 concurrency:
-  group: nox-colony-presence
+  group: nox-state
   cancel-in-progress: false
 
 env:
@@ -21,11 +24,17 @@ env:
   MAX_FEED_ITEMS: "20"
   MAX_TRACKED: "500"
   MAX_RUNS: "100"
+
   PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
+
+  # Cognitive reply engine.
+  # If GEMINI_API_KEY exists, Gemini is used only to formulate
+  # the bounded answer decided by Core.
+  GEMINI_MODEL: "gemini-3.8-flash"
+  GEMINI_MAX_CALLS_PER_RUN: "2"
+  GEMINI_MAX_OUTPUT_TOKENS: "500"
 
 jobs:
   colony-presence:
@@ -42,13 +51,27 @@ jobs:
 
       - name: Install Colony SDK
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install "colony-sdk>=1.37.0,<2.0.0"
+
+      - name: Install optional cognitive engine
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            pip install "google-genai>=1.0.0,<2.0.0"
+            echo "Gemini cognitive formulation enabled."
+          else
+            echo "No GEMINI_API_KEY. Deterministic cognitive fallback enabled."
+          fi
 
       - name: Run NØX Presence
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           import hashlib
           import json
@@ -57,77 +80,151 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
+          from colony_sdk import (
+              ColonyAPIError,
+              ColonyAuthError,
+              ColonyClient,
+          )
 
           NOW = datetime.now(timezone.utc).isoformat()
 
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_MEMORY_FILE"])
+          CORE_MEMORY_FILE = Path(
+              os.environ["CORE_MEMORY_FILE"]
+          )
+          CORE_RUNTIME_FILE = Path(
+              os.environ["CORE_RUNTIME_FILE"]
+          )
+          KNOWLEDGE_FILE = Path(
+              os.environ["KNOWLEDGE_FILE"]
+          )
+          PRESENCE_FILE = Path(
+              os.environ["PRESENCE_MEMORY_FILE"]
+          )
 
-          MAX_ACTIONS = int(os.environ["MAX_ACTIONS_PER_RUN"])
-          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
-          MAX_TRACKED = int(os.environ["MAX_TRACKED"])
-          MAX_RUNS = int(os.environ["MAX_RUNS"])
+          MAX_ACTIONS = int(
+              os.environ["MAX_ACTIONS_PER_RUN"]
+          )
+          MAX_FEED = int(
+              os.environ["MAX_FEED_ITEMS"]
+          )
+          MAX_TRACKED = int(
+              os.environ["MAX_TRACKED"]
+          )
+          MAX_RUNS = int(
+              os.environ["MAX_RUNS"]
+          )
+
+          GEMINI_KEY = os.environ.get(
+              "GEMINI_API_KEY",
+              ""
+          ).strip()
+
+          GEMINI_MODEL = os.environ.get(
+              "GEMINI_MODEL",
+              "gemini-3.8-flash"
+          )
+
+          GEMINI_MAX_CALLS = int(
+              os.environ.get(
+                  "GEMINI_MAX_CALLS_PER_RUN",
+                  "2"
+              )
+          )
+
+          GEMINI_MAX_OUTPUT = int(
+              os.environ.get(
+                  "GEMINI_MAX_OUTPUT_TOKENS",
+                  "500"
+              )
+          )
+
+          # ==========================================================
+          # SECURITY
+          # ==========================================================
 
           if (
-              os.environ.get("AUTO_PAYMENT") != "false"
-              or os.environ.get("AUTO_SPENDING") != "false"
+              os.environ.get("AUTO_PAYMENT")
+              != "false"
+              or os.environ.get("AUTO_SPENDING")
+              != "false"
           ):
               raise SystemExit(
-                  "SECURITY STOP: payment/spending policy must remain disabled."
+                  "SECURITY STOP: payment/spending must remain disabled."
+              )
+
+          # ==========================================================
+          # STORAGE
+          # ==========================================================
+
+          def clone(value):
+              return json.loads(
+                  json.dumps(value)
               )
 
           def load(path, default):
               if not path.exists():
-                  return json.loads(json.dumps(default))
+                  return clone(default)
 
               try:
                   value = json.loads(
-                      path.read_text(encoding="utf-8")
+                      path.read_text(
+                          encoding="utf-8"
+                      )
                   )
-                  return (
-                      value
-                      if isinstance(value, dict)
-                      else json.loads(json.dumps(default))
-                  )
+
+                  if isinstance(value, dict):
+                      return value
+
+                  return clone(default)
+
               except Exception as exc:
-                  print(f"WARNING: cannot read {path}: {exc}")
-                  return json.loads(json.dumps(default))
+                  print(
+                      f"WARNING: cannot read {path}: {exc}"
+                  )
+                  return clone(default)
 
           def save(path, value):
-              path.parent.mkdir(parents=True, exist_ok=True)
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
               path.write_text(
                   json.dumps(
                       value,
                       ensure_ascii=False,
-                      indent=2,
+                      indent=2
                   ),
-                  encoding="utf-8",
+                  encoding="utf-8"
               )
 
           def clean(value, limit=3000):
               return re.sub(
                   r"\s+",
                   " ",
-                  str(value or ""),
+                  str(value or "")
               ).strip()[:limit]
 
-          def norm(value):
-              return clean(value, 1000).lower()
-
           def stable(*parts):
+              raw = "|".join(
+                  clean(
+                      part,
+                      5000
+                  )
+                  for part in parts
+              )
+
               return hashlib.sha256(
-                  "|".join(
-                      clean(part, 5000)
-                      for part in parts
-                  ).encode()
+                  raw.encode("utf-8")
               ).hexdigest()[:24]
 
           def item_id(item):
-              if not isinstance(item, dict):
+              if not isinstance(
+                  item,
+                  dict
+              ):
                   return ""
+
               return str(
                   item.get("id")
                   or item.get("post_id")
@@ -135,100 +232,143 @@ jobs:
               )
 
           def item_title(item):
-              if not isinstance(item, dict):
+              if not isinstance(
+                  item,
+                  dict
+              ):
                   return ""
+
               return clean(
-                  item.get("title") or "",
-                  300,
+                  item.get("title")
+                  or "",
+                  400
               )
 
           def item_body(item):
-              if not isinstance(item, dict):
+              if not isinstance(
+                  item,
+                  dict
+              ):
                   return ""
+
               return clean(
                   item.get("body")
                   or item.get("content")
                   or item.get("text")
                   or "",
-                  3500,
+                  5000
               )
 
-          def author(item):
-              if not isinstance(item, dict):
+          def item_author(item):
+              if not isinstance(
+                  item,
+                  dict
+              ):
                   return ""
 
-              value = item.get("author")
+              value = item.get(
+                  "author"
+              )
 
-              if isinstance(value, dict):
+              if isinstance(
+                  value,
+                  dict
+              ):
                   return clean(
                       value.get("username")
                       or value.get("display_name")
                       or "",
-                      100,
+                      100
                   )
 
               return clean(
-                  item.get("author_username") or "",
-                  100,
+                  item.get(
+                      "author_username"
+                  )
+                  or item.get("username")
+                  or "",
+                  100
               )
 
           def extract(value, keys):
-              if isinstance(value, list):
+              if isinstance(
+                  value,
+                  list
+              ):
                   return value
 
-              if isinstance(value, dict):
+              if isinstance(
+                  value,
+                  dict
+              ):
                   for key in keys:
-                      candidate = value.get(key)
-                      if isinstance(candidate, list):
+                      candidate = value.get(
+                          key
+                      )
+
+                      if isinstance(
+                          candidate,
+                          list
+                      ):
                           return candidate
 
               return []
 
+          # ==========================================================
+          # DEFAULT PRESENCE STATE
+          # ==========================================================
+
+          DEFAULT_PRESENCE = {
+              "version": 6,
+              "observed_posts": [],
+              "replied_posts": [],
+              "published_posts": [],
+              "notifications": [],
+              "outcomes": [],
+              "runs": []
+          }
+
           core = load(
               CORE_MEMORY_FILE,
-              {},
+              {}
           )
 
           runtime = load(
               CORE_RUNTIME_FILE,
-              {"pending_actions": []},
+              {
+                  "pending_actions": []
+              }
           )
 
           knowledge = load(
               KNOWLEDGE_FILE,
-              {},
+              {}
           )
 
           presence = load(
               PRESENCE_FILE,
-              {
-                  "version": 4,
-                  "observed_posts": [],
-                  "replied_posts": [],
-                  "published_posts": [],
-                  "notifications": [],
-                  "outcomes": [],
-                  "runs": [],
-              },
+              DEFAULT_PRESENCE
           )
 
-          for key in (
-              "observed_posts",
-              "replied_posts",
-              "published_posts",
-              "notifications",
-              "outcomes",
-              "runs",
-          ):
+          for key in DEFAULT_PRESENCE:
+              if key == "version":
+                  continue
+
               if not isinstance(
                   presence.get(key),
-                  list,
+                  list
               ):
                   presence[key] = []
 
+          presence["version"] = 6
+
+          # ==========================================================
+          # COLONY CLIENT
+          # ==========================================================
+
           API_KEY = os.environ.get(
               "COLONY_API_KEY",
-              "",
+              ""
           ).strip()
 
           if not API_KEY:
@@ -236,277 +376,778 @@ jobs:
                   "COLONY_API_KEY manquant."
               )
 
-          client = ColonyClient(API_KEY)
+          client = ColonyClient(
+              API_KEY
+          )
 
           try:
               state = client.bootstrap()
+
           except ColonyAuthError as exc:
               raise SystemExit(
                   f"Authentification Colony refusée: {exc}"
               )
+
           except ColonyAPIError as exc:
               raise SystemExit(
                   f"Erreur Colony au bootstrap: {exc}"
               )
 
           profile = (
-              state.get("profile", {})
-              if isinstance(state, dict)
+              state.get(
+                  "profile",
+                  {}
+              )
+              if isinstance(
+                  state,
+                  dict
+              )
               else {}
           )
 
           username = clean(
-              profile.get("username"),
-              100,
+              profile.get(
+                  "username"
+              ),
+              100
           )
 
-          if (
-              username
-              and username != "nox_origine"
-          ):
+          if username != "nox_origine":
               raise SystemExit(
-                  "SECURITY STOP: "
-                  f"profil inattendu '{username}'."
+                  "SECURITY STOP: profil inattendu "
+                  f"'{username}'."
               )
 
-          pending = [
-              item
-              for item in runtime.get(
-                  "pending_actions",
-                  [],
+          # ==========================================================
+          # MEMORY HELPERS
+          # ==========================================================
+
+          def memory_blob(value):
+              try:
+                  return clean(
+                      json.dumps(
+                          value,
+                          ensure_ascii=False
+                      ),
+                      12000
+                  ).lower()
+              except Exception:
+                  return clean(
+                      value,
+                      12000
+                  ).lower()
+
+          def recall(text, limit=6):
+              words = set(
+                  re.findall(
+                      r"[a-zA-ZÀ-ÿ0-9_-]{4,}",
+                      clean(
+                          text,
+                          5000
+                      ).lower()
+                  )
               )
-              if isinstance(item, dict)
-          ]
 
-          pending = pending[:MAX_ACTIONS]
+              stop = {
+                  "this",
+                  "that",
+                  "with",
+                  "from",
+                  "have",
+                  "what",
+                  "when",
+                  "where",
+                  "which",
+                  "would",
+                  "could",
+                  "about",
+                  "your",
+                  "their",
+                  "there",
+                  "pour",
+                  "avec",
+                  "dans",
+                  "nous",
+                  "vous",
+                  "cela",
+                  "cette",
+                  "comme",
+                  "mais",
+                  "plus",
+                  "faire",
+                  "être",
+                  "sont"
+              }
 
-          done_ids = {
-              item.get("action_id")
-              for item in presence.get(
-                  "outcomes",
-                  [],
+              words = {
+                  word
+                  for word in words
+                  if word not in stop
+              }
+
+              scored = []
+
+              for kind, values in core.items():
+
+                  if (
+                      kind == "version"
+                      or not isinstance(
+                          values,
+                          list
+                      )
+                  ):
+                      continue
+
+                  for value in values:
+
+                      score = sum(
+                          1
+                          for word in words
+                          if word in memory_blob(
+                              value
+                          )
+                      )
+
+                      if score:
+                          scored.append(
+                              {
+                                  "kind": kind,
+                                  "score": score,
+                                  "item": value
+                              }
+                          )
+
+              scored.sort(
+                  key=lambda x: x["score"],
+                  reverse=True
               )
-              if isinstance(item, dict)
-          }
 
-          cases = {
-              item.get("case_id"): item
-              for item in core.get(
-                  "cognitive_cases",
-                  [],
-              )
-              if (
-                  isinstance(item, dict)
-                  and item.get("case_id")
-              )
-          }
+              return scored[:limit]
 
-          comments = 0
-          errors = 0
-          skipped = 0
-          posts = 0
+          # ==========================================================
+          # LANGUAGE
+          # ==========================================================
 
-          def language_of(post):
-              text = (
-                  f"{item_title(post)} "
-                  f"{item_body(post)}"
+          def detect_language(text):
+              low = clean(
+                  text,
+                  5000
               ).lower()
 
-              french = sum(
-                  text.count(word)
-                  for word in (
-                      " le ",
-                      " la ",
-                      " les ",
-                      " des ",
-                      " une ",
-                      " pour ",
-                      " avec ",
-                      " est ",
-                      " que ",
-                  )
+              french_markers = (
+                  " le ",
+                  " la ",
+                  " les ",
+                  " des ",
+                  " une ",
+                  " pour ",
+                  " avec ",
+                  " est ",
+                  " que ",
+                  " dans ",
+                  " pas ",
+                  " plus ",
+                  " comment ",
+                  " pourquoi "
               )
 
-              english = sum(
-                  text.count(word)
-                  for word in (
-                      " the ",
-                      " this ",
-                      " that ",
-                      " with ",
-                      " for ",
-                      " is ",
-                      " are ",
-                      " what ",
-                  )
+              english_markers = (
+                  " the ",
+                  " this ",
+                  " that ",
+                  " with ",
+                  " for ",
+                  " is ",
+                  " are ",
+                  " what ",
+                  " how ",
+                  " why ",
+                  " not ",
+                  " more "
               )
 
-              if french > english and french >= 2:
+              fr = sum(
+                  low.count(x)
+                  for x in french_markers
+              )
+
+              en = sum(
+                  low.count(x)
+                  for x in english_markers
+              )
+
+              if fr > en and fr >= 2:
                   return "fr"
 
               return "en"
 
-          def find_comments(post_id):
+          # ==========================================================
+          # THREAD CONTEXT
+          # ==========================================================
+
+          def get_comments(post_id):
               try:
-                  return client.get_all_comments(
+                  comments = client.get_all_comments(
                       post_id
                   )
-              except Exception:
+
+                  if not isinstance(
+                      comments,
+                      list
+                  ):
+                      return []
+
+                  return comments[-12:]
+
+              except Exception as exc:
+                  print(
+                      "WARNING: comments unavailable: "
+                      f"{clean(exc, 500)}"
+                  )
                   return []
+
+          def comment_author(comment):
+              if not isinstance(
+                  comment,
+                  dict
+              ):
+                  return ""
+
+              author = comment.get(
+                  "author"
+              )
+
+              if isinstance(
+                  author,
+                  dict
+              ):
+                  return clean(
+                      author.get(
+                          "username"
+                      )
+                      or author.get(
+                          "display_name"
+                      )
+                      or "",
+                      100
+                  )
+
+              return clean(
+                  comment.get(
+                      "author_username"
+                  )
+                  or "",
+                  100
+              )
+
+          def comment_body(comment):
+              if not isinstance(
+                  comment,
+                  dict
+              ):
+                  return ""
+
+              return clean(
+                  comment.get("body")
+                  or comment.get("content")
+                  or comment.get("text")
+                  or "",
+                  2000
+              )
+
+          # ==========================================================
+          # GEMINI COGNITIVE FORMULATION
+          # ==========================================================
+
+          gemini_calls = 0
+
+          def gemini_reply(
+              post,
+              comments,
+              case,
+              research,
+              memories
+          ):
+              global gemini_calls
+
+              if (
+                  not GEMINI_KEY
+                  or gemini_calls
+                  >= GEMINI_MAX_CALLS
+              ):
+                  return None
+
+              try:
+                  from google import genai
+                  from google.genai import types
+
+                  gemini_calls += 1
+
+                  client_ai = genai.Client(
+                      api_key=GEMINI_KEY
+                  )
+
+                  language = detect_language(
+                      f"{item_title(post)} "
+                      f"{item_body(post)}"
+                  )
+
+                  comments_text = "\n".join(
+                      f"- {comment_author(c)}: "
+                      f"{comment_body(c)}"
+                      for c in comments[-8:]
+                      if comment_body(c)
+                  )
+
+                  memory_text = json.dumps(
+                      memories[:4],
+                      ensure_ascii=False
+                  )[:5000]
+
+                  research_text = json.dumps(
+                      research,
+                      ensure_ascii=False
+                  )[:6000]
+
+                  case_text = json.dumps(
+                      {
+                          "intent": case.get(
+                              "intent"
+                          ),
+                          "decision": case.get(
+                              "decision"
+                          ),
+                          "reason": case.get(
+                              "decision_reason"
+                          ),
+                          "questions": case.get(
+                              "questions",
+                              []
+                          ),
+                          "uncertainties": case.get(
+                              "uncertainties",
+                              []
+                          )
+                      },
+                      ensure_ascii=False
+                  )
+
+                  system_instruction = """
+          You are the cognitive response layer of NØX, an AI agent on The Colony.
+
+          You do NOT decide whether NØX should reply.
+          Core already made that decision.
+
+          Your job is to formulate one authentic, specific response from
+          the evidence and context supplied to you.
+
+          Rules:
+          - Respond directly to what the author actually said.
+          - Do not invent facts.
+          - Do not pretend a search proved something it did not prove.
+          - Distinguish observation, reported information, research result,
+            hypothesis and uncertainty.
+          - Use relevant memory only when it genuinely connects to the post.
+          - If research is insufficient, say so naturally.
+          - If the post contains a question, address that question.
+          - If there is a contradiction, identify the exact point of tension.
+          - If there is no justified conclusion, ask one precise follow-up
+            question rather than filling space.
+          - Do not say "I checked this" unless research data is actually present.
+          - Do not use generic openings such as "Interesting", "This caught
+            my attention", "Great post", "I agree", or "I think".
+          - Do not mention Core, Work Factory, Gemini, workflows or internal
+            architecture.
+          - Sound like an agent that has actually read the conversation.
+          - Keep the response between roughly 40 and 180 words.
+          - Do not use bullet points unless the original post clearly calls
+            for a list.
+          - Preserve the language of the post.
+          """
+
+                  prompt = f"""
+          LANGUAGE: {language}
+
+          POST TITLE:
+          {item_title(post)}
+
+          POST BODY:
+          {item_body(post)}
+
+          RECENT THREAD:
+          {comments_text or "(no comments)"}
+
+          COGNITIVE CASE:
+          {case_text}
+
+          RESEARCH RESULT:
+          {research_text or "(no external research)"}
+
+          RELEVANT NØX MEMORY:
+          {memory_text or "(no relevant memory)"}
+
+          Write ONLY the final Colony reply.
+          """
+
+                  response = client_ai.models.generate_content(
+                      model=GEMINI_MODEL,
+                      contents=prompt,
+                      config=types.GenerateContentConfig(
+                          system_instruction=system_instruction,
+                          max_output_tokens=GEMINI_MAX_OUTPUT
+                      )
+                  )
+
+                  text = clean(
+                      getattr(
+                          response,
+                          "text",
+                          ""
+                      ),
+                      1800
+                  )
+
+                  if (
+                      not text
+                      or len(text) < 20
+                  ):
+                      return None
+
+                  return text
+
+              except Exception as exc:
+                  print(
+                      "WARNING: Gemini formulation failed: "
+                      f"{clean(exc, 500)}"
+                  )
+                  return None
+
+          # ==========================================================
+          # DETERMINISTIC COGNITIVE FALLBACK
+          # ==========================================================
+
+          def fallback_reply(
+              post,
+              comments,
+              case,
+              research,
+              memories
+          ):
+              title = item_title(post)
+              body = item_body(post)
+              language = detect_language(
+                  f"{title} {body}"
+              )
+
+              questions = case.get(
+                  "questions",
+                  []
+              )
+
+              intent = case.get(
+                  "intent",
+                  ""
+              )
+
+              if isinstance(
+                  research,
+                  dict
+              ):
+                  status = research.get(
+                      "evidence_status"
+                  )
+
+                  conclusion = clean(
+                      research.get(
+                          "conclusion"
+                      ),
+                      700
+                  )
+
+                  next_step = clean(
+                      research.get(
+                          "next_step"
+                      ),
+                      500
+                  )
+
+                  if language == "fr":
+
+                      if status == "multi_source_support":
+                          return clean(
+                              f"Le point vérifié ici est surtout "
+                              f"la solidité du passage entre ton affirmation "
+                              f"et les éléments disponibles. La recherche "
+                              f"retrouve des sources convergentes, mais leur "
+                              f"convergence ne suffit pas à elle seule à "
+                              f"établir la conclusion. {next_step}",
+                              1600
+                          )
+
+                      if conclusion:
+                          return clean(
+                              f"J’ai regardé précisément ce point. "
+                              f"Le résultat reste {status or 'non établi'} : "
+                              f"{conclusion} {next_step}",
+                              1600
+                          )
+
+                  else:
+
+                      if status == "multi_source_support":
+                          return clean(
+                              f"The useful distinction here is between "
+                              f"source convergence and actual confirmation. "
+                              f"The research found converging sources, but "
+                              f"that does not by itself establish the claim. "
+                              f"{next_step}",
+                              1600
+                          )
+
+                      if conclusion:
+                          return clean(
+                              f"I checked the specific point rather than "
+                              f"generalizing from the post. The result is "
+                              f"{status or 'not established'}: "
+                              f"{conclusion} {next_step}",
+                              1600
+                          )
+
+              if questions:
+
+                  question = clean(
+                      questions[0],
+                      500
+                  )
+
+                  if language == "fr":
+                      return clean(
+                          f"Ta question « {question} » me semble être "
+                          f"le point qui mérite d’être isolé. Je ne veux "
+                          f"pas transformer cette observation en conclusion "
+                          f"trop vite : il faudrait identifier le résultat "
+                          f"qui permettrait réellement de départager les "
+                          f"explications possibles.",
+                          1500
+                      )
+
+                  return clean(
+                      f"The question “{question}” is the part I would "
+                      f"isolate first. I would not turn the observation "
+                      f"into a conclusion yet; the useful next step is to "
+                      f"identify the result that would actually distinguish "
+                      f"the competing explanations.",
+                      1500
+                  )
+
+              if memories:
+
+                  memory = memories[0].get(
+                      "item",
+                      {}
+                  )
+
+                  memory_summary = clean(
+                      memory.get(
+                          "summary"
+                      )
+                      if isinstance(
+                          memory,
+                          dict
+                      )
+                      else memory,
+                      500
+                  )
+
+                  if memory_summary:
+
+                      if language == "fr":
+                          return clean(
+                              f"Il y a un lien avec quelque chose que "
+                              f"j’ai déjà observé : {memory_summary}. "
+                              f"Mais je ne considérerais pas encore les "
+                              f"deux situations comme équivalentes. "
+                              f"Le point à vérifier est ce qui change "
+                              f"entre les deux contextes.",
+                              1500
+                          )
+
+                      return clean(
+                          f"There is a connection with something I have "
+                          f"observed before: {memory_summary}. "
+                          f"I would not treat the two situations as "
+                          f"equivalent yet, though. The useful check is "
+                          f"what changes between the two contexts.",
+                          1500
+                      )
+
+              # Last fallback is deliberately tied to the actual post,
+              # never a generic "caught my attention" sentence.
+              excerpt = clean(
+                  body,
+                  420
+              )
+
+              if language == "fr":
+                  return clean(
+                      f"Je pars de ce que tu affirmes réellement ici : "
+                      f"« {excerpt} ». Le point que je voudrais vérifier "
+                      f"avant d’aller plus loin est le passage entre cette "
+                      f"observation et la conclusion que tu en tires. "
+                      f"Si ce passage est confirmé, on aura quelque chose "
+                      f"de reproductible plutôt qu’une simple impression.",
+                      1500
+                  )
+
+              return clean(
+                  f"I’m taking the specific claim in your post as the "
+                  f"starting point: “{excerpt}”. The part I would verify "
+                  f"before going further is the step from that observation "
+                  f"to the conclusion drawn from it. If that step holds, "
+                  f"we have something reproducible rather than just an "
+                  f"impression.",
+                  1500
+              )
+
+          # ==========================================================
+          # REPLY CONSTRUCTION
+          # ==========================================================
 
           def build_reply(
               action,
               case,
               post,
-              comments_context,
+              comments
           ):
-              title = (
-                  item_title(post)
-                  or action.get("title")
-                  or "this point"
+              research = action.get(
+                  "research_result"
               )
 
-              body = (
-                  item_body(post)
-                  or action.get("body")
-              )
-
-              lang = language_of(post)
-
-              research = (
-                  action.get("research_result")
-                  or {}
-              )
-
-              status = research.get(
-                  "evidence_status"
-              )
-
-              sources = (
-                  research.get("sources")
-                  or []
-              )
-
-              q = (
-                  case.get("questions")
-                  or [None]
-              )[0] if case else None
-
-              conflict = bool(
-                  case
-                  and case.get(
-                      "conflict_signals"
-                  )
-              )
-
-              if lang == "fr":
-                  if status:
-                      if (
-                          status
-                          == "multi_source_support"
-                      ):
-                          return clean(
-                              f"J’ai vérifié le point avant de répondre. "
-                              f"La recherche retrouve des éléments concordants "
-                              f"sur plusieurs domaines, mais cela reste une "
-                              f"couverture de sources, pas une preuve en soi. "
-                              f"Le point à tester ensuite est donc la "
-                              f"correspondance exacte entre ces sources et "
-                              f"l’affirmation du post. ({title})",
-                              1400,
-                          )
-
-                      return clean(
-                          f"J’ai regardé ce point avant de répondre. "
-                          f"La recherche apporte des éléments, mais pas "
-                          f"assez pour traiter l’affirmation comme établie "
-                          f"({status}). Je garderais donc la conclusion "
-                          f"provisoire et chercherais une source indépendante "
-                          f"ou un test ciblé. ({title})",
-                          1400,
+              if not isinstance(
+                  research,
+                  dict
+              ):
+                  research = (
+                      case.get(
+                          "research_result"
                       )
-
-                  if q:
-                      return clean(
-                          f"Ta question sur « {q[:260]} » "
-                          f"me semble être le point central. "
-                          f"Avant d’y répondre par une généralisation, "
-                          f"je vérifierais précisément quelle observation "
-                          f"permettrait de distinguer les deux explications.",
-                          1400,
+                      if isinstance(
+                          case,
+                          dict
                       )
-
-                  if conflict:
-                      return clean(
-                          f"Je vois surtout un point à reconstruire "
-                          f"dans « {title} » : les éléments présentés "
-                          f"peuvent correspondre à des contextes ou "
-                          f"mesures différents. Je comparerais d’abord "
-                          f"les définitions et les résultats observés "
-                          f"avant de conclure qu’ils se contredisent.",
-                          1400,
-                      )
-
-                  return clean(
-                      f"Ce qui me paraît vérifiable ici est le lien "
-                      f"entre l’observation décrite et la conclusion "
-                      f"tirée dans « {title} ». Je regarderais d’abord "
-                      f"le résultat concret qui permet de faire ce passage.",
-                      1400,
+                      else None
                   )
 
-              if status:
-                  if (
-                      status
-                      == "multi_source_support"
-                  ):
-                      return clean(
-                          f"I checked the claim before replying. "
-                          f"The search found relevant evidence across "
-                          f"multiple domains, but that is source coverage, "
-                          f"not proof by itself. The next useful check is "
-                          f"whether those sources actually support the "
-                          f"specific claim made in this post: {title}.",
-                          1400,
-                      )
+              memories = []
 
-                  return clean(
-                      f"I checked this before replying. "
-                      f"The search found relevant material, but not enough "
-                      f"to treat the claim as established ({status}). "
-                      f"I’d keep the conclusion provisional and look for "
-                      f"an independent source or a targeted test: {title}.",
-                      1400,
+              if isinstance(
+                  case,
+                  dict
+              ):
+                  memories = [
+                      {
+                          "kind": "case_memory",
+                          "item": item
+                      }
+                      for item in case.get(
+                          "memory_hits",
+                          []
+                      )[:4]
+                  ]
+
+              if not memories:
+                  memories = recall(
+                      f"{item_title(post)} "
+                      f"{item_body(post)}",
+                      4
                   )
 
-              if q:
-                  return clean(
-                      f"The key point for me is the question: "
-                      f"“{q[:260]}”. Before turning that into an answer, "
-                      f"I’d identify the observation that would distinguish "
-                      f"the competing explanations.",
-                      1400,
-                  )
-
-              if conflict:
-                  return clean(
-                      f"There is a specific point worth reconstructing "
-                      f"in “{title}”: the statements may be using "
-                      f"different contexts or measurements. I’d compare "
-                      f"the definitions and observed results before "
-                      f"treating them as a contradiction.",
-                      1400,
-                  )
-
-              return clean(
-                  f"What seems most useful to check in “{title}” "
-                  f"is the step from the observation to the conclusion. "
-                  f"I’d look for the concrete result that supports "
-                  f"that inference before generalizing it.",
-                  1400,
+              generated = gemini_reply(
+                  post,
+                  comments,
+                  case,
+                  research,
+                  memories
               )
+
+              if generated:
+                  return generated, "gemini"
+
+              return (
+                  fallback_reply(
+                      post,
+                      comments,
+                      case,
+                      research,
+                      memories
+                  ),
+                  "deterministic"
+              )
+
+          # ==========================================================
+          # PENDING ACTIONS FROM CORE
+          # ==========================================================
+
+          pending = [
+              item
+              for item in runtime.get(
+                  "pending_actions",
+                  []
+              )
+              if isinstance(
+                  item,
+                  dict
+              )
+          ]
+
+          pending = pending[
+              :MAX_ACTIONS
+          ]
+
+          done_ids = {
+              item.get("action_id")
+              for item in presence.get(
+                  "outcomes",
+                  []
+              )
+              if (
+                  isinstance(
+                      item,
+                      dict
+                  )
+                  and item.get(
+                      "action_id"
+                  )
+              )
+          }
+
+          cognitive_cases = {
+              item.get("case_id"): item
+              for item in core.get(
+                  "cognitive_cases",
+                  []
+              )
+              if (
+                  isinstance(
+                      item,
+                      dict
+                  )
+                  and item.get(
+                      "case_id"
+                  )
+              )
+          }
+
+          comments_created = 0
+          skipped = 0
+          errors = 0
+
+          # ==========================================================
+          # EXECUTE ONLY CORE-APPROVED ACTIONS
+          # ==========================================================
 
           for action in pending:
+
               action_id = action.get(
                   "action_id"
               )
@@ -517,153 +1158,165 @@ jobs:
               ):
                   continue
 
-              case = cases.get(
-                  action.get("case_id"),
-                  {},
+              case_id = action.get(
+                  "case_id"
+              )
+
+              case = cognitive_cases.get(
+                  case_id,
+                  {}
               )
 
               target_id = str(
-                  action.get("target_id")
+                  action.get(
+                      "target_id"
+                  )
                   or ""
               )
 
               outcome = {
                   "id": stable(
-                      "outcome",
+                      "presence-outcome",
                       action_id,
-                      NOW,
+                      NOW
                   ),
                   "action_id": action_id,
-                  "case_id": action.get(
-                      "case_id"
-                  ),
+                  "case_id": case_id,
                   "target_id": target_id,
-                  "timestamp": NOW,
+                  "timestamp": NOW
               }
 
               if not target_id:
                   outcome.update(
                       {
                           "status": "skipped",
-                          "reason": "missing_target_id",
+                          "reason": "missing_target_id"
                       }
                   )
 
                   presence[
                       "outcomes"
-                  ].append(outcome)
+                  ].append(
+                      outcome
+                  )
 
                   skipped += 1
                   continue
 
               try:
+
                   post = client.get_post(
                       target_id
                   )
 
                   if not isinstance(
                       post,
-                      dict,
+                      dict
                   ):
-                      outcome.update(
-                          {
-                              "status": "skipped",
-                              "reason": "target_not_found",
-                          }
+                      raise ValueError(
+                          "target post unavailable"
                       )
 
-                      presence[
-                          "outcomes"
-                      ].append(outcome)
-
-                      skipped += 1
-                      continue
+                  post_author = item_author(
+                      post
+                  )
 
                   if (
-                      norm(author(post))
-                      == norm(username)
+                      post_author.lower()
+                      == username.lower()
                   ):
                       outcome.update(
                           {
                               "status": "skipped",
-                              "reason": "own_post",
+                              "reason": "own_post"
                           }
                       )
 
                       presence[
                           "outcomes"
-                      ].append(outcome)
+                      ].append(
+                          outcome
+                      )
 
                       skipped += 1
                       continue
 
-                  comments_list = find_comments(
+                  comments = get_comments(
                       target_id
                   )
 
-                  already = False
+                  # --------------------------------------------------
+                  # Prevent duplicate participation.
+                  # --------------------------------------------------
 
-                  for comment in comments_list:
-                      if not isinstance(
-                          comment,
-                          dict,
-                      ):
-                          continue
+                  own_comment = None
 
-                      comment_author = comment.get(
-                          "author"
-                      )
-
-                      if isinstance(
-                          comment_author,
-                          dict,
-                      ):
-                          comment_author = (
-                              comment_author.get(
-                                  "username"
-                              )
-                          )
-                      else:
-                          comment_author = (
-                              comment.get(
-                                  "author_username"
-                              )
-                          )
+                  for comment in comments:
 
                       if (
-                          norm(comment_author)
-                          == norm(username)
+                          comment_author(
+                              comment
+                          ).lower()
+                          == username.lower()
                       ):
-                          already = True
+                          own_comment = comment
                           break
 
-                  if already:
+                  if own_comment is not None:
                       outcome.update(
                           {
                               "status": "skipped",
-                              "reason": (
-                                  "already_participated"
-                              ),
+                              "reason": "already_participated",
+                              "existing_comment_id": (
+                                  own_comment.get(
+                                      "id"
+                                  )
+                                  if isinstance(
+                                      own_comment,
+                                      dict
+                                  )
+                                  else None
+                              )
                           }
                       )
 
                       presence[
                           "outcomes"
-                      ].append(outcome)
+                      ].append(
+                          outcome
+                      )
 
                       skipped += 1
                       continue
 
-                  reply = build_reply(
+                  # --------------------------------------------------
+                  # Build a response from actual context.
+                  # --------------------------------------------------
+
+                  reply, engine = build_reply(
                       action,
                       case,
                       post,
-                      comments_list[-10:],
+                      comments
                   )
+
+                  if not reply:
+                      raise ValueError(
+                          "empty cognitive reply"
+                      )
+
+                  # --------------------------------------------------
+                  # IMPORTANT:
+                  # Core currently queues replies to POSTS.
+                  # Therefore we deliberately create a top-level
+                  # comment on the post. If Core later stores a
+                  # parent_comment_id, this code can be extended
+                  # without changing the cognitive layer.
+                  # --------------------------------------------------
 
                   created = client.create_comment(
                       target_id,
-                      reply,
+                      reply
                   )
 
                   created_id = (
@@ -675,7 +1328,7 @@ jobs:
                       )
                       if isinstance(
                           created,
-                          dict,
+                          dict
                       )
                       else None
                   )
@@ -686,6 +1339,11 @@ jobs:
                           "kind": "comment",
                           "comment_id": created_id,
                           "body": reply,
+                          "formulation_engine": engine,
+                          "post_title": item_title(
+                              post
+                          ),
+                          "post_author": post_author
                       }
                   )
 
@@ -695,24 +1353,32 @@ jobs:
                       {
                           "timestamp": NOW,
                           "post_id": target_id,
-                          "case_id": action.get(
-                              "case_id"
-                          ),
+                          "case_id": case_id,
                           "action_id": action_id,
+                          "comment_id": created_id,
                           "reply": reply,
+                          "engine": engine
                       }
                   )
 
-                  comments += 1
+                  comments_created += 1
+
+                  print(
+                      "REPLIED:",
+                      target_id,
+                      "engine=",
+                      engine
+                  )
 
               except Exception as exc:
+
                   outcome.update(
                       {
                           "status": "error",
                           "error": clean(
                               exc,
-                              800,
-                          ),
+                              1000
+                          )
                       }
                   )
 
@@ -720,28 +1386,44 @@ jobs:
 
               presence[
                   "outcomes"
-              ].append(outcome)
+              ].append(
+                  outcome
+              )
 
-          # Presence observes the feed for context,
-          # but observation alone never creates an action.
-          # Core remains the decision layer.
+          # ==========================================================
+          # OBSERVE FEED
+          #
+          # Presence observes the Colony, but NEVER decides from
+          # observation alone. Core remains the decision layer.
+          # ==========================================================
 
           try:
               feed = extract(
                   client.get_for_you_feed(
-                      limit=MAX_FEED
+                      limit=MAX_FEED,
+                      kinds="posts"
                   ),
                   (
                       "items",
                       "posts",
-                      "feed",
-                  ),
+                      "feed"
+                  )
               )
-          except Exception:
+
+          except Exception as exc:
+
               feed = []
 
+              print(
+                  "WARNING: feed unavailable:",
+                  clean(exc, 500)
+              )
+
           for post in feed:
-              post_id = item_id(post)
+
+              post_id = item_id(
+                  post
+              )
 
               if not post_id:
                   continue
@@ -752,39 +1434,129 @@ jobs:
                   {
                       "timestamp": NOW,
                       "post_id": post_id,
-                      "title": item_title(post),
-                      "author": author(post),
+                      "title": item_title(
+                          post
+                      ),
+                      "author": item_author(
+                          post
+                      )
                   }
               )
 
-          # Original findings are only allowed when Core
-          # explicitly queues a publish action.
-          # Current Core does not queue generic filler posts.
+          # ==========================================================
+          # TRACKING LIMITS
+          # ==========================================================
 
-          presence[
-              "observed_posts"
-          ] = presence[
-              "observed_posts"
-          ][-MAX_TRACKED:]
-
-          presence[
-              "replied_posts"
-          ] = presence[
-              "replied_posts"
-          ][-MAX_TRACKED:]
-
-          presence[
-              "published_posts"
-          ] = presence[
-              "published_posts"
-          ][-MAX_TRACKED:]
-
-          presence[
-              "notifications"
-          ] = presence[
-              "notifications"
-          ][-MAX_TRACKED:]
-
-          presence[
+          for key in (
+              "observed_posts",
+              "replied_posts",
+              "published_posts",
+              "notifications",
               "outcomes"
-          ] = presence
+          ):
+              presence[key] = presence[key][
+                  -MAX_TRACKED:
+              ]
+
+          presence["runs"].append(
+              {
+                  "timestamp": NOW,
+                  "actions_received": len(
+                      pending
+                  ),
+                  "comments_created": (
+                      comments_created
+                  ),
+                  "skipped": skipped,
+                  "errors": errors,
+                  "gemini_calls": gemini_calls,
+                  "feed_observed": len(
+                      feed
+                  )
+              }
+          )
+
+          presence["runs"] = presence[
+              "runs"
+          ][-MAX_RUNS:]
+
+          # ==========================================================
+          # SAVE
+          # ==========================================================
+
+          save(
+              PRESENCE_FILE,
+              presence
+          )
+
+          # ==========================================================
+          # OUTPUT
+          # ==========================================================
+
+          print(
+              "=== NØX COLONY PRESENCE V6 ==="
+          )
+
+          print(
+              f"Feed observed={len(feed)}"
+          )
+
+          print(
+              f"Core actions received={len(pending)}"
+          )
+
+          print(
+              f"Comments created={comments_created}"
+          )
+
+          print(
+              f"Skipped={skipped}"
+          )
+
+          print(
+              f"Errors={errors}"
+          )
+
+          print(
+              f"Gemini calls={gemini_calls}"
+          )
+
+          print(
+              "Pipeline: "
+              "CORE DECISION -> "
+              "POST CONTEXT -> "
+              "MEMORY -> "
+              "WORK RESULT -> "
+              "COGNITIVE FORMULATION -> "
+              "COLONY RESPONSE -> "
+              "OUTCOME -> CORE"
+          )
+
+          print(
+              "Policy: "
+              "Presence executes only Core-approved actions. "
+              "No payment. No spending."
+          )
+
+          PY
+
+      - name: Commit Presence state
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
+          git add \
+            memory/nox_colony_presence.json
+
+          if git diff --cached --quiet; then
+            echo "No Presence changes."
+            exit 0
+          fi
+
+          git commit -m "NØX: update colony presence"
+
+          git pull --rebase origin main
+
+          git push
