@@ -1,0 +1,1014 @@
+name: NØX - Self Evolution
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "11 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-self-evolution
+  cancel-in-progress: false
+
+env:
+  CORE_MEMORY_FILE: memory/nox_core_memory.json
+  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  WORK_FILE: memory/nox_work_factory.json
+  KNOWLEDGE_FILE: memory/nox_knowledge.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
+  EVOLUTION_FILE: memory/nox_self_evolution.json
+
+  GEMINI_MODEL: "gemini-3.7-flash"
+  GEMINI_THINKING_LEVEL: "medium"
+
+  MAX_HISTORY: "200"
+  MAX_FAILURES_SCAN: "30"
+  MAX_LEARNINGS_SCAN: "30"
+  MAX_PATCHES: "12"
+  MAX_FILE_SIZE: "70000"
+
+jobs:
+  self-evolution:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install evolution dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "google-genai>=1.0.0,<2.0.0" "pydantic>=2.0.0,<3.0.0" "pyyaml>=6.0,<7.0"
+
+      - name: Run NØX Self Evolution
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import copy
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import yaml
+          from pydantic import BaseModel, Field
+
+          try:
+              from google import genai
+          except Exception:
+              genai = None
+
+
+          # ============================================================
+          # NØX SELF EVOLUTION
+          #
+          # DETECT
+          #   ↓
+          # RESEARCH / ANALYZE
+          #   ↓
+          # DECIDE
+          #   ↓
+          # MODIFY
+          #   ↓
+          # TEST
+          #   ↓
+          # RESULT
+          #   ↓
+          # LEARN
+          #   ↓
+          # NEXT EVOLUTION
+          #
+          # The workflow may modify only explicitly allowlisted files.
+          # It never modifies repository settings, secrets, or payments.
+          # ============================================================
+
+          NOW = datetime.now(timezone.utc).isoformat()
+          ROOT = Path(".").resolve()
+
+          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
+          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
+          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
+          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
+          EVOLUTION_FILE = Path(os.environ["EVOLUTION_FILE"])
+
+          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+          GEMINI_MODEL = os.environ["GEMINI_MODEL"]
+          GEMINI_THINKING_LEVEL = os.environ["GEMINI_THINKING_LEVEL"]
+
+          MAX_HISTORY = int(os.environ["MAX_HISTORY"])
+          MAX_FAILURES_SCAN = int(os.environ["MAX_FAILURES_SCAN"])
+          MAX_LEARNINGS_SCAN = int(os.environ["MAX_LEARNINGS_SCAN"])
+          MAX_PATCHES = int(os.environ["MAX_PATCHES"])
+          MAX_FILE_SIZE = int(os.environ["MAX_FILE_SIZE"])
+
+          ALLOWED_TARGETS = {
+              ".github/workflows/nox-core-general.yml",
+              ".github/workflows/nox-work-factory.yml",
+              ".github/workflows/nox-colony-presence.yml",
+              ".github/workflows/nox-evolution-monitor.yml",
+              "memory/nox_core_memory.json",
+              "memory/nox_core_runtime.json",
+              "memory/nox_work_factory.json",
+              "memory/nox_knowledge.json",
+              "memory/nox_colony_presence.json",
+              "memory/nox_evolution_report.md",
+          }
+
+          FORBIDDEN_TARGETS = {
+              ".github/workflows/nox-self-evolution.yml",
+              ".github/workflows/nox-action-opportunities.yml",
+              ".github/workflows/nox-core-general-v2.yml",
+              ".github/workflows/nox-core-general-v3.yml",
+              ".github/workflows/nox-core-general-v4.yml",
+          }
+
+
+          # ============================================================
+          # UTILITIES
+          # ============================================================
+
+          def clean(value, limit=6000):
+              return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+          def stable(*parts):
+              raw = "|".join(clean(x, 10000) for x in parts)
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+          def sha256_file(path):
+              if not path.exists():
+                  return None
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+          def load_json(path, default):
+              if not path.exists():
+                  return copy.deepcopy(default)
+
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+                  return value
+              except Exception:
+                  return copy.deepcopy(default)
+
+
+          def save_json(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(
+                  json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+
+
+          def git(*args, check=True):
+              result = subprocess.run(
+                  ["git", *args],
+                  text=True,
+                  capture_output=True,
+                  check=False,
+              )
+
+              if check and result.returncode != 0:
+                  raise RuntimeError(
+                      f"git {' '.join(args)} failed: "
+                      f"{result.stdout[-2000:]} {result.stderr[-2000:]}"
+                  )
+
+              return result
+
+
+          def read_file(path):
+              if not path.exists():
+                  return ""
+
+              if path.stat().st_size > MAX_FILE_SIZE:
+                  raise RuntimeError(f"File too large for controlled evolution: {path}")
+
+              return path.read_text(encoding="utf-8")
+
+
+          def safe_target(path):
+              normalized = str(path).replace("\\", "/").lstrip("./")
+
+              if normalized in FORBIDDEN_TARGETS:
+                  return False
+
+              if normalized not in ALLOWED_TARGETS:
+                  return False
+
+              candidate = (ROOT / normalized).resolve()
+
+              try:
+                  candidate.relative_to(ROOT)
+              except ValueError:
+                  return False
+
+              return True
+
+
+          # ============================================================
+          # LOAD STATE
+          # ============================================================
+
+          memory = load_json(CORE_MEMORY_FILE, {})
+          runtime = load_json(CORE_RUNTIME_FILE, {})
+          work = load_json(WORK_FILE, {})
+          knowledge = load_json(KNOWLEDGE_FILE, {})
+          presence = load_json(PRESENCE_FILE, {})
+          evolution = load_json(
+              EVOLUTION_FILE,
+              {
+                  "version": 1,
+                  "runs": [],
+                  "history": [],
+                  "active_cases": [],
+                  "completed": [],
+                  "failed": [],
+              },
+          )
+
+          evolution.setdefault("runs", [])
+          evolution.setdefault("history", [])
+          evolution.setdefault("active_cases", [])
+          evolution.setdefault("completed", [])
+          evolution.setdefault("failed", [])
+
+
+          # ============================================================
+          # DETECTION
+          # ============================================================
+
+          failures = memory.get("failures", [])
+          learnings = memory.get("learnings", [])
+          cognitive_cases = memory.get("cognitive_cases", [])
+
+          recent_failures = [
+              x for x in failures[-MAX_FAILURES_SCAN:]
+              if isinstance(x, dict)
+          ]
+
+          recent_learnings = [
+              x for x in learnings[-MAX_LEARNINGS_SCAN:]
+              if isinstance(x, dict)
+          ]
+
+          detected = []
+
+          for failure in recent_failures:
+              detected.append({
+                  "source": "core_failure",
+                  "type": failure.get("type", "unknown"),
+                  "title": clean(
+                      failure.get("title")
+                      or failure.get("description")
+                      or failure.get("failure")
+                  ),
+                  "details": failure,
+              })
+
+          for learning in recent_learnings:
+              text = clean(
+                  learning.get("text")
+                  or learning.get("learning")
+                  or learning.get("description")
+              ).lower()
+
+              evolution_markers = (
+                  "generic",
+                  "regression",
+                  "repeated",
+                  "failure",
+                  "weak",
+                  "improve",
+                  "improvement",
+                  "self_audit",
+                  "direct message",
+                  "private message",
+                  "réponse générique",
+                  "message privé",
+                  "échec",
+                  "régression",
+              )
+
+              if any(marker in text for marker in evolution_markers):
+                  detected.append({
+                      "source": "core_learning",
+                      "type": "learning_signal",
+                      "title": clean(
+                          learning.get("text")
+                          or learning.get("learning")
+                          or learning.get("description")
+                      ),
+                      "details": learning,
+                  })
+
+          # Explicit evolution requests have priority.
+          explicit_requests = runtime.get("evolution_requests", [])
+
+          if isinstance(explicit_requests, list):
+              for request in explicit_requests[-20:]:
+                  if isinstance(request, dict):
+                      detected.append({
+                          "source": "explicit_request",
+                          "type": request.get("type", "requested_evolution"),
+                          "title": clean(
+                              request.get("title")
+                              or request.get("problem")
+                              or request.get("question")
+                          ),
+                          "details": request,
+                      })
+
+
+          # ============================================================
+          # AVOID REPEATING IDENTICAL EVOLUTION CASES
+          # ============================================================
+
+          previous_signatures = {
+              item.get("signature")
+              for item in evolution.get("history", [])
+              if isinstance(item, dict)
+          }
+
+          candidates = []
+
+          for item in detected:
+              signature = stable(
+                  item.get("source"),
+                  item.get("type"),
+                  item.get("title"),
+              )
+
+              if signature in previous_signatures:
+                  continue
+
+              item["signature"] = signature
+              candidates.append(item)
+
+
+          # If there is no new signal, still record the observation.
+          if not candidates:
+              run_record = {
+                  "timestamp": NOW,
+                  "status": "no_new_evolution_candidate",
+                  "detected_signals": len(detected),
+                  "new_candidates": 0,
+              }
+
+              evolution["runs"].append(run_record)
+              evolution["runs"] = evolution["runs"][-MAX_HISTORY:]
+              evolution["updated_at"] = NOW
+
+              save_json(EVOLUTION_FILE, evolution)
+
+              print("=== NØX SELF EVOLUTION ===")
+              print("No new evolution candidate.")
+              print(f"Detected signals: {len(detected)}")
+              print("No modification performed.")
+              PY
+          exit 0
+          fi
+
+
+          # ============================================================
+          # TARGET SELECTION
+          # ============================================================
+
+          def infer_targets(candidate):
+              text = json.dumps(candidate, ensure_ascii=False).lower()
+
+              targets = []
+
+              if any(x in text for x in (
+                  "presence",
+                  "generic",
+                  "direct message",
+                  "private message",
+                  "dm",
+                  "réponse générique",
+                  "message privé",
+              )):
+                  targets.append(".github/workflows/nox-colony-presence.yml")
+
+              if any(x in text for x in (
+                  "work factory",
+                  "research",
+                  "research result",
+                  "evidence",
+              )):
+                  targets.append(".github/workflows/nox-work-factory.yml")
+
+              if any(x in text for x in (
+                  "core",
+                  "cognitive",
+                  "decision",
+                  "reflection",
+                  "reasoning",
+              )):
+                  targets.append(".github/workflows/nox-core-general.yml")
+
+              if any(x in text for x in (
+                  "monitor",
+                  "metric",
+                  "regression",
+                  "evolution report",
+              )):
+                  targets.append(".github/workflows/nox-evolution-monitor.yml")
+
+              if any(x in text for x in (
+                  "memory",
+                  "learning",
+                  "knowledge",
+                  "history",
+              )):
+                  targets.extend([
+                      "memory/nox_core_memory.json",
+                      "memory/nox_knowledge.json",
+                  ])
+
+              if not targets:
+                  targets.append(".github/workflows/nox-core-general.yml")
+
+              return list(dict.fromkeys(
+                  target for target in targets if safe_target(target)
+              ))
+
+
+          selected = candidates[0]
+          inferred_targets = infer_targets(selected)
+
+          # Explicit target paths override inference.
+          requested_targets = selected.get("details", {}).get("targets", [])
+          if isinstance(requested_targets, list):
+              explicit_targets = [
+                  str(x).replace("\\", "/").lstrip("./")
+                  for x in requested_targets
+                  if safe_target(str(x).replace("\\", "/").lstrip("./"))
+              ]
+
+              if explicit_targets:
+                  inferred_targets = list(dict.fromkeys(explicit_targets))
+
+
+          # ============================================================
+          # BUILD CONTEXT FOR REASONING ENGINE
+          # ============================================================
+
+          target_contents = {}
+
+          for target in inferred_targets[:4]:
+              path = ROOT / target
+
+              if path.exists():
+                  target_contents[target] = read_file(path)
+
+
+          context = {
+              "timestamp": NOW,
+              "candidate": selected,
+              "recent_failures": recent_failures[-10:],
+              "recent_learnings": recent_learnings[-10:],
+              "recent_cognitive_cases": cognitive_cases[-10:],
+              "work_factory_history": work.get("history", [])[-10:],
+              "knowledge": knowledge,
+              "presence_state": {
+                  "outcomes": presence.get("outcomes", [])[-10:],
+                  "runs": presence.get("runs", [])[-10:],
+              },
+              "runtime": {
+                  "evolution_requests": runtime.get("evolution_requests", [])[-10:],
+                  "last_cycle": runtime.get("last_cycle"),
+                  "run_count": runtime.get("run_count"),
+              },
+              "target_files": target_contents,
+          }
+
+
+          # ============================================================
+          # STRUCTURED EVOLUTION PLAN
+          # ============================================================
+
+          class Patch(BaseModel):
+              path: str
+              old: str
+              new: str
+              reason: str
+
+
+          class EvolutionPlan(BaseModel):
+              should_evolve: bool
+              target_paths: list[str] = Field(default_factory=list)
+              problem: str = ""
+              hypothesis: str = ""
+              decision: str = ""
+              expected_result: str = ""
+              test_plan: list[str] = Field(default_factory=list)
+              patches: list[Patch] = Field(default_factory=list)
+              risk: str = "unknown"
+              learning_to_record: str = ""
+
+
+          plan = None
+          planner_error = None
+
+          if genai is not None and GEMINI_API_KEY:
+              try:
+                  client = genai.Client(api_key=GEMINI_API_KEY)
+
+                  prompt = {
+                      "role": (
+                          "You are the controlled self-evolution engine inside "
+                          "NØX. You may propose repository code changes, but "
+                          "only within the supplied allowlist."
+                      ),
+                      "mission": (
+                          "Diagnose one concrete observed weakness and propose "
+                          "the smallest justified modification that can be "
+                          "tested immediately."
+                      ),
+                      "rules": [
+                          "Use only supplied evidence.",
+                          "Do not invent failures.",
+                          "Do not modify secrets, repository settings, payments, spending, or authentication.",
+                          "Do not modify the Self Evolution workflow itself.",
+                          "Do not modify files outside the supplied target list.",
+                          "Prefer the smallest change that addresses the observed problem.",
+                          "Do not rewrite a complete workflow when a smaller replacement is sufficient.",
+                          "Every patch must contain an exact old string that exists in the current file.",
+                          "Never use an empty old string.",
+                          "Do not remove working behavior unless the evidence shows it causes the problem.",
+                          "Preserve zero-payment and zero-spending policies.",
+                          "Preserve existing Colony SDK/API behavior unless the evidence requires a change.",
+                          "The test plan must be executable locally in the workflow.",
+                          "If evidence is insufficient, set should_evolve=false.",
+                          "Return only the structured result.",
+                      ],
+                      "allowlist": sorted(ALLOWED_TARGETS),
+                      "context": context,
+                  }
+
+                  interaction = client.models.generate_content(
+                      model=GEMINI_MODEL,
+                      contents=json.dumps(prompt, ensure_ascii=False),
+                      config={
+                          "temperature": 0.1,
+                          "response_mime_type": "application/json",
+                          "response_schema": EvolutionPlan.model_json_schema(),
+                          "thinking_config": {
+                              "thinking_level": GEMINI_THINKING_LEVEL,
+                          },
+                      },
+                  )
+
+                  plan = EvolutionPlan.model_validate_json(interaction.text)
+
+              except Exception as exc:
+                  planner_error = clean(exc, 2000)
+
+
+          # ============================================================
+          # FALLBACK FOR EXPLICIT STRUCTURED PATCHES
+          # ============================================================
+
+          if plan is None:
+              details = selected.get("details", {})
+
+              raw_patches = details.get("patches", [])
+
+              if isinstance(raw_patches, list) and raw_patches:
+                  try:
+                      plan = EvolutionPlan(
+                          should_evolve=True,
+                          target_paths=[
+                              x for x in inferred_targets
+                              if safe_target(x)
+                          ],
+                          problem=clean(
+                              details.get("problem")
+                              or selected.get("title")
+                          ),
+                          hypothesis=clean(
+                              details.get("hypothesis")
+                              or "Explicit evolution request."
+                          ),
+                          decision="Apply supplied structured patches.",
+                          expected_result=clean(
+                              details.get("expected_result")
+                              or "The identified weakness is reduced without regression."
+                          ),
+                          test_plan=[
+                              "Validate YAML syntax.",
+                              "Compile embedded Python blocks.",
+                              "Inspect git diff.",
+                          ],
+                          patches=[
+                              Patch.model_validate(p)
+                              for p in raw_patches
+                          ],
+                          risk="controlled",
+                          learning_to_record="Structured evolution patch executed and tested.",
+                      )
+                  except Exception as exc:
+                      planner_error = clean(exc, 2000)
+
+
+          # ============================================================
+          # NO VALID PLAN
+          # ============================================================
+
+          if plan is None or not plan.should_evolve:
+              record = {
+                  "id": stable(NOW, selected.get("signature")),
+                  "timestamp": NOW,
+                  "status": "no_evolution",
+                  "candidate": selected,
+                  "planner_error": planner_error,
+                  "decision": getattr(plan, "decision", "") if plan else "",
+              }
+
+              evolution["history"].append(record)
+              evolution["history"] = evolution["history"][-MAX_HISTORY:]
+              evolution["runs"].append({
+                  "timestamp": NOW,
+                  "status": "no_evolution",
+                  "planner_error": planner_error,
+              })
+              evolution["runs"] = evolution["runs"][-MAX_HISTORY:]
+              evolution["updated_at"] = NOW
+
+              save_json(EVOLUTION_FILE, evolution)
+
+              print("=== NØX SELF EVOLUTION ===")
+              print("No justified modification produced.")
+              if planner_error:
+                  print(f"Planner error: {planner_error}")
+              PY
+          exit 0
+          fi
+
+
+          # ============================================================
+          # PLAN VALIDATION
+          # ============================================================
+
+          if len(plan.patches) > MAX_PATCHES:
+              raise RuntimeError("Evolution plan contains too many patches.")
+
+          if not plan.target_paths:
+              raise RuntimeError("Evolution plan contains no target.")
+
+          for target in plan.target_paths:
+              if not safe_target(target):
+                  raise RuntimeError(f"Forbidden evolution target: {target}")
+
+          for patch in plan.patches:
+              if not safe_target(patch.path):
+                  raise RuntimeError(f"Forbidden patch target: {patch.path}")
+
+              if not patch.old.strip():
+                  raise RuntimeError(f"Empty old text in patch: {patch.path}")
+
+              if patch.old == patch.new:
+                  raise RuntimeError(f"No-op patch: {patch.path}")
+
+              current = read_file(ROOT / patch.path)
+
+              occurrences = current.count(patch.old)
+
+              if occurrences != 1:
+                  raise RuntimeError(
+                      f"Patch for {patch.path} expected exactly one match; "
+                      f"found {occurrences}."
+                  )
+
+
+          # ============================================================
+          # PRE-EVOLUTION SNAPSHOT
+          # ============================================================
+
+          evolution_id = stable(
+              NOW,
+              plan.problem,
+              json.dumps(
+                  [p.model_dump() for p in plan.patches],
+                  ensure_ascii=False,
+                  sort_keys=True,
+              ),
+          )
+
+          before_hashes = {
+              path: sha256_file(ROOT / path)
+              for path in {
+                  patch.path for patch in plan.patches
+              }
+          }
+
+          # ============================================================
+          # APPLY PATCHES
+          # ============================================================
+
+          changed_paths = []
+
+          for patch in plan.patches:
+              path = ROOT / patch.path
+              current = path.read_text(encoding="utf-8")
+
+              updated = current.replace(
+                  patch.old,
+                  patch.new,
+                  1,
+              )
+
+              if updated == current:
+                  raise RuntimeError(
+                      f"Patch did not change {patch.path}"
+                  )
+
+              path.write_text(updated, encoding="utf-8")
+              changed_paths.append(patch.path)
+
+
+          changed_paths = list(dict.fromkeys(changed_paths))
+
+
+          # ============================================================
+          # TEST 1 — YAML
+          # ============================================================
+
+          yaml_errors = []
+
+          for path in changed_paths:
+              if not path.endswith((".yml", ".yaml")):
+                  continue
+
+              try:
+                  with open(ROOT / path, "r", encoding="utf-8") as handle:
+                      yaml.safe_load(handle)
+              except Exception as exc:
+                  yaml_errors.append({
+                      "path": path,
+                      "error": clean(exc, 2000),
+                  })
+
+
+          if yaml_errors:
+              raise RuntimeError(
+                  "YAML validation failed: "
+                  + json.dumps(yaml_errors, ensure_ascii=False)
+              )
+
+
+          # ============================================================
+          # TEST 2 — EMBEDDED PYTHON
+          # ============================================================
+
+          python_errors = []
+
+          for path in changed_paths:
+              if not path.endswith((".yml", ".yaml")):
+                  continue
+
+              text = read_file(ROOT / path)
+
+              blocks = re.findall(
+                  r"python3\s+-\s*<<['\"]?PY['\"]?\s*\n(.*?)\n\s*PY\s*$",
+                  text,
+                  flags=re.MULTILINE | re.DOTALL,
+              )
+
+              for index, block in enumerate(blocks, start=1):
+                  try:
+                      compile(
+                          block,
+                          f"{path}:embedded-python:{index}",
+                          "exec",
+                      )
+                  except Exception as exc:
+                      python_errors.append({
+                          "path": path,
+                          "block": index,
+                          "error": clean(exc, 2000),
+                      })
+
+
+          if python_errors:
+              raise RuntimeError(
+                  "Embedded Python validation failed: "
+                  + json.dumps(python_errors, ensure_ascii=False)
+              )
+
+
+          # ============================================================
+          # TEST 3 — POLICY INTEGRITY
+          # ============================================================
+
+          policy_errors = []
+
+          for path in changed_paths:
+              text = read_file(ROOT / path)
+
+              lowered = text.lower()
+
+              if "auto_payment" in lowered and "false" not in lowered:
+                  policy_errors.append(
+                      f"{path}: AUTO_PAYMENT policy may have been altered."
+                  )
+
+              if "auto_spending" in lowered and "false" not in lowered:
+                  policy_errors.append(
+                      f"{path}: AUTO_SPENDING policy may have been altered."
+                  )
+
+              if "project_cost_eur" in lowered:
+                  if '"0"' not in lowered and "project_cost_eur: 0" not in lowered:
+                      policy_errors.append(
+                          f"{path}: project cost policy may have been altered."
+                      )
+
+
+          if policy_errors:
+              raise RuntimeError(
+                  "Policy integrity test failed: "
+                  + json.dumps(policy_errors, ensure_ascii=False)
+              )
+
+
+          # ============================================================
+          # TEST 4 — GIT DIFF
+          # ============================================================
+
+          diff = git("diff", "--", *changed_paths).stdout
+
+          if not diff.strip():
+              raise RuntimeError("Evolution produced no git diff.")
+
+          if len(diff) > 120000:
+              raise RuntimeError("Evolution diff is too large.")
+
+
+          # ============================================================
+          # POST-TEST HASHES
+          # ============================================================
+
+          after_hashes = {
+              path: sha256_file(ROOT / path)
+              for path in changed_paths
+          }
+
+
+          # ============================================================
+          # RECORD RESULT BEFORE COMMIT
+          # ============================================================
+
+          history_entry = {
+              "id": evolution_id,
+              "timestamp": NOW,
+              "status": "tested_pending_commit",
+              "problem": plan.problem,
+              "hypothesis": plan.hypothesis,
+              "decision": plan.decision,
+              "expected_result": plan.expected_result,
+              "test_plan": plan.test_plan,
+              "risk": plan.risk,
+              "target_paths": plan.target_paths,
+              "changed_paths": changed_paths,
+              "patches": [
+                  {
+                      "path": patch.path,
+                      "reason": patch.reason,
+                      "old_sha256": hashlib.sha256(
+                          patch.old.encode("utf-8")
+                      ).hexdigest(),
+                      "new_sha256": hashlib.sha256(
+                          patch.new.encode("utf-8")
+                      ).hexdigest(),
+                  }
+                  for patch in plan.patches
+              ],
+              "before_hashes": before_hashes,
+              "after_hashes": after_hashes,
+              "tests": {
+                  "yaml": "passed",
+                  "embedded_python": "passed",
+                  "policy_integrity": "passed",
+                  "git_diff": "passed",
+              },
+              "learning": plan.learning_to_record,
+          }
+
+          evolution["history"].append(history_entry)
+          evolution["history"] = evolution["history"][-MAX_HISTORY:]
+          evolution["active_cases"].append(evolution_id)
+          evolution["active_cases"] = evolution["active_cases"][-50:]
+          evolution["updated_at"] = NOW
+
+          save_json(EVOLUTION_FILE, evolution)
+
+
+          # ============================================================
+          # COMMIT
+          # ============================================================
+
+          git("config", "user.name", "NØX")
+          git("config", "user.email", "nox@users.noreply.github.com")
+
+          git(
+              "add",
+              *changed_paths,
+              str(EVOLUTION_FILE),
+          )
+
+          if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+              print("No staged changes.")
+              sys.exit(0)
+
+          commit_message = (
+              f"NØX: self evolution {evolution_id}"
+          )
+
+          git(
+              "commit",
+              "-m",
+              commit_message,
+          )
+
+          # Rebase against the current main before publishing.
+          git("pull", "--rebase", "origin", "main")
+
+          git("push", "origin", "HEAD:main")
+
+
+          # ============================================================
+          # FINAL RESULT
+          # ============================================================
+
+          commit_sha = git("rev-parse", "HEAD").stdout.strip()
+
+          for item in evolution["history"]:
+              if item.get("id") == evolution_id:
+                  item["status"] = "committed"
+                  item["commit"] = commit_sha
+                  item["result"] = "modification_committed"
+                  break
+
+          evolution["completed"].append({
+              "id": evolution_id,
+              "timestamp": NOW,
+              "commit": commit_sha,
+              "changed_paths": changed_paths,
+              "expected_result": plan.expected_result,
+              "learning": plan.learning_to_record,
+          })
+
+          evolution["completed"] = evolution["completed"][-MAX_HISTORY:]
+          evolution["active_cases"] = [
+              x for x in evolution["active_cases"]
+              if x != evolution_id
+          ]
+          evolution["updated_at"] = NOW
+
+          save_json(EVOLUTION_FILE, evolution)
+
+          # Commit the final evolution-state update.
+          git("add", str(EVOLUTION_FILE))
+
+          if git("diff", "--cached", "--quiet", check=False).returncode != 0:
+              git(
+                  "commit",
+                  "-m",
+                  f"NØX: record self evolution result {evolution_id}",
+              )
+              git("push", "origin", "HEAD:main")
+
+          print("")
+          print("=== NØX SELF EVOLUTION ===")
+          print(f"Evolution ID: {evolution_id}")
+          print(f"Problem: {plan.problem}")
+          print(f"Decision: {plan.decision}")
+          print(f"Changed: {', '.join(changed_paths)}")
+          print("YAML test: PASSED")
+          print("Python test: PASSED")
+          print("Policy test: PASSED")
+          print(f"Commit: {commit_sha}")
+          print("Result: MODIFICATION COMMITTED")
+          print("Cycle: DETECT -> RESEARCH -> DECIDE -> MODIFY -> TEST -> RESULT -> LEARN")
+          PY
