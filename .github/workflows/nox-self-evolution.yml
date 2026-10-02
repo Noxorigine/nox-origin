@@ -19,10 +19,13 @@ env:
   WORK_FILE: memory/nox_work_factory.json
   KNOWLEDGE_FILE: memory/nox_knowledge.json
   PRESENCE_FILE: memory/nox_colony_presence.json
+
   GEMINI_MODEL: gemini-3.7-flash
+
   MAX_HISTORY: "200"
   MAX_PATCHES: "8"
-  MAX_FILE_CHARS: "90000"
+  MAX_CONTEXT_CHARS: "24000"
+  MAX_FILE_CHARS: "500000"
 
 jobs:
   self-evolution:
@@ -79,45 +82,58 @@ jobs:
 
           MAX_HISTORY = int(os.environ["MAX_HISTORY"])
           MAX_PATCHES = int(os.environ["MAX_PATCHES"])
+          MAX_CONTEXT_CHARS = int(os.environ["MAX_CONTEXT_CHARS"])
           MAX_FILE_CHARS = int(os.environ["MAX_FILE_CHARS"])
 
-          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-          GEMINI_MODEL = os.environ["GEMINI_MODEL"]
+          GEMINI_API_KEY = os.environ.get(
+              "GEMINI_API_KEY",
+              "",
+          ).strip()
 
-          EVOLUTION_FILE = Path(os.environ["EVOLUTION_FILE"])
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
+          GEMINI_MODEL = os.environ[
+              "GEMINI_MODEL"
+          ]
+
+          EVOLUTION_FILE = Path(
+              os.environ["EVOLUTION_FILE"]
+          )
+          CORE_MEMORY_FILE = Path(
+              os.environ["CORE_MEMORY_FILE"]
+          )
+          CORE_RUNTIME_FILE = Path(
+              os.environ["CORE_RUNTIME_FILE"]
+          )
+          WORK_FILE = Path(
+              os.environ["WORK_FILE"]
+          )
+          KNOWLEDGE_FILE = Path(
+              os.environ["KNOWLEDGE_FILE"]
+          )
+          PRESENCE_FILE = Path(
+              os.environ["PRESENCE_FILE"]
+          )
 
           # ============================================================
-          # ALLOWED SELF-EVOLUTION SURFACE
+          # SELF-EVOLUTION PERIMETER
           # ============================================================
 
-          WORKFLOW_ALLOWLIST = {
+          ALLOWED_TARGETS = {
               ".github/workflows/nox-core-general.yml",
               ".github/workflows/nox-work-factory.yml",
               ".github/workflows/nox-colony-presence.yml",
               ".github/workflows/nox-evolution-monitor.yml",
-          }
-
-          MEMORY_ALLOWLIST = {
-              str(CORE_MEMORY_FILE),
-              str(CORE_RUNTIME_FILE),
-              str(WORK_FILE),
-              str(KNOWLEDGE_FILE),
-              str(PRESENCE_FILE),
-              str(EVOLUTION_FILE),
+              "memory/nox_core_memory.json",
+              "memory/nox_core_runtime.json",
+              "memory/nox_work_factory.json",
+              "memory/nox_knowledge.json",
+              "memory/nox_colony_presence.json",
               "memory/nox_evolution_report.md",
           }
 
-          FORBIDDEN = {
+          FORBIDDEN_TARGETS = {
               ".github/workflows/nox-self-evolution.yml",
               ".github/workflows/nox-action-opportunities.yml",
           }
-
-          ALLOWED_TARGETS = WORKFLOW_ALLOWLIST | MEMORY_ALLOWLIST
 
           # ============================================================
           # UTILITIES
@@ -189,7 +205,34 @@ jobs:
               )
 
 
-          def read_text(path):
+          def read_full(path):
+              if not path.exists():
+                  return ""
+
+              size = path.stat().st_size
+
+              if size > MAX_FILE_CHARS:
+                  raise RuntimeError(
+                      f"Target file exceeds safety limit: "
+                      f"{path} ({size} bytes)"
+                  )
+
+              return path.read_text(
+                  encoding="utf-8"
+              )
+
+
+          def read_for_context(path):
+              """
+              Large memory files are NOT copied in full into the
+              reasoning prompt.
+
+              This is critical because Presence memory grows over time.
+              The complete file remains available for exact patch
+              validation, while the reasoning engine receives a bounded
+              representation.
+              """
+
               if not path.exists():
                   return ""
 
@@ -197,12 +240,25 @@ jobs:
                   encoding="utf-8"
               )
 
-              if len(text) > MAX_FILE_CHARS:
-                  raise RuntimeError(
-                      f"Target file too large: {path}"
-                  )
+              if len(text) <= MAX_CONTEXT_CHARS:
+                  return text
 
-              return text
+              head_size = MAX_CONTEXT_CHARS // 3
+              tail_size = (
+                  MAX_CONTEXT_CHARS
+                  - head_size
+              )
+
+              head = text[:head_size]
+              tail = text[-tail_size:]
+
+              return (
+                  head
+                  + "\n\n"
+                  + "[... MIDDLE OF FILE OMITTED "
+                  "FROM REASONING CONTEXT ...]\n\n"
+                  + tail
+              )
 
 
           def file_hash(path):
@@ -222,11 +278,14 @@ jobs:
                   check=False,
               )
 
-              if check and result.returncode != 0:
+              if (
+                  check
+                  and result.returncode != 0
+              ):
                   raise RuntimeError(
                       f"git {' '.join(args)} failed: "
-                      f"{result.stdout[-1500:]} "
-                      f"{result.stderr[-1500:]}"
+                      f"{result.stdout[-2000:]} "
+                      f"{result.stderr[-2000:]}"
                   )
 
               return result
@@ -239,7 +298,7 @@ jobs:
                   .lstrip("./")
               )
 
-              if normalized in FORBIDDEN:
+              if normalized in FORBIDDEN_TARGETS:
                   return False
 
               if normalized not in ALLOWED_TARGETS:
@@ -257,207 +316,187 @@ jobs:
               return True
 
 
-          def existing_targets():
-              return sorted(
-                  target
-                  for target in ALLOWED_TARGETS
-                  if (
-                      ROOT / target
-                  ).exists()
-                  and safe_target(target)
-              )
-
-
           # ============================================================
-          # CONTEXT
+          # LOAD NØX STATE
           # ============================================================
 
-          def collect_context():
-              memory = load_json(
-                  CORE_MEMORY_FILE,
-                  {},
-              )
+          memory = load_json(
+              CORE_MEMORY_FILE,
+              {},
+          )
 
-              runtime = load_json(
-                  CORE_RUNTIME_FILE,
-                  {},
-              )
+          runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {},
+          )
 
-              work = load_json(
-                  WORK_FILE,
-                  {},
-              )
+          work = load_json(
+              WORK_FILE,
+              {},
+          )
 
-              knowledge = load_json(
-                  KNOWLEDGE_FILE,
-                  {},
-              )
+          knowledge = load_json(
+              KNOWLEDGE_FILE,
+              {},
+          )
 
-              presence = load_json(
-                  PRESENCE_FILE,
-                  {},
-              )
+          presence = load_json(
+              PRESENCE_FILE,
+              {},
+          )
 
-              evolution = load_json(
-                  EVOLUTION_FILE,
-                  {
-                      "history": [],
-                      "runs": [],
-                  },
-              )
-
-              failures = memory.get(
-                  "failures",
-                  [],
-              )
-
-              learnings = memory.get(
-                  "learnings",
-                  [],
-              )
-
-              cognitive_cases = memory.get(
-                  "cognitive_cases",
-                  [],
-              )
-
-              signals = []
-
-              for item in failures[-30:]:
-                  if isinstance(item, dict):
-                      signals.append(
-                          {
-                              "source": "failure",
-                              "data": item,
-                          }
-                      )
-
-              for item in learnings[-30:]:
-                  if isinstance(item, dict):
-                      signals.append(
-                          {
-                              "source": "learning",
-                              "data": item,
-                          }
-                      )
-
-              for item in runtime.get(
-                  "evolution_requests",
-                  [],
-              )[-20:]:
-                  if isinstance(item, dict):
-                      signals.append(
-                          {
-                              "source": "evolution_request",
-                              "data": item,
-                          }
-                      )
-
-              for item in runtime.get(
-                  "cognitive_gaps",
-                  [],
-              )[-20:]:
-                  if isinstance(item, dict):
-                      signals.append(
-                          {
-                              "source": "cognitive_gap",
-                              "data": item,
-                          }
-                      )
-
-              return {
-                  "timestamp": NOW,
-                  "signals": signals[-60:],
-                  "recent_cases": cognitive_cases[-15:],
-                  "work_factory": work.get(
-                      "history",
-                      [],
-                  )[-15:],
-                  "knowledge": knowledge,
-                  "presence": {
-                      "runs": presence.get(
-                          "runs",
-                          [],
-                      )[-10:],
-                      "outcomes": presence.get(
-                          "outcomes",
-                          [],
-                      )[-10:],
-                  },
-                  "runtime": {
-                      "run_count": runtime.get(
-                          "run_count"
-                      ),
-                      "last_run": runtime.get(
-                          "last_run"
-                      ),
-                      "evolution_requests": runtime.get(
-                          "evolution_requests",
-                          [],
-                      )[-10:],
-                  },
-                  "existing_targets": existing_targets(),
-                  "history": evolution.get(
-                      "history",
-                      [],
-                  )[-20:],
-              }
-
-
-          context = collect_context()
-
-          # ============================================================
-          # DETECTION
-          # ============================================================
-
-          def signature_for_signal(signal):
-              return stable(
-                  signal.get("source"),
-                  json.dumps(
-                      signal.get("data", {}),
-                      ensure_ascii=False,
-                      sort_keys=True,
-                  ),
-              )
-
-
-          evolution_state = load_json(
+          evolution = load_json(
               EVOLUTION_FILE,
               {
+                  "version": 1,
                   "history": [],
                   "runs": [],
               },
           )
 
-          history = evolution_state.get(
+          evolution.setdefault(
+              "version",
+              1,
+          )
+
+          evolution.setdefault(
               "history",
               [],
           )
 
+          evolution.setdefault(
+              "runs",
+              [],
+          )
+
+          # ============================================================
+          # DETECTION
+          # ============================================================
+
+          signals = []
+
+          for item in memory.get(
+              "failures",
+              [],
+          )[-40:]:
+              if isinstance(item, dict):
+                  signals.append(
+                      {
+                          "source": "core_failure",
+                          "data": item,
+                      }
+                  )
+
+          for item in memory.get(
+              "learnings",
+              [],
+          )[-40:]:
+              if isinstance(item, dict):
+                  signals.append(
+                      {
+                          "source": "core_learning",
+                          "data": item,
+                      }
+                  )
+
+          for item in runtime.get(
+              "evolution_requests",
+              [],
+          )[-20:]:
+              if isinstance(item, dict):
+                  signals.append(
+                      {
+                          "source": "evolution_request",
+                          "data": item,
+                      }
+                  )
+
+          for item in runtime.get(
+              "cognitive_gaps",
+              [],
+          )[-20:]:
+              if isinstance(item, dict):
+                  signals.append(
+                      {
+                          "source": "cognitive_gap",
+                          "data": item,
+                      }
+                  )
+
+          for item in work.get(
+              "history",
+              [],
+          )[-20:]:
+              if isinstance(item, dict):
+                  status = str(
+                      item.get(
+                          "evidence_status",
+                          "",
+                      )
+                  ).lower()
+
+                  if status in {
+                      "insufficient_verification",
+                      "partial_support",
+                  }:
+                      signals.append(
+                          {
+                              "source": "work_factory",
+                              "data": item,
+                          }
+                      )
+
+          for item in presence.get(
+              "outcomes",
+              [],
+          )[-30:]:
+              if isinstance(item, dict):
+                  signals.append(
+                      {
+                          "source": "presence_outcome",
+                          "data": item,
+                      }
+                  )
+
           known_signatures = {
-              item.get("signal_signature")
-              for item in history
+              item.get(
+                  "signal_signature"
+              )
+              for item in evolution[
+                  "history"
+              ]
               if isinstance(item, dict)
           }
 
           candidates = []
 
-          for signal in context["signals"]:
-              signature = signature_for_signal(
-                  signal
+          for signal in signals:
+              signature = stable(
+                  signal.get(
+                      "source"
+                  ),
+                  json.dumps(
+                      signal.get(
+                          "data",
+                          {},
+                      ),
+                      ensure_ascii=False,
+                      sort_keys=True,
+                  ),
               )
 
-              if signature not in known_signatures:
-                  candidates.append(
-                      {
-                          **signal,
-                          "signature": signature,
-                      }
-                  )
+              if signature in known_signatures:
+                  continue
+
+              candidates.append(
+                  {
+                      **signal,
+                      "signature": signature,
+                  }
+              )
 
           print(
-              f"Detected signals: "
-              f"{len(context['signals'])}"
+              f"Detected signals: {len(signals)}"
           )
 
           print(
@@ -465,41 +504,32 @@ jobs:
               f"{len(candidates)}"
           )
 
+          # ============================================================
+          # NO NEW EVOLUTION
+          # ============================================================
+
           if not candidates:
-              evolution_state.setdefault(
-                  "version",
-                  1,
-              )
-
-              evolution_state.setdefault(
-                  "history",
-                  [],
-              )
-
-              evolution_state.setdefault(
-                  "runs",
-                  [],
-              )
-
-              evolution_state["runs"].append(
+              evolution["runs"].append(
                   {
                       "timestamp": NOW,
-                      "status": "no_new_candidate",
-                      "signals": len(
-                          context["signals"]
+                      "status": (
+                          "no_new_candidate"
                       ),
+                      "signals": len(signals),
                   }
               )
 
-              evolution_state["runs"] = (
-                  evolution_state["runs"]
+              evolution["runs"] = (
+                  evolution["runs"]
               )[-MAX_HISTORY:]
 
-              evolution_state["updated_at"] = NOW
+              evolution[
+                  "updated_at"
+              ] = NOW
 
               save_json(
                   EVOLUTION_FILE,
-                  evolution_state,
+                  evolution,
               )
 
               print(
@@ -511,57 +541,104 @@ jobs:
           candidate = candidates[0]
 
           # ============================================================
-          # READ CURRENT TARGETS
+          # REASONING CONTEXT
           # ============================================================
 
-          target_contents = {}
+          context_files = {}
 
-          for target in context[
-              "existing_targets"
-          ]:
+          for target in sorted(
+              ALLOWED_TARGETS
+          ):
+              path = ROOT / target
+
+              if not path.exists():
+                  continue
+
               if target == str(
                   EVOLUTION_FILE
               ):
                   continue
 
-              target_contents[target] = read_text(
-                  ROOT / target
+              context_files[target] = (
+                  read_for_context(path)
               )
 
+          reasoning_context = {
+              "timestamp": NOW,
+              "candidate": candidate,
+              "recent_failures": memory.get(
+                  "failures",
+                  [],
+              )[-15:],
+              "recent_learnings": memory.get(
+                  "learnings",
+                  [],
+              )[-15:],
+              "recent_cognitive_cases": memory.get(
+                  "cognitive_cases",
+                  [],
+              )[-15:],
+              "work_factory_history": work.get(
+                  "history",
+                  [],
+              )[-10:],
+              "knowledge": knowledge,
+              "presence_recent_outcomes": presence.get(
+                  "outcomes",
+                  [],
+              )[-10:],
+              "runtime": {
+                  "run_count": runtime.get(
+                      "run_count"
+                  ),
+                  "last_run": runtime.get(
+                      "last_run"
+                  ),
+                  "evolution_requests": runtime.get(
+                      "evolution_requests",
+                      [],
+                  )[-10:],
+              },
+              "files": context_files,
+          }
+
           # ============================================================
-          # EVOLUTION DECISION
+          # GEMINI DECISION
           # ============================================================
 
           prompt = {
               "role": (
                   "NØX Self Evolution Engine"
               ),
-              "objective": (
-                  "Identify one evidence-based "
-                  "improvement and produce the "
-                  "smallest safe patch."
+              "mission": (
+                  "Diagnose one concrete weakness "
+                  "from evidence and, only when "
+                  "justified, prepare the smallest "
+                  "safe repository modification."
               ),
-              "candidate": candidate,
-              "context": context,
-              "files": target_contents,
-              "allowed_targets": (
-                  context["existing_targets"]
-              ),
+              "context": reasoning_context,
               "rules": [
-                  "Use only supplied evidence.",
-                  "If evidence is insufficient, return should_evolve=false.",
-                  "Choose at most 3 target files.",
-                  "Do not modify the Self Evolution workflow.",
-                  "Do not modify Action & Opportunities.",
-                  "Never modify secrets, credentials, repository settings, permissions, payments, spending, or authentication.",
-                  "Preserve existing working behavior unless evidence justifies changing it.",
-                  "Prefer a small exact patch over a rewrite.",
-                  "Every patch must contain an exact old string that occurs exactly once in the supplied file.",
-                  "The new text must be syntactically valid for the target file.",
-                  "Every modification must have an executable validation plan.",
-                  "Return JSON only.",
+                  "Use evidence, not assumptions.",
+                  "If evidence is insufficient, do not evolve.",
+                  "One evolution case per run.",
+                  "Maximum 3 target files.",
+                  "Maximum 8 patches.",
+                  "Never modify the Self Evolution workflow.",
+                  "Never modify Action & Opportunities.",
+                  "Never modify secrets or credentials.",
+                  "Never modify repository settings.",
+                  "Never introduce automatic spending or payment.",
+                  "Preserve working behavior.",
+                  "Prefer a precise patch to a rewrite.",
+                  "Every old patch string must occur exactly once.",
+                  "Every patch must have a reason.",
+                  "Every change must have a test.",
+                  "The result must remain reversible through git history.",
               ],
-              "schema": {
+              "allowed_targets": sorted(
+                  ALLOWED_TARGETS
+              ),
+              "output": {
                   "should_evolve": "boolean",
                   "problem": "string",
                   "hypothesis": "string",
@@ -623,13 +700,17 @@ jobs:
                       2000,
                   )
 
-          if not isinstance(plan, dict):
+          if not isinstance(
+              plan,
+              dict,
+          ):
               plan = {
                   "should_evolve": False,
                   "problem": "",
                   "hypothesis": "",
                   "decision": (
-                      "Planner unavailable."
+                      "No valid evolution "
+                      "decision was produced."
                   ),
                   "expected_result": "",
                   "targets": [],
@@ -638,15 +719,9 @@ jobs:
                   "learning": "",
               }
 
-          should_evolve = (
-              plan.get(
-                  "should_evolve"
-              )
-              is True
-          )
-
           patches = plan.get(
-              "patches"
+              "patches",
+              [],
           )
 
           if not isinstance(
@@ -656,38 +731,26 @@ jobs:
               patches = []
 
           # ============================================================
-          # NO MODIFICATION
+          # DECISION: NO EVOLUTION
           # ============================================================
 
           if (
-              not should_evolve
+              plan.get(
+                  "should_evolve"
+              )
+              is not True
               or not patches
           ):
-              evolution_state.setdefault(
-                  "version",
-                  1,
+              evolution_id = stable(
+                  NOW,
+                  candidate[
+                      "signature"
+                  ],
               )
 
-              evolution_state.setdefault(
-                  "history",
-                  [],
-              )
-
-              evolution_state.setdefault(
-                  "runs",
-                  [],
-              )
-
-              evolution_state[
-                  "history"
-              ].append(
+              evolution["history"].append(
                   {
-                      "id": stable(
-                          NOW,
-                          candidate[
-                              "signature"
-                          ],
-                      ),
+                      "id": evolution_id,
                       "timestamp": NOW,
                       "status": (
                           "no_evolution"
@@ -697,12 +760,23 @@ jobs:
                               "signature"
                           ]
                       ),
-                      "candidate": candidate,
+                      "problem": clean(
+                          plan.get(
+                              "problem"
+                          ),
+                          4000,
+                      ),
+                      "hypothesis": clean(
+                          plan.get(
+                              "hypothesis"
+                          ),
+                          4000,
+                      ),
                       "decision": clean(
                           plan.get(
-                              "decision",
-                              "",
-                          )
+                              "decision"
+                          ),
+                          4000,
                       ),
                       "planner_error": (
                           planner_error
@@ -710,57 +784,51 @@ jobs:
                   }
               )
 
-              evolution_state[
-                  "history"
-              ] = evolution_state[
-                  "history"
-              ][-MAX_HISTORY:]
+              evolution["history"] = (
+                  evolution["history"]
+              )[-MAX_HISTORY:]
 
-              evolution_state[
-                  "runs"
-              ].append(
+              evolution["runs"].append(
                   {
                       "timestamp": NOW,
                       "status": (
                           "no_evolution"
                       ),
-                      "planner_error": (
-                          planner_error
+                      "evolution_id": (
+                          evolution_id
                       ),
                   }
               )
 
-              evolution_state[
-                  "runs"
-              ] = evolution_state[
-                  "runs"
-              ][-MAX_HISTORY:]
+              evolution["runs"] = (
+                  evolution["runs"]
+              )[-MAX_HISTORY:]
 
-              evolution_state[
+              evolution[
                   "updated_at"
               ] = NOW
 
               save_json(
                   EVOLUTION_FILE,
-                  evolution_state,
+                  evolution,
               )
 
               print(
-                  "No justified modification produced."
+                  "Decision: NO EVOLUTION"
               )
 
               sys.exit(0)
 
           # ============================================================
-          # VALIDATE PATCH PLAN
+          # PATCH VALIDATION
           # ============================================================
 
           if len(patches) > MAX_PATCHES:
               raise RuntimeError(
-                  "Evolution plan exceeds patch limit."
+                  "Too many patches."
               )
 
-          normalized_patches = []
+          normalized = []
 
           for patch in patches:
               if not isinstance(
@@ -801,17 +869,17 @@ jobs:
                       "reason",
                       "",
                   ),
-                  2000,
+                  3000,
               )
 
               if not safe_target(path):
                   raise RuntimeError(
-                      f"Forbidden evolution target: {path}"
+                      f"Forbidden target: {path}"
                   )
 
               if not old.strip():
                   raise RuntimeError(
-                      f"Empty old text: {path}"
+                      f"Empty old patch: {path}"
                   )
 
               if old == new:
@@ -819,7 +887,7 @@ jobs:
                       f"No-op patch: {path}"
                   )
 
-              current = read_text(
+              current = read_full(
                   ROOT / path
               )
 
@@ -829,12 +897,12 @@ jobs:
 
               if occurrences != 1:
                   raise RuntimeError(
-                      f"Patch match count for "
-                      f"{path}: expected 1, "
-                      f"found {occurrences}"
+                      f"Patch for {path} "
+                      f"has {occurrences} matches; "
+                      f"exactly 1 required."
                   )
 
-              normalized_patches.append(
+              normalized.append(
                   {
                       "path": path,
                       "old": old,
@@ -843,22 +911,25 @@ jobs:
                   }
               )
 
-          target_paths = {
-              patch["path"]
-              for patch in normalized_patches
-          }
+          target_paths = sorted(
+              {
+                  item["path"]
+                  for item in normalized
+              }
+          )
 
           if len(target_paths) > 3:
               raise RuntimeError(
-                  "Evolution plan touches "
-                  "more than 3 files."
+                  "More than 3 target files."
               )
 
           evolution_id = stable(
               NOW,
-              candidate["signature"],
+              candidate[
+                  "signature"
+              ],
               json.dumps(
-                  normalized_patches,
+                  normalized,
                   ensure_ascii=False,
                   sort_keys=True,
               ),
@@ -875,7 +946,7 @@ jobs:
           # APPLY EXACT PATCHES
           # ============================================================
 
-          for patch in normalized_patches:
+          for patch in normalized:
               path = ROOT / patch["path"]
 
               current = path.read_text(
@@ -888,6 +959,12 @@ jobs:
                   1,
               )
 
+              if updated == current:
+                  raise RuntimeError(
+                      f"No change produced: "
+                      f"{patch['path']}"
+                  )
+
               path.write_text(
                   updated,
                   encoding="utf-8",
@@ -897,9 +974,7 @@ jobs:
           # TEST 1 — YAML
           # ============================================================
 
-          for path in sorted(
-              target_paths
-          ):
+          for path in target_paths:
               if path.endswith(
                   (".yml", ".yaml")
               ):
@@ -914,15 +989,13 @@ jobs:
           # TEST 2 — EMBEDDED PYTHON
           # ============================================================
 
-          for path in sorted(
-              target_paths
-          ):
+          for path in target_paths:
               if not path.endswith(
                   (".yml", ".yaml")
               ):
                   continue
 
-              text = read_text(
+              text = read_full(
                   ROOT / path
               )
 
@@ -953,20 +1026,49 @@ jobs:
           # TEST 3 — JSON
           # ============================================================
 
-          for path in sorted(
-              target_paths
-          ):
+          for path in target_paths:
               if path.endswith(
                   ".json"
               ):
                   json.loads(
-                      read_text(
+                      read_full(
                           ROOT / path
                       )
                   )
 
           # ============================================================
-          # TEST 4 — GIT
+          # TEST 4 — SECURITY POLICIES
+          # ============================================================
+
+          for path in target_paths:
+              text = read_full(
+                  ROOT / path
+              )
+
+              lowered = text.lower()
+
+              if (
+                  "auto_payment"
+                  in lowered
+                  and "auto_payment: true"
+                  in lowered
+              ):
+                  raise RuntimeError(
+                      f"Payment policy enabled: {path}"
+                  )
+
+              if (
+                  "auto_spending"
+                  in lowered
+                  and "auto_spending: true"
+                  in lowered
+              ):
+                  raise RuntimeError(
+                      f"Spending policy enabled: {path}"
+                  )
+
+          # ============================================================
+          # TEST 5 — GIT DIFF
           # ============================================================
 
           run_git(
@@ -977,7 +1079,7 @@ jobs:
           diff = run_git(
               "diff",
               "--",
-              *sorted(target_paths),
+              *target_paths,
           ).stdout
 
           if not diff.strip():
@@ -998,27 +1100,10 @@ jobs:
           }
 
           # ============================================================
-          # RECORD TEST RESULT
+          # RECORD TESTED EVOLUTION
           # ============================================================
 
-          evolution_state.setdefault(
-              "version",
-              1,
-          )
-
-          evolution_state.setdefault(
-              "history",
-              [],
-          )
-
-          evolution_state.setdefault(
-              "runs",
-              [],
-          )
-
-          evolution_state[
-              "history"
-          ].append(
+          evolution["history"].append(
               {
                   "id": evolution_id,
                   "timestamp": NOW,
@@ -1056,33 +1141,17 @@ jobs:
                       ),
                       4000,
                   ),
-                  "targets": sorted(
-                      target_paths
-                  ),
+                  "targets": target_paths,
                   "patches": [
                       {
-                          "path": patch[
+                          "path": item[
                               "path"
                           ],
-                          "reason": patch[
+                          "reason": item[
                               "reason"
                           ],
-                          "old_hash": (
-                              hashlib.sha256(
-                                  patch[
-                                      "old"
-                                  ].encode()
-                              ).hexdigest()
-                          ),
-                          "new_hash": (
-                              hashlib.sha256(
-                                  patch[
-                                      "new"
-                                  ].encode()
-                              ).hexdigest()
-                          ),
                       }
-                      for patch in normalized_patches
+                      for item in normalized
                   ],
                   "before_hashes": (
                       before_hashes
@@ -1096,6 +1165,7 @@ jobs:
                           "passed"
                       ),
                       "json": "passed",
+                      "security": "passed",
                       "git_diff_check": (
                           "passed"
                       ),
@@ -1110,19 +1180,17 @@ jobs:
               }
           )
 
-          evolution_state[
-              "history"
-          ] = evolution_state[
-              "history"
-          ][-MAX_HISTORY:]
+          evolution["history"] = (
+              evolution["history"]
+          )[-MAX_HISTORY:]
 
-          evolution_state[
+          evolution[
               "updated_at"
           ] = NOW
 
           save_json(
               EVOLUTION_FILE,
-              evolution_state,
+              evolution,
           )
 
           # ============================================================
@@ -1143,19 +1211,18 @@ jobs:
 
           run_git(
               "add",
-              *sorted(target_paths),
+              *target_paths,
               str(EVOLUTION_FILE),
           )
 
-          if (
-              run_git(
-                  "diff",
-                  "--cached",
-                  "--quiet",
-                  check=False,
-              ).returncode
-              == 0
-          ):
+          staged = run_git(
+              "diff",
+              "--cached",
+              "--quiet",
+              check=False,
+          )
+
+          if staged.returncode == 0:
               raise RuntimeError(
                   "Nothing staged after evolution."
               )
@@ -1163,7 +1230,10 @@ jobs:
           run_git(
               "commit",
               "-m",
-              f"NØX: self evolution {evolution_id}",
+              (
+                  "NØX: self evolution "
+                  f"{evolution_id}"
+              ),
           )
 
           run_git(
@@ -1178,10 +1248,10 @@ jobs:
           ).stdout.strip()
 
           # ============================================================
-          # RECORD REAL COMMITTED RESULT
+          # FINAL RESULT
           # ============================================================
 
-          evolution_state = load_json(
+          evolution = load_json(
               EVOLUTION_FILE,
               {
                   "version": 1,
@@ -1191,7 +1261,7 @@ jobs:
           )
 
           for entry in reversed(
-              evolution_state.get(
+              evolution.get(
                   "history",
                   [],
               )
@@ -1215,14 +1285,12 @@ jobs:
 
                   break
 
-          evolution_state.setdefault(
+          evolution.setdefault(
               "runs",
               [],
           )
 
-          evolution_state[
-              "runs"
-          ].append(
+          evolution["runs"].append(
               {
                   "timestamp": NOW,
                   "status": "committed",
@@ -1230,25 +1298,23 @@ jobs:
                       evolution_id
                   ),
                   "commit": commit_sha,
-                  "changed_paths": sorted(
+                  "changed_paths": (
                       target_paths
                   ),
               }
           )
 
-          evolution_state[
-              "runs"
-          ] = evolution_state[
-              "runs"
-          ][-MAX_HISTORY:]
+          evolution["runs"] = (
+              evolution["runs"]
+          )[-MAX_HISTORY:]
 
-          evolution_state[
+          evolution[
               "updated_at"
           ] = NOW
 
           save_json(
               EVOLUTION_FILE,
-              evolution_state,
+              evolution,
           )
 
           run_git(
@@ -1256,20 +1322,19 @@ jobs:
               str(EVOLUTION_FILE),
           )
 
-          if (
-              run_git(
-                  "diff",
-                  "--cached",
-                  "--quiet",
-                  check=False,
-              ).returncode
-              != 0
-          ):
+          staged_result = run_git(
+              "diff",
+              "--cached",
+              "--quiet",
+              check=False,
+          )
+
+          if staged_result.returncode != 0:
               run_git(
                   "commit",
                   "-m",
                   (
-                      "NØX: record evolution "
+                      "NØX: record self evolution "
                       f"result {evolution_id}"
                   ),
               )
@@ -1280,47 +1345,42 @@ jobs:
                   "HEAD:main",
               )
 
+          print("")
           print(
               "=== NØX SELF EVOLUTION ==="
           )
-
           print(
               f"Evolution ID: {evolution_id}"
           )
-
           print(
               "Changed files: "
               + ", ".join(
-                  sorted(target_paths)
+                  target_paths
               )
           )
-
           print(
-              "YAML validation: PASSED"
+              "YAML: PASSED"
           )
-
           print(
-              "Embedded Python validation: PASSED"
+              "Embedded Python: PASSED"
           )
-
           print(
-              "JSON validation: PASSED"
+              "JSON: PASSED"
           )
-
           print(
-              "Git diff check: PASSED"
+              "Security: PASSED"
           )
-
+          print(
+              "Git diff: PASSED"
+          )
           print(
               f"Commit: {commit_sha}"
           )
-
           print(
-              "Result: MODIFICATION COMMITTED"
+              "RESULT: MODIFICATION COMMITTED"
           )
-
           print(
-              "Cycle: "
+              "CYCLE: "
               "DETECT -> RESEARCH -> DECIDE -> "
               "MODIFY -> TEST -> RESULT -> LEARN"
           )
