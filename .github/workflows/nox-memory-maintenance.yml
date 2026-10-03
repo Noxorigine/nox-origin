@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   memory-maintenance:
-    name: Clean and audit NØX memory
+    name: Clean and compact NØX memory
     runs-on: ubuntu-latest
 
     env:
@@ -219,7 +219,7 @@ jobs:
           print(f"DUPLICATES_REMOVED: {total_removed}")
           PY
 
-      - name: Audit semantic redundancy in knowledge
+      - name: Compact redundant knowledge experiences
         shell: bash
         run: |
           set -euo pipefail
@@ -227,17 +227,25 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
-          from collections import defaultdict
+          import os
+          import tempfile
           from pathlib import Path
 
           path = Path("memory/nox_knowledge.json")
+          DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
           if not path.exists():
-              print("KNOWLEDGE AUDIT: file does not exist")
+              print("KNOWLEDGE COMPACTION: file does not exist")
               raise SystemExit(0)
 
           with path.open("r", encoding="utf-8") as f:
               data = json.load(f)
+
+          experiences = data.get("experiences")
+
+          if not isinstance(experiences, list):
+              print("KNOWLEDGE COMPACTION: experiences is not a list")
+              raise SystemExit(0)
 
           def canonical(value):
               return json.dumps(
@@ -247,132 +255,192 @@ jobs:
                   separators=(",", ":"),
               )
 
-          def digest(value):
+          def fingerprint(value):
               return hashlib.sha256(
                   canonical(value).encode("utf-8")
               ).hexdigest()
 
-          def normalize_entry(entry, ignored_fields):
+          def identity_body(entry):
+              """
+              Identity used for safe experience compaction.
+
+              Only these fields are ignored:
+              - id
+              - evidence
+
+              Everything else must be identical.
+              """
               if not isinstance(entry, dict):
-                  return entry
+                  return None
 
-              result = {}
+              return {
+                  key: value
+                  for key, value in entry.items()
+                  if key not in {"id", "evidence"}
+              }
 
-              for key, value in entry.items():
-                  if key in ignored_fields:
-                      continue
+          def evidence_state(entry):
+              if "evidence" not in entry:
+                  return None
 
-                  result[key] = value
+              evidence = entry["evidence"]
 
-              return result
+              if evidence is None:
+                  return None
 
-          def duplicate_groups(items, ignored_fields):
-              groups = defaultdict(list)
+              if evidence == "":
+                  return None
 
-              if not isinstance(items, list):
-                  return []
+              if evidence == []:
+                  return None
 
-              for index, item in enumerate(items):
-                  normalized = normalize_entry(
-                      item,
-                      ignored_fields,
-                  )
+              if evidence == {}:
+                  return None
 
-                  groups[digest(normalized)].append(index)
+              return evidence
 
-              return [
-                  indexes
-                  for indexes in groups.values()
-                  if len(indexes) > 1
+          groups = {}
+
+          for index, entry in enumerate(experiences):
+              if not isinstance(entry, dict):
+                  continue
+
+              body = identity_body(entry)
+
+              if body is None:
+                  continue
+
+              key = fingerprint(body)
+              groups.setdefault(key, []).append(index)
+
+          compacted = []
+          removed = 0
+          merged_evidence = 0
+          protected_conflicts = 0
+
+          consumed = set()
+
+          for index, entry in enumerate(experiences):
+              if index in consumed:
+                  continue
+
+              if not isinstance(entry, dict):
+                  compacted.append(entry)
+                  continue
+
+              body = identity_body(entry)
+
+              if body is None:
+                  compacted.append(entry)
+                  continue
+
+              key = fingerprint(body)
+              indexes = groups.get(key, [index])
+
+              if len(indexes) == 1:
+                  compacted.append(entry)
+                  consumed.add(index)
+                  continue
+
+              entries = [
+                  experiences[i]
+                  for i in indexes
               ]
 
-          print("=== KNOWLEDGE SEMANTIC AUDIT ===")
+              non_empty_evidence = []
 
-          arrays = {
-              "facts": ["id"],
-              "experiences": ["id", "evidence"],
-              "learnings": ["id"],
-              "observations": ["id"],
-              "sources": ["id"],
-              "hypotheses": ["id"],
-              "results": ["id"],
-          }
+              for candidate in entries:
+                  evidence = evidence_state(candidate)
 
-          for section, ignored in arrays.items():
-              items = data.get(section, [])
+                  if evidence is not None:
+                      non_empty_evidence.append(evidence)
 
-              if not isinstance(items, list):
-                  print(
-                      f"{section}: SKIP "
-                      f"(not a list)"
-                  )
+              unique_evidence = {
+                  canonical(value)
+                  for value in non_empty_evidence
+              }
+
+              # If multiple distinct evidence payloads exist,
+              # the experiences are NOT safe to merge.
+              if len(unique_evidence) > 1:
+                  protected_conflicts += 1
+
+                  for i in indexes:
+                      compacted.append(experiences[i])
+                      consumed.add(i)
+
                   continue
 
-              groups = duplicate_groups(
-                  items,
-                  ignored,
-              )
+              # Safe merge.
+              keeper = dict(entries[0])
 
-              print(
-                  f"{section}: "
-                  f"entries={len(items)} "
-                  f"candidate_groups={len(groups)} "
-                  f"candidate_entries={sum(len(g) - 1 for g in groups)}"
-              )
+              if non_empty_evidence:
+                  keeper["evidence"] = non_empty_evidence[0]
 
-          # Colony bootstrap analysis.
-          bootstrap = []
+                  if "evidence" not in entries[0] or evidence_state(entries[0]) is None:
+                      merged_evidence += 1
 
-          for section in (
-              "facts",
-              "experiences",
-              "observations",
-              "learnings",
-          ):
-              items = data.get(section, [])
+              compacted.append(keeper)
 
-              if not isinstance(items, list):
-                  continue
+              for i in indexes:
+                  consumed.add(i)
 
-              for item in items:
-                  if not isinstance(item, dict):
-                      continue
+              removed += len(indexes) - 1
 
-                  text = canonical(item).lower()
+          print("=== KNOWLEDGE EXPERIENCE COMPACTION ===")
+          print(f"EXPERIENCES_BEFORE: {len(experiences)}")
+          print(f"SAFE_DUPLICATES_FOUND: {removed}")
+          print(f"EVIDENCE_MERGES: {merged_evidence}")
+          print(f"PROTECTED_CONFLICT_GROUPS: {protected_conflicts}")
+          print(f"DRY_RUN: {DRY_RUN}")
 
-                  if "colony_bootstrap" in text:
-                      bootstrap.append(item)
+          if removed == 0:
+              print("No safely redundant experiences found.")
+              raise SystemExit(0)
 
-          capability_groups = defaultdict(list)
+          data["experiences"] = compacted
 
-          for item in bootstrap:
-              capabilities = item.get("capabilities")
+          if DRY_RUN:
+              print("DRY RUN: no knowledge file modified.")
+              raise SystemExit(0)
 
-              if capabilities is None:
-                  continue
-
-              capability_groups[digest(capabilities)].append(item)
-
-          repeated_capability_groups = [
-              group
-              for group in capability_groups.values()
-              if len(group) > 1
-          ]
-
-          print(
-              "colony_bootstrap: "
-              f"entries={len(bootstrap)} "
-              f"repeated_capability_groups="
-              f"{len(repeated_capability_groups)}"
+          fd, tmp_name = tempfile.mkstemp(
+              prefix=".nox_knowledge.",
+              suffix=".tmp",
+              dir=str(path.parent),
+              text=True,
           )
 
-          # Explicitly report that semantic candidates are not deleted.
-          print("")
-          print("SEMANTIC ACTION: REPORT ONLY")
-          print("No semantic candidate was deleted.")
-          print("No field was rewritten.")
-          print("No historical snapshot was removed.")
-          print("No learning or experience was compacted.")
+          try:
+              with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                  json.dump(
+                      data,
+                      tmp,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+                  tmp.write("\n")
+                  tmp.flush()
+                  os.fsync(tmp.fileno())
+
+              with open(tmp_name, "r", encoding="utf-8") as check:
+                  validated = json.load(check)
+
+              if canonical(validated) != canonical(data):
+                  raise RuntimeError(
+                      "Temporary knowledge validation mismatch"
+                  )
+
+              os.replace(tmp_name, path)
+
+          finally:
+              if os.path.exists(tmp_name):
+                  os.unlink(tmp_name)
+
+          print(
+              f"KNOWLEDGE_COMPACTED: removed {removed} "
+              f"redundant experience entries."
+          )
           PY
 
       - name: Validate JSON after maintenance
@@ -442,6 +510,6 @@ jobs:
 
           git add "${files[@]}"
 
-          git commit -m "chore(memory): remove exact duplicate entries"
+          git commit -m "chore(memory): compact redundant experiences"
 
           git push
