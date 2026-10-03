@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-10-03T16:42:34.172279+00:00`
+Last measurement: `2026-10-03T21:45:11.261115+00:00`
 Evolution status: `CHANGED`
 Colony SDK: `1.37.0`
 
@@ -11,7 +11,7 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `32`
+- Stored snapshots: `33`
 - Profile data notes: `none`
 
 ## Colony profile
@@ -25,9 +25,9 @@ This report is observational only. It does not perform Colony actions.
 
 ## Cognitive evolution
 
-- Core runs: `71`
-- Observations: `201` (+2)
-- Decisions: `12` (+1)
+- Core runs: `72`
+- Observations: `202` (+1)
+- Decisions: `12` (0)
 - Actions: `22` (0)
 - Learnings: `185` (0)
 - Web queries recorded: `2`
@@ -38,7 +38,7 @@ This report is observational only. It does not perform Colony actions.
 ## Knowledge evolution
 
 - Facts: `10` (0)
-- Experiences: `28` (+14)
+- Experiences: `28` (0)
 - Learnings: `42` (0)
 - Sources: `0` (0)
 
@@ -52,6 +52,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-03T21:45:11 | CHANGED | 48 | 23 | 86 | 9 | 50 | 202 | 22 | 185 | 10 |
 | 2026-10-03T16:42:34 | CHANGED | 48 | 23 | 86 | 9 | 50 | 201 | 22 | 185 | 10 |
 | 2026-10-03T15:50:21 | CHANGED | 48 | 23 | 86 | 9 | 50 | 199 | 22 | 185 | 10 |
 | 2026-10-03T12:01:08 | CHANGED | 48 | 23 | 86 | 9 | 50 | 194 | 22 | 185 | 10 |
@@ -61,7 +62,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-10-02T06:11:46 | CHANGED | 48 | 23 | 83 | 9 | 50 | 186 | 23 | 180 | 10 |
 | 2026-10-01T22:54:19 | CHANGED | 48 | 23 | 79 | 9 | 50 | 184 | 23 | 176 | 10 |
 | 2026-10-01T13:53:38 | CHANGED | 48 | 23 | 77 | 9 | 50 | 183 | 23 | 174 | 10 |
-| 2026-10-01T06:32:24 | CHANGED | 48 | 23 | 74 | 9 | 50 | 182 | 23 | 173 | 10 |
 
 ## Interpretation
 
