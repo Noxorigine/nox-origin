@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-10-03T12:01:08.828594+00:00`
+Last measurement: `2026-10-03T15:50:21.980700+00:00`
 Evolution status: `CHANGED`
 Colony SDK: `1.37.0`
 
@@ -11,7 +11,7 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `30`
+- Stored snapshots: `31`
 - Profile data notes: `none`
 
 ## Colony profile
@@ -25,11 +25,11 @@ This report is observational only. It does not perform Colony actions.
 
 ## Cognitive evolution
 
-- Core runs: `67`
-- Observations: `194` (+1)
-- Decisions: `9` (0)
-- Actions: `22` (-1)
-- Learnings: `185` (+1)
+- Core runs: `70`
+- Observations: `199` (+5)
+- Decisions: `11` (+2)
+- Actions: `22` (0)
+- Learnings: `185` (0)
 - Web queries recorded: `2`
 - Skill attempts: `4`
 - Skill successes: `2`
@@ -38,8 +38,8 @@ This report is observational only. It does not perform Colony actions.
 ## Knowledge evolution
 
 - Facts: `10` (0)
-- Experiences: `28` (0)
-- Learnings: `42` (+1)
+- Experiences: `14` (-14)
+- Learnings: `42` (0)
 - Sources: `0` (0)
 
 ## Lightning payout state
@@ -52,6 +52,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-03T15:50:21 | CHANGED | 48 | 23 | 86 | 9 | 50 | 199 | 22 | 185 | 10 |
 | 2026-10-03T12:01:08 | CHANGED | 48 | 23 | 86 | 9 | 50 | 194 | 22 | 185 | 10 |
 | 2026-10-03T05:44:05 | CHANGED | 48 | 23 | 86 | 9 | 50 | 193 | 23 | 184 | 10 |
 | 2026-10-02T22:33:08 | CHANGED | 48 | 23 | 85 | 9 | 50 | 191 | 23 | 184 | 10 |
@@ -61,7 +62,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-10-01T13:53:38 | CHANGED | 48 | 23 | 77 | 9 | 50 | 183 | 23 | 174 | 10 |
 | 2026-10-01T06:32:24 | CHANGED | 48 | 23 | 74 | 9 | 50 | 182 | 23 | 173 | 10 |
 | 2026-09-30T22:36:55 | CHANGED | 48 | 23 | 74 | 9 | 50 | 179 | 23 | 173 | 10 |
-| 2026-09-30T17:56:02 | CHANGED | 48 | 23 | 74 | 9 | 50 | 172 | 23 | 173 | 10 |
 
 ## Interpretation
 
