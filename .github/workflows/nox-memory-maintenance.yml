@@ -1,0 +1,291 @@
+name: NØX - Memory Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Analyse uniquement, sans modifier les fichiers"
+        required: false
+        default: true
+        type: boolean
+
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nox-memory-maintenance
+  cancel-in-progress: false
+
+jobs:
+  memory-maintenance:
+    name: Clean and compact NØX memory
+    runs-on: ubuntu-latest
+
+    env:
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Validate target files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=(
+            "memory/nox_colony_presence.json"
+            "memory/nox_core_memory.json"
+            "memory/nox_knowledge.json"
+            "memory/nox_evolution_history.json"
+            "memory/nox_core_runtime.json"
+          )
+
+          for file in "${files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "OK: $file"
+            else
+              echo "SKIP: $file does not exist"
+            fi
+          done
+
+      - name: Validate JSON before maintenance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          files = [
+              Path("memory/nox_colony_presence.json"),
+              Path("memory/nox_core_memory.json"),
+              Path("memory/nox_knowledge.json"),
+              Path("memory/nox_evolution_history.json"),
+              Path("memory/nox_core_runtime.json"),
+          ]
+
+          for path in files:
+              if not path.exists():
+                  continue
+
+              try:
+                  with path.open("r", encoding="utf-8") as f:
+                      json.load(f)
+                  print(f"VALID JSON: {path}")
+              except Exception as exc:
+                  raise SystemExit(
+                      f"Invalid JSON detected in {path}: {exc}"
+                  )
+          PY
+
+      - name: Analyze and clean memory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import copy
+          import hashlib
+          import json
+          import os
+          import tempfile
+          from pathlib import Path
+
+          DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+          TARGETS = [
+              Path("memory/nox_colony_presence.json"),
+              Path("memory/nox_core_memory.json"),
+              Path("memory/nox_knowledge.json"),
+              Path("memory/nox_evolution_history.json"),
+              Path("memory/nox_core_runtime.json"),
+          ]
+
+          def canonical(value):
+              return json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+
+          def fingerprint(value):
+              return hashlib.sha256(
+                  canonical(value).encode("utf-8")
+              ).hexdigest()
+
+          def deduplicate_lists(value):
+              """
+              Only removes exact duplicate elements from JSON arrays.
+
+              No semantic deletion is performed here.
+              Ordering is preserved.
+              """
+              removed = 0
+
+              if isinstance(value, dict):
+                  result = {}
+                  for key, item in value.items():
+                      cleaned, count = deduplicate_lists(item)
+                      result[key] = cleaned
+                      removed += count
+                  return result, removed
+
+              if isinstance(value, list):
+                  result = []
+                  seen = set()
+
+                  for item in value:
+                      cleaned, count = deduplicate_lists(item)
+                      removed += count
+
+                      key = fingerprint(cleaned)
+
+                      if key in seen:
+                          removed += 1
+                          continue
+
+                      seen.add(key)
+                      result.append(cleaned)
+
+                  return result, removed
+
+              return value, 0
+
+          changed_files = 0
+          removed_items = 0
+
+          for path in TARGETS:
+              if not path.exists():
+                  continue
+
+              with path.open("r", encoding="utf-8") as f:
+                  original = json.load(f)
+
+              cleaned, removed = deduplicate_lists(copy.deepcopy(original))
+
+              original_text = canonical(original)
+              cleaned_text = canonical(cleaned)
+
+              if original_text == cleaned_text:
+                  print(f"UNCHANGED: {path}")
+                  continue
+
+              changed_files += 1
+              removed_items += removed
+
+              print(
+                  f"CANDIDATE: {path} | "
+                  f"exact duplicate entries removable: {removed}"
+              )
+
+              if DRY_RUN:
+                  continue
+
+              # Atomic replacement:
+              # write -> validate -> replace.
+              fd, tmp_name = tempfile.mkstemp(
+                  prefix=f".{path.name}.",
+                  suffix=".tmp",
+                  dir=str(path.parent),
+                  text=True,
+              )
+
+              try:
+                  with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                      json.dump(
+                          cleaned,
+                          tmp,
+                          ensure_ascii=False,
+                          indent=2,
+                      )
+                      tmp.write("\n")
+                      tmp.flush()
+                      os.fsync(tmp.fileno())
+
+                  with open(tmp_name, "r", encoding="utf-8") as check:
+                      json.load(check)
+
+                  os.replace(tmp_name, path)
+
+              finally:
+                  if os.path.exists(tmp_name):
+                      os.unlink(tmp_name)
+
+          print("")
+          print("=== MEMORY MAINTENANCE ===")
+          print(f"DRY_RUN: {DRY_RUN}")
+          print(f"FILES_CHANGED: {changed_files}")
+          print(f"DUPLICATES_REMOVED: {removed_items}")
+
+          if DRY_RUN:
+              print("No memory file was modified.")
+          else:
+              print("Maintenance completed.")
+          PY
+
+      - name: Validate JSON after maintenance
+        if: env.DRY_RUN != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          files = [
+              Path("memory/nox_colony_presence.json"),
+              Path("memory/nox_core_memory.json"),
+              Path("memory/nox_knowledge.json"),
+              Path("memory/nox_evolution_history.json"),
+              Path("memory/nox_core_runtime.json"),
+          ]
+
+          for path in files:
+              if not path.exists():
+                  continue
+
+              with path.open("r", encoding="utf-8") as f:
+                  json.load(f)
+
+              print(f"VALID AFTER MAINTENANCE: {path}")
+          PY
+
+      - name: Commit only real changes
+        if: env.DRY_RUN != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- \
+            memory/nox_colony_presence.json \
+            memory/nox_core_memory.json \
+            memory/nox_knowledge.json \
+            memory/nox_evolution_history.json \
+            memory/nox_core_runtime.json
+          then
+            echo "No memory changes detected."
+            exit 0
+          fi
+
+          git config user.name "NØX Memory Maintenance"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            memory/nox_colony_presence.json \
+            memory/nox_core_memory.json \
+            memory/nox_knowledge.json \
+            memory/nox_evolution_history.json \
+            memory/nox_core_runtime.json
+
+          git commit -m "chore(memory): maintain NØX memory"
+
+          git push
