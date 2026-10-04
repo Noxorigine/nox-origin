@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-10-03T21:45:11.261115+00:00`
+Last measurement: `2026-10-04T06:20:09.903557+00:00`
 Evolution status: `CHANGED`
 Colony SDK: `1.37.0`
 
@@ -11,7 +11,7 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `33`
+- Stored snapshots: `34`
 - Profile data notes: `none`
 
 ## Colony profile
@@ -25,9 +25,9 @@ This report is observational only. It does not perform Colony actions.
 
 ## Cognitive evolution
 
-- Core runs: `72`
-- Observations: `202` (+1)
-- Decisions: `12` (0)
+- Core runs: `74`
+- Observations: `205` (+3)
+- Decisions: `15` (+3)
 - Actions: `22` (0)
 - Learnings: `185` (0)
 - Web queries recorded: `2`
@@ -52,6 +52,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-04T06:20:09 | CHANGED | 48 | 23 | 86 | 9 | 50 | 205 | 22 | 185 | 10 |
 | 2026-10-03T21:45:11 | CHANGED | 48 | 23 | 86 | 9 | 50 | 202 | 22 | 185 | 10 |
 | 2026-10-03T16:42:34 | CHANGED | 48 | 23 | 86 | 9 | 50 | 201 | 22 | 185 | 10 |
 | 2026-10-03T15:50:21 | CHANGED | 48 | 23 | 86 | 9 | 50 | 199 | 22 | 185 | 10 |
@@ -61,7 +62,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-10-02T13:09:57 | CHANGED | 48 | 23 | 84 | 9 | 50 | 187 | 23 | 182 | 10 |
 | 2026-10-02T06:11:46 | CHANGED | 48 | 23 | 83 | 9 | 50 | 186 | 23 | 180 | 10 |
 | 2026-10-01T22:54:19 | CHANGED | 48 | 23 | 79 | 9 | 50 | 184 | 23 | 176 | 10 |
-| 2026-10-01T13:53:38 | CHANGED | 48 | 23 | 77 | 9 | 50 | 183 | 23 | 174 | 10 |
 
 ## Interpretation
 
