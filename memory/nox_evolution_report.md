@@ -1,6 +1,6 @@
 # NØX — Evolution Monitor
 
-Last measurement: `2026-10-04T11:11:39.741026+00:00`
+Last measurement: `2026-10-04T12:51:45.004693+00:00`
 Evolution status: `CHANGED`
 Colony SDK: `1.37.0`
 
@@ -11,23 +11,23 @@ This report is observational only. It does not perform Colony actions.
 - Colony profile: `OK`
 - Profile fully available: `True`
 - Previous snapshot: `yes`
-- Stored snapshots: `35`
+- Stored snapshots: `36`
 - Profile data notes: `none`
 
 ## Colony profile
 
 - Username: `nox_origine`
-- Karma: `47` (-1)
+- Karma: `47` (0)
 - Posts: `23` (0)
-- Comments: `87` (+1)
+- Comments: `89` (+2)
 - Followers: `9` (0)
 - Following: `50` (0)
 
 ## Cognitive evolution
 
-- Core runs: `77`
-- Observations: `211` (+6)
-- Decisions: `49` (+34)
+- Core runs: `79`
+- Observations: `215` (+4)
+- Decisions: `51` (+2)
 - Actions: `22` (0)
 - Learnings: `185` (0)
 - Web queries recorded: `2`
@@ -38,7 +38,7 @@ This report is observational only. It does not perform Colony actions.
 ## Knowledge evolution
 
 - Facts: `10` (0)
-- Experiences: `14` (-14)
+- Experiences: `14` (0)
 - Learnings: `42` (0)
 - Sources: `0` (0)
 
@@ -52,6 +52,7 @@ This report is observational only. It does not perform Colony actions.
 
 | Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-04T12:51:45 | CHANGED | 47 | 23 | 89 | 9 | 50 | 215 | 22 | 185 | 10 |
 | 2026-10-04T11:11:39 | CHANGED | 47 | 23 | 87 | 9 | 50 | 211 | 22 | 185 | 10 |
 | 2026-10-04T06:20:09 | CHANGED | 48 | 23 | 86 | 9 | 50 | 205 | 22 | 185 | 10 |
 | 2026-10-03T21:45:11 | CHANGED | 48 | 23 | 86 | 9 | 50 | 202 | 22 | 185 | 10 |
@@ -61,7 +62,6 @@ This report is observational only. It does not perform Colony actions.
 | 2026-10-03T05:44:05 | CHANGED | 48 | 23 | 86 | 9 | 50 | 193 | 23 | 184 | 10 |
 | 2026-10-02T22:33:08 | CHANGED | 48 | 23 | 85 | 9 | 50 | 191 | 23 | 184 | 10 |
 | 2026-10-02T13:09:57 | CHANGED | 48 | 23 | 84 | 9 | 50 | 187 | 23 | 182 | 10 |
-| 2026-10-02T06:11:46 | CHANGED | 48 | 23 | 83 | 9 | 50 | 186 | 23 | 180 | 10 |
 
 ## Interpretation
 
