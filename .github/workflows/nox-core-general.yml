@@ -27,7 +27,7 @@ env:
   MAX_COGNITIVE_CASES: "150"
   MAX_PENDING_ACTIONS: "20"
   MAX_WORK_REQUESTS: "20"
-  MAX_PUBLISH_ACTIONS: "1"
+  MAX_PUBLISH_ACTIONS: "3"
   ENABLE_LIGHTNING_CHECK: "true"
 
 jobs:
@@ -257,34 +257,59 @@ jobs:
               except Exception as exc:
                   remember(memory, "failures", "Unread notifications could not be read.", {"error":clean(exc,500)}, "colony_notifications")
 
-          # DM detection must not depend on bootstrap.unread_direct_messages.
-          # That counter is only a hint and can be stale/absent; the actual
-          # conversation list is the source used to discover unread messages.
+          # DM detection must inspect the actual conversation inbox.
+          # bootstrap.unread_direct_messages is only a summary counter and is
+          # not used as a gate. The SDK provides iter_conversations() for the
+          # complete 1:1 inbox; get_conversation() then returns the thread and
+          # marks it read, so detection happens before the thread is fetched.
+          def message_sender(message):
+              if not isinstance(message, dict):
+                  return ""
+              sender = message.get("sender") or message.get("author") or message.get("from")
+              if isinstance(sender, dict):
+                  return clean(sender.get("username") or sender.get("handle") or sender.get("name"), 100)
+              return clean(
+                  message.get("sender_username")
+                  or message.get("author_username")
+                  or message.get("from_username")
+                  or sender,
+                  100,
+              )
+
           messages = []
           try:
-              conversations = extract(client.list_conversations(), ("items","conversations"))
+              conversations = list(client.iter_conversations(max_results=50))
               for conversation in conversations:
                   if len(messages) >= MAX_DMS or not isinstance(conversation, dict):
                       break
-                  unread_value = conversation.get("unread_count", conversation.get("unread"))
-                  unread = int(unread_value or 0) if unread_value is not None else 1
-                  other = conversation.get("username") or conversation.get("other_username") or conversation.get("with_username")
-                  if unread <= 0 or not other:
+                  other = (
+                      conversation.get("username")
+                      or conversation.get("other_username")
+                      or conversation.get("with_username")
+                      or conversation.get("partner_username")
+                  )
+                  if not other:
                       continue
                   try:
-                      detail = extract(client.get_conversation(str(other)), ("items","messages"))
+                      detail = client.get_conversation(str(other))
+                      detail = extract(detail, ("items", "messages"))
                       for message in detail[-MAX_DMS:]:
-                          if isinstance(message, dict):
-                              enriched = dict(message)
-                              enriched["_conversation_username"] = str(other)
-                              messages.append(enriched)
-                          else:
-                              messages.append(message)
+                          if not isinstance(message, dict):
+                              continue
+                          # Only incoming messages are actionable. This also
+                          # makes the detector independent of unread counters.
+                          sender = message_sender(message)
+                          if sender and sender == username:
+                              continue
+                          enriched = dict(message)
+                          enriched["_conversation_username"] = str(other)
+                          messages.append(enriched)
+                          if len(messages) >= MAX_DMS:
+                              break
                   except Exception as exc:
                       remember(memory, "failures", "A conversation could not be inspected.", {"username":other,"error":clean(exc,500)}, "colony_messages")
-              messages = messages[:MAX_DMS]
           except Exception as exc:
-              remember(memory, "failures", "Conversation list could not be read.", {"error":clean(exc,500)}, "colony_messages")
+              remember(memory, "failures", "Conversation inbox could not be read.", {"error":clean(exc,500)}, "colony_messages")
 
           try:
               feed = extract(client.get_for_you_feed(limit=MAX_FEED, kinds="posts"), ("items","posts","feed"))
@@ -452,10 +477,15 @@ jobs:
               reason = "No concrete contribution is justified by the available context."
               action_kind = None
 
-              if case["intent"] == "answer_or_research_question" and case["questions"]:
+              if case["source"] == "dm" and case["intent"] == "answer_or_research_question" and case["questions"]:
+                  question = case["questions"][0]
+                  decision = "dm_reply"
+                  reason = "A direct question was received in a DM; Core can answer from its observed memory without requiring public research first."
+                  action_kind = "dm_reply"
+              elif case["intent"] == "answer_or_research_question" and case["questions"]:
                   question = case["questions"][0]
                   decision = "research_before_reply"
-                  reason = "The post contains a concrete question; research is required before asserting an answer."
+                  reason = "The public post contains a concrete question; research is required before asserting an answer."
                   action_kind = "research"
                   work_id = stable("work", case["id"], question)
                   if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
@@ -505,55 +535,129 @@ jobs:
           runtime["work_requests"] = (runtime.get("work_requests", []) + new_work)[-MAX_WORK:]
           runtime["pending_actions"] = (runtime.get("pending_actions", []) + new_actions)[-MAX_PENDING:]
 
-          # A completed research result unlocks a reply action. It is created
-          # only when the result belongs to a live cognitive case.
+          # A completed research result can unlock either a reply or a public
+          # post. Core decides. Publication is capped at three successful posts
+          # in any rolling 24-hour window, with at most one new publish action
+          # created by this Core run. The cap is a cadence control, not a ban.
           publish_actions_created = 0
+
+          def recent_publications_24h():
+              cutoff = datetime.now(timezone.utc).timestamp() - 86400
+              count = 0
+              if isinstance(presence, dict):
+                  for item in presence.get("published_posts", []):
+                      if not isinstance(item, dict):
+                          continue
+                      stamp = item.get("timestamp")
+                      try:
+                          if datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp() >= cutoff:
+                              count += 1
+                      except Exception:
+                          continue
+              return count
+
+          publications_24h = recent_publications_24h()
+
           for case in memory.get("cognitive_cases", []):
+              if publish_actions_created >= min(1, MAX_PUBLISH):
+                  break
               if not isinstance(case, dict) or not case.get("research_result"):
                   continue
               result = case["research_result"]
               status = result.get("evidence_status")
-              if status not in ("multi_source_support","partial_support","insufficient_verification","no_evidence"):
+              if status not in ("multi_source_support", "partial_support"):
                   continue
-              action_id = stable("action", case.get("case_id"), "research_reply")
-              if any(isinstance(a,dict) and a.get("action_id") == action_id for a in runtime["pending_actions"]):
+              if case.get("source") not in ("for_you", "suggestion"):
                   continue
               if case.get("outcome") not in (None, "research_returned"):
                   continue
-              if case.get("source") == "dm":
-                  recipient = case.get("recipient") or case.get("author")
-                  if not recipient:
+
+              conclusion = clean(result.get("conclusion"), 1800)
+              sources = [x for x in (result.get("sources") or []) if isinstance(x, dict) and (x.get("url") or x.get("title"))]
+              lower_conclusion = conclusion.lower()
+              meta_markers = (
+                  "search coverage", "source coverage", "coverage found",
+                  "found relevant results", "relevant results across",
+                  "evidence coverage", "search results found"
+              )
+              # A publication needs a real bounded conclusion, not a statement
+              # about the search process itself. This directly blocks the class
+              # of incoherent post produced in the previous cycle.
+              if len(conclusion) < 180:
+                  continue
+              if any(marker in lower_conclusion for marker in meta_markers):
+                  continue
+              if len(sources) < 2:
+                  continue
+
+              action_id = stable("action", case.get("case_id"), "publish")
+              if any(isinstance(a, dict) and a.get("action_id") == action_id for a in runtime["pending_actions"]):
+                  continue
+              if publications_24h >= 3:
+                  break
+
+              source_lines = []
+              for source in sources[:4]:
+                  label = clean(source.get("title") or source.get("url"), 220)
+                  url = clean(source.get("url"), 500)
+                  if label and url:
+                      source_lines.append(f"- {label}: {url}")
+                  elif label:
+                      source_lines.append(f"- {label}")
+
+              title_text = clean(case.get("title") or "NØX research finding", 220)
+              body_text = (
+                  f"NØX research finding\n\n{conclusion}\n\n"
+                  f"Evidence status: {status}.\n\n"
+                  "This conclusion is bounded by the evidence currently available; it is not treated as universal proof.\n\n"
+                  "Sources:\n" + "\n".join(source_lines)
+              )
+              runtime["pending_actions"].append({
+                  "action_id": action_id, "case_id": case.get("case_id"), "kind": "publish",
+                  "title": title_text, "body": body_text,
+                  "reason": "Core judged the research conclusion sufficiently concrete, relevant and multi-source-supported for a public contribution.",
+                  "research_result": result, "created_at": NOW
+              })
+              case["decision"] = "publish_after_research"
+              case["action_kind"] = "publish"
+              publish_actions_created += 1
+
+          # If no research publication was selected this run, Core may also
+          # publish one concrete, evidence-backed learning from its own observed
+          # execution history. This keeps public presence alive without inventing
+          # filler: the learning must already exist in memory with evidence.
+          if publish_actions_created < min(1, MAX_PUBLISH) and publications_24h < 3:
+              existing_publish_ids = {
+                  a.get("action_id") for a in runtime.get("pending_actions", [])
+                  if isinstance(a, dict) and a.get("kind") == "publish"
+              }
+              for learning in reversed(memory.get("learnings", [])):
+                  if not isinstance(learning, dict):
+                      continue
+                  summary = clean(learning.get("summary"), 1200)
+                  evidence = learning.get("evidence")
+                  if len(summary) < 120 or not isinstance(evidence, dict) or not evidence:
+                      continue
+                  if clean(learning.get("source"), 100) in ("core_cycle", "colony_bootstrap"):
+                      continue
+                  learning_key = stable("learning_publish", learning.get("timestamp"), summary)
+                  action_id = stable("action", learning_key, "publish")
+                  if action_id in existing_publish_ids:
                       continue
                   runtime["pending_actions"].append({
-                      "action_id":stable("action", case.get("case_id"), "dm_research_reply"),
-                      "case_id":case.get("case_id"),"kind":"dm_reply","recipient":recipient,
-                      "target_id":case.get("target_id"),"title":case.get("title"),"body":case.get("body"),
-                      "author":case.get("author"),"reason":"Research completed; Presence may now send a bounded, evidence-aware direct response.",
-                      "research_result":result,"created_at":NOW
+                      "action_id": action_id, "kind": "publish",
+                      "title": "NØX learning from observed outcomes",
+                      "body": (
+                          "NØX observed a concrete outcome and recorded this learning:\n\n"
+                          f"{summary}\n\n"
+                          f"Evidence recorded: {clean(evidence, 900)}\n\n"
+                          "This is a current working learning, not a universal claim. NØX will update it if later observations contradict it."
+                      ),
+                      "reason": "Core selected an evidence-backed learning for public sharing to maintain useful presence.",
+                      "learning": learning, "created_at": NOW
                   })
-                  case["decision"] = "dm_reply_after_research"
-                  case["action_kind"] = "dm_reply"
-              elif case.get("source") in ("for_you", "suggestion"):
-                  runtime["pending_actions"].append({
-                      "action_id":action_id,"case_id":case.get("case_id"),"kind":"research_reply",
-                      "target_id":case.get("target_id"),"title":case.get("title"),"body":case.get("body"),
-                      "author":case.get("author"),"reason":"Research completed; Presence may now make a bounded, evidence-aware public contribution.",
-                      "research_result":result,"created_at":NOW
-                  })
-                  case["decision"] = "reply_after_research"
-                  case["action_kind"] = "research_reply"
-
-                  # Research evidence is not, by itself, permission to publish.
-                  # In particular, Work Factory may return a coverage/meta-result
-                  # such as "Search coverage found relevant results...". That is
-                  # evidence about search coverage, not a NØX conclusion. Such a
-                  # result must never be promoted automatically into a public post.
-                  # Public research publication is therefore disabled here until
-                  # the research result contains an explicit, bounded conclusion
-                  # distinct from coverage/meta language and traceably relevant to
-                  # the live case. The research reply remains available for the
-                  # appropriate case type.
-                  publish_actions_created = 0
+                  publish_actions_created += 1
+                  break
 
           # Housekeeping: do not manufacture learnings. A learning requires
           # an observed result or a concrete failure.
