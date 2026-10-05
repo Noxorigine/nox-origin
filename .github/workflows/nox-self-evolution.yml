@@ -20,29 +20,23 @@ env:
   KNOWLEDGE_FILE: memory/nox_knowledge.json
   PRESENCE_FILE: memory/nox_colony_presence.json
 
-  GEMINI_MODEL: gemini-3.7-flash
-
   MAX_HISTORY: "200"
-  MAX_PATCHES: "8"
+
+  # Structural memory targets.
+  # The workflow compacts before evolution analysis.
+  MEMORY_TARGET_BYTES: "350000"
+  MEMORY_HARD_LIMIT_BYTES: "400000"
+
+  # Bounded reasoning context.
   MAX_CONTEXT_CHARS: "24000"
-  MAX_FILE_CHARS: "500000"
 
-  # Structural health thresholds.
-  MAX_RUNTIME_BYTES: "400000"
-  MAX_PRESENCE_BYTES: "400000"
-  MAX_WORK_BYTES: "400000"
-  MAX_MEMORY_BYTES: "400000"
-  MAX_KNOWLEDGE_BYTES: "400000"
+  # Evolution limits.
+  MAX_PATCHES: "8"
+  MAX_DIFF_CHARS: "120000"
 
-  MAX_PENDING_ACTIONS: "30"
-  MAX_WORK_REQUESTS: "150"
-  MAX_CASES: "150"
-  MAX_MEMORY_CONTEXT_CHARS: "30000"
-
-  DUPLICATE_PUBLISH_THRESHOLD: "2"
-  DUPLICATE_WORK_REQUEST_THRESHOLD: "3"
-
-  COLLECTION_WARNING_RATIO: "0.90"
+  # Gemini is optional for reasoning only.
+  # It must never be required for memory maintenance.
+  GEMINI_MODEL: gemini-3.7-flash
 
 jobs:
   self-evolution:
@@ -84,7 +78,6 @@ jobs:
           import re
           import subprocess
           import sys
-          from collections import Counter
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -99,58 +92,20 @@ jobs:
           NOW = datetime.now(timezone.utc).isoformat()
 
           MAX_HISTORY = int(os.environ["MAX_HISTORY"])
-          MAX_PATCHES = int(os.environ["MAX_PATCHES"])
+          MEMORY_TARGET_BYTES = int(
+              os.environ["MEMORY_TARGET_BYTES"]
+          )
+          MEMORY_HARD_LIMIT_BYTES = int(
+              os.environ["MEMORY_HARD_LIMIT_BYTES"]
+          )
           MAX_CONTEXT_CHARS = int(
               os.environ["MAX_CONTEXT_CHARS"]
           )
-          MAX_FILE_CHARS = int(
-              os.environ["MAX_FILE_CHARS"]
+          MAX_PATCHES = int(
+              os.environ["MAX_PATCHES"]
           )
-
-          MAX_RUNTIME_BYTES = int(
-              os.environ["MAX_RUNTIME_BYTES"]
-          )
-          MAX_PRESENCE_BYTES = int(
-              os.environ["MAX_PRESENCE_BYTES"]
-          )
-          MAX_WORK_BYTES = int(
-              os.environ["MAX_WORK_BYTES"]
-          )
-          MAX_MEMORY_BYTES = int(
-              os.environ["MAX_MEMORY_BYTES"]
-          )
-          MAX_KNOWLEDGE_BYTES = int(
-              os.environ["MAX_KNOWLEDGE_BYTES"]
-          )
-
-          MAX_PENDING_ACTIONS = int(
-              os.environ["MAX_PENDING_ACTIONS"]
-          )
-          MAX_WORK_REQUESTS = int(
-              os.environ["MAX_WORK_REQUESTS"]
-          )
-          MAX_CASES = int(
-              os.environ["MAX_CASES"]
-          )
-          MAX_MEMORY_CONTEXT_CHARS = int(
-              os.environ["MAX_MEMORY_CONTEXT_CHARS"]
-          )
-
-          DUPLICATE_PUBLISH_THRESHOLD = int(
-              os.environ[
-                  "DUPLICATE_PUBLISH_THRESHOLD"
-              ]
-          )
-          DUPLICATE_WORK_REQUEST_THRESHOLD = int(
-              os.environ[
-                  "DUPLICATE_WORK_REQUEST_THRESHOLD"
-              ]
-          )
-
-          COLLECTION_WARNING_RATIO = float(
-              os.environ[
-                  "COLLECTION_WARNING_RATIO"
-              ]
+          MAX_DIFF_CHARS = int(
+              os.environ["MAX_DIFF_CHARS"]
           )
 
           GEMINI_API_KEY = os.environ.get(
@@ -203,6 +158,12 @@ jobs:
               ".github/workflows/nox-action-opportunities.yml",
           }
 
+          MEMORY_TARGETS = {
+              CORE_MEMORY_FILE,
+              CORE_RUNTIME_FILE,
+              PRESENCE_FILE,
+          }
+
           # ============================================================
           # UTILITIES
           # ============================================================
@@ -247,12 +208,8 @@ jobs:
                   )
 
               except Exception as exc:
-                  print(
-                      f"WARNING: cannot read {path}: {exc}"
-                  )
-
-                  return json.loads(
-                      json.dumps(default)
+                  raise RuntimeError(
+                      f"Cannot safely read JSON {path}: {exc}"
                   )
 
 
@@ -273,160 +230,6 @@ jobs:
               )
 
 
-          def read_full(path):
-              if not path.exists():
-                  return ""
-
-              size = path.stat().st_size
-
-              if size > MAX_FILE_CHARS:
-                  raise RuntimeError(
-                      f"Target file exceeds safety limit: "
-                      f"{path} ({size} bytes)"
-                  )
-
-              return path.read_text(
-                  encoding="utf-8"
-              )
-
-
-          def bounded_text(value, limit):
-              text = json.dumps(
-                  value,
-                  ensure_ascii=False,
-                  sort_keys=True,
-              )
-
-              if len(text) <= limit:
-                  return value
-
-              if isinstance(value, list):
-                  result = []
-
-                  for item in value:
-                      candidate = result + [item]
-
-                      if len(
-                          json.dumps(
-                              candidate,
-                              ensure_ascii=False,
-                          )
-                      ) > limit:
-                          break
-
-                      result.append(item)
-
-                  return {
-                      "truncated": True,
-                      "items_returned": len(result),
-                      "items_total": len(value),
-                      "items": result,
-                  }
-
-              if isinstance(value, dict):
-                  result = {}
-
-                  for key, item in value.items():
-                      candidate = dict(result)
-                      candidate[key] = item
-
-                      if len(
-                          json.dumps(
-                              candidate,
-                              ensure_ascii=False,
-                          )
-                      ) > limit:
-                          break
-
-                      result[key] = item
-
-                  return {
-                      "truncated": True,
-                      "keys_returned": len(result),
-                      "keys_total": len(value),
-                      "data": result,
-                  }
-
-              return clean(value, limit)
-
-
-          def read_for_context(path):
-              """
-              Large files are represented structurally rather than by
-              copying an arbitrary middle/edge slice into the prompt.
-              """
-
-              if not path.exists():
-                  return ""
-
-              try:
-                  data = json.loads(
-                      path.read_text(
-                          encoding="utf-8"
-                      )
-                  )
-
-                  if isinstance(data, dict):
-                      summary = {
-                          "file": str(path),
-                          "keys": list(
-                              data.keys()
-                          ),
-                          "collections": {},
-                      }
-
-                      for key, value in data.items():
-                          if isinstance(
-                              value,
-                              list,
-                          ):
-                              summary[
-                                  "collections"
-                              ][key] = {
-                                  "count": len(
-                                      value
-                                  ),
-                                  "recent": value[
-                                      -5:
-                                  ],
-                              }
-
-                      return json.dumps(
-                          bounded_text(
-                              summary,
-                              MAX_CONTEXT_CHARS,
-                          ),
-                          ensure_ascii=False,
-                          indent=2,
-                      )
-
-              except Exception:
-                  pass
-
-              text = path.read_text(
-                  encoding="utf-8"
-              )
-
-              if len(text) <= MAX_CONTEXT_CHARS:
-                  return text
-
-              head_size = (
-                  MAX_CONTEXT_CHARS // 2
-              )
-
-              tail_size = (
-                  MAX_CONTEXT_CHARS
-                  - head_size
-              )
-
-              return (
-                  text[:head_size]
-                  + "\n\n"
-                  + "[... TEXT CONTEXT OMITTED ...]\n\n"
-                  + text[-tail_size:]
-              )
-
-
           def file_hash(path):
               if not path.exists():
                   return None
@@ -434,6 +237,13 @@ jobs:
               return hashlib.sha256(
                   path.read_bytes()
               ).hexdigest()
+
+
+          def file_size(path):
+              if not path.exists():
+                  return 0
+
+              return path.stat().st_size
 
 
           def run_git(*args, check=True):
@@ -482,59 +292,306 @@ jobs:
               return True
 
 
-          def recursive_string_size(value):
-              if isinstance(value, str):
-                  return len(value)
+          def timestamp_value(item):
+              if not isinstance(item, dict):
+                  return ""
 
-              if isinstance(value, dict):
-                  return sum(
-                      recursive_string_size(k)
-                      + recursive_string_size(v)
-                      for k, v in value.items()
+              for key in (
+                  "timestamp",
+                  "created_at",
+                  "updated_at",
+                  "completed_at",
+                  "observed_at",
+              ):
+                  value = item.get(key)
+
+                  if value:
+                      return str(value)
+
+              return ""
+
+
+          def identity_value(item):
+              if not isinstance(item, dict):
+                  return ""
+
+              for key in (
+                  "id",
+                  "action_id",
+                  "request_id",
+                  "work_id",
+                  "case_id",
+                  "post_id",
+                  "comment_id",
+                  "notification_id",
+                  "signature",
+              ):
+                  value = item.get(key)
+
+                  if value:
+                      return f"{key}:{value}"
+
+              return ""
+
+
+          def compact_list(
+              values,
+              max_items,
+          ):
+              if not isinstance(values, list):
+                  return values, 0
+
+              before = len(values)
+
+              deduped = []
+              seen = set()
+
+              # Preserve the most recent occurrence of an identified
+              # record. Records without a stable identity are preserved.
+              for item in reversed(values):
+                  identity = identity_value(item)
+
+                  if identity:
+                      if identity in seen:
+                          continue
+
+                      seen.add(identity)
+
+                  deduped.append(item)
+
+              deduped.reverse()
+
+              if len(deduped) > max_items:
+                  deduped = deduped[-max_items:]
+
+              return deduped, before - len(deduped)
+
+
+          def compact_memory(
+              path,
+              target_bytes,
+          ):
+              """
+              Deterministic bounded compaction.
+
+              The function never guesses semantic content.
+              It only:
+                1. removes exact duplicate identified records;
+                2. retains recent records;
+                3. progressively lowers list retention until the file
+                   reaches the target size.
+
+              Scalar/top-level values are preserved.
+              """
+
+              if not path.exists():
+                  return {
+                      "changed": False,
+                      "before": 0,
+                      "after": 0,
+                      "removed": 0,
+                      "reason": "missing",
+                  }
+
+              before_bytes = file_size(path)
+
+              if before_bytes <= target_bytes:
+                  return {
+                      "changed": False,
+                      "before": before_bytes,
+                      "after": before_bytes,
+                      "removed": 0,
+                      "reason": "within_target",
+                  }
+
+              data = load_json(path, {})
+
+              if not isinstance(data, dict):
+                  raise RuntimeError(
+                      f"Expected object at {path}"
                   )
 
-              if isinstance(value, list):
-                  return sum(
-                      recursive_string_size(item)
-                      for item in value
+              list_keys = [
+                  key
+                  for key, value in data.items()
+                  if isinstance(value, list)
+              ]
+
+              removed_total = 0
+
+              # First pass: remove exact duplicate identities while
+              # retaining recent occurrences.
+              for key in list_keys:
+                  compacted, removed = compact_list(
+                      data[key],
+                      max_items=max(
+                          50,
+                          len(data[key]),
+                      ),
                   )
 
-              return 0
+                  data[key] = compacted
+                  removed_total += removed
 
+              save_json(path, data)
 
-          def count_collection(value):
-              if isinstance(value, list):
-                  return len(value)
+              current = file_size(path)
 
-              if isinstance(value, dict):
-                  return len(value)
+              if current <= target_bytes:
+                  return {
+                      "changed": True,
+                      "before": before_bytes,
+                      "after": current,
+                      "removed": removed_total,
+                      "reason": "deduplicated",
+                  }
 
-              return 0
+              # Second pass: progressively bound list lengths.
+              #
+              # Start generously, then become more aggressive only
+              # while the file remains above the target.
+              limits = [
+                  500,
+                  300,
+                  200,
+                  150,
+                  100,
+                  75,
+                  50,
+                  35,
+                  25,
+                  15,
+                  10,
+              ]
 
+              for limit in limits:
+                  for key in list_keys:
+                      values = data.get(key)
 
-          def duplicate_signatures(items, signature_fn):
-              signatures = []
+                      if not isinstance(
+                          values,
+                          list,
+                      ):
+                          continue
 
-              for item in items:
-                  try:
-                      signature = signature_fn(
-                          item
+                      if len(values) <= limit:
+                          continue
+
+                      old_length = len(values)
+
+                      data[key] = values[-limit:]
+
+                      removed_total += (
+                          old_length
+                          - len(data[key])
                       )
-                  except Exception:
-                      continue
 
-                  if signature:
-                      signatures.append(
-                          signature
-                      )
+                  save_json(path, data)
 
-              counts = Counter(signatures)
+                  current = file_size(path)
+
+                  if current <= target_bytes:
+                      break
+
+              # Final safety pass. If the file is still too large,
+              # lower every list to a small bounded window.
+              if current > target_bytes:
+                  for limit in (
+                      8,
+                      5,
+                      3,
+                  ):
+                      for key in list_keys:
+                          values = data.get(key)
+
+                          if not isinstance(
+                              values,
+                              list,
+                          ):
+                              continue
+
+                          if len(values) > limit:
+                              old_length = len(
+                                  values
+                              )
+
+                              data[key] = values[
+                                  -limit:
+                              ]
+
+                              removed_total += (
+                                  old_length
+                                  - len(
+                                      data[key]
+                                  )
+                              )
+
+                      save_json(path, data)
+
+                      current = file_size(path)
+
+                      if current <= target_bytes:
+                          break
+
+              if current > MEMORY_HARD_LIMIT_BYTES:
+                  raise RuntimeError(
+                      f"Unable to safely compact {path}: "
+                      f"{current} bytes remain."
+                  )
 
               return {
-                  signature: count
-                  for signature, count in counts.items()
-                  if count >= 2
+                  "changed": True,
+                  "before": before_bytes,
+                  "after": current,
+                  "removed": removed_total,
+                  "reason": "bounded_compaction",
               }
+
+
+          def read_for_context(path):
+              """
+              Never load an oversized memory file completely into the
+              reasoning context.
+              """
+
+              if not path.exists():
+                  return ""
+
+              text = path.read_text(
+                  encoding="utf-8"
+              )
+
+              if len(text) <= MAX_CONTEXT_CHARS:
+                  return text
+
+              head_size = MAX_CONTEXT_CHARS // 3
+              tail_size = (
+                  MAX_CONTEXT_CHARS
+                  - head_size
+              )
+
+              return (
+                  text[:head_size]
+                  + "\n\n"
+                  + "[... MIDDLE OMITTED FROM "
+                    "REASONING CONTEXT ...]\n\n"
+                  + text[-tail_size:]
+              )
+
+
+          def read_full(path):
+              """
+              Full reads are reserved for files that are actually
+              being patched. Memory maintenance uses bounded JSON
+              operations instead.
+              """
+
+              if not path.exists():
+                  return ""
+
+              return path.read_text(
+                  encoding="utf-8"
+              )
 
 
           # ============================================================
@@ -572,6 +629,7 @@ jobs:
                   "version": 2,
                   "history": [],
                   "runs": [],
+                  "maintenance": [],
               },
           )
 
@@ -590,467 +648,339 @@ jobs:
               [],
           )
 
+          evolution.setdefault(
+              "maintenance",
+              [],
+          )
+
           # ============================================================
-          # STRUCTURAL HEALTH ANALYSIS
+          # STRUCTURAL DIAGNOSTICS
           # ============================================================
 
-          file_objects = {
-              "core_memory": (
-                  CORE_MEMORY_FILE,
-                  memory,
-                  MAX_MEMORY_BYTES,
-              ),
-              "core_runtime": (
-                  CORE_RUNTIME_FILE,
-                  runtime,
-                  MAX_RUNTIME_BYTES,
-              ),
-              "work_factory": (
-                  WORK_FILE,
-                  work,
-                  MAX_WORK_BYTES,
-              ),
-              "knowledge": (
-                  KNOWLEDGE_FILE,
-                  knowledge,
-                  MAX_KNOWLEDGE_BYTES,
-              ),
-              "presence": (
-                  PRESENCE_FILE,
-                  presence,
-                  MAX_PRESENCE_BYTES,
-              ),
-          }
+          def structural_warnings():
+              warnings = []
 
-          structural = {
-              "files": {},
-              "collections": {},
-              "duplicates": {},
-              "warnings": [],
-          }
-
-          for name, (
-              path,
-              data,
-              max_bytes,
-          ) in file_objects.items():
-              size = (
-                  path.stat().st_size
-                  if path.exists()
-                  else 0
-              )
-
-              structural["files"][name] = {
-                  "path": str(path),
-                  "bytes": size,
-                  "lines": (
-                      path.read_text(
-                          encoding="utf-8"
-                      ).count("\n")
-                      if path.exists()
-                      else 0
+              sizes = {
+                  "core_memory": file_size(
+                      CORE_MEMORY_FILE
                   ),
-                  "max_bytes": max_bytes,
+                  "core_runtime": file_size(
+                      CORE_RUNTIME_FILE
+                  ),
+                  "presence": file_size(
+                      PRESENCE_FILE
+                  ),
               }
 
-              if size > max_bytes:
-                  structural[
-                      "warnings"
-                  ].append(
-                      {
-                          "type": "file_size",
-                          "file": name,
-                          "bytes": size,
-                          "threshold": max_bytes,
-                      }
+              for name, size in sizes.items():
+                  if size > MEMORY_HARD_LIMIT_BYTES:
+                      warnings.append(
+                          {
+                              "type": "file_size",
+                              "file": name,
+                              "bytes": size,
+                              "threshold": (
+                                  MEMORY_HARD_LIMIT_BYTES
+                              ),
+                          }
+                      )
+
+              publish_signatures = {}
+
+              for item in (
+                  runtime.get(
+                      "pending_actions",
+                      [],
+                  )
+                  + presence.get(
+                      "executed_actions",
+                      [],
+                  )
+              ):
+                  if not isinstance(
+                      item,
+                      dict,
+                  ):
+                      continue
+
+                  if item.get("kind") != "publish":
+                      continue
+
+                  body = clean(
+                      item.get("body"),
+                      3000,
                   )
 
-          runtime_pending = runtime.get(
-              "pending_actions",
-              [],
-          )
+                  if not body:
+                      continue
 
-          if not isinstance(
-              runtime_pending,
-              list,
-          ):
-              runtime_pending = []
+                  signature = stable(
+                      item.get("title"),
+                      body,
+                  )
 
-          work_requests = runtime.get(
-              "work_requests",
-              [],
-          )
-
-          if not isinstance(
-              work_requests,
-              list,
-          ):
-              work_requests = []
-
-          cases = memory.get(
-              "cognitive_cases",
-              [],
-          )
-
-          if not isinstance(
-              cases,
-              list,
-          ):
-              cases = []
-
-          structural[
-              "collections"
-          ]["pending_actions"] = len(
-              runtime_pending
-          )
-
-          structural[
-              "collections"
-          ]["work_requests"] = len(
-              work_requests
-          )
-
-          structural[
-              "collections"
-          ]["cognitive_cases"] = len(
-              cases
-          )
-
-          for name, data in (
-              (
-                  "runtime_evolution_requests",
-                  runtime.get(
-                      "evolution_requests",
-                      [],
-                  ),
-              ),
-              (
-                  "runtime_cognitive_gaps",
-                  runtime.get(
-                      "cognitive_gaps",
-                      [],
-                  ),
-              ),
-              (
-                  "memory_failures",
-                  memory.get(
-                      "failures",
-                      [],
-                  ),
-              ),
-              (
-                  "memory_learnings",
-                  memory.get(
-                      "learnings",
-                      [],
-                  ),
-              ),
-              (
-                  "presence_outcomes",
-                  presence.get(
-                      "outcomes",
-                      [],
-                  ),
-              ),
-              (
-                  "presence_notifications",
-                  presence.get(
-                      "notifications",
-                      [],
-                  ),
-              ),
-              (
-                  "presence_observed_posts",
-                  presence.get(
-                      "observed_posts",
-                      [],
-                  ),
-              ),
-              (
-                  "presence_replied_posts",
-                  presence.get(
-                      "replied_posts",
-                      [],
-                  ),
-              ),
-              (
-                  "presence_published_posts",
-                  presence.get(
-                      "published_posts",
-                      [],
-                  ),
-              ),
-          ):
-              structural[
-                  "collections"
-              ][name] = count_collection(
-                  data
-              )
-
-          # ============================================================
-          # DUPLICATE ACTION DETECTION
-          # ============================================================
-
-          publish_duplicates = duplicate_signatures(
-              [
-                  item
-                  for item in runtime_pending
-                  if isinstance(item, dict)
-                  and item.get("kind")
-                  == "publish"
-              ],
-              lambda item: stable(
-                  item.get("kind"),
-                  item.get("title"),
-                  item.get("body"),
-              ),
-          )
-
-          if publish_duplicates:
-              structural[
-                  "duplicates"
-              ]["pending_publish"] = (
-                  publish_duplicates
-              )
+                  publish_signatures[
+                      signature
+                  ] = (
+                      publish_signatures.get(
+                          signature,
+                          0,
+                      )
+                      + 1
+                  )
 
               for signature, count in (
-                  publish_duplicates.items()
+                  publish_signatures.items()
               ):
-                  if (
-                      count
-                      >= DUPLICATE_PUBLISH_THRESHOLD
-                  ):
-                      structural[
-                          "warnings"
-                      ].append(
+                  if count > 1:
+                      warnings.append(
                           {
-                              "type": (
-                                  "duplicate_publish"
-                              ),
+                              "type": "duplicate_publish",
                               "signature": signature,
                               "count": count,
                           }
                       )
 
-          work_duplicates = duplicate_signatures(
-              work_requests,
-              lambda item: stable(
-                  item.get("target_id"),
-                  item.get("intent"),
-                  json.dumps(
-                      item.get(
-                          "queries",
-                          [],
-                      ),
-                      ensure_ascii=False,
-                      sort_keys=True,
-                  ),
-              ),
-          )
+              request_signatures = {}
 
-          if work_duplicates:
-              structural[
-                  "duplicates"
-              ]["work_requests"] = (
-                  work_duplicates
-              )
-
-              for signature, count in (
-                  work_duplicates.items()
+              for item in (
+                  runtime.get(
+                      "work_requests",
+                      [],
+                  )
+                  + presence.get(
+                      "work_requests",
+                      [],
+                  )
               ):
-                  if (
-                      count
-                      >= DUPLICATE_WORK_REQUEST_THRESHOLD
+                  if not isinstance(
+                      item,
+                      dict,
                   ):
-                      structural[
-                          "warnings"
-                      ].append(
-                          {
-                              "type": (
-                                  "duplicate_work_request"
-                              ),
-                              "signature": signature,
-                              "count": count,
-                          }
-                      )
+                      continue
 
-          # ============================================================
-          # MEMORY CONTEXT ANALYSIS
-          # ============================================================
-
-          memory_context_sizes = []
-
-          for request in work_requests:
-              if not isinstance(
-                  request,
-                  dict,
-              ):
-                  continue
-
-              context = request.get(
-                  "memory_context"
-              )
-
-              if context is None:
-                  continue
-
-              size = recursive_string_size(
-                  context
-              )
-
-              memory_context_sizes.append(
-                  size
-              )
-
-          structural[
-              "memory_context"
-          ] = {
-              "requests_with_context": len(
-                  memory_context_sizes
-              ),
-              "max_chars": max(
-                  memory_context_sizes,
-                  default=0,
-              ),
-              "total_chars": sum(
-                  memory_context_sizes
-              ),
-          }
-
-          if (
-              structural[
-                  "memory_context"
-              ]["max_chars"]
-              > MAX_MEMORY_CONTEXT_CHARS
-          ):
-              structural[
-                  "warnings"
-              ].append(
-                  {
-                      "type": (
-                          "oversized_memory_context"
-                      ),
-                      "max_chars": structural[
-                          "memory_context"
-                      ]["max_chars"],
-                      "threshold": (
-                          MAX_MEMORY_CONTEXT_CHARS
-                      ),
-                  }
-              )
-
-          # ============================================================
-          # COLLECTION CAPACITY ANALYSIS
-          # ============================================================
-
-          known_caps = {
-              "presence_outcomes": 500,
-              "presence_observed_posts": 500,
-              "presence_replied_posts": 500,
-              "presence_published_posts": 500,
-              "presence_notifications": 500,
-              "runtime_pending_actions": 500,
-          }
-
-          for name, cap in known_caps.items():
-              collection_name = name
-
-              if name == "runtime_pending_actions":
-                  count = len(
-                      runtime_pending
-                  )
-              else:
-                  count = structural[
-                      "collections"
-                  ].get(
-                      collection_name,
-                      0,
-                  )
-
-              ratio = (
-                  count / cap
-                  if cap
-                  else 0
-              )
-
-              if ratio >= COLLECTION_WARNING_RATIO:
-                  structural[
-                      "warnings"
-                  ].append(
-                      {
-                          "type": (
-                              "collection_near_capacity"
+                  signature = stable(
+                      item.get("target_id"),
+                      item.get("intent"),
+                      json.dumps(
+                          item.get(
+                              "queries",
+                              [],
                           ),
-                          "collection": name,
-                          "count": count,
-                          "cap": cap,
-                          "ratio": ratio,
+                          ensure_ascii=False,
+                          sort_keys=True,
+                      ),
+                  )
+
+                  request_signatures[
+                      signature
+                  ] = (
+                      request_signatures.get(
+                          signature,
+                          0,
+                      )
+                      + 1
+                  )
+
+              for signature, count in (
+                  request_signatures.items()
+              ):
+                  if count > 1:
+                      warnings.append(
+                          {
+                              "type": "duplicate_work_request",
+                              "signature": signature,
+                              "count": count,
+                          }
+                      )
+
+              context_sizes = []
+
+              for path in (
+                  CORE_MEMORY_FILE,
+                  CORE_RUNTIME_FILE,
+                  PRESENCE_FILE,
+              ):
+                  if path.exists():
+                      text = path.read_text(
+                          encoding="utf-8"
+                      )
+
+                      context_sizes.append(
+                          len(text)
+                      )
+
+              if context_sizes:
+                  maximum = max(
+                      context_sizes
+                  )
+
+                  if maximum > 30000:
+                      warnings.append(
+                          {
+                              "type": (
+                                  "oversized_memory_context"
+                              ),
+                              "max_chars": maximum,
+                              "threshold": 30000,
+                          }
+                      )
+
+              return warnings
+
+
+          # ============================================================
+          # PRIORITY MAINTENANCE
+          # ============================================================
+
+          warnings_before = structural_warnings()
+
+          print(
+              "Structural warnings before maintenance: "
+              f"{len(warnings_before)}"
+          )
+
+          if warnings_before:
+              print(
+                  json.dumps(
+                      warnings_before,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+              )
+
+          maintenance_results = []
+
+          for path in (
+              CORE_MEMORY_FILE,
+              CORE_RUNTIME_FILE,
+              PRESENCE_FILE,
+          ):
+              result = compact_memory(
+                  path,
+                  MEMORY_TARGET_BYTES,
+              )
+
+              if result["changed"]:
+                  maintenance_results.append(
+                      {
+                          "file": str(path),
+                          **result,
                       }
                   )
 
-          # ============================================================
-          # OPERATIONAL PRESSURE ANALYSIS
-          # ============================================================
+          # Reload all compacted state.
+          memory = load_json(
+              CORE_MEMORY_FILE,
+              {},
+          )
 
-          if (
-              len(runtime_pending)
-              > MAX_PENDING_ACTIONS
-          ):
-              structural[
-                  "warnings"
-              ].append(
+          runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {},
+          )
+
+          presence = load_json(
+              PRESENCE_FILE,
+              {},
+          )
+
+          warnings_after = structural_warnings()
+
+          maintenance_id = stable(
+              "maintenance",
+              NOW,
+              json.dumps(
+                  maintenance_results,
+                  ensure_ascii=False,
+                  sort_keys=True,
+              ),
+          )
+
+          if maintenance_results:
+              evolution["maintenance"].append(
                   {
-                      "type": (
-                          "pending_actions_pressure"
+                      "id": maintenance_id,
+                      "timestamp": NOW,
+                      "status": (
+                          "completed"
                       ),
-                      "count": len(
-                          runtime_pending
+                      "before_warnings": (
+                          len(warnings_before)
                       ),
-                      "threshold": (
-                          MAX_PENDING_ACTIONS
+                      "after_warnings": (
+                          len(warnings_after)
+                      ),
+                      "results": (
+                          maintenance_results
                       ),
                   }
               )
 
-          if (
-              len(work_requests)
-              > MAX_WORK_REQUESTS
-          ):
-              structural[
-                  "warnings"
-              ].append(
+              evolution["maintenance"] = (
+                  evolution["maintenance"]
+              )[-MAX_HISTORY:]
+          else:
+              evolution["maintenance"].append(
                   {
-                      "type": (
-                          "work_request_pressure"
+                      "id": maintenance_id,
+                      "timestamp": NOW,
+                      "status": "not_required",
+                      "before_warnings": (
+                          len(warnings_before)
                       ),
-                      "count": len(
-                          work_requests
-                      ),
-                      "threshold": (
-                          MAX_WORK_REQUESTS
+                      "after_warnings": (
+                          len(warnings_after)
                       ),
                   }
               )
 
-          if (
-              len(cases)
-              > MAX_CASES
-          ):
-              structural[
-                  "warnings"
-              ].append(
-                  {
-                      "type": "case_pressure",
-                      "count": len(cases),
-                      "threshold": MAX_CASES,
-                  }
+              evolution["maintenance"] = (
+                  evolution["maintenance"]
+              )[-MAX_HISTORY:]
+
+          save_json(
+              EVOLUTION_FILE,
+              evolution,
+          )
+
+          print(
+              "Structural warnings after maintenance: "
+              f"{len(warnings_after)}"
+          )
+
+          if maintenance_results:
+              print(
+                  "Memory maintenance completed:"
               )
+
+              for result in maintenance_results:
+                  print(
+                      f" - {result['file']}: "
+                      f"{result['before']} -> "
+                      f"{result['after']} bytes; "
+                      f"removed={result['removed']}"
+                  )
 
           # ============================================================
           # DETECTION
           # ============================================================
 
           signals = []
+
+          # Structural warnings are deliberately first.
+          # A structural integrity problem is higher priority than
+          # ordinary learning/work signals.
+          for warning in warnings_after:
+              signals.append(
+                  {
+                      "source": (
+                          "structural_integrity"
+                      ),
+                      "priority": 100,
+                      "data": warning,
+                  }
+              )
 
           for item in memory.get(
               "failures",
@@ -1060,6 +990,7 @@ jobs:
                   signals.append(
                       {
                           "source": "core_failure",
+                          "priority": 80,
                           "data": item,
                       }
                   )
@@ -1072,6 +1003,7 @@ jobs:
                   signals.append(
                       {
                           "source": "core_learning",
+                          "priority": 50,
                           "data": item,
                       }
                   )
@@ -1083,7 +1015,10 @@ jobs:
               if isinstance(item, dict):
                   signals.append(
                       {
-                          "source": "evolution_request",
+                          "source": (
+                              "evolution_request"
+                          ),
+                          "priority": 90,
                           "data": item,
                       }
                   )
@@ -1096,6 +1031,7 @@ jobs:
                   signals.append(
                       {
                           "source": "cognitive_gap",
+                          "priority": 70,
                           "data": item,
                       }
                   )
@@ -1118,7 +1054,10 @@ jobs:
                   }:
                       signals.append(
                           {
-                              "source": "work_factory",
+                              "source": (
+                                  "work_factory"
+                              ),
+                              "priority": 40,
                               "data": item,
                           }
                       )
@@ -1130,50 +1069,13 @@ jobs:
               if isinstance(item, dict):
                   signals.append(
                       {
-                          "source": "presence_outcome",
+                          "source": (
+                              "presence_outcome"
+                          ),
+                          "priority": 60,
                           "data": item,
                       }
                   )
-
-          # Structural health is now a first-class evolution source.
-          for warning in structural[
-              "warnings"
-          ]:
-              signals.append(
-                  {
-                      "source": "structural_health",
-                      "data": warning,
-                  }
-              )
-
-          # Add a complete structural snapshot when a pressure
-          # condition exists. This lets Self Evolution reason about
-          # the relationship between several related metrics.
-          if structural[
-              "warnings"
-          ]:
-              signals.append(
-                  {
-                      "source": "system_health_snapshot",
-                      "data": {
-                          "files": structural[
-                              "files"
-                          ],
-                          "collections": structural[
-                              "collections"
-                          ],
-                          "duplicates": structural[
-                              "duplicates"
-                          ],
-                          "memory_context": structural[
-                              "memory_context"
-                          ],
-                          "warnings": structural[
-                              "warnings"
-                          ],
-                      },
-                  }
-              )
 
           known_signatures = {
               item.get(
@@ -1212,25 +1114,18 @@ jobs:
                   }
               )
 
-          # Structural problems are prioritized because they can
-          # degrade several other workflows simultaneously.
-          priority = {
-              "system_health_snapshot": 0,
-              "structural_health": 1,
-              "core_failure": 2,
-              "presence_outcome": 3,
-              "evolution_request": 4,
-              "cognitive_gap": 5,
-              "work_factory": 6,
-              "core_learning": 7,
-          }
-
           candidates.sort(
-              key=lambda item: priority.get(
-                  item.get(
-                      "source"
+              key=lambda item: (
+                  -int(
+                      item.get(
+                          "priority",
+                          0,
+                      )
                   ),
-                  99,
+                  item.get(
+                      "signature",
+                      "",
+                  ),
               )
           )
 
@@ -1244,40 +1139,50 @@ jobs:
           )
 
           print(
-              "Structural warnings: "
-              f"{len(structural['warnings'])}"
+              f"Structural warnings: "
+              f"{len(warnings_after)}"
+          )
+
+          # ============================================================
+          # PENDING ACTION / WORK REQUEST COUNTS
+          # ============================================================
+
+          pending_actions = runtime.get(
+              "pending_actions",
+              [],
+          )
+
+          work_requests = runtime.get(
+              "work_requests",
+              [],
           )
 
           print(
-              "Pending actions: "
-              f"{len(runtime_pending)}"
+              f"Pending actions: "
+              f"{len(pending_actions) if isinstance(pending_actions, list) else 0}"
           )
 
           print(
-              "Work requests: "
-              f"{len(work_requests)}"
+              f"Work requests: "
+              f"{len(work_requests) if isinstance(work_requests, list) else 0}"
           )
 
           print(
-              "Runtime bytes: "
-              f"{structural['files']['core_runtime']['bytes']}"
+              f"Runtime bytes: "
+              f"{file_size(CORE_RUNTIME_FILE)}"
           )
 
           print(
-              "Presence bytes: "
-              f"{structural['files']['presence']['bytes']}"
+              f"Presence bytes: "
+              f"{file_size(PRESENCE_FILE)}"
           )
 
-          if structural[
-              "warnings"
-          ]:
+          if warnings_after:
               print(
                   "Structural warnings detail:"
               )
 
-              for warning in structural[
-                  "warnings"
-              ][:20]:
+              for warning in warnings_after:
                   print(
                       " - "
                       + json.dumps(
@@ -1295,13 +1200,16 @@ jobs:
                   {
                       "timestamp": NOW,
                       "status": (
-                          "no_new_candidate"
+                          "maintenance_only"
+                          if maintenance_results
+                          else "no_new_candidate"
                       ),
                       "signals": len(signals),
-                      "structural_warnings": len(
-                          structural[
-                              "warnings"
-                          ]
+                      "structural_warnings": (
+                          len(warnings_after)
+                      ),
+                      "maintenance_id": (
+                          maintenance_id
                       ),
                   }
               )
@@ -1320,7 +1228,7 @@ jobs:
               )
 
               print(
-                  "No modification required."
+                  "Decision: NO EVOLUTION"
               )
 
               sys.exit(0)
@@ -1353,7 +1261,9 @@ jobs:
           reasoning_context = {
               "timestamp": NOW,
               "candidate": candidate,
-              "structural_health": structural,
+              "structural_warnings": (
+                  warnings_after
+              ),
               "recent_failures": memory.get(
                   "failures",
                   [],
@@ -1370,10 +1280,7 @@ jobs:
                   "history",
                   [],
               )[-10:],
-              "knowledge": bounded_text(
-                  knowledge,
-                  MAX_CONTEXT_CHARS // 2,
-              ),
+              "knowledge": knowledge,
               "presence_recent_outcomes": presence.get(
                   "outcomes",
                   [],
@@ -1389,12 +1296,6 @@ jobs:
                       "evolution_requests",
                       [],
                   )[-10:],
-                  "pending_actions": runtime_pending[
-                      -20:
-                  ],
-                  "work_requests": work_requests[
-                      -20:
-                  ],
               },
               "files": context_files,
           }
@@ -1416,10 +1317,8 @@ jobs:
               "context": reasoning_context,
               "rules": [
                   "Use evidence, not assumptions.",
-                  "Structural health warnings are evidence, not proof of the correct fix.",
-                  "Determine the root cause before proposing cleanup.",
-                  "Do not confuse file size with actual capacity exhaustion.",
-                  "If a collection is large, inspect its structure and duplication before deleting data.",
+                  "Structural integrity warnings have priority.",
+                  "If the selected structural warning has already been deterministically repaired, do not create a redundant patch.",
                   "If evidence is insufficient, do not evolve.",
                   "One evolution case per run.",
                   "Maximum 3 target files.",
@@ -1430,11 +1329,7 @@ jobs:
                   "Never modify repository settings.",
                   "Never introduce automatic spending or payment.",
                   "Preserve working behavior.",
-                  "Prefer bounded reads, compaction, deduplication, stale-item handling, or precise logic fixes when evidence supports them.",
-                  "Do not delete current operational state merely because it is old.",
-                  "Do not delete evidence that is required to understand previous outcomes.",
-                  "Do not remove pending actions unless the target action is demonstrably obsolete, duplicated, invalid, or already completed.",
-                  "Do not automatically publish internal diagnostics.",
+                  "Prefer a precise patch to a rewrite.",
                   "Every old patch string must occur exactly once.",
                   "Every patch must have a reason.",
                   "Every change must have a test.",
@@ -1564,9 +1459,6 @@ jobs:
                           candidate[
                               "signature"
                           ]
-                      ),
-                      "source": candidate.get(
-                          "source"
                       ),
                       "problem": clean(
                           plan.get(
@@ -1876,17 +1768,7 @@ jobs:
                   )
 
           # ============================================================
-          # TEST 5 — SELF-EVOLUTION PERIMETER
-          # ============================================================
-
-          for path in target_paths:
-              if path in FORBIDDEN_TARGETS:
-                  raise RuntimeError(
-                      f"Forbidden self-modification: {path}"
-                  )
-
-          # ============================================================
-          # TEST 6 — GIT DIFF
+          # TEST 5 — GIT DIFF
           # ============================================================
 
           run_git(
@@ -1905,7 +1787,7 @@ jobs:
                   "Evolution produced no diff."
               )
 
-          if len(diff) > 120000:
+          if len(diff) > MAX_DIFF_CHARS:
               raise RuntimeError(
                   "Evolution diff is too large."
               )
@@ -1930,9 +1812,6 @@ jobs:
                       candidate[
                           "signature"
                       ]
-                  ),
-                  "source": candidate.get(
-                      "source"
                   ),
                   "problem": clean(
                       plan.get(
@@ -1974,6 +1853,12 @@ jobs:
                       }
                       for item in normalized
                   ],
+                  "before_hashes": (
+                      before_hashes
+                  ),
+                  "after_hashes": (
+                      after_hashes
+                  ),
                   "tests": {
                       "yaml": "passed",
                       "embedded_python": (
@@ -1981,7 +1866,6 @@ jobs:
                       ),
                       "json": "passed",
                       "security": "passed",
-                      "perimeter": "passed",
                       "git_diff_check": (
                           "passed"
                       ),
@@ -2073,6 +1957,7 @@ jobs:
                   "version": 2,
                   "history": [],
                   "runs": [],
+                  "maintenance": [],
               },
           )
 
@@ -2163,33 +2048,15 @@ jobs:
 
           print("")
           print(
-              "=== NØX SELF EVOLUTION V2 ==="
+              "=== NØX SELF EVOLUTION ==="
           )
           print(
               f"Evolution ID: {evolution_id}"
           )
           print(
-              "Candidate source: "
-              + str(
-                  candidate.get(
-                      "source"
-                  )
-              )
-          )
-          print(
               "Changed files: "
               + ", ".join(
                   target_paths
-              )
-          )
-          print(
-              "Structural warnings: "
-              + str(
-                  len(
-                      structural[
-                          "warnings"
-                      ]
-                  )
               )
           )
           print(
@@ -2205,9 +2072,6 @@ jobs:
               "Security: PASSED"
           )
           print(
-              "Perimeter: PASSED"
-          )
-          print(
               "Git diff: PASSED"
           )
           print(
@@ -2218,7 +2082,7 @@ jobs:
           )
           print(
               "CYCLE: "
-              "DETECT -> RESEARCH -> DECIDE -> "
-              "MODIFY -> TEST -> RESULT -> LEARN"
+              "MAINTENANCE -> DETECT -> RESEARCH -> "
+              "DECIDE -> MODIFY -> TEST -> RESULT -> LEARN"
           )
           PY
