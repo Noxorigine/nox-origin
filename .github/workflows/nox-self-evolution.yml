@@ -23,7 +23,6 @@ env:
   MAX_HISTORY: "200"
 
   # Structural memory targets.
-  # The workflow compacts before evolution analysis.
   MEMORY_TARGET_BYTES: "350000"
   MEMORY_HARD_LIMIT_BYTES: "400000"
 
@@ -35,7 +34,6 @@ env:
   MAX_DIFF_CHARS: "120000"
 
   # Gemini is optional for reasoning only.
-  # It must never be required for memory maintenance.
   GEMINI_MODEL: gemini-3.7-flash
 
 jobs:
@@ -91,19 +89,26 @@ jobs:
           ROOT = Path.cwd()
           NOW = datetime.now(timezone.utc).isoformat()
 
-          MAX_HISTORY = int(os.environ["MAX_HISTORY"])
+          MAX_HISTORY = int(
+              os.environ["MAX_HISTORY"]
+          )
+
           MEMORY_TARGET_BYTES = int(
               os.environ["MEMORY_TARGET_BYTES"]
           )
+
           MEMORY_HARD_LIMIT_BYTES = int(
               os.environ["MEMORY_HARD_LIMIT_BYTES"]
           )
+
           MAX_CONTEXT_CHARS = int(
               os.environ["MAX_CONTEXT_CHARS"]
           )
+
           MAX_PATCHES = int(
               os.environ["MAX_PATCHES"]
           )
+
           MAX_DIFF_CHARS = int(
               os.environ["MAX_DIFF_CHARS"]
           )
@@ -120,18 +125,23 @@ jobs:
           EVOLUTION_FILE = Path(
               os.environ["EVOLUTION_FILE"]
           )
+
           CORE_MEMORY_FILE = Path(
               os.environ["CORE_MEMORY_FILE"]
           )
+
           CORE_RUNTIME_FILE = Path(
               os.environ["CORE_RUNTIME_FILE"]
           )
+
           WORK_FILE = Path(
               os.environ["WORK_FILE"]
           )
+
           KNOWLEDGE_FILE = Path(
               os.environ["KNOWLEDGE_FILE"]
           )
+
           PRESENCE_FILE = Path(
               os.environ["PRESENCE_FILE"]
           )
@@ -203,13 +213,14 @@ jobs:
                   if isinstance(value, dict):
                       return value
 
-                  return json.loads(
-                      json.dumps(default)
+                  raise RuntimeError(
+                      f"Expected JSON object in {path}"
                   )
 
               except Exception as exc:
                   raise RuntimeError(
-                      f"Cannot safely read JSON {path}: {exc}"
+                      f"Cannot safely read JSON "
+                      f"{path}: {exc}"
                   )
 
 
@@ -292,25 +303,6 @@ jobs:
               return True
 
 
-          def timestamp_value(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              for key in (
-                  "timestamp",
-                  "created_at",
-                  "updated_at",
-                  "completed_at",
-                  "observed_at",
-              ):
-                  value = item.get(key)
-
-                  if value:
-                      return str(value)
-
-              return ""
-
-
           def identity_value(item):
               if not isinstance(item, dict):
                   return ""
@@ -334,7 +326,7 @@ jobs:
               return ""
 
 
-          def compact_list(
+          def compact_identified_list(
               values,
               max_items,
           ):
@@ -346,8 +338,6 @@ jobs:
               deduped = []
               seen = set()
 
-              # Preserve the most recent occurrence of an identified
-              # record. Records without a stable identity are preserved.
               for item in reversed(values):
                   identity = identity_value(item)
 
@@ -364,7 +354,66 @@ jobs:
               if len(deduped) > max_items:
                   deduped = deduped[-max_items:]
 
-              return deduped, before - len(deduped)
+              return (
+                  deduped,
+                  before - len(deduped),
+              )
+
+
+          def compact_nested(
+              value,
+              list_limit,
+          ):
+              """
+              Recursively compact JSON arrays.
+
+              This fixes the previous maintenance limitation:
+              large memory structures are not necessarily stored as
+              top-level arrays. Nested arrays are therefore bounded too.
+
+              Dictionaries and scalar values are preserved.
+              """
+
+              if isinstance(value, dict):
+                  result = {}
+
+                  for key, child in value.items():
+                      result[key] = compact_nested(
+                          child,
+                          list_limit,
+                      )
+
+                  return result
+
+              if isinstance(value, list):
+                  result = []
+
+                  seen = set()
+
+                  for item in reversed(value):
+                      identity = identity_value(item)
+
+                      if identity:
+                          if identity in seen:
+                              continue
+
+                          seen.add(identity)
+
+                      result.append(
+                          compact_nested(
+                              item,
+                              list_limit,
+                          )
+                      )
+
+                      if len(result) >= list_limit:
+                          break
+
+                  result.reverse()
+
+                  return result
+
+              return value
 
 
           def compact_memory(
@@ -372,16 +421,16 @@ jobs:
               target_bytes,
           ):
               """
-              Deterministic bounded compaction.
+              Deterministic bounded memory maintenance.
 
-              The function never guesses semantic content.
-              It only:
-                1. removes exact duplicate identified records;
-                2. retains recent records;
-                3. progressively lowers list retention until the file
-                   reaches the target size.
+              Order:
+                1. Load valid JSON.
+                2. Deduplicate identified records recursively.
+                3. Bound nested arrays progressively.
+                4. Persist the result.
+                5. Verify the resulting size.
 
-              Scalar/top-level values are preserved.
+              No semantic rewriting is performed.
               """
 
               if not path.exists():
@@ -406,50 +455,21 @@ jobs:
 
               data = load_json(path, {})
 
-              if not isinstance(data, dict):
-                  raise RuntimeError(
-                      f"Expected object at {path}"
-                  )
+              original_serialized = json.dumps(
+                  data,
+                  ensure_ascii=False,
+                  indent=2,
+              )
 
-              list_keys = [
-                  key
-                  for key, value in data.items()
-                  if isinstance(value, list)
-              ]
+              original_count = (
+                  len(original_serialized)
+              )
 
-              removed_total = 0
-
-              # First pass: remove exact duplicate identities while
-              # retaining recent occurrences.
-              for key in list_keys:
-                  compacted, removed = compact_list(
-                      data[key],
-                      max_items=max(
-                          50,
-                          len(data[key]),
-                      ),
-                  )
-
-                  data[key] = compacted
-                  removed_total += removed
-
-              save_json(path, data)
-
-              current = file_size(path)
-
-              if current <= target_bytes:
-                  return {
-                      "changed": True,
-                      "before": before_bytes,
-                      "after": current,
-                      "removed": removed_total,
-                      "reason": "deduplicated",
-                  }
-
-              # Second pass: progressively bound list lengths.
+              # Progressive limits.
               #
-              # Start generously, then become more aggressive only
-              # while the file remains above the target.
+              # The first pass is deliberately generous.
+              # More aggressive retention is only applied when
+              # necessary to reach the target.
               limits = [
                   500,
                   300,
@@ -462,96 +482,68 @@ jobs:
                   25,
                   15,
                   10,
+                  8,
+                  5,
+                  3,
               ]
 
+              best_data = data
+              best_size = before_bytes
+
               for limit in limits:
-                  for key in list_keys:
-                      values = data.get(key)
+                  candidate = compact_nested(
+                      data,
+                      limit,
+                  )
 
-                      if not isinstance(
-                          values,
-                          list,
-                      ):
-                          continue
+                  serialized = json.dumps(
+                      candidate,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
 
-                      if len(values) <= limit:
-                          continue
+                  candidate_size = len(
+                      serialized.encode("utf-8")
+                  )
 
-                      old_length = len(values)
+                  best_data = candidate
+                  best_size = candidate_size
 
-                      data[key] = values[-limit:]
-
-                      removed_total += (
-                          old_length
-                          - len(data[key])
-                      )
-
-                  save_json(path, data)
-
-                  current = file_size(path)
-
-                  if current <= target_bytes:
+                  if candidate_size <= target_bytes:
                       break
 
-              # Final safety pass. If the file is still too large,
-              # lower every list to a small bounded window.
-              if current > target_bytes:
-                  for limit in (
-                      8,
-                      5,
-                      3,
-                  ):
-                      for key in list_keys:
-                          values = data.get(key)
+              save_json(
+                  path,
+                  best_data,
+              )
 
-                          if not isinstance(
-                              values,
-                              list,
-                          ):
-                              continue
-
-                          if len(values) > limit:
-                              old_length = len(
-                                  values
-                              )
-
-                              data[key] = values[
-                                  -limit:
-                              ]
-
-                              removed_total += (
-                                  old_length
-                                  - len(
-                                      data[key]
-                                  )
-                              )
-
-                      save_json(path, data)
-
-                      current = file_size(path)
-
-                      if current <= target_bytes:
-                          break
+              current = file_size(path)
 
               if current > MEMORY_HARD_LIMIT_BYTES:
                   raise RuntimeError(
-                      f"Unable to safely compact {path}: "
-                      f"{current} bytes remain."
+                      f"Unable to safely compact "
+                      f"{path}: {current} bytes remain "
+                      f"after recursive maintenance."
                   )
 
+              removed_estimate = max(
+                  0,
+                  original_count - current,
+              )
+
               return {
-                  "changed": True,
+                  "changed": current != before_bytes,
                   "before": before_bytes,
                   "after": current,
-                  "removed": removed_total,
-                  "reason": "bounded_compaction",
+                  "removed": removed_estimate,
+                  "reason": "recursive_bounded_compaction",
               }
 
 
           def read_for_context(path):
               """
-              Never load an oversized memory file completely into the
-              reasoning context.
+              Never inject a complete oversized memory file
+              into the reasoning context.
               """
 
               if not path.exists():
@@ -565,6 +557,7 @@ jobs:
                   return text
 
               head_size = MAX_CONTEXT_CHARS // 3
+
               tail_size = (
                   MAX_CONTEXT_CHARS
                   - head_size
@@ -580,18 +573,90 @@ jobs:
 
 
           def read_full(path):
-              """
-              Full reads are reserved for files that are actually
-              being patched. Memory maintenance uses bounded JSON
-              operations instead.
-              """
-
               if not path.exists():
                   return ""
 
               return path.read_text(
                   encoding="utf-8"
               )
+
+
+          def commit_maintenance(
+              maintenance_results,
+              maintenance_id,
+          ):
+              """
+              Persist deterministic maintenance independently from
+              whether an evolutionary modification is selected.
+
+              This is the critical fix for the previous workflow.
+              """
+
+              if not maintenance_results:
+                  return None
+
+              run_git(
+                  "diff",
+                  "--check",
+              )
+
+              changed_paths = [
+                  str(
+                      result["file"]
+                  )
+                  for result in maintenance_results
+              ]
+
+              changed_paths.append(
+                  str(EVOLUTION_FILE)
+              )
+
+              run_git(
+                  "config",
+                  "user.name",
+                  "NØX",
+              )
+
+              run_git(
+                  "config",
+                  "user.email",
+                  "nox@users.noreply.github.com",
+              )
+
+              run_git(
+                  "add",
+                  *changed_paths,
+              )
+
+              staged = run_git(
+                  "diff",
+                  "--cached",
+                  "--quiet",
+                  check=False,
+              )
+
+              if staged.returncode == 0:
+                  return None
+
+              run_git(
+                  "commit",
+                  "-m",
+                  (
+                      "NØX: memory maintenance "
+                      f"{maintenance_id}"
+                  ),
+              )
+
+              run_git(
+                  "push",
+                  "origin",
+                  "HEAD:main",
+              )
+
+              return run_git(
+                  "rev-parse",
+                  "HEAD",
+              ).stdout.strip()
 
 
           # ============================================================
@@ -626,7 +691,7 @@ jobs:
           evolution = load_json(
               EVOLUTION_FILE,
               {
-                  "version": 2,
+                  "version": 3,
                   "history": [],
                   "runs": [],
                   "maintenance": [],
@@ -635,7 +700,7 @@ jobs:
 
           evolution.setdefault(
               "version",
-              2,
+              3,
           )
 
           evolution.setdefault(
@@ -788,7 +853,9 @@ jobs:
                   if count > 1:
                       warnings.append(
                           {
-                              "type": "duplicate_work_request",
+                              "type": (
+                                  "duplicate_work_request"
+                              ),
                               "signature": signature,
                               "count": count,
                           }
@@ -802,12 +869,12 @@ jobs:
                   PRESENCE_FILE,
               ):
                   if path.exists():
-                      text = path.read_text(
-                          encoding="utf-8"
-                      )
-
                       context_sizes.append(
-                          len(text)
+                          len(
+                              path.read_text(
+                                  encoding="utf-8"
+                              )
+                          )
                       )
 
               if context_sizes:
@@ -869,7 +936,7 @@ jobs:
                       }
                   )
 
-          # Reload all compacted state.
+          # Reload every maintained file.
           memory = load_json(
               CORE_MEMORY_FILE,
               {},
@@ -897,47 +964,32 @@ jobs:
               ),
           )
 
-          if maintenance_results:
-              evolution["maintenance"].append(
-                  {
-                      "id": maintenance_id,
-                      "timestamp": NOW,
-                      "status": (
-                          "completed"
-                      ),
-                      "before_warnings": (
-                          len(warnings_before)
-                      ),
-                      "after_warnings": (
-                          len(warnings_after)
-                      ),
-                      "results": (
-                          maintenance_results
-                      ),
-                  }
-              )
+          evolution["maintenance"].append(
+              {
+                  "id": maintenance_id,
+                  "timestamp": NOW,
+                  "status": (
+                      "completed"
+                      if maintenance_results
+                      else "not_required"
+                  ),
+                  "before_warnings": len(
+                      warnings_before
+                  ),
+                  "after_warnings": len(
+                      warnings_after
+                  ),
+                  "results": maintenance_results,
+              }
+          )
 
-              evolution["maintenance"] = (
-                  evolution["maintenance"]
-              )[-MAX_HISTORY:]
-          else:
-              evolution["maintenance"].append(
-                  {
-                      "id": maintenance_id,
-                      "timestamp": NOW,
-                      "status": "not_required",
-                      "before_warnings": (
-                          len(warnings_before)
-                      ),
-                      "after_warnings": (
-                          len(warnings_after)
-                      ),
-                  }
-              )
+          evolution["maintenance"] = (
+              evolution["maintenance"]
+          )[-MAX_HISTORY:]
 
-              evolution["maintenance"] = (
-                  evolution["maintenance"]
-              )[-MAX_HISTORY:]
+          evolution[
+              "updated_at"
+          ] = NOW
 
           save_json(
               EVOLUTION_FILE,
@@ -958,9 +1010,78 @@ jobs:
                   print(
                       f" - {result['file']}: "
                       f"{result['before']} -> "
-                      f"{result['after']} bytes; "
-                      f"removed={result['removed']}"
+                      f"{result['after']} bytes"
                   )
+
+          # ============================================================
+          # CRITICAL: PERSIST MAINTENANCE
+          # ============================================================
+
+          maintenance_commit = (
+              commit_maintenance(
+                  maintenance_results,
+                  maintenance_id,
+              )
+          )
+
+          if maintenance_commit:
+              print(
+                  "Maintenance commit: "
+                  f"{maintenance_commit}"
+              )
+          else:
+              print(
+                  "Maintenance commit: NONE"
+              )
+
+          # ============================================================
+          # RELOAD AFTER COMMIT
+          # ============================================================
+
+          memory = load_json(
+              CORE_MEMORY_FILE,
+              {},
+          )
+
+          runtime = load_json(
+              CORE_RUNTIME_FILE,
+              {},
+          )
+
+          presence = load_json(
+              PRESENCE_FILE,
+              {},
+          )
+
+          evolution = load_json(
+              EVOLUTION_FILE,
+              {
+                  "version": 3,
+                  "history": [],
+                  "runs": [],
+                  "maintenance": [],
+              },
+          )
+
+          evolution.setdefault(
+              "version",
+              3,
+          )
+
+          evolution.setdefault(
+              "history",
+              [],
+          )
+
+          evolution.setdefault(
+              "runs",
+              [],
+          )
+
+          evolution.setdefault(
+              "maintenance",
+              [],
+          )
 
           # ============================================================
           # DETECTION
@@ -968,9 +1089,6 @@ jobs:
 
           signals = []
 
-          # Structural warnings are deliberately first.
-          # A structural integrity problem is higher priority than
-          # ordinary learning/work signals.
           for warning in warnings_after:
               signals.append(
                   {
@@ -1143,10 +1261,6 @@ jobs:
               f"{len(warnings_after)}"
           )
 
-          # ============================================================
-          # PENDING ACTION / WORK REQUEST COUNTS
-          # ============================================================
-
           pending_actions = runtime.get(
               "pending_actions",
               [],
@@ -1158,23 +1272,45 @@ jobs:
           )
 
           print(
-              f"Pending actions: "
-              f"{len(pending_actions) if isinstance(pending_actions, list) else 0}"
+              "Pending actions: "
+              + str(
+                  len(pending_actions)
+                  if isinstance(
+                      pending_actions,
+                      list,
+                  )
+                  else 0
+              )
           )
 
           print(
-              f"Work requests: "
-              f"{len(work_requests) if isinstance(work_requests, list) else 0}"
+              "Work requests: "
+              + str(
+                  len(work_requests)
+                  if isinstance(
+                      work_requests,
+                      list,
+                  )
+                  else 0
+              )
           )
 
           print(
-              f"Runtime bytes: "
-              f"{file_size(CORE_RUNTIME_FILE)}"
+              "Runtime bytes: "
+              + str(
+                  file_size(
+                      CORE_RUNTIME_FILE
+                  )
+              )
           )
 
           print(
-              f"Presence bytes: "
-              f"{file_size(PRESENCE_FILE)}"
+              "Presence bytes: "
+              + str(
+                  file_size(
+                      PRESENCE_FILE
+                  )
+              )
           )
 
           if warnings_after:
@@ -1205,11 +1341,14 @@ jobs:
                           else "no_new_candidate"
                       ),
                       "signals": len(signals),
-                      "structural_warnings": (
-                          len(warnings_after)
+                      "structural_warnings": len(
+                          warnings_after
                       ),
                       "maintenance_id": (
                           maintenance_id
+                      ),
+                      "maintenance_commit": (
+                          maintenance_commit
                       ),
                   }
               )
@@ -1227,8 +1366,53 @@ jobs:
                   evolution,
               )
 
+              # Persist the final run record.
+              run_git(
+                  "config",
+                  "user.name",
+                  "NØX",
+              )
+
+              run_git(
+                  "config",
+                  "user.email",
+                  "nox@users.noreply.github.com",
+              )
+
+              run_git(
+                  "add",
+                  str(EVOLUTION_FILE),
+              )
+
+              staged = run_git(
+                  "diff",
+                  "--cached",
+                  "--quiet",
+                  check=False,
+              )
+
+              if staged.returncode != 0:
+                  run_git(
+                      "commit",
+                      "-m",
+                      (
+                          "NØX: record self evolution "
+                          f"run {maintenance_id}"
+                      ),
+                  )
+
+                  run_git(
+                      "push",
+                      "origin",
+                      "HEAD:main",
+                  )
+
               print(
                   "Decision: NO EVOLUTION"
+              )
+
+              print(
+                  "Result: maintenance persisted."
               )
 
               sys.exit(0)
@@ -1318,7 +1502,7 @@ jobs:
               "rules": [
                   "Use evidence, not assumptions.",
                   "Structural integrity warnings have priority.",
-                  "If the selected structural warning has already been deterministically repaired, do not create a redundant patch.",
+                  "If a structural warning has already been deterministically repaired and persisted, do not create a redundant patch.",
                   "If evidence is insufficient, do not evolve.",
                   "One evolution case per run.",
                   "Maximum 3 target files.",
@@ -1497,6 +1681,9 @@ jobs:
                       "evolution_id": (
                           evolution_id
                       ),
+                      "maintenance_commit": (
+                          maintenance_commit
+                      ),
                   }
               )
 
@@ -1512,6 +1699,46 @@ jobs:
                   EVOLUTION_FILE,
                   evolution,
               )
+
+              run_git(
+                  "config",
+                  "user.name",
+                  "NØX",
+              )
+
+              run_git(
+                  "config",
+                  "user.email",
+                  "nox@users.noreply.github.com",
+              )
+
+              run_git(
+                  "add",
+                  str(EVOLUTION_FILE),
+              )
+
+              staged = run_git(
+                  "diff",
+                  "--cached",
+                  "--quiet",
+                  check=False,
+              )
+
+              if staged.returncode != 0:
+                  run_git(
+                      "commit",
+                      "-m",
+                      (
+                          "NØX: record evolution decision "
+                          f"{evolution_id}"
+                      ),
+                  )
+
+                  run_git(
+                      "push",
+                      "origin",
+                      "HEAD:main",
+                  )
 
               print(
                   "Decision: NO EVOLUTION"
@@ -1894,7 +2121,7 @@ jobs:
           )
 
           # ============================================================
-          # COMMIT MODIFICATION
+          # COMMIT EVOLUTION
           # ============================================================
 
           run_git(
@@ -1954,7 +2181,7 @@ jobs:
           evolution = load_json(
               EVOLUTION_FILE,
               {
-                  "version": 2,
+                  "version": 3,
                   "history": [],
                   "runs": [],
                   "maintenance": [],
@@ -2001,6 +2228,9 @@ jobs:
                   "commit": commit_sha,
                   "changed_paths": (
                       target_paths
+                  ),
+                  "maintenance_commit": (
+                      maintenance_commit
                   ),
               }
           )
