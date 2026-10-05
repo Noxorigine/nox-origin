@@ -44,6 +44,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install "colony-sdk>=1.37.0,<2.0.0"
 
+      - name: Verify Colony SDK
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import inspect
+          from colony_sdk import ColonyClient, ColonyConflictError
+          required=("bootstrap","create_comment","create_post","send_message","get_post","get_all_comments","get_for_you_feed")
+          missing=[name for name in required if not hasattr(ColonyClient,name)]
+          if missing:
+              raise RuntimeError("Colony SDK missing required methods: " + ", ".join(missing))
+          print("Colony SDK methods: OK")
+          print("create_comment:", inspect.signature(ColonyClient.create_comment))
+          print("create_post:", inspect.signature(ColonyClient.create_post))
+          print("send_message:", inspect.signature(ColonyClient.send_message))
+          print("ColonyConflictError: OK")
+          PY
+
       - name: Run NØX Presence
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
@@ -56,7 +73,7 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
+          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient, ColonyConflictError
 
           NOW=datetime.now(timezone.utc).isoformat()
           CORE_MEMORY_FILE=Path(os.environ["CORE_MEMORY_FILE"])
@@ -106,7 +123,7 @@ jobs:
           core=load(CORE_MEMORY_FILE,{})
           runtime=load(CORE_RUNTIME_FILE,{"pending_actions":[]})
           knowledge=load(KNOWLEDGE_FILE,{})
-          presence=load(PRESENCE_FILE,{"version":4,"observed_posts":[],"replied_posts":[],"published_posts":[],"notifications":[],"outcomes":[],"runs":[]})
+          presence=load(PRESENCE_FILE,{"version":8,"observed_posts":[],"replied_posts":[],"published_posts":[],"notifications":[],"outcomes":[],"runs":[]})
           for key in ("observed_posts","replied_posts","published_posts","notifications","outcomes","runs"):
               if not isinstance(presence.get(key),list): presence[key]=[]
 
@@ -120,11 +137,11 @@ jobs:
           username=clean(profile.get("username"),100)
           if username and username!="nox_origine": raise SystemExit(f"SECURITY STOP: profil inattendu '{username}'.")
 
-          pending=[x for x in runtime.get("pending_actions",[]) if isinstance(x,dict)]
-          pending=pending[:MAX_ACTIONS]
           done_ids={x.get("action_id") for x in presence.get("outcomes",[]) if isinstance(x,dict)}
+          pending=[x for x in runtime.get("pending_actions",[]) if isinstance(x,dict) and x.get("action_id") and x.get("action_id") not in done_ids]
+          pending=pending[:MAX_ACTIONS]
           cases={x.get("case_id"):x for x in core.get("cognitive_cases",[]) if isinstance(x,dict) and x.get("case_id")}
-          comments=0; errors=0; skipped=0; posts=0
+          comments=0; errors=0; skipped=0; conflicts=0; posts=0
 
           def language_of(post):
               text=f"{item_title(post)} {item_body(post)}".lower()
@@ -253,6 +270,21 @@ jobs:
                                   comments+=1
                   else:
                       outcome.update({"status":"skipped","reason":"unsupported_action_kind"}); skipped+=1
+              except ColonyConflictError as exc:
+                  # A 409 means the requested write conflicts with the current
+                  # Colony state. The action is no longer safely retryable as-is.
+                  # Record it as resolved/obsolete, not as a runtime failure.
+                  detail = getattr(exc, "response", None)
+                  outcome.update({
+                      "status":"conflict",
+                      "reason":"colony_conflict_409",
+                      "error":clean(exc,800),
+                      "response":detail if isinstance(detail,dict) else None,
+                  })
+                  skipped+=1
+                  conflicts+=1
+              except ColonyAPIError as exc:
+                  outcome.update({"status":"error","status_code":getattr(exc,"status",None),"error":clean(exc,800)}); errors+=1
               except Exception as exc:
                   outcome.update({"status":"error","error":clean(exc,800)}); errors+=1
               presence["outcomes"].append(outcome)
@@ -275,11 +307,11 @@ jobs:
           presence["outcomes"]=presence["outcomes"][-MAX_TRACKED:]
           presence["runs"].append({"timestamp":NOW,"identity":username,"pending_seen":len(pending),"comments_created":comments,"comments_skipped":skipped,"errors":errors,"posts_created":posts,"policy":{"project_cost_eur":0,"gemini_used":False,"external_ai_used":False,"auto_payment":False,"auto_spending":False}})
           presence["runs"]=presence["runs"][-MAX_RUNS:]
-          presence["version"]=4; presence["updated_at"]=NOW
+          presence["version"]=8; presence["updated_at"]=NOW
           save(PRESENCE_FILE,presence)
 
-          print("=== NØX COLONY PRESENCE V4 ===")
-          print(f"Actions received={len(pending)} comments={comments} skipped={skipped} errors={errors} posts={posts}")
+          print("=== NØX COLONY PRESENCE V8 ===")
+          print(f"Actions received={len(pending)} comments={comments} skipped={skipped} conflicts={conflicts} errors={errors} posts={posts}")
           print("Core decision -> Presence execution -> Presence outcome -> Core reassessment")
           print("No payment or spending performed.")
           PY
