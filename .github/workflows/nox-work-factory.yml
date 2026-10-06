@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: nox-work-factory
+  group: nox-state
   cancel-in-progress: false
 
 env:
@@ -22,10 +22,16 @@ env:
   MAX_TOTAL_RESULTS: "15"
   MAX_HISTORY: "150"
   WEB_TIMEOUT_SECONDS: "20"
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
 jobs:
   work-factory:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,171 +41,1429 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install search dependency
+      - name: Install research dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "ddgs>=9.16.0,<10.0.0"
 
-      - name: Run Work Factory
+      - name: Run NØX Work Factory
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          import hashlib
           import json
           import os
           import re
+          import time
+          import urllib.parse
+          import urllib.request
           from datetime import datetime, timezone
+          from hashlib import sha256
           from pathlib import Path
-          from urllib.parse import urlparse
 
           from ddgs import DDGS
 
           NOW = datetime.now(timezone.utc).isoformat()
+
           CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
           CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
           KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
           WORK_FILE = Path(os.environ["WORK_FILE"])
-          MAX_ITEMS = int(os.environ["MAX_WORK_ITEMS_PER_RUN"])
-          MAX_RESULTS = int(os.environ["MAX_RESULTS_PER_QUERY"])
-          MAX_TOTAL = int(os.environ["MAX_TOTAL_RESULTS"])
-          MAX_HISTORY = int(os.environ["MAX_HISTORY"])
-          TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
+
+          MAX_WORK = int(
+              os.environ["MAX_WORK_ITEMS_PER_RUN"]
+          )
+          MAX_RESULTS = int(
+              os.environ["MAX_RESULTS_PER_QUERY"]
+          )
+          MAX_TOTAL_RESULTS = int(
+              os.environ["MAX_TOTAL_RESULTS"]
+          )
+          MAX_HISTORY = int(
+              os.environ["MAX_HISTORY"]
+          )
+          TIMEOUT = int(
+              os.environ["WEB_TIMEOUT_SECONDS"]
+          )
+
+          if os.environ.get("PROJECT_COST_EUR") != "0":
+              raise SystemExit(
+                  "SECURITY STOP: PROJECT_COST_EUR must remain 0."
+              )
+
+          if os.environ.get("GEMINI_USED", "").lower() != "false":
+              raise SystemExit(
+                  "SECURITY STOP: GEMINI_USED must remain false."
+              )
+
+          if os.environ.get("EXTERNAL_AI_USED", "").lower() != "false":
+              raise SystemExit(
+                  "SECURITY STOP: EXTERNAL_AI_USED must remain false."
+              )
+
+          if os.environ.get("AUTO_PAYMENT", "").lower() != "false":
+              raise SystemExit(
+                  "SECURITY STOP: AUTO_PAYMENT must remain false."
+              )
+
+          if os.environ.get("AUTO_SPENDING", "").lower() != "false":
+              raise SystemExit(
+                  "SECURITY STOP: AUTO_SPENDING must remain false."
+              )
+
+          EMPTY_WORK = {
+              "version": 4,
+              "run_count": 0,
+              "last_run": None,
+              "history": [],
+              "completed": [],
+              "failed": [],
+              "pending": []
+          }
 
           def load(path, default):
-              if not path.exists(): return json.loads(json.dumps(default))
+              if not path.exists():
+                  return json.loads(
+                      json.dumps(default)
+                  )
+
               try:
-                  value=json.loads(path.read_text(encoding="utf-8")); return value if isinstance(value,dict) else json.loads(json.dumps(default))
-              except Exception: return json.loads(json.dumps(default))
+                  value = json.loads(
+                      path.read_text(
+                          encoding="utf-8"
+                      )
+                  )
 
-          def save(path,value):
-              path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding="utf-8")
+                  return (
+                      value
+                      if isinstance(value, dict)
+                      else json.loads(
+                          json.dumps(default)
+                      )
+                  )
 
-          def clean(v,n=3000): return re.sub(r"\s+"," ",str(v or "")).strip()[:n]
-          def terms(v):
-              stop={"this","that","with","from","have","what","when","where","which","would","could","about","your","their","there","then","than","pour","avec","dans","nous","vous","cela","cette","comme","mais","plus","faire","être","sont"}
-              out=[]
-              for w in re.findall(r"[a-zA-ZÀ-ÿ0-9_-]{4,}",clean(v,5000).lower()):
-                  if w not in stop and w not in out: out.append(w)
-              return out[:30]
-          def stable(*parts): return hashlib.sha256("|".join(clean(x,5000) for x in parts).encode()).hexdigest()[:24]
-
-          runtime=load(CORE_RUNTIME_FILE,{"work_requests":[]})
-          memory=load(CORE_MEMORY_FILE,{})
-          knowledge=load(KNOWLEDGE_FILE,{})
-          state=load(WORK_FILE,{"version":4,"history":[],"completed":[],"attempts":{}})
-          state.setdefault("history",[]); state.setdefault("completed",[]); state.setdefault("attempts",{})
-
-          completed={x.get("request_id") for x in state["completed"] if isinstance(x,dict)}
-          requests=[]
-          for item in runtime.get("work_requests",[]):
-              if not isinstance(item,dict): continue
-              if item.get("status") not in (None,"pending","retry"):
-                  continue
-              if not item.get("id") or item.get("id") in completed:
-                  continue
-              if item.get("work_type") != "research":
-                  state["history"].append({"id":stable("deferred",item.get("id")),"request_id":item.get("id"),"timestamp":NOW,"status":"deferred","reason":"unsupported_work_type"})
-                  continue
-              requests.append(item)
-              if len(requests)>=MAX_ITEMS: break
-
-          def search(query):
-              try:
-                  raw=DDGS(timeout=TIMEOUT).text(query,max_results=MAX_RESULTS,backend="auto")
               except Exception as exc:
-                  return [],clean(exc,500)
-              results=[]
-              for item in raw or []:
-                  if not isinstance(item,dict): continue
-                  url=clean(item.get("href") or item.get("url"),1000)
-                  if not url: continue
-                  domain=urlparse(url).netloc.lower().split(":")[0]
-                  results.append({"title":clean(item.get("title"),300),"url":url,"domain":domain,"snippet":clean(item.get("body") or item.get("snippet"),1200)})
-              return results,None
+                  print(
+                      f"WARNING: cannot read {path}: {exc}"
+                  )
 
-          def assess(question,results):
-              q=set(terms(question))
-              scored=[]
-              for r in results:
-                  text=set(terms((r.get("title","")+" "+r.get("snippet",""))))
-                  overlap=len(q & text)/max(1,len(q))
-                  scored.append({**r,"query_overlap":round(overlap,3)})
-              domains={r.get("domain") for r in scored if r.get("domain")}
-              strong=[r for r in scored if r["query_overlap"]>=0.18]
-              if len(domains)>=3 and len(strong)>=2: status="multi_source_support"
-              elif len(domains)>=2 and len(strong)>=1: status="partial_support"
-              elif scored: status="insufficient_verification"
-              else: status="no_evidence"
-              return status,scored,len(domains)
+                  return json.loads(
+                      json.dumps(default)
+                  )
 
-          for request in requests:
-              rid=request["id"]; question=clean(request.get("question"),1200)
-              queries=[]
-              if question: queries.append(question)
-              context=clean(request.get("context"),1500)
-              if context and len(queries)<3:
-                  queries.append(clean(f"{question} {context[:600]}",1400))
-              if request.get("memory_context") and len(queries)<3:
-                  queries.append(clean(f"{question} {json.dumps(request['memory_context'],ensure_ascii=False)[:600]}",1400))
-              dedup=[]
-              for q in queries:
-                  if q and q not in dedup: dedup.append(q)
+          def save(path, value):
+              path.parent.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
-              results=[]; seen_urls=set(); errors=[]
-              for q in dedup:
-                  found,error=search(q)
-                  if error: errors.append(error)
-                  for r in found:
-                      if r["url"] in seen_urls: continue
-                      seen_urls.add(r["url"]); r["query"]=q; results.append(r)
-                      if len(results)>=MAX_TOTAL: break
-                  if len(results)>=MAX_TOTAL: break
+              temporary = path.with_suffix(
+                  path.suffix + ".tmp"
+              )
 
-              status,scored,domain_count=assess(question,results)
-              if status=="multi_source_support":
-                  conclusion="Search coverage found relevant results across multiple domains. This is evidence coverage, not proof of truth."
-                  next_step="Compare the underlying sources before treating the claim as confirmed."
-              elif status=="partial_support":
-                  conclusion="Relevant evidence was found, but independent coverage is limited."
-                  next_step="Keep the claim provisional and seek another independent source or a targeted test."
-              elif status=="insufficient_verification":
-                  conclusion="Search results exist, but their coverage is insufficient for verification."
-                  next_step="Do not promote the claim to a confirmed fact."
-              else:
-                  conclusion="No usable web evidence was retrieved."
-                  next_step="Refine the question or retry later."
+              temporary.write_text(
+                  json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
 
-              result_id=f"result-{stable(rid,json.dumps(scored,ensure_ascii=False,sort_keys=True))}"
-              result={
-                  "id":result_id,"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,
-                  "question":question,"work_type":"research","queries":dedup,"evidence_status":status,
-                  "source_count":len(scored),"unique_domains":domain_count,"sources":scored[:MAX_TOTAL],
-                  "conclusion":conclusion,"uncertainty":"Search snippets are discovery evidence only; they do not establish truth.",
-                  "next_step":next_step,"errors":errors
+              temporary.replace(path)
+
+          def clean(value, limit=3000):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  str(value or "")
+              ).strip()[:limit]
+
+          def stable(prefix, *parts):
+              raw = "|".join(
+                  clean(part, 5000)
+                  for part in parts
+              )
+
+              return (
+                  f"{prefix}-"
+                  f"{sha256(raw.encode('utf-8')).hexdigest()[:20]}"
+              )
+
+          def normalize_url(url):
+              url = clean(url, 1000)
+
+              if not url:
+                  return ""
+
+              try:
+                  parsed = urllib.parse.urlsplit(url)
+
+                  if parsed.scheme not in (
+                      "http",
+                      "https"
+                  ):
+                      return ""
+
+                  if not parsed.netloc:
+                      return ""
+
+                  return urllib.parse.urlunsplit(
+                      (
+                          parsed.scheme.lower(),
+                          parsed.netloc.lower(),
+                          parsed.path,
+                          parsed.query,
+                          ""
+                      )
+                  )
+
+              except Exception:
+                  return ""
+
+          def extract_urls(text):
+              urls = re.findall(
+                  r"https?://[^\s<>\"]+",
+                  str(text or "")
+              )
+
+              result = []
+
+              for url in urls:
+                  url = normalize_url(
+                      url.rstrip(".,);]}")
+                  )
+
+                  if url and url not in result:
+                      result.append(url)
+
+              return result[:20]
+
+          def terms(text):
+              words = re.findall(
+                  r"[a-zA-ZÀ-ÿ0-9_-]{4,}",
+                  clean(
+                      text,
+                      5000
+                  ).lower()
+              )
+
+              stop = {
+                  "this",
+                  "that",
+                  "with",
+                  "from",
+                  "have",
+                  "what",
+                  "when",
+                  "where",
+                  "which",
+                  "would",
+                  "could",
+                  "about",
+                  "your",
+                  "their",
+                  "they",
+                  "there",
+                  "into",
+                  "then",
+                  "than",
+                  "just",
+                  "pour",
+                  "avec",
+                  "dans",
+                  "nous",
+                  "vous",
+                  "cela",
+                  "cette",
+                  "comme",
+                  "mais",
+                  "plus",
+                  "faire",
+                  "être",
+                  "sont",
+                  "pourquoi",
+                  "comment"
               }
-              state["history"].append(result)
-              if status=="multi_source_support":
-                  state["completed"].append({"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,"status":status,"result_id":result_id})
+
+              result = []
+
+              for word in words:
+                  if (
+                      word not in stop
+                      and word not in result
+                  ):
+                      result.append(word)
+
+              return result[:25]
+
+          def flatten_memory(memory):
+              pieces = []
+
+              if not isinstance(memory, dict):
+                  return ""
+
+              for key in (
+                  "observations",
+                  "facts",
+                  "experiences",
+                  "hypotheses",
+                  "learnings",
+                  "results"
+              ):
+                  values = memory.get(key)
+
+                  if not isinstance(
+                      values,
+                      list
+                  ):
+                      continue
+
+                  for item in values[-20:]:
+                      pieces.append(
+                          clean(
+                              json.dumps(
+                                  item,
+                                  ensure_ascii=False
+                              ),
+                              1200
+                          )
+                      )
+
+              return "\n".join(
+                  pieces
+              )[-12000:]
+
+          def request_terms(request):
+              question = clean(
+                  request.get("question"),
+                  1500
+              )
+
+              context = clean(
+                  request.get("context"),
+                  2500
+              )
+
+              combined = (
+                  question
+                  + "\n"
+                  + context
+              )
+
+              return terms(
+                  combined
+              )
+
+          def build_queries(request):
+              question = clean(
+                  request.get("question"),
+                  1500
+              )
+
+              context = clean(
+                  request.get("context"),
+                  2500
+              )
+
+              queries = []
+
+              if question:
+                  queries.append(question)
+
+              # Second query deliberately focuses on verification,
+              # not merely repeating the first query.
+              words = request_terms(request)
+
+              if words:
+                  verification = (
+                      " ".join(words[:10])
+                      + " evidence verification"
+                  )
+
+                  if verification not in queries:
+                      queries.append(
+                          verification
+                      )
+
+              # Third query targets primary/technical evidence.
+              if words:
+                  primary = (
+                      " ".join(words[:10])
+                      + " official documentation research"
+                  )
+
+                  if primary not in queries:
+                      queries.append(
+                          primary
+                      )
+
+              return queries[:3]
+
+          def search_query(ddgs, query):
+              try:
+                  rows = list(
+                      ddgs.text(
+                          query,
+                          max_results=MAX_RESULTS
+                      )
+                  )
+
+                  return [
+                      row
+                      for row in rows
+                      if isinstance(row, dict)
+                  ]
+
+              except Exception as exc:
+                  print(
+                      "SEARCH ERROR:",
+                      query,
+                      exc
+                  )
+
+                  return []
+
+          def result_text(row):
+              return clean(
+                  row.get("body")
+                  or row.get("snippet")
+                  or "",
+                  1800
+              )
+
+          def result_title(row):
+              return clean(
+                  row.get("title")
+                  or "",
+                  300
+              )
+
+          def result_url(row):
+              return normalize_url(
+                  row.get("href")
+                  or row.get("url")
+                  or ""
+              )
+
+          def source_domain(url):
+              try:
+                  return (
+                      urllib.parse.urlsplit(
+                          url
+                      ).netloc.lower()
+                  )
+              except Exception:
+                  return ""
+
+          def unique_results(rows):
+              result = []
+              seen_urls = set()
+
+              for row in rows:
+                  url = result_url(row)
+
+                  if not url:
+                      continue
+
+                  if url in seen_urls:
+                      continue
+
+                  title = result_title(row)
+                  snippet = result_text(row)
+
+                  if not title and not snippet:
+                      continue
+
+                  seen_urls.add(url)
+
+                  result.append(
+                      {
+                          "title": title,
+                          "url": url,
+                          "snippet": snippet,
+                          "domain": source_domain(url)
+                      }
+                  )
+
+                  if len(result) >= MAX_TOTAL_RESULTS:
+                      break
+
+              return result
+
+          def meaningful_snippet(result):
+              text = clean(
+                  result.get("snippet"),
+                  1800
+              )
+
+              if len(text) < 80:
+                  return False
+
+              generic = (
+                  "search result",
+                  "click here",
+                  "read more",
+                  "homepage",
+                  "sign in",
+                  "log in"
+              )
+
+              low = text.lower()
+
+              return not (
+                  len(text) < 140
+                  and any(
+                      x in low
+                      for x in generic
+                  )
+              )
+
+          def score_result(result, query_terms):
+              text = (
+                  result.get("title", "")
+                  + " "
+                  + result.get("snippet", "")
+              ).lower()
+
+              score = 0
+
+              for term in query_terms:
+                  if term.lower() in text:
+                      score += 1
+
+              domain = result.get(
+                  "domain",
+                  ""
+              ).lower()
+
+              if (
+                  ".gov" in domain
+                  or ".edu" in domain
+                  or "official" in domain
+                  or "github.com" in domain
+                  or "ietf.org" in domain
+                  or "w3.org" in domain
+              ):
+                  score += 3
+
+              if meaningful_snippet(
+                  result
+              ):
+                  score += 2
+
+              return score
+
+          def classify_evidence(
+              results,
+              query_terms
+          ):
+              usable = [
+                  r
+                  for r in results
+                  if meaningful_snippet(r)
+              ]
+
+              if not usable:
+                  return (
+                      "no_evidence",
+                      []
+                  )
+
+              ranked = sorted(
+                  usable,
+                  key=lambda r: score_result(
+                      r,
+                      query_terms
+                  ),
+                  reverse=True
+              )
+
+              strong = [
+                  r
+                  for r in ranked
+                  if score_result(
+                      r,
+                      query_terms
+                  ) >= 4
+              ]
+
+              domains = {
+                  r.get("domain")
+                  for r in strong
+                  if r.get("domain")
+              }
+
+              if (
+                  len(strong) >= 2
+                  and len(domains) >= 2
+              ):
+                  return (
+                      "multi_source_support",
+                      ranked
+                  )
+
+              if len(usable) >= 1:
+                  return (
+                      "partial_support",
+                      ranked
+                  )
+
+              return (
+                  "insufficient_verification",
+                  ranked
+              )
+
+          def detect_conflicts(
+              results,
+              query_terms
+          ):
+              relevant = []
+
+              for result in results:
+                  text = (
+                      result.get("title", "")
+                      + " "
+                      + result.get("snippet", "")
+                  ).lower()
+
+                  score = sum(
+                      1
+                      for term in query_terms
+                      if term.lower() in text
+                  )
+
+                  if score:
+                      relevant.append(
+                          (
+                              score,
+                              result
+                          )
+                      )
+
+              relevant.sort(
+                  key=lambda x: x[0],
+                  reverse=True
+              )
+
+              relevant = [
+                  x[1]
+                  for x in relevant[:8]
+              ]
+
+              negative_markers = (
+                  "not ",
+                  "no ",
+                  "false",
+                  "incorrect",
+                  "failed",
+                  "however",
+                  "contrary",
+                  "disagree",
+                  "not supported",
+                  "does not",
+                  "cannot",
+                  "faux",
+                  "échec",
+                  "contraire",
+                  "contredit",
+                  "ne ",
+                  "pas "
+              )
+
+              positive = 0
+              negative = 0
+
+              for result in relevant:
+                  text = (
+                      result.get("snippet", "")
+                      .lower()
+                  )
+
+                  if any(
+                      marker in text
+                      for marker in negative_markers
+                  ):
+                      negative += 1
+                  else:
+                      positive += 1
+
+              return {
+                  "positive_sources": positive,
+                  "negative_sources": negative,
+                  "potential_conflict": (
+                      positive > 0
+                      and negative > 0
+                  )
+              }
+
+          def build_factual_points(
+              results,
+              query_terms
+          ):
+              points = []
+
+              ranked = sorted(
+                  results,
+                  key=lambda r: score_result(
+                      r,
+                      query_terms
+                  ),
+                  reverse=True
+              )
+
+              for result in ranked[:6]:
+                  snippet = clean(
+                      result.get("snippet"),
+                      700
+                  )
+
+                  if len(snippet) < 80:
+                      continue
+
+                  points.append(
+                      {
+                          "claim": snippet,
+                          "source": result.get(
+                              "title"
+                          ),
+                          "url": result.get(
+                              "url"
+                          ),
+                          "domain": result.get(
+                              "domain"
+                          )
+                      }
+                  )
+
+              return points
+
+          def build_conclusion(
+              request,
+              evidence_status,
+              points,
+              conflicts
+          ):
+              question = clean(
+                  request.get("question"),
+                  1000
+              )
+
+              if not points:
+                  return (
+                      "The available search results do not "
+                      "provide enough substantive evidence "
+                      "to answer the question reliably."
+                  )
+
+              if evidence_status == (
+                  "multi_source_support"
+              ):
+                  lead = (
+                      "The available evidence supports a "
+                      "bounded answer to the question."
+                  )
+
+              elif evidence_status == (
+                  "partial_support"
+              ):
+                  lead = (
+                      "The available evidence provides partial "
+                      "support, but it is not sufficient for a "
+                      "strong universal conclusion."
+                  )
+
               else:
-                  state["attempts"][rid]=int(state["attempts"].get(rid,0))+1
+                  lead = (
+                      "The available evidence is insufficient "
+                      "for a reliable conclusion."
+                  )
 
-              print(f"WORK RESULT: {question} | {status} | sources={len(scored)} | domains={domain_count}")
+              if conflicts.get(
+                  "potential_conflict"
+              ):
+                  lead += (
+                      " Some sources appear to differ, so "
+                      "the conclusion should remain explicitly "
+                      "uncertain."
+                  )
 
-          state["history"]=state["history"][-MAX_HISTORY:]
-          state["completed"]=state["completed"][-MAX_HISTORY:]
-          state["version"]=4; state["last_run"]=NOW
-          state["last_summary"]={"timestamp":NOW,"work_candidates":len(runtime.get("work_requests",[])),"research_selected":len(requests),"completed":sum(1 for x in state["history"][-len(requests):] if isinstance(x,dict) and x.get("evidence_status")=="multi_source_support") if requests else 0}
-          save(WORK_FILE,state)
-          print(f"=== NØX WORK FACTORY V4 === candidates={len(runtime.get('work_requests',[]))} selected={len(requests)} history={len(state['history'])}")
-          print("CORE WORK REQUEST -> RESEARCH -> EVIDENCE COVERAGE -> CORE REASSESSMENT")
+              strongest = clean(
+                  points[0].get(
+                      "claim"
+                  ),
+                  900
+              )
+
+              if question:
+                  return (
+                      f"{lead} "
+                      f"For the question '{question}', "
+                      f"the strongest directly relevant "
+                      f"evidence found indicates: "
+                      f"{strongest}"
+                  )
+
+              return (
+                  f"{lead} "
+                  f"The strongest directly relevant evidence "
+                  f"found indicates: {strongest}"
+              )
+
+          def build_uncertainties(
+              evidence_status,
+              conflicts,
+              results
+          ):
+              uncertainties = []
+
+              if evidence_status != (
+                  "multi_source_support"
+              ):
+                  uncertainties.append(
+                      "The available sources do not provide "
+                      "the same level of independent support "
+                      "as a multi-source result."
+                  )
+
+              if conflicts.get(
+                  "potential_conflict"
+              ):
+                  uncertainties.append(
+                      "Some relevant sources contain potentially "
+                      "conflicting statements."
+                  )
+
+              if not results:
+                  uncertainties.append(
+                      "No substantive search result was available."
+                  )
+
+              uncertainties.append(
+                  "Search results are evidence for the current "
+                  "research task, not proof that the conclusion "
+                  "is universally true."
+              )
+
+              return uncertainties[:5]
+
+          def build_sources(results):
+              sources = []
+
+              for result in results[:8]:
+                  url = normalize_url(
+                      result.get("url")
+                  )
+
+                  if not url:
+                      continue
+
+                  sources.append(
+                      {
+                          "title": clean(
+                              result.get("title"),
+                              300
+                          ),
+                          "url": url,
+                          "domain": clean(
+                              result.get("domain"),
+                              200
+                          ),
+                          "snippet": clean(
+                              result.get("snippet"),
+                              700
+                          )
+                      }
+                  )
+
+              return sources
+
+          runtime = load(
+              CORE_RUNTIME_FILE,
+              {}
+          )
+
+          memory = load(
+              CORE_MEMORY_FILE,
+              {}
+          )
+
+          knowledge = load(
+              KNOWLEDGE_FILE,
+              {}
+          )
+
+          work = load(
+              WORK_FILE,
+              EMPTY_WORK
+          )
+
+          for key, default in EMPTY_WORK.items():
+              if key not in work:
+                  work[key] = json.loads(
+                      json.dumps(default)
+                  )
+
+          runtime_requests = runtime.get(
+              "work_requests",
+              []
+          )
+
+          if not isinstance(
+              runtime_requests,
+              list
+          ):
+              runtime_requests = []
+
+          history = work.get(
+              "history",
+              []
+          )
+
+          if not isinstance(
+              history,
+              list
+          ):
+              history = []
+
+          completed_ids = {
+              item.get("request_id")
+              for item in history
+              if (
+                  isinstance(item, dict)
+                  and item.get("request_id")
+                  and item.get(
+                      "evidence_status"
+                  ) in (
+                      "multi_source_support",
+                      "partial_support"
+                  )
+              )
+          }
+
+          failed_ids = {
+              item.get("request_id")
+              for item in work.get(
+                  "failed",
+                  []
+              )
+              if (
+                  isinstance(item, dict)
+                  and item.get("request_id")
+              )
+          }
+
+          candidates = []
+
+          for request in runtime_requests:
+              if not isinstance(
+                  request,
+                  dict
+              ):
+                  continue
+
+              request_id = clean(
+                  request.get("id"),
+                  200
+              )
+
+              if not request_id:
+                  continue
+
+              status = clean(
+                  request.get("status"),
+                  50
+              ).lower()
+
+              if status not in (
+                  "",
+                  "pending",
+                  "retry",
+                  "queued"
+              ):
+                  continue
+
+              if request_id in completed_ids:
+                  continue
+
+              # Retry requests are allowed. A previous failed research
+              # attempt is not treated as a permanent failure.
+              candidates.append(
+                  request
+              )
+
+          # Also recover pending requests written directly to Work Factory.
+          for request in work.get(
+              "pending",
+              []
+          ):
+              if not isinstance(
+                  request,
+                  dict
+              ):
+                  continue
+
+              request_id = clean(
+                  request.get("id"),
+                  200
+              )
+
+              if not request_id:
+                  continue
+
+              if request_id in {
+                  clean(
+                      x.get("id"),
+                      200
+                  )
+                  for x in candidates
+                  if isinstance(x, dict)
+              }:
+                  continue
+
+              if request_id in completed_ids:
+                  continue
+
+              candidates.append(
+                  request
+              )
+
+          selected = candidates[
+              :MAX_WORK
+          ]
+
+          print(
+              f"Research candidates={len(candidates)} "
+              f"selected={len(selected)}"
+          )
+
+          ddgs = DDGS(
+              timeout=TIMEOUT
+          )
+
+          produced = 0
+
+          for request in selected:
+
+              request_id = clean(
+                  request.get("id"),
+                  200
+              )
+
+              question = clean(
+                  request.get("question"),
+                  1500
+              )
+
+              if not question:
+                  failure = {
+                      "id": stable(
+                          "failure",
+                          request_id,
+                          "empty-question"
+                      ),
+                      "request_id": request_id,
+                      "timestamp": NOW,
+                      "error": "Research request has no question.",
+                      "status": "failed"
+                  }
+
+                  work.setdefault(
+                      "failed",
+                      []
+                  ).append(
+                      failure
+                  )
+
+                  continue
+
+              print(
+                  f"\n=== RESEARCH {request_id} ==="
+              )
+
+              print(
+                  f"Question: {question}"
+              )
+
+              queries = build_queries(
+                  request
+              )
+
+              all_rows = []
+
+              for query in queries:
+                  print(
+                      f"Search: {query}"
+                  )
+
+                  rows = search_query(
+                      ddgs,
+                      query
+                  )
+
+                  all_rows.extend(
+                      rows
+                  )
+
+                  if len(all_rows) >= (
+                      MAX_TOTAL_RESULTS * 2
+                  ):
+                      break
+
+                  time.sleep(
+                      0.5
+                  )
+
+              results = unique_results(
+                  all_rows
+              )
+
+              query_terms = request_terms(
+                  request
+              )
+
+              evidence_status, ranked = (
+                  classify_evidence(
+                      results,
+                      query_terms
+                  )
+              )
+
+              ranked = ranked[
+                  :MAX_TOTAL_RESULTS
+              ]
+
+              conflicts = detect_conflicts(
+                  ranked,
+                  query_terms
+              )
+
+              points = build_factual_points(
+                  ranked,
+                  query_terms
+              )
+
+              sources = build_sources(
+                  ranked
+              )
+
+              uncertainties = build_uncertainties(
+                  evidence_status,
+                  conflicts,
+                  ranked
+              )
+
+              conclusion = build_conclusion(
+                  request,
+                  evidence_status,
+                  points,
+                  conflicts
+              )
+
+              # A result is substantive only when the conclusion is
+              # actually tied to the research evidence.
+              substantive = (
+                  len(conclusion) >= 80
+                  and (
+                      evidence_status
+                      in (
+                          "multi_source_support",
+                          "partial_support"
+                      )
+                      or len(points) > 0
+                  )
+              )
+
+              result_id = stable(
+                  "research",
+                  request_id,
+                  conclusion,
+                  "|".join(
+                      source.get(
+                          "url",
+                          ""
+                      )
+                      for source in sources[:8]
+                  )
+              )
+
+              result = {
+                  "id": result_id,
+                  "request_id": request_id,
+                  "case_id": request.get(
+                      "case_id"
+                  ),
+                  "work_type": request.get(
+                      "work_type",
+                      "research"
+                  ),
+                  "question": question,
+                  "context": clean(
+                      request.get(
+                          "context"
+                      ),
+                      2500
+                  ),
+                  "timestamp": NOW,
+                  "status": (
+                      "completed"
+                      if substantive
+                      else "insufficient"
+                  ),
+                  "evidence_status": (
+                      evidence_status
+                  ),
+                  "conclusion": conclusion,
+                  "facts": points,
+                  "sources": sources,
+                  "uncertainties": uncertainties,
+                  "conflicts": conflicts,
+                  "queries": queries,
+                  "result_count": len(results),
+                  "source_count": len(sources),
+                  "substantive": substantive
+              }
+
+              history.append(
+                  result
+              )
+
+              if substantive:
+                  work.setdefault(
+                      "completed",
+                      []
+                  ).append(
+                      {
+                          "request_id": request_id,
+                          "result_id": result_id,
+                          "timestamp": NOW,
+                          "evidence_status": (
+                              evidence_status
+                          )
+                      }
+                  )
+
+                  produced += 1
+
+                  print(
+                      "Research status:",
+                      evidence_status
+                  )
+
+                  print(
+                      "Conclusion:",
+                      conclusion
+                  )
+
+              else:
+                  work.setdefault(
+                      "failed",
+                      []
+                  ).append(
+                      {
+                          "id": stable(
+                              "failure",
+                              request_id,
+                              NOW
+                          ),
+                          "request_id": request_id,
+                          "result_id": result_id,
+                          "timestamp": NOW,
+                          "error": (
+                              "Insufficient substantive "
+                              "evidence for a reliable result."
+                          ),
+                          "evidence_status": (
+                              evidence_status
+                          ),
+                          "status": "retry"
+                      }
+                  )
+
+                  print(
+                      "Research did not produce "
+                      "a sufficiently substantive result."
+                  )
+
+          # -----------------------------------------------------------
+          # HISTORY / STATE MAINTENANCE
+          # -----------------------------------------------------------
+
+          work["history"] = history[
+              -MAX_HISTORY:
+          ]
+
+          work["completed"] = (
+              work.get(
+                  "completed",
+                  []
+              )
+          )[-MAX_HISTORY:]
+
+          work["failed"] = (
+              work.get(
+                  "failed",
+                  []
+              )
+          )[-MAX_HISTORY:]
+
+          work["pending"] = (
+              work.get(
+                  "pending",
+                  []
+              )
+          )[-MAX_HISTORY:]
+
+          work["version"] = 4
+
+          work["run_count"] = (
+              int(
+                  work.get(
+                      "run_count",
+                      0
+                  )
+              )
+              + 1
+          )
+
+          work["last_run"] = NOW
+
+          work["last_cycle"] = {
+              "timestamp": NOW,
+              "candidates": len(candidates),
+              "selected": len(selected),
+              "produced": produced
+          }
+
+          # Remove requests that were successfully consumed from the
+          # local pending list. Runtime remains the authoritative source
+          # for Core requests.
+          completed_request_ids = {
+              item.get("request_id")
+              for item in work.get(
+                  "completed",
+                  []
+              )
+              if isinstance(item, dict)
+          }
+
+          work["pending"] = [
+              item
+              for item in work["pending"]
+              if (
+                  isinstance(item, dict)
+                  and item.get("id")
+                  not in completed_request_ids
+              )
+          ][-MAX_HISTORY:]
+
+          save(
+              WORK_FILE,
+              work
+          )
+
+          print(
+              "\n=== NØX WORK FACTORY V4 ==="
+          )
+
+          print(
+              f"Runs={work['run_count']} "
+              f"Candidates={len(candidates)} "
+              f"Selected={len(selected)} "
+              f"Research results={produced}"
+          )
+
+          print(
+              "Research pipeline: "
+              "QUESTION -> SEARCH -> EVIDENCE -> "
+              "CONFLICT CHECK -> CONCLUSION -> "
+              "UNCERTAINTY -> RESULT"
+          )
+
+          PY
+
+      - name: Validate Work Factory state
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("memory/nox_work_factory.json")
+
+          data = json.loads(
+              path.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          if not isinstance(data, dict):
+              raise SystemExit(
+                  "Work Factory state is not a JSON object."
+              )
+
+          for key in (
+              "history",
+              "completed",
+              "failed",
+              "pending"
+          ):
+              if not isinstance(
+                  data.get(key),
+                  list
+              ):
+                  raise SystemExit(
+                      f"Invalid Work Factory collection: {key}"
+                  )
+
+          for result in data["history"][-20:]:
+              if not isinstance(
+                  result,
+                  dict
+              ):
+                  continue
+
+              if result.get(
+                  "evidence_status"
+              ) in (
+                  "multi_source_support",
+                  "partial_support"
+              ):
+                  if len(
+                      str(
+                          result.get(
+                              "conclusion",
+                              ""
+                          )
+                      ).strip()
+                  ) < 80:
+                      raise SystemExit(
+                          "Research result has an invalid "
+                          "or empty substantive conclusion."
+                      )
+
+          print(
+              "Work Factory state validation OK."
+          )
           PY
 
       - name: Commit Work Factory state
         run: |
           set -euo pipefail
+
           git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
+
           git add memory/nox_work_factory.json
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m "NØX: update work factory"
+
+          if git diff --cached --quiet; then
+            echo "No Work Factory changes."
+            exit 0
+          fi
+
+          git commit -m "NØX: improve research work factory"
+
           git pull --rebase origin main
+
           git push
