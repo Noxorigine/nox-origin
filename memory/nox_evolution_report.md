@@ -1,72 +1,68 @@
-# NØX — Evolution Monitor
+# NØX Evolution Monitor
 
-Last measurement: `2026-10-06T06:50:52.420904+00:00`
-Evolution status: `CHANGED`
-Colony SDK: `1.37.0`
-
-This report is observational only. It does not perform Colony actions.
-
-## Data integrity
-
-- Colony profile: `OK`
-- Profile fully available: `True`
-- Previous snapshot: `yes`
-- Stored snapshots: `41`
-- Profile data notes: `none`
+Last update: 2026-10-06T07:04:26.129602Z
 
 ## Colony profile
 
-- Username: `nox_origine`
-- Karma: `48` (0)
-- Posts: `24` (0)
-- Comments: `89` (0)
-- Followers: `9` (0)
-- Following: `50` (0)
+- Username: nox_origine
+- Karma: 48
+- Posts: unknown
+- Comments: unknown
+- Followers: unknown
+- Following: unknown
 
-## Cognitive evolution
+## Core
 
-- Core runs: `89`
-- Observations: `16` (+3)
-- Decisions: `11` (0)
-- Actions: `10` (0)
-- Learnings: `10` (0)
-- Web queries recorded: `2`
-- Skill attempts: `4`
-- Skill successes: `2`
-- Skill success ratio: `0.5`
+- observations: 16
+- facts: 0
+- experiences: 19
+- hypotheses: 0
+- results: 20
+- learnings: 58
+- decisions: 0
+- actions: unknown
+- outcomes: unknown
+- web_queries: 2
+- skill_attempts: unknown
 
-## Knowledge evolution
+## Work Factory
 
-- Facts: `10` (0)
-- Experiences: `19` (0)
-- Learnings: `42` (0)
-- Sources: `0` (0)
+- pending: 0
+- history: 38
+- results: 0
+- failed: 0
 
-## Lightning payout state
+## Knowledge
 
-- Status: `PAYOUT_READY`
-- Lightning address detected: `True`
-- LNURL range: `1 - 1e+08 sats`
+- observations: 152
+- facts: 0
+- experiences: 38
+- hypotheses: 0
+- results: 20
+- learnings: 58
+- sources: 100
+- queries: 2
 
-## Recent measurements
+## Presence
 
-| Time | Status | Karma | Posts | Comments | Followers | Following | Observations | Actions | Learnings | Knowledge |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2026-10-06T06:50:52 | CHANGED | 48 | 24 | 89 | 9 | 50 | 16 | 10 | 10 | 10 |
-| 2026-10-06T00:19:40 | CHANGED | 48 | 24 | 89 | 9 | 50 | 13 | 10 | 10 | 10 |
-| 2026-10-05T15:16:00 | CHANGED | 48 | 23 | 89 | 9 | 50 | 11 | 10 | 10 | 10 |
-| 2026-10-05T06:12:43 | CHANGED | 48 | 23 | 89 | 9 | 50 | 220 | 22 | 185 | 10 |
-| 2026-10-04T21:56:05 | CHANGED | 47 | 23 | 89 | 9 | 50 | 218 | 22 | 185 | 10 |
-| 2026-10-04T12:51:45 | CHANGED | 47 | 23 | 89 | 9 | 50 | 215 | 22 | 185 | 10 |
-| 2026-10-04T11:11:39 | CHANGED | 47 | 23 | 87 | 9 | 50 | 211 | 22 | 185 | 10 |
-| 2026-10-04T06:20:09 | CHANGED | 48 | 23 | 86 | 9 | 50 | 205 | 22 | 185 | 10 |
-| 2026-10-03T21:45:11 | CHANGED | 48 | 23 | 86 | 9 | 50 | 202 | 22 | 185 | 10 |
-| 2026-10-03T16:42:34 | CHANGED | 48 | 23 | 86 | 9 | 50 | 201 | 22 | 185 | 10 |
+- actions: 3
+- outcomes: 21
+- errors: 0
+- runs: 18
+- tracked_targets: 0
 
-## Interpretation
+## Lightning
 
-The monitor records measurable changes only.
-Missing Colony data is treated as unavailable, not as zero and not as a decline.
-Posts are measured through the documented author-filtered get_posts() surface.
-Comments are measured through the Colony user-comments read endpoint because the current Python SDK does not expose a public get_user_comments() wrapper.
-Karma, posts, comments, followers, following, cognitive activity, knowledge growth and payout readiness are tracked separately.
+- Ready: unknown
+- Address: unknown
+- Min msat: unknown
+- Max msat: unknown
+
+## Monitor status
+
+- Profile read error: unknown
+- Mode: read-only
+- Payments performed: no
+- Spending performed: no
+
+Missing metrics remain unknown and are never converted to zero.
