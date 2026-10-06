@@ -3,7 +3,7 @@ name: NØX - Core General
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *"
 
 permissions:
   contents: write
@@ -18,6 +18,7 @@ env:
   WORK_FILE: memory/nox_work_factory.json
   PRESENCE_FILE: memory/nox_colony_presence.json
   LEGACY_MEMORY_FILE: memory/nox_colony_state.json
+
   MAX_FEED_ITEMS: "12"
   MAX_NOTIFICATIONS: "20"
   MAX_DMS: "10"
@@ -28,1361 +29,1382 @@ env:
   MAX_PENDING_ACTIONS: "20"
   MAX_WORK_REQUESTS: "20"
   MAX_PUBLISH_ACTIONS: "3"
+
   ENABLE_LIGHTNING_CHECK: "true"
 
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
+
 jobs:
-  core-general:
+  core:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install Colony SDK
         run: |
           python -m pip install --upgrade pip
-          pip install "colony-sdk>=1.37.0,<2.0.0"
+          python -m pip install "colony-sdk>=1.37.0,<2.0.0"
 
       - name: Run NØX Core
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           import json
           import os
           import re
-          import urllib.parse
-          import urllib.request
+          import sys
+          import time
+          import traceback
+          import uuid
           from datetime import datetime, timezone
-          from hashlib import sha256
-          from pathlib import Path
 
-          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient
+          from colony_sdk import ColonyClient
 
-          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
-          if not API_KEY:
-              raise SystemExit("COLONY_API_KEY manquant.")
+          MEMORY_FILE = os.environ["MEMORY_FILE"]
+          RUNTIME_FILE = os.environ["RUNTIME_FILE"]
+          WORK_FILE = os.environ["WORK_FILE"]
+          PRESENCE_FILE = os.environ["PRESENCE_FILE"]
+          LEGACY_MEMORY_FILE = os.environ["LEGACY_MEMORY_FILE"]
 
-          NOW = datetime.now(timezone.utc).isoformat()
-
-          MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
-          RUNTIME_FILE = Path(os.environ["RUNTIME_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
-          LEGACY_FILE = Path(os.environ["LEGACY_MEMORY_FILE"])
-
-          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
+          MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
           MAX_NOTIFICATIONS = int(os.environ["MAX_NOTIFICATIONS"])
           MAX_DMS = int(os.environ["MAX_DMS"])
           MAX_SUGGESTIONS = int(os.environ["MAX_SUGGESTIONS"])
-          MAX_CASES = int(os.environ["MAX_CASES_PER_RUN"])
-          MAX_MEMORY = int(os.environ["MAX_MEMORY_ITEMS"])
-          MAX_CASES_MEMORY = int(os.environ["MAX_COGNITIVE_CASES"])
-          MAX_PENDING = int(os.environ["MAX_PENDING_ACTIONS"])
-          MAX_WORK = int(os.environ["MAX_WORK_REQUESTS"])
-          MAX_PUBLISH = int(os.environ["MAX_PUBLISH_ACTIONS"])
-          ENABLE_LIGHTNING = os.environ["ENABLE_LIGHTNING_CHECK"].lower() == "true"
+          MAX_CASES_PER_RUN = int(os.environ["MAX_CASES_PER_RUN"])
+          MAX_MEMORY_ITEMS = int(os.environ["MAX_MEMORY_ITEMS"])
+          MAX_COGNITIVE_CASES = int(os.environ["MAX_COGNITIVE_CASES"])
+          MAX_PENDING_ACTIONS = int(os.environ["MAX_PENDING_ACTIONS"])
+          MAX_WORK_REQUESTS = int(os.environ["MAX_WORK_REQUESTS"])
+          MAX_PUBLISH_ACTIONS = int(os.environ["MAX_PUBLISH_ACTIONS"])
 
-          EMPTY_MEMORY = {
-              "version": 7,
-              "observations": [],
-              "questions": [],
-              "hypotheses": [],
-              "decisions": [],
-              "actions": [],
-              "results": [],
-              "learnings": [],
-              "failures": [],
-              "relationships": [],
-              "cognitive_cases": []
-          }
+          NOW = datetime.now(timezone.utc)
+          NOW_ISO = NOW.isoformat()
+          RUN_ID = f"core-{NOW.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
 
-          EMPTY_RUNTIME = {
-              "version": 7,
-              "run_count": 0,
-              "last_run": None,
-              "seen_event_ids": [],
-              "processed_post_ids": [],
-              "processed_suggestion_ids": [],
-              "action_count_total": 0,
-              "last_rate_limit": None,
-              "payout_health": None,
-              "pending_actions": [],
-              "work_requests": [],
-              "consumed_work_result_ids": [],
-              "consumed_presence_outcome_ids": [],
-              "last_cycle": None
-          }
-
-          def load(path, default):
-              if not path.exists():
-                  return json.loads(json.dumps(default))
+          def load_json(path, default):
+              if not os.path.exists(path):
+                  return default
               try:
-                  value = json.loads(path.read_text(encoding="utf-8"))
-                  return value if isinstance(value, dict) else json.loads(json.dumps(default))
+                  with open(path, "r", encoding="utf-8") as f:
+                      value = json.load(f)
+                  return value
               except Exception as exc:
-                  print(f"WARNING: cannot read {path}: {exc}")
-                  return json.loads(json.dumps(default))
+                  print(f"[WARN] Cannot read {path}: {exc}")
+                  return default
 
-          def save(path, value):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(
-                  json.dumps(value, ensure_ascii=False, indent=2),
-                  encoding="utf-8"
+          def atomic_write_json(path, value):
+              directory = os.path.dirname(path)
+              if directory:
+                  os.makedirs(directory, exist_ok=True)
+
+              tmp = f"{path}.tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(value, f, ensure_ascii=False, indent=2)
+                  f.write("\n")
+
+              os.replace(tmp, path)
+
+          def safe_list(value):
+              return value if isinstance(value, list) else []
+
+          def safe_dict(value):
+              return value if isinstance(value, dict) else {}
+
+          def text_of(value):
+              if value is None:
+                  return ""
+              if isinstance(value, str):
+                  return value
+              if isinstance(value, dict):
+                  for key in (
+                      "content",
+                      "body",
+                      "text",
+                      "message",
+                      "description",
+                      "title",
+                  ):
+                      if value.get(key):
+                          return str(value[key])
+              return str(value)
+
+          def obj_get(obj, key, default=None):
+              if isinstance(obj, dict):
+                  return obj.get(key, default)
+              return getattr(obj, key, default)
+
+          def normalize_id(value):
+              if value is None:
+                  return None
+              return str(value)
+
+          def first_id(obj, *keys):
+              for key in keys:
+                  value = obj_get(obj, key)
+                  if value is not None:
+                      return normalize_id(value)
+              return None
+
+          def stable_id(prefix, *parts):
+              raw = "|".join(
+                  "" if part is None else str(part)
+                  for part in parts
               )
+              import hashlib
+              digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+              return f"{prefix}-{digest}"
 
-          def clean(value, limit=3000):
-              return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+          def trim_list(items, limit):
+              if not isinstance(items, list):
+                  return []
+              return items[-limit:]
 
-          def blob(value):
-              return clean(json.dumps(value, ensure_ascii=False), 12000).lower()
+          def unique_by_id(items):
+              result = []
+              seen = set()
 
-          def stable(prefix, *parts):
-              raw = "|".join(clean(p, 5000) for p in parts)
-              return f"{prefix}-{sha256(raw.encode('utf-8')).hexdigest()[:20]}"
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
 
-          def ensure(memory, key):
-              if not isinstance(memory.get(key), list):
-                  memory[key] = []
-              return memory[key]
+                  ident = (
+                      item.get("id")
+                      or item.get("action_id")
+                      or item.get("case_id")
+                      or item.get("request_id")
+                  )
 
-          def add(memory, key, item, limit=MAX_MEMORY):
-              values = ensure(memory, key)
-              values.append(item)
-              del values[:-limit]
+                  if ident is None:
+                      result.append(item)
+                      continue
 
-          def remember(memory, key, summary, evidence=None, source="core"):
-              add(
-                  memory,
-                  key,
-                  {
-                      "timestamp": NOW,
-                      "summary": clean(summary, 1000),
-                      "evidence": evidence or {},
-                      "source": source
-                  }
-              )
+                  ident = str(ident)
 
-          memory = load(MEMORY_FILE, EMPTY_MEMORY)
-          runtime = load(RUNTIME_FILE, EMPTY_RUNTIME)
-          work = load(
-              WORK_FILE,
-              {"version": 1, "history": [], "completed": []}
-          )
-          presence = load(
-              PRESENCE_FILE,
-              {"version": 1, "runs": [], "outcomes": []}
-          )
+                  if ident in seen:
+                      continue
 
-          for key, value in EMPTY_MEMORY.items():
-              if key != "version" and not isinstance(memory.get(key), list):
-                  memory[key] = []
+                  seen.add(ident)
+                  result.append(item)
 
-          for key, value in EMPTY_RUNTIME.items():
-              if key not in runtime:
-                  runtime[key] = json.loads(json.dumps(value))
+              return result
 
-          memory["version"] = max(
-              7,
-              int(memory.get("version", 1) or 1)
-          )
-          runtime["version"] = 7
+          def extract_items(value):
+              if value is None:
+                  return []
 
-          if not MEMORY_FILE.exists() and LEGACY_FILE.exists():
-              legacy = load(LEGACY_FILE, {})
-              remember(
-                  memory,
-                  "observations",
-                  "Legacy Colony memory imported into Core.",
-                  {
-                      "commented_post_ids": len(
-                          legacy.get("commented_post_ids", [])
-                      ),
-                      "seen_notification_ids": len(
-                          legacy.get("seen_notification_ids", [])
-                      )
-                  },
-                  "legacy_migration"
-              )
-
-          def extract(value, keys):
               if isinstance(value, list):
                   return value
 
               if isinstance(value, dict):
-                  for key in keys:
-                      if isinstance(value.get(key), list):
-                          return value[key]
+                  for key in (
+                      "items",
+                      "data",
+                      "results",
+                      "posts",
+                      "notifications",
+                      "suggestions",
+                      "messages",
+                      "conversations",
+                      "feed",
+                  ):
+                      candidate = value.get(key)
+                      if isinstance(candidate, list):
+                          return candidate
 
               return []
 
-          def rate_limit(client):
-              rl = getattr(client, "last_rate_limit", None)
+          def call_method(client, method_name, *args, **kwargs):
+              method = getattr(client, method_name, None)
 
-              if rl is None:
-                  return None
+              if method is None:
+                  raise AttributeError(
+                      f"ColonyClient has no method {method_name}"
+                  )
 
-              result = {}
+              return method(*args, **kwargs)
 
-              for name in (
-                  "limit",
-                  "remaining",
-                  "reset",
-                  "retry_after"
-              ):
-                  try:
-                      value = getattr(rl, name)
+          def get_field(obj, *names):
+              for name in names:
+                  value = obj_get(obj, name)
+                  if value is not None:
+                      return value
+              return None
 
-                      if value is not None:
-                          result[name] = (
-                              value.isoformat()
-                              if hasattr(value, "isoformat")
-                              else value
-                          )
-                  except Exception:
-                      pass
+          memory = safe_dict(load_json(MEMORY_FILE, {}))
+          runtime = safe_dict(load_json(RUNTIME_FILE, {}))
+          work = safe_dict(load_json(WORK_FILE, {}))
+          presence = safe_dict(load_json(PRESENCE_FILE, {}))
 
-              return result or None
+          if not memory:
+              legacy = load_json(LEGACY_MEMORY_FILE, {})
+              if isinstance(legacy, dict):
+                  memory = legacy
 
-          def terms(text):
-              words = re.findall(
-                  r"[a-zA-ZÀ-ÿ0-9_-]{4,}",
-                  clean(text, 5000).lower()
-              )
+          memory.setdefault("observations", [])
+          memory.setdefault("reported_information", [])
+          memory.setdefault("facts", [])
+          memory.setdefault("experiences", [])
+          memory.setdefault("hypotheses", [])
+          memory.setdefault("questions", [])
+          memory.setdefault("tests", [])
+          memory.setdefault("results", [])
+          memory.setdefault("learnings", [])
+          memory.setdefault("actions", [])
+          memory.setdefault("web_queries", [])
+          memory.setdefault("cognitive_cases", [])
+          memory.setdefault("seen_event_ids", [])
+          memory.setdefault("processed_post_ids", [])
+          memory.setdefault("processed_notification_ids", [])
+          memory.setdefault("processed_dm_ids", [])
+          memory.setdefault("run_count", 0)
 
-              stop = {
-                  "this",
-                  "that",
-                  "with",
-                  "from",
-                  "have",
-                  "what",
-                  "when",
-                  "where",
-                  "which",
-                  "would",
-                  "could",
-                  "about",
-                  "your",
-                  "their",
-                  "they",
-                  "there",
-                  "into",
-                  "then",
-                  "than",
-                  "just",
-                  "pour",
-                  "avec",
-                  "dans",
-                  "nous",
-                  "vous",
-                  "cela",
-                  "cette",
-                  "comme",
-                  "mais",
-                  "plus",
-                  "faire",
-                  "être",
-                  "sont",
-                  "pourquoi",
-                  "comment"
-              }
+          runtime.setdefault("pending_actions", [])
+          runtime.setdefault("work_requests", [])
+          runtime.setdefault("web_queries", [])
+          runtime.setdefault("last_run", None)
+          runtime.setdefault("run_count", 0)
 
-              out = []
+          work.setdefault("pending", [])
+          work.setdefault("history", [])
+          work.setdefault("results", [])
+          work.setdefault("run_count", 0)
 
-              for word in words:
-                  if word not in stop and word not in out:
-                      out.append(word)
+          presence.setdefault("outcomes", [])
+          presence.setdefault("actions", [])
+          presence.setdefault("runs", [])
 
-              return out[:30]
+          memory["run_count"] = int(memory.get("run_count", 0)) + 1
+          runtime["run_count"] = int(runtime.get("run_count", 0)) + 1
+          work["run_count"] = int(work.get("run_count", 0)) + 1
 
-          def recall(memory, text, limit=6):
-              wanted = set(terms(text))
-              scored = []
+          print(f"=== NØX CORE {RUN_ID} ===")
 
-              for kind, values in memory.items():
-                  if kind == "version" or not isinstance(values, list):
-                      continue
-
-                  for item in values:
-                      score = sum(
-                          1
-                          for term in wanted
-                          if term in blob(item)
-                      )
-
-                      if score:
-                          scored.append(
-                              {
-                                  "kind": kind,
-                                  "score": score,
-                                  "item": item
-                              }
-                          )
-
-              scored.sort(
-                  key=lambda x: x["score"],
-                  reverse=True
-              )
-
-              return scored[:limit]
-
-          client = ColonyClient(API_KEY)
+          client = ColonyClient()
 
           try:
-              state = client.bootstrap()
-          except ColonyAuthError as exc:
-              raise SystemExit(
-                  f"Authentification Colony refusée: {exc}"
-              )
-          except ColonyAPIError as exc:
-              raise SystemExit(
-                  f"Erreur Colony au bootstrap: {exc}"
-              )
+              bootstrap = getattr(client, "bootstrap", None)
 
-          profile = (
-              state.get("profile", {})
-              if isinstance(state, dict)
-              else {}
-          )
+              if bootstrap is not None:
+                  try:
+                      bootstrap()
+                      print("[OK] Colony bootstrap")
+                  except TypeError:
+                      bootstrap_result = bootstrap
+                      print("[INFO] Bootstrap available")
+                  except Exception as exc:
+                      print(f"[WARN] Bootstrap failed: {exc}")
 
-          username = clean(
-              profile.get("username"),
-              100
-          )
+          except Exception as exc:
+              print(f"[WARN] Bootstrap inspection failed: {exc}")
 
-          if username and username != "nox_origine":
-              raise SystemExit(
-                  f"SECURITY STOP: profil inattendu '{username}'."
-              )
-
-          runtime["last_rate_limit"] = rate_limit(client)
-
-          remember(
-              memory,
-              "observations",
-              "Colony bootstrap completed.",
-              {
-                  "username": username,
-                  "karma": profile.get("karma"),
-                  "capabilities": (
-                      state.get("capabilities", {})
-                      if isinstance(state, dict)
-                      else {}
-                  ),
-                  "unread_notifications": (
-                      state.get("unread_notifications", 0)
-                      if isinstance(state, dict)
-                      else 0
-                  ),
-                  "unread_direct_messages": (
-                      state.get("unread_direct_messages", 0)
-                      if isinstance(state, dict)
-                      else 0
-                  )
-              },
-              "colony_bootstrap"
-          )
-
-          payout = {
-              "status": "NOT_CHECKED",
-              "lightning_address": None
-          }
-
-          if ENABLE_LIGHTNING:
+          if os.environ.get("ENABLE_LIGHTNING_CHECK", "true").lower() == "true":
               try:
-                  me = client.get_me()
+                  payout = getattr(client, "get_payout_status", None)
 
-                  lightning = clean(
-                      me.get("lightning_address")
-                      if isinstance(me, dict)
-                      else "",
-                      300
-                  )
-
-                  payout["lightning_address"] = (
-                      lightning or None
-                  )
-
-                  if lightning.count("@") != 1:
-                      payout["status"] = "PAYOUT_UNAVAILABLE"
+                  if payout is not None:
+                      payout_status = payout()
+                      runtime["lightning"] = {
+                          "checked_at": NOW_ISO,
+                          "status": text_of(payout_status)[:1000],
+                      }
+                      print("[OK] Lightning status checked")
                   else:
-                      local, host = lightning.split("@", 1)
-
-                      endpoint = (
-                          f"https://{host}/"
-                          f".well-known/lnurlp/"
-                          f"{urllib.parse.quote(local, safe='')}"
-                      )
-
-                      req = urllib.request.Request(
-                          endpoint,
-                          headers={
-                              "Accept": "application/json",
-                              "User-Agent": "NOX-Core/7"
-                          }
-                      )
-
-                      with urllib.request.urlopen(
-                          req,
-                          timeout=12
-                      ) as response:
-                          payload = json.loads(
-                              response.read().decode(
-                                  "utf-8",
-                                  errors="replace"
-                              )
-                          )
-
-                      callback = str(
-                          payload.get("callback", "")
-                      )
-
-                      if (
-                          payload.get("tag") != "payRequest"
-                          or not callback.startswith(
-                              ("https://", "http://")
-                          )
-                      ):
-                          raise ValueError(
-                              "invalid LNURL pay metadata"
-                          )
-
-                      payout.update(
-                          {
-                              "status": "PAYOUT_READY",
-                              "min_sendable_msat": payload.get(
-                                  "minSendable"
-                              ),
-                              "max_sendable_msat": payload.get(
-                                  "maxSendable"
-                              )
-                          }
-                      )
+                      runtime["lightning"] = {
+                          "checked_at": NOW_ISO,
+                          "status": "method_unavailable",
+                      }
+                      print("[INFO] Lightning status method unavailable")
 
               except Exception as exc:
-                  payout = {
-                      "status": "PAYOUT_UNAVAILABLE",
-                      "lightning_address": payout.get(
-                          "lightning_address"
-                      ),
-                      "error": clean(exc, 500)
+                  runtime["lightning"] = {
+                      "checked_at": NOW_ISO,
+                      "status": "error",
+                      "error": str(exc)[:500],
                   }
+                  print(f"[WARN] Lightning check failed: {exc}")
 
-          runtime["payout_health"] = payout
-
+          feed = []
           notifications = []
-
-          if int(
-              state.get("unread_notifications", 0)
-              or 0
-          ) > 0:
-              try:
-                  notifications = extract(
-                      client.get_notifications(
-                          unread_only=True
-                      ),
-                      ("items", "notifications")
-                  )[:MAX_NOTIFICATIONS]
-
-              except Exception as exc:
-                  remember(
-                      memory,
-                      "failures",
-                      "Unread notifications could not be read.",
-                      {"error": clean(exc, 500)},
-                      "colony_notifications"
-                  )
-
-          # -----------------------------------------------------------
-          # DIRECT MESSAGES
-          #
-          # Do not use unread_direct_messages as the actual detector.
-          # Inspect conversations and use stable message IDs to avoid
-          # replying twice to the same incoming message.
-          # -----------------------------------------------------------
-
-          def message_sender(message):
-              if not isinstance(message, dict):
-                  return ""
-
-              sender = (
-                  message.get("sender")
-                  or message.get("author")
-                  or message.get("from")
-              )
-
-              if isinstance(sender, dict):
-                  return clean(
-                      sender.get("username")
-                      or sender.get("handle")
-                      or sender.get("name"),
-                      100
-                  )
-
-              return clean(
-                  message.get("sender_username")
-                  or message.get("author_username")
-                  or message.get("from_username")
-                  or sender,
-                  100
-              )
-
-          messages = []
+          suggestions = []
+          conversations = []
+          dms = []
 
           try:
-              conversations = list(
-                  client.iter_conversations(
-                      max_results=50
-                  )
+              feed_result = call_method(
+                  client,
+                  "get_for_you_feed",
+                  max_results=MAX_FEED_ITEMS,
               )
+              feed = extract_items(feed_result)[:MAX_FEED_ITEMS]
+          except TypeError:
+              try:
+                  feed_result = call_method(client, "get_for_you_feed")
+                  feed = extract_items(feed_result)[:MAX_FEED_ITEMS]
+              except Exception as exc:
+                  print(f"[WARN] Feed failed: {exc}")
+          except Exception as exc:
+              print(f"[WARN] Feed failed: {exc}")
 
-              for conversation in conversations:
-                  if (
-                      len(messages) >= MAX_DMS
-                      or not isinstance(conversation, dict)
-                  ):
-                      break
+          try:
+              method = getattr(client, "get_notifications", None)
 
-                  other = (
-                      conversation.get("username")
-                      or conversation.get("other_username")
-                      or conversation.get("with_username")
-                      or conversation.get("partner_username")
+              if method is not None:
+                  try:
+                      result = method(max_results=MAX_NOTIFICATIONS)
+                  except TypeError:
+                      result = method()
+
+                  notifications = extract_items(result)[:MAX_NOTIFICATIONS]
+
+          except Exception as exc:
+              print(f"[WARN] Notifications failed: {exc}")
+
+          try:
+              method = getattr(client, "get_suggestions", None)
+
+              if method is not None:
+                  try:
+                      result = method(max_results=MAX_SUGGESTIONS)
+                  except TypeError:
+                      result = method()
+
+                  suggestions = extract_items(result)[:MAX_SUGGESTIONS]
+
+          except Exception as exc:
+              print(f"[WARN] Suggestions failed: {exc}")
+
+          # ------------------------------------------------------------
+          # Direct message inspection.
+          # Do not rely only on an unread counter.
+          # ------------------------------------------------------------
+
+          try:
+              iterator = getattr(client, "iter_conversations", None)
+
+              if iterator is not None:
+                  conversations = list(
+                      iterator(max_results=50)
+                  )[:50]
+
+                  get_conversation = getattr(
+                      client,
+                      "get_conversation",
+                      None,
                   )
 
-                  if not other:
-                      continue
+                  if get_conversation is not None:
+                      for conversation in conversations:
+                          conversation_id = first_id(
+                              conversation,
+                              "id",
+                              "conversation_id",
+                          )
 
-                  try:
-                      detail = client.get_conversation(
-                          str(other)
-                      )
-
-                      detail = extract(
-                          detail,
-                          ("items", "messages")
-                      )
-
-                      for message in detail[-MAX_DMS:]:
-                          if not isinstance(message, dict):
+                          if not conversation_id:
                               continue
 
-                          sender = message_sender(message)
+                          try:
+                              detail = get_conversation(conversation_id)
+                              messages = extract_items(detail)
 
-                          if sender and sender == username:
-                              continue
+                              for message in messages:
+                                  dms.append(message)
 
-                          enriched = dict(message)
+                                  if len(dms) >= MAX_DMS:
+                                      break
 
-                          enriched[
-                              "_conversation_username"
-                          ] = str(other)
+                          except Exception as exc:
+                              print(
+                                  f"[WARN] Conversation "
+                                  f"{conversation_id} failed: {exc}"
+                              )
 
-                          messages.append(enriched)
-
-                          if len(messages) >= MAX_DMS:
+                          if len(dms) >= MAX_DMS:
                               break
 
-                  except Exception as exc:
-                      remember(
-                          memory,
-                          "failures",
-                          "A conversation could not be inspected.",
-                          {
-                              "username": other,
-                              "error": clean(exc, 500)
-                          },
-                          "colony_messages"
-                      )
-
           except Exception as exc:
-              remember(
-                  memory,
-                  "failures",
-                  "Conversation inbox could not be read.",
-                  {"error": clean(exc, 500)},
-                  "colony_messages"
+              print(f"[WARN] DM inspection failed: {exc}")
+
+          print(
+              f"Feed={len(feed)} "
+              f"Notifications={len(notifications)} "
+              f"Suggestions={len(suggestions)} "
+              f"DMs={len(dms)}"
+          )
+
+          seen_event_ids = set(
+              str(x)
+              for x in safe_list(memory.get("seen_event_ids"))
+          )
+
+          processed_posts = set(
+              str(x)
+              for x in safe_list(memory.get("processed_post_ids"))
+          )
+
+          processed_notifications = set(
+              str(x)
+              for x in safe_list(
+                  memory.get("processed_notification_ids")
               )
+          )
 
-          try:
-              feed = extract(
-                  client.get_for_you_feed(
-                      limit=MAX_FEED,
-                      kinds="posts"
-                  ),
-                  ("items", "posts", "feed")
-              )
+          processed_dms = set(
+              str(x)
+              for x in safe_list(memory.get("processed_dm_ids"))
+          )
 
-          except Exception as exc:
-              feed = []
+          cognitive_cases = safe_list(memory.get("cognitive_cases"))
 
-              remember(
-                  memory,
-                  "failures",
-                  "For-you feed could not be read.",
-                  {"error": clean(exc, 500)},
-                  "colony_feed"
-              )
+          pending_actions = unique_by_id(
+              safe_list(runtime.get("pending_actions"))
+          )
 
-          try:
-              suggestions = extract(
-                  client.get_suggestions(
-                      limit=MAX_SUGGESTIONS
-                  ),
-                  ("items", "suggestions")
-              )
+          work_requests = unique_by_id(
+              safe_list(runtime.get("work_requests"))
+          )
 
-          except Exception as exc:
-              suggestions = []
-              print(
-                  f"SUGGESTIONS unavailable: {exc}"
-              )
-
-          def item_id(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              return str(
-                  item.get("id")
-                  or item.get("post_id")
-                  or item.get("notification_id")
-                  or item.get("message_id")
-                  or ""
-              )
-
-          # IMPORTANT:
-          # For notifications, notification_id is an event ID.
-          # The actual reply target must prefer comment_id/post_id.
-          def target_id(item, source):
-              if not isinstance(item, dict):
-                  return ""
-
-              if source == "dm":
-                  return str(
-                      item.get("message_id")
-                      or item.get("id")
-                      or ""
-                  )
-
-              return str(
-                  item.get("comment_id")
-                  or item.get("post_id")
-                  or item.get("target_post_id")
-                  or item.get("parent_post_id")
-                  or item.get("id")
-                  or ""
-              )
-
-          def event_id(item, source):
-              if not isinstance(item, dict):
-                  return ""
-
-              if source == "dm":
-                  return str(
-                      item.get("message_id")
-                      or item.get("id")
-                      or ""
-                  )
-
-              if source == "notification":
-                  return str(
-                      item.get("notification_id")
-                      or item.get("id")
-                      or target_id(item, source)
-                  )
-
-              return target_id(item, source)
-
-          def title(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              return clean(
-                  item.get("title")
-                  or item.get("subject")
-                  or "",
-                  300
-              )
-
-          def body(item):
-              if not isinstance(item, dict):
-                  return clean(item, 3000)
-
-              direct = (
-                  item.get("body")
-                  or item.get("content")
-                  or item.get("message")
-                  or item.get("text")
-                  or ""
-              )
-
-              if isinstance(direct, dict):
-                  direct = (
-                      direct.get("body")
-                      or direct.get("content")
-                      or direct.get("text")
-                      or direct.get("message")
-                      or ""
-                  )
-
-              # Some notification payloads wrap the actual comment/post.
-              nested = item.get("comment") or item.get("post")
-
-              if not direct and isinstance(nested, dict):
-                  direct = (
-                      nested.get("body")
-                      or nested.get("content")
-                      or nested.get("text")
-                      or nested.get("message")
-                      or ""
-                  )
-
-              return clean(direct, 3000)
-
-          def author(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              a = item.get("author")
-
-              if isinstance(a, dict):
-                  return clean(
-                      a.get("username")
-                      or a.get("display_name"),
-                      100
-                  )
-
-              return clean(
-                  item.get("author_username")
-                  or item.get("username")
-                  or item.get("sender_username")
-                  or "",
-                  100
-              )
-
-          def classify(item, source):
-              text = (
-                  f"{title(item)}\n"
-                  f"{body(item)}"
-              )
-
-              low = text.lower()
-
-              qs = re.findall(
-                  r"[^.!?]{5,}\?",
-                  text
-              )[:4]
-
-              evidence = [
-                  x
-                  for x in (
-                      "evidence",
-                      "proof",
-                      "data",
-                      "test",
-                      "result",
-                      "verified",
-                      "research",
-                      "preuve",
-                      "données",
-                      "testé",
-                      "résultat",
-                      "vérifié"
-                  )
-                  if x in low
-              ]
-
-              conflicts = [
-                  x
-                  for x in (
-                      "however",
-                      "but",
-                      "yet",
-                      "contradiction",
-                      "failed",
-                      "wrong",
-                      "false",
-                      "pourtant",
-                      "cependant",
-                      "échec",
-                      "faux"
-                  )
-                  if x in low
-              ]
-
-              memory_hits = recall(
-                  memory,
-                  text
-              )
-
-              has_substance = (
-                  len(body(item)) >= 80
-                  or bool(qs)
-                  or bool(evidence)
-                  or bool(conflicts)
-              )
-
-              if not has_substance:
-                  return None
-
-              if conflicts:
-                  intent = "reconcile_conflict"
-              elif qs:
-                  intent = "answer_or_research_question"
-              elif evidence:
-                  intent = "verify_claim"
-              else:
-                  intent = "contextual_observation"
-
-              return {
-                  "id": stable(
-                      "case",
+          def add_observation(kind, source, subject, data=None):
+              observation = {
+                  "id": stable_id(
+                      "obs",
+                      RUN_ID,
+                      kind,
                       source,
-                      event_id(item, source),
-                      title(item),
-                      body(item)[:700]
+                      subject,
                   ),
-                  "event_id": event_id(
-                      item,
-                      source
-                  ),
+                  "timestamp": NOW_ISO,
+                  "kind": kind,
                   "source": source,
-                  "target_id": target_id(
-                      item,
-                      source
-                  ),
-                  "title": title(item),
-                  "body": body(item),
-                  "author": author(item),
-                  "recipient": clean(
-                      item.get("_conversation_username")
-                      or item.get("recipient")
-                      or "",
-                      100
-                  ) if (
-                      source == "dm"
-                      and isinstance(item, dict)
-                  ) else "",
-                  "intent": intent,
-                  "questions": qs,
-                  "evidence_signals": evidence,
-                  "conflict_signals": conflicts,
-                  "terms": terms(text),
-                  "memory_hits": memory_hits,
-                  "uncertainty": [
-                      "The available context may be incomplete."
-                  ],
-                  "created_at": (
-                      item.get("created_at")
-                      if isinstance(item, dict)
-                      else None
-                  )
+                  "subject": subject,
+                  "data": data or {},
               }
 
-          raw_cases = []
+              memory["observations"].append(observation)
+
+          def add_case(case):
+              nonlocal cognitive_cases
+
+              case_id = case["id"]
+
+              if any(
+                  str(existing.get("id")) == str(case_id)
+                  for existing in cognitive_cases
+                  if isinstance(existing, dict)
+              ):
+                  return False
+
+              cognitive_cases.append(case)
+              return True
+
+          def add_work_request(case, reason):
+              case_id = case["id"]
+
+              if any(
+                  str(item.get("request_id")) == str(case_id)
+                  for item in work_requests
+                  if isinstance(item, dict)
+              ):
+                  return False
+
+              request = {
+                  "request_id": case_id,
+                  "case_id": case_id,
+                  "created_at": NOW_ISO,
+                  "question": case.get("question", ""),
+                  "reason": reason,
+                  "status": "pending",
+                  "priority": case.get("priority", "normal"),
+              }
+
+              work_requests.append(request)
+              return True
+
+          def add_action(action):
+              action_id = action.get("action_id")
+
+              if not action_id:
+                  return False
+
+              for existing in pending_actions:
+                  if (
+                      str(existing.get("action_id"))
+                      == str(action_id)
+                  ):
+                      return False
+
+              for existing in memory["actions"]:
+                  if (
+                      isinstance(existing, dict)
+                      and str(existing.get("action_id"))
+                      == str(action_id)
+                  ):
+                      return False
+
+              pending_actions.append(action)
+
+              memory["actions"].append(
+                  {
+                      "action_id": action_id,
+                      "created_at": NOW_ISO,
+                      "type": action.get("type"),
+                      "status": "planned",
+                      "target_id": action.get("target_id"),
+                      "case_id": action.get("case_id"),
+                  }
+              )
+
+              return True
+
+          # ------------------------------------------------------------
+          # Observe feed
+          # ------------------------------------------------------------
+
+          new_feed = 0
 
           for item in feed:
-              case = classify(item, "for_you")
-              if case:
-                  raw_cases.append(case)
-
-          for item in notifications:
-              case = classify(
+              post_id = first_id(
                   item,
-                  "notification"
-              )
-              if case:
-                  raw_cases.append(case)
-
-          for item in messages:
-              case = classify(item, "dm")
-              if case:
-                  raw_cases.append(case)
-
-          for item in suggestions:
-              case = classify(
-                  item,
-                  "suggestion"
-              )
-              if case:
-                  raw_cases.append(case)
-
-          seen = set(
-              runtime.get(
-                  "seen_event_ids",
-                  []
-              )
-          )
-
-          processed = set(
-              runtime.get(
-                  "processed_post_ids",
-                  []
-              )
-          )
-
-          unique = []
-          local_seen = set()
-
-          for case in raw_cases:
-              event_key = (
-                  case["event_id"]
-                  or case["id"]
+                  "id",
+                  "post_id",
               )
 
-              if event_key in local_seen:
+              if not post_id:
                   continue
 
-              if (
-                  event_key in seen
-                  and case["source"] in (
-                      "notification",
-                      "dm"
+              if post_id in processed_posts:
+                  continue
+
+              processed_posts.add(post_id)
+              new_feed += 1
+
+              author = get_field(
+                  item,
+                  "author",
+                  "user",
+                  "creator",
+              )
+
+              author_id = first_id(
+                  author,
+                  "id",
+                  "user_id",
+              )
+
+              author_name = get_field(
+                  author,
+                  "username",
+                  "name",
+                  "handle",
+              )
+
+              title = text_of(
+                  get_field(
+                      item,
+                      "title",
                   )
-              ):
-                  continue
-
-              if (
-                  case["target_id"] in processed
-                  and case["source"] == "for_you"
-              ):
-                  continue
-
-              if case["author"] == "nox_origine":
-                  continue
-
-              local_seen.add(event_key)
-              unique.append(case)
-
-          cases = unique[:MAX_CASES]
-
-          # -----------------------------------------------------------
-          # CLOSE PREVIOUS CYCLE
-          # -----------------------------------------------------------
-
-          consumed_work = set(
-              runtime.get(
-                  "consumed_work_result_ids",
-                  []
               )
-          )
 
-          history = (
-              work.get("history", [])
-              if isinstance(work, dict)
-              else []
-          )
+              body = text_of(
+                  get_field(
+                      item,
+                      "body",
+                      "content",
+                      "text",
+                  )
+              )
 
-          for result in history:
+              content = (
+                  f"{title}\n{body}"
+                  if title
+                  else body
+              ).strip()
+
+              add_observation(
+                  "feed_post",
+                  "colony",
+                  post_id,
+                  {
+                      "author_id": author_id,
+                      "author": author_name,
+                      "content": content[:2000],
+                  },
+              )
+
+              text_lower = content.lower()
+
+              is_question = (
+                  "?" in content
+                  or any(
+                      marker in text_lower
+                      for marker in (
+                          "how do",
+                          "how can",
+                          "why ",
+                          "what is",
+                          "does ",
+                          "can an agent",
+                          "can agents",
+                      )
+                  )
+              )
+
+              is_evidence_claim = any(
+                  marker in text_lower
+                  for marker in (
+                      "i tested",
+                      "we tested",
+                      "works",
+                      "doesn't work",
+                      "failed",
+                      "succeeded",
+                      "verified",
+                      "confirmed",
+                      "according to",
+                      "documentation says",
+                  )
+              )
+
+              if is_question or is_evidence_claim:
+                  case_type = (
+                      "public_question"
+                      if is_question
+                      else "evidence_claim"
+                  )
+
+                  case_id = stable_id(
+                      "case",
+                      "post",
+                      post_id,
+                      content[:1000],
+                  )
+
+                  case = {
+                      "id": case_id,
+                      "created_at": NOW_ISO,
+                      "updated_at": NOW_ISO,
+                      "type": case_type,
+                      "source": "feed",
+                      "source_id": post_id,
+                      "target_id": post_id,
+                      "author_id": author_id,
+                      "author": author_name,
+                      "question": content[:3000],
+                      "context": {
+                          "title": title,
+                          "body": body[:3000],
+                      },
+                      "status": "needs_research",
+                      "priority": (
+                          "high"
+                          if case_type == "public_question"
+                          else "normal"
+                      ),
+                  }
+
+                  if add_case(case):
+                      add_work_request(
+                          case,
+                          "public_question_or_evidence",
+                      )
+
+          # ------------------------------------------------------------
+          # Notifications
+          # ------------------------------------------------------------
+
+          for notification in notifications:
+              notification_id = first_id(
+                  notification,
+                  "id",
+                  "notification_id",
+              )
+
+              if not notification_id:
+                  continue
+
+              if notification_id in processed_notifications:
+                  continue
+
+              processed_notifications.add(notification_id)
+
+              add_observation(
+                  "notification",
+                  "colony",
+                  notification_id,
+                  {
+                      "content": text_of(notification)[:1500],
+                  },
+              )
+
+          # ------------------------------------------------------------
+          # Direct messages
+          # ------------------------------------------------------------
+
+          for message in dms:
+              message_id = first_id(
+                  message,
+                  "id",
+                  "message_id",
+              )
+
+              if not message_id:
+                  continue
+
+              if message_id in processed_dms:
+                  continue
+
+              processed_dms.add(message_id)
+
+              sender = get_field(
+                  message,
+                  "sender",
+                  "author",
+                  "from_user",
+              )
+
+              sender_id = first_id(
+                  sender,
+                  "id",
+                  "user_id",
+              )
+
+              sender_name = get_field(
+                  sender,
+                  "username",
+                  "name",
+                  "handle",
+              )
+
+              body = text_of(
+                  get_field(
+                      message,
+                      "body",
+                      "content",
+                      "text",
+                      "message",
+                  )
+              ).strip()
+
+              add_observation(
+                  "direct_message",
+                  "colony",
+                  message_id,
+                  {
+                      "sender_id": sender_id,
+                      "sender": sender_name,
+                      "content": body[:3000],
+                  },
+              )
+
+              if not body:
+                  continue
+
+              case_id = stable_id(
+                  "case",
+                  "dm",
+                  message_id,
+              )
+
+              case = {
+                  "id": case_id,
+                  "created_at": NOW_ISO,
+                  "updated_at": NOW_ISO,
+                  "type": "dm_question",
+                  "source": "dm",
+                  "source_id": message_id,
+                  "target_id": sender_id,
+                  "author_id": sender_id,
+                  "author": sender_name,
+                  "question": body[:3000],
+                  "context": {
+                      "message_id": message_id,
+                  },
+                  "status": "needs_research",
+                  "priority": "high",
+              }
+
+              if add_case(case):
+                  add_work_request(
+                      case,
+                      "direct_message",
+                  )
+
+          # ------------------------------------------------------------
+          # Consume Work Factory results.
+          # ------------------------------------------------------------
+
+          history = safe_list(work.get("history"))
+          results = safe_list(work.get("results"))
+
+          all_research_results = history + results
+
+          research_by_request = {}
+
+          for result in all_research_results:
               if not isinstance(result, dict):
                   continue
 
-              rid = result.get("id")
+              request_id = (
+                  result.get("request_id")
+                  or result.get("case_id")
+                  or result.get("id")
+              )
 
-              if not rid or rid in consumed_work:
+              if request_id:
+                  research_by_request[str(request_id)] = result
+
+          consumed_results = 0
+
+          for case in cognitive_cases:
+              if not isinstance(case, dict):
                   continue
 
-              request_id = result.get(
-                  "request_id"
+              case_id = str(case.get("id", ""))
+
+              if not case_id:
+                  continue
+
+              result = research_by_request.get(case_id)
+
+              if not result:
+                  continue
+
+              evidence_status = result.get(
+                  "evidence_status",
+                  "unknown",
               )
 
-              matched = None
-
-              for case in memory.get(
-                  "cognitive_cases",
-                  []
+              if evidence_status not in (
+                  "multi_source_support",
+                  "partial_support",
+                  "insufficient_verification",
+                  "no_evidence",
               ):
-                  if (
-                      isinstance(case, dict)
-                      and case.get("case_id")
-                      == request_id
-                  ):
-                      matched = case
-                      break
+                  continue
 
-              if matched:
-                  matched["research_result"] = result
-                  matched["outcome"] = (
-                      "research_returned"
-                  )
-                  matched["learning"] = None
+              case["research"] = {
+                  "consumed_at": NOW_ISO,
+                  "evidence_status": evidence_status,
+                  "facts": safe_list(result.get("facts")),
+                  "sources": safe_list(result.get("sources")),
+                  "uncertainties": safe_list(
+                      result.get("uncertainties")
+                  ),
+                  "conflicts": safe_list(
+                      result.get("conflicts")
+                  ),
+                  "conclusion": text_of(
+                      result.get("conclusion")
+                  )[:5000],
+              }
 
-              else:
-                  add(
-                      memory,
-                      "results",
-                      {
-                          "timestamp": NOW,
-                          "type": "research_result",
-                          "request_id": request_id,
-                          "result_id": rid,
-                          "evidence_status": result.get(
-                              "evidence_status"
-                          ),
-                          "conclusion": result.get(
-                              "conclusion"
-                          ),
-                          "sources": (
-                              result.get("sources", [])
-                          )[:8]
-                      }
-                  )
+              case["updated_at"] = NOW_ISO
+              case["status"] = "research_complete"
 
-              consumed_work.add(rid)
+              consumed_results += 1
 
-          runtime[
-              "consumed_work_result_ids"
-          ] = list(consumed_work)[-500:]
+          # ------------------------------------------------------------
+          # Consume Presence outcomes.
+          # ------------------------------------------------------------
 
-          consumed_presence = set(
-              runtime.get(
-                  "consumed_presence_outcome_ids",
-                  []
-              )
-          )
+          outcomes = safe_list(presence.get("outcomes"))
+          consumed_outcomes = 0
 
-          outcomes = (
-              presence.get("outcomes", [])
-              if isinstance(presence, dict)
-              else []
-          )
+          outcome_by_action = {}
 
           for outcome in outcomes:
               if not isinstance(outcome, dict):
                   continue
 
-              oid = outcome.get("id")
+              action_id = outcome.get("action_id")
 
-              if not oid or oid in consumed_presence:
+              if action_id:
+                  outcome_by_action[str(action_id)] = outcome
+
+          remaining_actions = []
+
+          for action in pending_actions:
+              if not isinstance(action, dict):
                   continue
 
-              for case in memory.get(
-                  "cognitive_cases",
-                  []
-              ):
-                  if (
-                      isinstance(case, dict)
-                      and case.get("case_id")
-                      == outcome.get("case_id")
-                  ):
-                      case["outcome"] = (
-                          outcome.get("status")
-                      )
-
-                      case["outcome_detail"] = outcome
-
-                      if outcome.get(
-                          "status"
-                      ) == "executed":
-
-                          add(
-                              memory,
-                              "results",
-                              {
-                                  "timestamp": NOW,
-                                  "type": "public_action",
-                                  "case_id": case.get(
-                                      "case_id"
-                                  ),
-                                  "action_id": outcome.get(
-                                      "action_id"
-                                  ),
-                                  "target_id": outcome.get(
-                                      "target_id"
-                                  ),
-                                  "status": "executed"
-                              }
-                          )
-
-                          remember(
-                              memory,
-                              "learnings",
-                              "A planned public action executed successfully.",
-                              {
-                                  "case_id": case.get(
-                                      "case_id"
-                                  ),
-                                  "action_id": outcome.get(
-                                      "action_id"
-                                  ),
-                                  "target_id": outcome.get(
-                                      "target_id"
-                                  )
-                              },
-                              "presence_outcome"
-                          )
-
-                      elif outcome.get(
-                          "status"
-                      ) in (
-                          "error",
-                          "skipped"
-                      ):
-
-                          add(
-                              memory,
-                              "failures",
-                              {
-                                  "timestamp": NOW,
-                                  "summary": (
-                                      "A planned presence "
-                                      "action did not execute."
-                                  ),
-                                  "evidence": outcome
-                              },
-                              MAX_MEMORY
-                          )
-
-                      break
-
-              consumed_presence.add(oid)
-
-          runtime[
-              "consumed_presence_outcome_ids"
-          ] = list(consumed_presence)[-500:]
-
-          # Remove actions that Presence already resolved.
-          resolved_action_ids = {
-              o.get("action_id")
-              for o in outcomes
-              if (
-                  isinstance(o, dict)
-                  and o.get("status") in (
-                      "executed",
-                      "error",
-                      "skipped"
-                  )
-              )
-          }
-
-          pending = []
-
-          for action in runtime.get(
-              "pending_actions",
-              []
-          ):
-              if (
-                  isinstance(action, dict)
-                  and action.get("action_id")
-                  not in resolved_action_ids
-              ):
-                  pending.append(action)
-
-          runtime["pending_actions"] = (
-              pending[-MAX_PENDING:]
-          )
-
-          # -----------------------------------------------------------
-          # DECISION HELPERS
-          # -----------------------------------------------------------
-
-          def find_case_record(case_id):
-              for record in reversed(
-                  memory.get(
-                      "cognitive_cases",
-                      []
-                  )
-              ):
-                  if (
-                      isinstance(record, dict)
-                      and record.get("case_id")
-                      == case_id
-                  ):
-                      return record
-
-              return None
-
-          def valid_research_result(result):
-              if not isinstance(result, dict):
-                  return False
-
-              conclusion = clean(
-                  result.get("conclusion"),
-                  1800
-              )
-
-              status = result.get(
-                  "evidence_status"
-              )
-
-              sources = [
-                  x
-                  for x in (
-                      result.get("sources")
-                      or []
-                  )
-                  if (
-                      isinstance(x, dict)
-                      and (
-                          x.get("url")
-                          or x.get("title")
-                      )
-                  )
-              ]
-
-              if len(conclusion) < 80:
-                  return False
-
-              if status not in (
-                  "multi_source_support",
-                  "partial_support"
-              ):
-                  return False
-
-              return bool(sources)
-
-          def build_research_reply(case, result):
-              conclusion = clean(
-                  result.get("conclusion"),
-                  1800
-              )
-
-              status = clean(
-                  result.get(
-                      "evidence_status"
-                  ),
-                  100
-              )
-
-              sources = [
-                  x
-                  for x in (
-                      result.get("sources")
-                      or []
-                  )
-                  if (
-                      isinstance(x, dict)
-                      and (
-                          x.get("url")
-                          or x.get("title")
-                      )
-                  )
-              ]
-
-              source_lines = []
-
-              for source in sources[:3]:
-                  label = clean(
-                      source.get("title")
-                      or source.get("url"),
-                      180
-                  )
-
-                  url = clean(
-                      source.get("url"),
-                      500
-                  )
-
-                  if label and url:
-                      source_lines.append(
-                          f"- {label}: {url}"
-                      )
-                  elif label:
-                      source_lines.append(
-                          f"- {label}"
-                      )
-
-              prefix = ""
-
-              if case.get("source") == "dm":
-                  prefix = (
-                      "I checked the question against "
-                      "the available research.\n\n"
-                  )
-
-              else:
-                  prefix = (
-                      "I checked this against the "
-                      "available evidence.\n\n"
-                  )
-
-              text = (
-                  prefix
-                  + conclusion
-                  + f"\n\nEvidence status: {status}."
-              )
-
-              if source_lines:
-                  text += (
-                      "\n\nSources:\n"
-                      + "\n".join(source_lines)
-                  )
-
-              text += (
-                  "\n\nThis conclusion is bounded by "
-                  "the evidence currently available."
-              )
-
-              return clean(text, 3500)
-
-          def build_contextual_reply(case):
-              hits = case.get(
-                  "memory_hits",
-                  []
-              )
-
-              if not hits:
-                  return None
-
-              useful = []
-
-              for hit in hits[:2]:
-                  item = hit.get("item")
-
-                  if not isinstance(item, dict):
-                      continue
-
-                  summary = clean(
-                      item.get("summary"),
-                      700
-                  )
-
-                  if summary:
-                      useful.append(summary)
-
-              if not useful:
-                  return None
-
-              return (
-                  "I have a relevant prior observation "
-                  "on this point:\n\n"
-                  + "\n".join(
-                      f"- {x}"
-                      for x in useful
-                  )
-                  + "\n\n"
-                  "I am treating this as contextual evidence, "
-                  "not as a universal conclusion."
-              )
-
-          def queue_action(action):
-              action_id = action.get(
-                  "action_id"
-              )
+              action_id = action.get("action_id")
 
               if not action_id:
-                  return False
+                  continue
 
-              for existing in runtime.get(
-                  "pending_actions",
-                  []
-              ):
+              outcome = outcome_by_action.get(str(action_id))
+
+              if outcome is None:
+                  remaining_actions.append(action)
+                  continue
+
+              consumed_outcomes += 1
+
+              status = outcome.get("status", "unknown")
+
+              for memory_action in memory["actions"]:
                   if (
-                      isinstance(existing, dict)
-                      and existing.get("action_id")
-                      == action_id
+                      isinstance(memory_action, dict)
+                      and str(memory_action.get("action_id"))
+                      == str(action_id)
                   ):
-                      return False
+                      memory_action["status"] = status
+                      memory_action["outcome"] = outcome
+                      memory_action["completed_at"] = NOW_ISO
 
-              runtime[
-                  "pending_actions"
-              ].append(action)
+              case_id = action.get("case_id")
 
-              remember(
-                  memory,
-                  "actions
+              if case_id:
+                  for case in cognitive_cases:
+                      if (
+                          isinstance(case, dict)
+                          and str(case.get("id"))
+                          == str(case_id)
+                      ):
+                          case["last_outcome"] = outcome
+                          case["updated_at"] = NOW_ISO
+
+                          if status == "success":
+                              case["status"] = "completed"
+                          else:
+                              case["status"] = "action_failed"
+
+              if status == "success":
+                  memory["experiences"].append(
+                      {
+                          "id": stable_id(
+                              "exp",
+                              action_id,
+                              outcome.get("timestamp"),
+                          ),
+                          "timestamp": NOW_ISO,
+                          "action_id": action_id,
+                          "case_id": action.get("case_id"),
+                          "type": "action_outcome",
+                          "status": "success",
+                          "observation": outcome,
+                      }
+                  )
+
+          pending_actions = remaining_actions
+
+          # ------------------------------------------------------------
+          # Decide actions from completed research.
+          # ------------------------------------------------------------
+
+          published_this_run = 0
+
+          for case in cognitive_cases:
+              if not isinstance(case, dict):
+                  continue
+
+              if case.get("status") != "research_complete":
+                  continue
+
+              research = safe_dict(case.get("research"))
+
+              conclusion = text_of(
+                  research.get("conclusion")
+              ).strip()
+
+              evidence_status = research.get(
+                  "evidence_status",
+                  "unknown",
+              )
+
+              if not conclusion:
+                  continue
+
+              case_type = case.get("type")
+              target_id = case.get("target_id")
+              case_id = case.get("id")
+
+              # A weak result is retained as learning/research state,
+              # but must not automatically become a public claim.
+              if evidence_status in (
+                  "insufficient_verification",
+                  "no_evidence",
+              ):
+                  case["status"] = "uncertain"
+
+                  memory["questions"].append(
+                      {
+                          "id": stable_id(
+                              "question",
+                              case_id,
+                              conclusion,
+                          ),
+                          "timestamp": NOW_ISO,
+                          "case_id": case_id,
+                          "question": case.get("question", ""),
+                          "reason": "insufficient_verification",
+                      }
+                  )
+
+                  continue
+
+              if case_type == "dm_question":
+                  action_id = stable_id(
+                      "action",
+                      "dm_reply",
+                      case_id,
+                      conclusion,
+                  )
+
+                  action = {
+                      "action_id": action_id,
+                      "case_id": case_id,
+                      "type": "dm_reply",
+                      "created_at": NOW_ISO,
+                      "target_id": case.get("author_id"),
+                      "message_id": case.get("source_id"),
+                      "question": case.get("question", ""),
+                      "research": research,
+                      "reply_text": conclusion[:4000],
+                      "status": "pending",
+                  }
+
+                  if add_action(action):
+                      case["status"] = "action_planned"
+
+                  continue
+
+              if case_type in (
+                  "public_question",
+                  "evidence_claim",
+              ):
+                  if not target_id:
+                      case["status"] = "missing_target"
+                      continue
+
+                  action_id = stable_id(
+                      "action",
+                      "reply",
+                      case_id,
+                      conclusion,
+                  )
+
+                  action = {
+                      "action_id": action_id,
+                      "case_id": case_id,
+                      "type": "reply",
+                      "created_at": NOW_ISO,
+                      "target_id": target_id,
+                      "post_id": target_id,
+                      "question": case.get("question", ""),
+                      "research": research,
+                      "reply_text": conclusion[:4000],
+                      "status": "pending",
+                  }
+
+                  if add_action(action):
+                      case["status"] = "action_planned"
+
+                  continue
+
+          # ------------------------------------------------------------
+          # Publish only when there is a substantive research-backed
+          # conclusion that is not simply a reply to an existing post.
+          # ------------------------------------------------------------
+
+          suitable_learnings = []
+
+          for learning in safe_list(memory.get("learnings")):
+              if not isinstance(learning, dict):
+                  continue
+
+              text = text_of(
+                  learning.get("text")
+                  or learning.get("learning")
+                  or learning.get("conclusion")
+              ).strip()
+
+              if len(text) >= 80:
+                  suitable_learnings.append(
+                      {
+                          "text": text,
+                          "source": learning,
+                      }
+                  )
+
+          if published_this_run < MAX_PUBLISH_ACTIONS:
+              for case in cognitive_cases:
+                  if not isinstance(case, dict):
+                      continue
+
+                  if case.get("status") != "research_complete":
+                      continue
+
+                  if case.get("type") not in (
+                      "evidence_claim",
+                  ):
+                      continue
+
+                  research = safe_dict(
+                      case.get("research")
+                  )
+
+                  if research.get("evidence_status") != (
+                      "multi_source_support"
+                  ):
+                      continue
+
+                  conclusion = text_of(
+                      research.get("conclusion")
+                  ).strip()
+
+                  if len(conclusion) < 100:
+                      continue
+
+                  action_id = stable_id(
+                      "action",
+                      "publish",
+                      case.get("id"),
+                      conclusion,
+                  )
+
+                  action = {
+                      "action_id": action_id,
+                      "case_id": case.get("id"),
+                      "type": "publish",
+                      "created_at": NOW_ISO,
+                      "question": case.get("question", ""),
+                      "research": research,
+                      "title": "NØX research result",
+                      "body": conclusion[:5000],
+                      "status": "pending",
+                  }
+
+                  if add_action(action):
+                      published_this_run += 1
+                      case["status"] = "action_planned"
+
+                  if published_this_run >= MAX_PUBLISH_ACTIONS:
+                      break
+
+          # ------------------------------------------------------------
+          # Keep runtime bounded and deterministic.
+          # ------------------------------------------------------------
+
+          cognitive_cases = unique_by_id(cognitive_cases)
+          cognitive_cases = cognitive_cases[-MAX_COGNITIVE_CASES:]
+
+          work_requests = unique_by_id(work_requests)
+          work_requests = work_requests[-MAX_WORK_REQUESTS:]
+
+          pending_actions = unique_by_id(pending_actions)
+          pending_actions = pending_actions[-MAX_PENDING_ACTIONS:]
+
+          memory["observations"] = trim_list(
+              memory["observations"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["reported_information"] = trim_list(
+              memory["reported_information"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["facts"] = trim_list(
+              memory["facts"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["experiences"] = trim_list(
+              memory["experiences"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["hypotheses"] = trim_list(
+              memory["hypotheses"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["questions"] = trim_list(
+              memory["questions"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["tests"] = trim_list(
+              memory["tests"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["results"] = trim_list(
+              memory["results"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["learnings"] = trim_list(
+              memory["learnings"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["actions"] = trim_list(
+              memory["actions"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["web_queries"] = trim_list(
+              memory["web_queries"],
+              MAX_MEMORY_ITEMS,
+          )
+
+          memory["seen_event_ids"] = list(
+              dict.fromkeys(
+                  list(seen_event_ids)
+                  + list(processed_posts)
+                  + list(processed_notifications)
+                  + list(processed_dms)
+              )
+          )[-MAX_MEMORY_ITEMS:]
+
+          memory["processed_post_ids"] = list(
+              processed_posts
+          )[-MAX_MEMORY_ITEMS:]
+
+          memory["processed_notification_ids"] = list(
+              processed_notifications
+          )[-MAX_MEMORY_ITEMS:]
+
+          memory["processed_dm_ids"] = list(
+              processed_dms
+          )[-MAX_MEMORY_ITEMS:]
+
+          memory["cognitive_cases"] = cognitive_cases
+
+          runtime["pending_actions"] = pending_actions
+          runtime["work_requests"] = work_requests
+
+          runtime["last_run"] = NOW_ISO
+          runtime["run_id"] = RUN_ID
+
+          runtime["stats"] = {
+              "feed_items": len(feed),
+              "new_feed_items": new_feed,
+              "notifications": len(notifications),
+              "suggestions": len(suggestions),
+              "dms": len(dms),
+              "cognitive_cases": len(cognitive_cases),
+              "pending_actions": len(pending_actions),
+              "work_requests": len(work_requests),
+              "research_results_consumed": consumed_results,
+              "presence_outcomes_consumed": consumed_outcomes,
+          }
+
+          # Keep a compact run record in memory.
+          memory.setdefault("runs", [])
+
+          memory["runs"].append(
+              {
+                  "run_id": RUN_ID,
+                  "timestamp": NOW_ISO,
+                  "stats": runtime["stats"],
+              }
+          )
+
+          memory["runs"] = trim_list(
+              memory["runs"],
+              100,
+          )
+
+          # ------------------------------------------------------------
+          # Validate before writing.
+          # ------------------------------------------------------------
+
+          json.dumps(memory, ensure_ascii=False)
+          json.dumps(runtime, ensure_ascii=False)
+          json.dumps(work, ensure_ascii=False)
+
+          atomic_write_json(MEMORY_FILE, memory)
+          atomic_write_json(RUNTIME_FILE, runtime)
+          atomic_write_json(WORK_FILE, work)
+
+          print("")
+          print("=== NØX CORE RESULT ===")
+          print(f"Run: {RUN_ID}")
+          print(f"Feed: {len(feed)}")
+          print(f"Notifications: {len(notifications)}")
+          print(f"DMs: {len(dms)}")
+          print(f"Cases: {len(cognitive_cases)}")
+          print(f"New work: {len(work_requests)}")
+          print(f"Pending actions: {len(pending_actions)}")
+          print(f"Research results consumed: {consumed_results}")
+          print(f"Presence outcomes consumed: {consumed_outcomes}")
+          print("========================")
+
+          PY
+
+      - name: Validate state files
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          files = [
+              "memory/nox_core_memory.json",
+              "memory/nox_core_runtime.json",
+              "memory/nox_work_factory.json",
+          ]
+
+          for path in files:
+              with open(path, "r", encoding="utf-8") as f:
+                  json.load(f)
+              print(f"[OK] {path}")
+
+          PY
+
+      - name: Check diff
+        run: |
+          set -euo pipefail
+          git diff --check
+
+      - name: Commit and push state
+        run: |
+          set -euo pipefail
+
+          git config user.name "NØX"
+          git config user.email "nox-origin@users.noreply.github.com"
+
+          git add \
+            memory/nox_core_memory.json \
+            memory/nox_core_runtime.json \
+            memory/nox_work_factory.json
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(nox): update core state"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "State pushed successfully."
+              exit 0
+            fi
+
+            echo "Push attempt ${attempt} failed; retrying..."
+            sleep 3
+          done
+
+          echo "Unable to push state after 3 attempts."
+          exit 1
