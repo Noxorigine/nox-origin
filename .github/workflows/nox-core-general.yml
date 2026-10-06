@@ -17,20 +17,14 @@ env:
   RUNTIME_FILE: memory/nox_core_runtime.json
   WORK_FILE: memory/nox_work_factory.json
   PRESENCE_FILE: memory/nox_colony_presence.json
-  LEGACY_MEMORY_FILE: memory/nox_colony_state.json
+  LEGACY_MEMORY_FILE: memory/nox_memory.json
 
-  MAX_FEED_ITEMS: "12"
+  MAX_FEED_ITEMS: "20"
   MAX_NOTIFICATIONS: "20"
-  MAX_DMS: "10"
-  MAX_SUGGESTIONS: "10"
-  MAX_CASES_PER_RUN: "12"
-  MAX_MEMORY_ITEMS: "300"
-  MAX_COGNITIVE_CASES: "150"
-  MAX_PENDING_ACTIONS: "20"
-  MAX_WORK_REQUESTS: "20"
-  MAX_PUBLISH_ACTIONS: "3"
-
-  ENABLE_LIGHTNING_CHECK: "true"
+  MAX_CASES: "100"
+  MAX_ACTIONS: "100"
+  MAX_WORK_REQUESTS: "50"
+  MAX_HISTORY: "150"
 
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
@@ -40,72 +34,68 @@ env:
 
 jobs:
   core:
+    name: core
     runs-on: ubuntu-latest
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Configure Git
+        run: |
+          git config user.name "NØX"
+          git config user.email "nox@noreply.github.com"
 
-      - name: Install Colony SDK
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install "colony-sdk>=1.37.0,<2.0.0"
 
       - name: Run NØX Core
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import hashlib
           import json
           import os
+          import re
+          import sys
+          import time
           from datetime import datetime, timezone
+          from pathlib import Path
 
-          from colony_sdk import ColonyClient
-
-          MEMORY_FILE = os.environ["MEMORY_FILE"]
-          RUNTIME_FILE = os.environ["RUNTIME_FILE"]
-          WORK_FILE = os.environ["WORK_FILE"]
-
-          MAX_FEED = int(os.environ["MAX_FEED_ITEMS"])
-          MAX_NOTIFICATIONS = int(os.environ["MAX_NOTIFICATIONS"])
-          MAX_DMS = int(os.environ["MAX_DMS"])
-          MAX_CASES = int(os.environ["MAX_CASES_PER_RUN"])
-          MAX_MEMORY = int(os.environ["MAX_MEMORY_ITEMS"])
-          MAX_CASE_HISTORY = int(os.environ["MAX_COGNITIVE_CASES"])
-          MAX_ACTIONS = int(os.environ["MAX_PENDING_ACTIONS"])
-          MAX_WORK = int(os.environ["MAX_WORK_REQUESTS"])
-          MAX_PUBLISH = int(os.environ["MAX_PUBLISH_ACTIONS"])
+          print("=== NØX CORE ===")
 
           now = datetime.now(timezone.utc)
-          now_iso = now.isoformat()
           run_id = "core-" + now.strftime("%Y%m%dT%H%M%SZ")
+          print("RUN:", run_id)
+
+          MEMORY_FILE = Path(os.environ["MEMORY_FILE"])
+          RUNTIME_FILE = Path(os.environ["RUNTIME_FILE"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
+          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
 
           def load(path, default):
-              if not os.path.exists(path):
+              if not path.exists():
                   return default
               try:
-                  with open(path, "r", encoding="utf-8") as f:
+                  with path.open("r", encoding="utf-8") as f:
                       return json.load(f)
               except Exception as exc:
-                  print("[WARN] read", path, exc)
+                  print(f"WARNING: cannot load {path}: {exc}")
                   return default
 
-          def save(path, data):
-              tmp = path + ".tmp"
-              with open(tmp, "w", encoding="utf-8") as f:
-                  json.dump(data, f, ensure_ascii=False, indent=2)
+          def save(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              with tmp.open("w", encoding="utf-8") as f:
+                  json.dump(value, f, ensure_ascii=False, indent=2)
                   f.write("\n")
-              os.replace(tmp, path)
+              tmp.replace(path)
 
           def as_dict(value):
               return value if isinstance(value, dict) else {}
@@ -113,1063 +103,770 @@ jobs:
           def as_list(value):
               return value if isinstance(value, list) else []
 
-          def get(obj, *names):
-              if isinstance(obj, dict):
-                  for name in names:
-                      if obj.get(name) is not None:
-                          return obj.get(name)
-              else:
-                  for name in names:
-                      value = getattr(obj, name, None)
-                      if value is not None:
-                          return value
-              return None
+          def get(obj, key, default=None):
+              return obj.get(key, default) if isinstance(obj, dict) else default
 
           def text(value):
               if value is None:
                   return ""
               if isinstance(value, str):
-                  return value
+                  return value.strip()
               if isinstance(value, dict):
-                  for key in ("body", "content", "text", "message"):
-                      if value.get(key):
-                          return str(value[key])
-              return str(value)
+                  for key in ("content", "body", "text", "message", "title"):
+                      if key in value and value[key]:
+                          return text(value[key])
+              return str(value).strip()
 
-          def ident(obj, *names):
-              value = get(obj, *names)
-              if value is None:
-                  return None
-              return str(value)
+          def ident(obj):
+              if not isinstance(obj, dict):
+                  return ""
+              for key in (
+                  "id",
+                  "post_id",
+                  "comment_id",
+                  "message_id",
+                  "conversation_id",
+                  "username",
+                  "slug",
+              ):
+                  value = obj.get(key)
+                  if value is not None and str(value).strip():
+                      return str(value)
+              return ""
 
-          def make_id(prefix, *parts):
-              raw = "|".join("" if x is None else str(x) for x in parts)
-              digest = hashlib.sha256(raw.encode()).hexdigest()[:20]
-              return prefix + "-" + digest
+          def make_id(prefix, *values):
+              raw = "|".join(str(v or "") for v in values)
+              safe = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw)
+              return f"{prefix}:{safe[:180]}"
 
           def items(value):
+              if value is None:
+                  return []
               if isinstance(value, list):
                   return value
+              if isinstance(value, tuple):
+                  return list(value)
               if isinstance(value, dict):
-                  for key in (
-                      "items",
-                      "data",
-                      "results",
-                      "posts",
-                      "messages",
-                      "notifications",
-                      "suggestions",
-                      "feed",
-                  ):
+                  for key in ("items", "data", "results", "posts", "notifications"):
                       if isinstance(value.get(key), list):
                           return value[key]
-              return []
+              try:
+                  return list(value)
+              except Exception:
+                  return []
 
           memory = as_dict(load(MEMORY_FILE, {}))
           runtime = as_dict(load(RUNTIME_FILE, {}))
           work = as_dict(load(WORK_FILE, {}))
+          presence = as_dict(load(PRESENCE_FILE, {}))
 
-          for key in (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "questions",
-              "tests",
-              "results",
-              "learnings",
-              "actions",
-              "web_queries",
-              "cognitive_cases",
-              "seen_event_ids",
-              "processed_post_ids",
-              "processed_notification_ids",
-              "processed_dm_ids",
-              "runs",
-          ):
-              memory.setdefault(key, [])
+          memory.setdefault("observations", [])
+          memory.setdefault("facts", [])
+          memory.setdefault("experiences", [])
+          memory.setdefault("hypotheses", [])
+          memory.setdefault("questions", [])
+          memory.setdefault("results", [])
+          memory.setdefault("learnings", [])
+          memory.setdefault("sources", [])
+          memory.setdefault("actions", [])
+          memory.setdefault("cognitive_cases", [])
 
+          runtime.setdefault("run_count", 0)
+          runtime.setdefault("observations", [])
+          runtime.setdefault("decisions", [])
           runtime.setdefault("pending_actions", [])
           runtime.setdefault("work_requests", [])
+          runtime.setdefault("processed_ids", [])
           runtime.setdefault("web_queries", [])
+          runtime.setdefault("last_run", None)
 
           work.setdefault("pending", [])
           work.setdefault("history", [])
           work.setdefault("results", [])
 
-          memory["run_count"] = int(memory.get("run_count", 0)) + 1
+          presence.setdefault("outcomes", [])
+
           runtime["run_count"] = int(runtime.get("run_count", 0)) + 1
-          work["run_count"] = int(work.get("run_count", 0)) + 1
+          runtime["last_run"] = now.isoformat()
 
-          print("=== NØX CORE ===")
-          print("RUN:", run_id)
+          api_key = os.environ.get("COLONY_API_KEY", "").strip()
 
-          client = ColonyClient()
+          if not api_key:
+              raise RuntimeError(
+                  "COLONY_API_KEY is missing. Add the GitHub Actions secret COLONY_API_KEY."
+              )
 
-          try:
-              bootstrap = getattr(client, "bootstrap", None)
-              if bootstrap:
+          from colony import ColonyClient
+
+          # Colony SDK requires the API key as a positional constructor argument.
+          client = ColonyClient(api_key)
+
+          print("ColonyClient initialized")
+
+          # ------------------------------------------------------------
+          # Helpers for SDK calls
+          # ------------------------------------------------------------
+
+          def call(method_name, *args, **kwargs):
+              method = getattr(client, method_name, None)
+              if method is None:
+                  print(f"WARNING: SDK method unavailable: {method_name}")
+                  return None
+              try:
+                  return method(*args, **kwargs)
+              except TypeError:
+                  try:
+                      return method(*args)
+                  except Exception as exc:
+                      print(f"WARNING: {method_name} failed: {exc}")
+                      return None
+              except Exception as exc:
+                  print(f"WARNING: {method_name} failed: {exc}")
+                  return None
+
+          # ------------------------------------------------------------
+          # Bootstrap
+          # ------------------------------------------------------------
+
+          bootstrap = getattr(client, "bootstrap", None)
+
+          if callable(bootstrap):
+              try:
                   bootstrap()
                   print("Bootstrap: OK")
-          except Exception as exc:
-              print("Bootstrap warning:", exc)
+              except Exception as exc:
+                  print("WARNING: bootstrap failed:", exc)
 
-          feed = []
-          notifications = []
-          dms = []
+          # ------------------------------------------------------------
+          # Collections
+          # ------------------------------------------------------------
 
-          try:
-              method = getattr(client, "get_for_you_feed", None)
-              if method:
-                  try:
-                      feed = items(method(max_results=MAX_FEED))
-                  except TypeError:
-                      feed = items(method())
-                  feed = feed[:MAX_FEED]
-          except Exception as exc:
-              print("Feed warning:", exc)
+          observations = []
+          cognitive_cases = []
+          new_work = []
+          new_actions = []
 
-          try:
-              method = getattr(client, "get_notifications", None)
-              if method:
-                  try:
-                      notifications = items(
-                          method(max_results=MAX_NOTIFICATIONS)
-                      )
-                  except TypeError:
-                      notifications = items(method())
-                  notifications = notifications[:MAX_NOTIFICATIONS]
-          except Exception as exc:
-              print("Notifications warning:", exc)
-
-          try:
-              iterator = getattr(client, "iter_conversations", None)
-              getter = getattr(client, "get_conversation", None)
-
-              if iterator and getter:
-                  conversations = list(iterator(max_results=50))
-
-                  for conversation in conversations:
-                      conversation_id = ident(
-                          conversation,
-                          "id",
-                          "conversation_id",
-                      )
-
-                      if not conversation_id:
-                          continue
-
-                      try:
-                          detail = getter(conversation_id)
-                          messages = items(detail)
-                          dms.extend(messages)
-                      except Exception as exc:
-                          print(
-                              "Conversation warning:",
-                              conversation_id,
-                              exc,
-                          )
-
-                      if len(dms) >= MAX_DMS:
-                          break
-
-                  dms = dms[:MAX_DMS]
-
-          except Exception as exc:
-              print("DM warning:", exc)
-
-          print("Feed:", len(feed))
-          print("Notifications:", len(notifications))
-          print("DMs:", len(dms))
-
-          processed_posts = set(
+          processed_ids = set(
               str(x)
-              for x in as_list(memory["processed_post_ids"])
+              for x in as_list(runtime.get("processed_ids"))
+              if x is not None
           )
 
-          processed_notifications = set(
-              str(x)
-              for x in as_list(
-                  memory["processed_notification_ids"]
-              )
+          pending_action_ids = set(
+              str(get(x, "action_id", ""))
+              for x in as_list(runtime.get("pending_actions"))
+              if get(x, "action_id")
           )
 
-          processed_dms = set(
-              str(x)
-              for x in as_list(memory["processed_dm_ids"])
-          )
+          def add_observation(kind, source, value, **extra):
+              obs = {
+                  "id": make_id("obs", run_id, kind, source),
+                  "timestamp": now.isoformat(),
+                  "type": kind,
+                  "source": source,
+                  "value": value,
+              }
+              obs.update(extra)
+              observations.append(obs)
+              memory["observations"].append(obs)
+              return obs
 
-          cases = as_list(memory["cognitive_cases"])
-          pending_actions = as_list(runtime["pending_actions"])
-          work_requests = as_list(runtime["work_requests"])
+          def add_case(case_type, source, target_id="", question="", **extra):
+              case = {
+                  "id": make_id("case", run_id, case_type, target_id, question),
+                  "timestamp": now.isoformat(),
+                  "type": case_type,
+                  "source": source,
+                  "target_id": target_id,
+                  "question": question,
+                  "status": "open",
+              }
+              case.update(extra)
+              cognitive_cases.append(case)
+              memory["cognitive_cases"].append(case)
+              return case
 
-          case_ids = set()
-          for case in cases:
-              if isinstance(case, dict) and case.get("id"):
-                  case_ids.add(str(case["id"]))
+          def add_work(case, query, reason):
+              work_id = make_id("work", case.get("id"), query)
 
-          action_ids = set()
-          for action in pending_actions:
-              if isinstance(action, dict) and action.get("action_id"):
-                  action_ids.add(str(action["action_id"]))
+              existing = set()
+              for entry in as_list(runtime.get("work_requests")):
+                  if isinstance(entry, dict):
+                      existing.add(str(entry.get("work_id", "")))
 
-          memory_action_ids = set()
-          for action in as_list(memory["actions"]):
-              if isinstance(action, dict) and action.get("action_id"):
-                  memory_action_ids.add(str(action["action_id"]))
+              for entry in as_list(work.get("pending")):
+                  if isinstance(entry, dict):
+                      existing.add(str(entry.get("work_id", "")))
 
-          work_ids = set()
-          for request in work_requests:
-              if isinstance(request, dict) and request.get("request_id"):
-                  work_ids.add(str(request["request_id"]))
+              for entry in as_list(work.get("history")):
+                  if isinstance(entry, dict):
+                      existing.add(str(entry.get("work_id", "")))
 
-          def observe(kind, source_id, data):
-              memory["observations"].append(
-                  {
-                      "id": make_id(
-                          "obs",
-                          run_id,
-                          kind,
-                          source_id,
-                      ),
-                      "timestamp": now_iso,
-                      "kind": kind,
-                      "source_id": source_id,
-                      "data": data,
-                  }
+              if work_id in existing:
+                  return None
+
+              request = {
+                  "work_id": work_id,
+                  "case_id": case.get("id"),
+                  "created_at": now.isoformat(),
+                  "status": "pending",
+                  "question": query,
+                  "reason": reason,
+                  "source": "core",
+              }
+
+              runtime["work_requests"].append(request)
+              work["pending"].append(request)
+              new_work.append(request)
+              return request
+
+          def add_action(action_type, target_id="", body="", recipient="",
+                         source_case="", metadata=None):
+              action_id = make_id(
+                  "action",
+                  action_type,
+                  target_id,
+                  recipient,
+                  body[:120],
               )
 
-          def add_case(case):
-              case_id = str(case["id"])
+              if action_id in pending_action_ids:
+                  return None
 
-              if case_id in case_ids:
-                  return False
+              action = {
+                  "action_id": action_id,
+                  "created_at": now.isoformat(),
+                  "status": "pending",
+                  "type": action_type,
+                  "target_id": target_id,
+                  "body": body,
+                  "recipient": recipient,
+                  "source_case": source_case,
+                  "attempts": 0,
+              }
 
-              cases.append(case)
-              case_ids.add(case_id)
-              return True
+              if isinstance(metadata, dict):
+                  action["metadata"] = metadata
 
-          def add_work(case, reason):
-              request_id = str(case["id"])
+              runtime["pending_actions"].append(action)
+              memory["actions"].append(action)
+              new_actions.append(action)
+              pending_action_ids.add(action_id)
 
-              if request_id in work_ids:
-                  return False
+              return action
 
-              work_requests.append(
-                  {
-                      "request_id": request_id,
-                      "case_id": request_id,
-                      "created_at": now_iso,
-                      "question": case.get("question", ""),
-                      "reason": reason,
-                      "status": "pending",
-                      "priority": case.get("priority", "normal"),
-                  }
-              )
+          # ------------------------------------------------------------
+          # Feed
+          # ------------------------------------------------------------
 
-              work_ids.add(request_id)
-              return True
+          feed = call("get_for_you_feed")
 
-          def add_action(action):
-              action_id = str(action["action_id"])
+          feed_items = items(feed)[: int(os.environ["MAX_FEED_ITEMS"])]
 
-              if action_id in action_ids:
-                  return False
+          print("Feed:", len(feed_items))
 
-              if action_id in memory_action_ids:
-                  return False
-
-              pending_actions.append(action)
-              action_ids.add(action_id)
-              memory_action_ids.add(action_id)
-
-              memory["actions"].append(
-                  {
-                      "action_id": action_id,
-                      "created_at": now_iso,
-                      "type": action.get("type"),
-                      "case_id": action.get("case_id"),
-                      "target_id": action.get("target_id"),
-                      "status": "planned",
-                  }
-              )
-
-              return True
-
-          # ----------------------------------------------------------
-          # FEED
-          # ----------------------------------------------------------
-
-          created = 0
-
-          for post in feed:
-              if created >= MAX_CASES:
-                  break
-
-              post_id = ident(post, "id", "post_id")
-
-              if not post_id or post_id in processed_posts:
+          for post in feed_items:
+              if not isinstance(post, dict):
                   continue
 
-              processed_posts.add(post_id)
+              post_id = ident(post)
+              if not post_id:
+                  continue
 
-              author = get(
-                  post,
-                  "author",
-                  "user",
-                  "creator",
-              )
-
-              author_id = ident(
-                  author,
-                  "id",
-                  "user_id",
-              )
-
-              author_name = get(
-                  author,
-                  "username",
-                  "name",
-                  "handle",
+              author = get(post, "author", {})
+              author_name = (
+                  text(get(author, "username"))
+                  or text(get(post, "username"))
+                  or text(get(post, "author_username"))
               )
 
               title = text(get(post, "title"))
               body = text(
-                  get(
-                      post,
-                      "body",
-                      "content",
-                      "text",
-                  )
+                  get(post, "body")
+                  or get(post, "content")
+                  or get(post, "text")
               )
 
-              content = (
-                  title + "\n" + body
-                  if title
-                  else body
-              ).strip()
-
-              observe(
-                  "feed_post",
-                  post_id,
+              add_observation(
+                  "feed_item",
+                  "colony",
                   {
-                      "author_id": author_id,
+                      "post_id": post_id,
                       "author": author_name,
-                      "content": content[:2000],
-                  },
-              )
-
-              lower = content.lower()
-
-              question = (
-                  "?" in content
-                  or any(
-                      marker in lower
-                      for marker in (
-                          "how do",
-                          "how can",
-                          "why ",
-                          "what is",
-                          "does ",
-                          "can an agent",
-                          "can agents",
-                      )
-                  )
-              )
-
-              evidence = any(
-                  marker in lower
-                  for marker in (
-                      "i tested",
-                      "we tested",
-                      "works",
-                      "doesn't work",
-                      "failed",
-                      "succeeded",
-                      "verified",
-                      "confirmed",
-                      "according to",
-                      "documentation says",
-                  )
-              )
-
-              if not question and not evidence:
-                  continue
-
-              case_type = (
-                  "public_question"
-                  if question
-                  else "evidence_claim"
-              )
-
-              case_id = make_id(
-                  "case",
-                  "post",
-                  post_id,
-                  content[:1000],
-              )
-
-              case = {
-                  "id": case_id,
-                  "created_at": now_iso,
-                  "updated_at": now_iso,
-                  "type": case_type,
-                  "source": "feed",
-                  "source_id": post_id,
-                  "target_id": post_id,
-                  "author_id": author_id,
-                  "author": author_name,
-                  "question": content[:3000],
-                  "context": {
                       "title": title,
-                      "body": body[:3000],
                   },
-                  "status": "needs_research",
-                  "priority": (
-                      "high"
-                      if question
-                      else "normal"
-                  ),
-              }
+              )
 
-              if add_case(case):
+              if post_id in processed_ids:
+                  continue
+
+              # A public question is a cognitive case.
+              combined = f"{title}\n{body}".strip()
+
+              question_markers = (
+                  "?",
+                  "how ",
+                  "what ",
+                  "why ",
+                  "can ",
+                  "does ",
+                  "should ",
+                  "would ",
+                  "is ",
+                  "are ",
+              )
+
+              lowered = combined.lower()
+
+              is_question = (
+                  "?" in combined
+                  or any(lowered.startswith(marker) for marker in question_markers)
+              )
+
+              if is_question and body:
+                  case = add_case(
+                      "public_question",
+                      "feed",
+                      post_id,
+                      combined[:2000],
+                      author=author_name,
+                  )
+
                   add_work(
                       case,
-                      "public_question_or_evidence",
+                      combined[:2000],
+                      "Public feed question requires evidence before response.",
                   )
-                  created += 1
 
-          # ----------------------------------------------------------
-          # NOTIFICATIONS
-          # ----------------------------------------------------------
+              processed_ids.add(post_id)
 
-          for notification in notifications:
-              notification_id = ident(
-                  notification,
-                  "id",
-                  "notification_id",
-              )
+          # ------------------------------------------------------------
+          # Notifications
+          # ------------------------------------------------------------
 
-              if not notification_id:
+          notifications = call("get_notifications")
+
+          notification_items = items(notifications)[
+              : int(os.environ["MAX_NOTIFICATIONS"])
+          ]
+
+          print("Notifications:", len(notification_items))
+
+          for notification in notification_items:
+              if not isinstance(notification, dict):
                   continue
 
-              if notification_id in processed_notifications:
-                  continue
+              notification_id = ident(notification)
 
-              processed_notifications.add(
-                  notification_id
-              )
-
-              observe(
-                  "notification",
-                  notification_id,
-                  {
-                      "content": text(notification)[:1500],
-                  },
-              )
-
-          # ----------------------------------------------------------
-          # DIRECT MESSAGES
-          # ----------------------------------------------------------
-
-          for message in dms:
-              message_id = ident(
-                  message,
-                  "id",
-                  "message_id",
-              )
-
-              if not message_id:
-                  continue
-
-              if message_id in processed_dms:
-                  continue
-
-              processed_dms.add(message_id)
-
-              sender = get(
-                  message,
-                  "sender",
-                  "author",
-                  "from_user",
-              )
-
-              sender_id = ident(
-                  sender,
-                  "id",
-                  "user_id",
-              )
-
-              sender_name = get(
-                  sender,
-                  "username",
-                  "name",
-                  "handle",
-              )
-
-              body = text(
-                  get(
-                      message,
-                      "body",
-                      "content",
-                      "text",
-                      "message",
+              if notification_id:
+                  add_observation(
+                      "notification",
+                      "colony",
+                      {
+                          "id": notification_id,
+                          "type": text(get(notification, "type")),
+                          "text": text(notification),
+                      },
                   )
-              ).strip()
 
-              observe(
-                  "direct_message",
-                  message_id,
-                  {
-                      "sender_id": sender_id,
-                      "sender": sender_name,
-                      "content": body[:3000],
-                  },
-              )
+          # ------------------------------------------------------------
+          # Direct messages
+          # ------------------------------------------------------------
 
-              if not body:
+          conversations = call("iter_conversations")
+          conversation_items = items(conversations)
+
+          dm_count = 0
+
+          for conversation in conversation_items:
+              if dm_count >= int(os.environ["MAX_NOTIFICATIONS"]):
+                  break
+
+              if isinstance(conversation, dict):
+                  conversation_id = ident(conversation)
+              else:
+                  conversation_id = str(conversation)
+
+              if not conversation_id:
                   continue
 
-              case_id = make_id(
-                  "case",
-                  "dm",
-                  message_id,
+              conversation_data = call(
+                  "get_conversation",
+                  conversation_id,
               )
 
-              case = {
-                  "id": case_id,
-                  "created_at": now_iso,
-                  "updated_at": now_iso,
-                  "type": "dm_question",
-                  "source": "dm",
-                  "source_id": message_id,
-                  "target_id": sender_id,
-                  "author_id": sender_id,
-                  "author": sender_name,
-                  "question": body[:3000],
-                  "context": {
-                      "message_id": message_id,
-                  },
-                  "status": "needs_research",
-                  "priority": "high",
-              }
+              messages = items(conversation_data)
 
-              if add_case(case):
-                  add_work(
-                      case,
+              for message in messages:
+                  if not isinstance(message, dict):
+                      continue
+
+                  message_id = ident(message)
+
+                  if not message_id:
+                      continue
+
+                  if message_id in processed_ids:
+                      continue
+
+                  sender = get(message, "sender", {})
+                  sender_name = (
+                      text(get(sender, "username"))
+                      or text(get(message, "sender_username"))
+                      or text(get(message, "from"))
+                  )
+
+                  body = text(
+                      get(message, "body")
+                      or get(message, "content")
+                      or get(message, "text")
+                  )
+
+                  if not body:
+                      continue
+
+                  add_observation(
                       "direct_message",
+                      "colony",
+                      {
+                          "message_id": message_id,
+                          "conversation_id": conversation_id,
+                          "sender": sender_name,
+                          "body": body[:2000],
+                      },
                   )
 
-          # ----------------------------------------------------------
-          # WORK FACTORY RESULTS
-          # ----------------------------------------------------------
+                  case = add_case(
+                      "dm",
+                      "conversation",
+                      conversation_id,
+                      body[:2000],
+                      message_id=message_id,
+                      sender=sender_name,
+                  )
 
-          research = {}
+                  add_work(
+                      case,
+                      body[:2000],
+                      "Incoming direct message requires contextual reasoning before reply.",
+                  )
 
-          for result in (
-              as_list(work.get("history"))
-              + as_list(work.get("results"))
-          ):
+                  processed_ids.add(message_id)
+                  dm_count += 1
+
+          print("DMs:", dm_count)
+
+          # ------------------------------------------------------------
+          # Consume Work Factory results
+          # ------------------------------------------------------------
+
+          results = as_list(work.get("results"))
+
+          consumed_results = 0
+
+          for result in results[-int(os.environ["MAX_HISTORY"]):]:
               if not isinstance(result, dict):
                   continue
 
-              request_id = (
-                  result.get("request_id")
-                  or result.get("case_id")
-                  or result.get("id")
-              )
-
-              if request_id:
-                  research[str(request_id)] = result
-
-          consumed_research = 0
-
-          for case in cases:
-              if not isinstance(case, dict):
-                  continue
-
-              case_id = str(case.get("id", ""))
-
-              if not case_id:
-                  continue
-
-              result = research.get(case_id)
-
-              if not result:
-                  continue
-
-              status = result.get(
-                  "evidence_status",
-                  "unknown",
-              )
+              status = text(get(result, "evidence_status"))
 
               if status not in (
                   "multi_source_support",
                   "partial_support",
-                  "insufficient_verification",
-                  "no_evidence",
               ):
                   continue
 
-              case["research"] = {
-                  "consumed_at": now_iso,
-                  "evidence_status": status,
-                  "facts": as_list(
-                      result.get("facts")
-                  ),
-                  "sources": as_list(
-                      result.get("sources")
-                  ),
-                  "uncertainties": as_list(
-                      result.get("uncertainties")
-                  ),
-                  "conflicts": as_list(
-                      result.get("conflicts")
-                  ),
-                  "conclusion": text(
-                      result.get("conclusion")
-                  )[:5000],
-              }
+              case_id = text(get(result, "case_id"))
+              conclusion = text(get(result, "conclusion"))
 
-              case["updated_at"] = now_iso
+              if not case_id or not conclusion:
+                  continue
+
+              consumed_key = make_id("result", case_id, conclusion[:100])
+
+              if consumed_key in processed_ids:
+                  continue
+
+              # Locate the original cognitive case.
+              case = None
+
+              for candidate in reversed(
+                  as_list(memory.get("cognitive_cases"))
+              ):
+                  if isinstance(candidate, dict) and str(
+                      candidate.get("id", "")
+                  ) == case_id:
+                      case = candidate
+                      break
+
+              if case is None:
+                  continue
+
               case["status"] = "research_complete"
-              consumed_research += 1
+              case["result_id"] = text(get(result, "result_id"))
+              case["evidence_status"] = status
+              case["conclusion"] = conclusion
+              case["reply_text"] = conclusion
 
-          # ----------------------------------------------------------
-          # PRESENCE OUTCOMES
-          # ----------------------------------------------------------
+              case_type = text(get(case, "type"))
+              target_id = text(get(case, "target_id"))
+              sender = text(get(case, "sender"))
 
-          presence = as_dict(
-              load(
-                  "memory/nox_colony_presence.json",
-                  {},
+              if case_type == "dm":
+                  add_action(
+                      "dm_reply",
+                      target_id=target_id,
+                      body=conclusion,
+                      recipient=sender,
+                      source_case=case_id,
+                      metadata={
+                          "message_id": get(case, "message_id"),
+                          "evidence_status": status,
+                      },
+                  )
+
+              elif case_type == "public_question":
+                  add_action(
+                      "reply",
+                      target_id=target_id,
+                      body=conclusion,
+                      source_case=case_id,
+                      metadata={
+                          "evidence_status": status,
+                      },
+                  )
+
+              elif case_type == "evidence_claim":
+                  add_action(
+                      "reply",
+                      target_id=target_id,
+                      body=conclusion,
+                      source_case=case_id,
+                      metadata={
+                          "evidence_status": status,
+                      },
+                  )
+
+              memory["results"].append(
+                  {
+                      "id": consumed_key,
+                      "timestamp": now.isoformat(),
+                      "case_id": case_id,
+                      "status": status,
+                      "conclusion": conclusion,
+                  }
               )
-          )
 
-          outcomes = as_list(
-              presence.get("outcomes")
-          )
+              processed_ids.add(consumed_key)
+              consumed_results += 1
 
-          outcome_map = {}
+          print("Research results consumed:", consumed_results)
 
-          for outcome in outcomes:
+          # ------------------------------------------------------------
+          # Consume Presence outcomes
+          # ------------------------------------------------------------
+
+          outcomes = as_list(presence.get("outcomes"))
+
+          consumed_outcomes = 0
+
+          for outcome in outcomes[-int(os.environ["MAX_HISTORY"]):]:
               if not isinstance(outcome, dict):
                   continue
 
-              action_id = outcome.get("action_id")
+              outcome_id = ident(outcome)
 
-              if action_id:
-                  outcome_map[str(action_id)] = outcome
-
-          remaining = []
-          consumed_outcomes = 0
-
-          for action in pending_actions:
-              if not isinstance(action, dict):
+              if not outcome_id or outcome_id in processed_ids:
                   continue
 
-              action_id = action.get("action_id")
+              action_id = text(get(outcome, "action_id"))
+              status = text(get(outcome, "status"))
 
               if not action_id:
                   continue
 
-              outcome = outcome_map.get(
-                  str(action_id)
+              add_observation(
+                  "presence_outcome",
+                  "presence",
+                  {
+                      "action_id": action_id,
+                      "status": status,
+                      "error": text(get(outcome, "error")),
+                  },
               )
 
-              if outcome is None:
-                  remaining.append(action)
-                  continue
+              memory["experiences"].append(
+                  {
+                      "id": make_id("experience", outcome_id),
+                      "timestamp": now.isoformat(),
+                      "type": "action_outcome",
+                      "action_id": action_id,
+                      "status": status,
+                      "error": text(get(outcome, "error")),
+                  }
+              )
 
+              processed_ids.add(outcome_id)
               consumed_outcomes += 1
 
-              status = outcome.get(
-                  "status",
-                  "unknown",
-              )
+          print("Presence outcomes consumed:", consumed_outcomes)
 
-              for stored in memory["actions"]:
-                  if (
-                      isinstance(stored, dict)
-                      and str(
-                          stored.get("action_id")
-                      ) == str(action_id)
-                  ):
-                      stored["status"] = status
-                      stored["outcome"] = outcome
-                      stored["completed_at"] = now_iso
+          # ------------------------------------------------------------
+          # Runtime decision records
+          # ------------------------------------------------------------
 
-              case_id = action.get("case_id")
+          if observations:
+              runtime["observations"].extend(observations)
 
-              for case in cases:
-                  if (
-                      isinstance(case, dict)
-                      and str(case.get("id"))
-                      == str(case_id)
-                  ):
-                      case["last_outcome"] = outcome
-                      case["updated_at"] = now_iso
-
-                      if status == "success":
-                          case["status"] = "completed"
-                      else:
-                          case["status"] = "action_failed"
-
-              if status == "success":
-                  memory["experiences"].append(
-                      {
-                          "id": make_id(
-                              "experience",
-                              action_id,
-                              now_iso,
-                          ),
-                          "timestamp": now_iso,
-                          "type": "action_outcome",
-                          "action_id": action_id,
-                          "case_id": action.get(
-                              "case_id"
-                          ),
-                          "status": "success",
-                          "observation": outcome,
-                      }
-                  )
-
-          pending_actions = remaining
-
-          # ----------------------------------------------------------
-          # DECISIONS
-          # ----------------------------------------------------------
-
-          for case in cases:
-              if not isinstance(case, dict):
-                  continue
-
-              if case.get("status") != "research_complete":
-                  continue
-
-              research_data = as_dict(
-                  case.get("research")
-              )
-
-              evidence_status = research_data.get(
-                  "evidence_status",
-                  "unknown",
-              )
-
-              conclusion = text(
-                  research_data.get(
-                      "conclusion"
-                  )
-              ).strip()
-
-              case_id = case.get("id")
-
-              if not conclusion:
-                  continue
-
-              if evidence_status in (
-                  "insufficient_verification",
-                  "no_evidence",
-              ):
-                  case["status"] = "uncertain"
-
-                  memory["questions"].append(
-                      {
-                          "id": make_id(
-                              "question",
-                              case_id,
-                              conclusion,
-                          ),
-                          "timestamp": now_iso,
-                          "case_id": case_id,
-                          "question": case.get(
-                              "question",
-                              "",
-                          ),
-                          "reason": (
-                              "insufficient_verification"
-                          ),
-                      }
-                  )
-
-                  continue
-
-              if case.get("type") == "dm_question":
-                  action_id = make_id(
-                      "action",
-                      "dm_reply",
-                      case_id,
-                      conclusion,
-                  )
-
-                  action = {
-                      "action_id": action_id,
-                      "case_id": case_id,
-                      "type": "dm_reply",
-                      "created_at": now_iso,
-                      "target_id": case.get(
-                          "author_id"
-                      ),
-                      "message_id": case.get(
-                          "source_id"
-                      ),
-                      "question": case.get(
-                          "question",
-                          "",
-                      ),
-                      "reply_text": conclusion[:4000],
-                      "research": research_data,
-                      "status": "pending",
+          if cognitive_cases:
+              runtime["decisions"].extend(
+                  {
+                      "timestamp": now.isoformat(),
+                      "case_id": case["id"],
+                      "decision": "research",
+                      "reason": case.get("question", ""),
                   }
+                  for case in cognitive_cases
+              )
 
-                  if add_action(action):
-                      case["status"] = "action_planned"
+          # ------------------------------------------------------------
+          # Semantic bounds
+          # ------------------------------------------------------------
 
-              elif case.get("type") in (
-                  "public_question",
-                  "evidence_claim",
+          def bound_list(obj, key, limit):
+              value = as_list(obj.get(key))
+              if len(value) > limit:
+                  obj[key] = value[-limit:]
+
+          bound_list(memory, "observations", 500)
+          bound_list(memory, "cognitive_cases", int(os.environ["MAX_CASES"]))
+          bound_list(memory, "actions", int(os.environ["MAX_ACTIONS"]))
+          bound_list(memory, "experiences", 300)
+          bound_list(memory, "results", 300)
+          bound_list(memory, "facts", 300)
+          bound_list(memory, "hypotheses", 200)
+          bound_list(memory, "questions", 200)
+          bound_list(memory, "learnings", 300)
+          bound_list(memory, "sources", 300)
+
+          bound_list(runtime, "observations", 500)
+          bound_list(runtime, "decisions", 500)
+          bound_list(
+              runtime,
+              "pending_actions",
+              int(os.environ["MAX_ACTIONS"]),
+          )
+          bound_list(
+              runtime,
+              "work_requests",
+              int(os.environ["MAX_WORK_REQUESTS"]),
+          )
+          bound_list(
+              runtime,
+              "processed_ids",
+              2000,
+          )
+
+          # Do not create payments or spending actions.
+          for action in runtime["pending_actions"]:
+              if not isinstance(action, dict):
+                  continue
+
+              action_type = text(get(action, "type")).lower()
+
+              if any(
+                  token in action_type
+                  for token in ("payment", "pay", "spend", "invoice", "withdraw")
               ):
-                  target_id = case.get(
-                      "target_id"
+                  raise RuntimeError(
+                      f"Forbidden financial action generated by Core: {action_type}"
                   )
 
-                  if not target_id:
-                      case["status"] = "missing_target"
-                      continue
-
-                  action_id = make_id(
-                      "action",
-                      "reply",
-                      case_id,
-                      conclusion,
-                  )
-
-                  action = {
-                      "action_id": action_id,
-                      "case_id": case_id,
-                      "type": "reply",
-                      "created_at": now_iso,
-                      "target_id": target_id,
-                      "post_id": target_id,
-                      "question": case.get(
-                          "question",
-                          "",
-                      ),
-                      "reply_text": conclusion[:4000],
-                      "research": research_data,
-                      "status": "pending",
-                  }
-
-                  if add_action(action):
-                      case["status"] = "action_planned"
-
-          # ----------------------------------------------------------
-          # OPTIONAL RESEARCH-BACKED PUBLIC POST
-          # ----------------------------------------------------------
-
-          published = 0
-
-          for case in cases:
-              if published >= MAX_PUBLISH:
-                  break
-
-              if not isinstance(case, dict):
-                  continue
-
-              if case.get("status") != "research_complete":
-                  continue
-
-              if case.get("type") != "evidence_claim":
-                  continue
-
-              research_data = as_dict(
-                  case.get("research")
-              )
-
-              if research_data.get(
-                  "evidence_status"
-              ) != "multi_source_support":
-                  continue
-
-              conclusion = text(
-                  research_data.get(
-                      "conclusion"
-                  )
-              ).strip()
-
-              if len(conclusion) < 100:
-                  continue
-
-              action_id = make_id(
-                  "action",
-                  "publish",
-                  case.get("id"),
-                  conclusion,
-              )
-
-              action = {
-                  "action_id": action_id,
-                  "case_id": case.get("id"),
-                  "type": "publish",
-                  "created_at": now_iso,
-                  "title": "NØX research result",
-                  "body": conclusion[:5000],
-                  "research": research_data,
-                  "status": "pending",
-              }
-
-              if add_action(action):
-                  case["status"] = "action_planned"
-                  published += 1
-
-          # ----------------------------------------------------------
-          # BOUNDS
-          # ----------------------------------------------------------
-
-          cases = cases[-MAX_CASE_HISTORY:]
-          pending_actions = pending_actions[-MAX_ACTIONS:]
-          work_requests = work_requests[-MAX_WORK:]
-
-          for key in (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "questions",
-              "tests",
-              "results",
-              "learnings",
-              "actions",
-              "web_queries",
-          ):
-              memory[key] = as_list(
-                  memory.get(key)
-              )[-MAX_MEMORY:]
-
-          memory["processed_post_ids"] = list(
-              processed_posts
-          )[-MAX_MEMORY:]
-
-          memory["processed_notification_ids"] = list(
-              processed_notifications
-          )[-MAX_MEMORY:]
-
-          memory["processed_dm_ids"] = list(
-              processed_dms
-          )[-MAX_MEMORY:]
-
-          memory["seen_event_ids"] = list(
-              dict.fromkeys(
-                  list(processed_posts)
-                  + list(processed_notifications)
-                  + list(processed_dms)
-              )
-          )[-MAX_MEMORY:]
-
-          memory["cognitive_cases"] = cases
-
-          runtime["pending_actions"] = pending_actions
-          runtime["work_requests"] = work_requests
-          runtime["last_run"] = now_iso
-          runtime["run_id"] = run_id
-
-          runtime["stats"] = {
-              "feed_items": len(feed),
-              "notifications": len(notifications),
-              "dms": len(dms),
-              "cases": len(cases),
-              "pending_actions": len(pending_actions),
-              "work_requests": len(work_requests),
-              "research_results_consumed": consumed_research,
+          runtime["last_summary"] = {
+              "run_id": run_id,
+              "timestamp": now.isoformat(),
+              "feed": len(feed_items),
+              "notifications": len(notification_items),
+              "dms": dm_count,
+              "cases_created": len(cognitive_cases),
+              "new_work": len(new_work),
+              "new_actions": len(new_actions),
+              "research_results_consumed": consumed_results,
               "presence_outcomes_consumed": consumed_outcomes,
           }
 
-          memory["runs"].append(
-              {
-                  "run_id": run_id,
-                  "timestamp": now_iso,
-                  "stats": runtime["stats"],
-              }
-          )
-
-          memory["runs"] = memory["runs"][-100:]
-
-          # Validate objects before writing.
-          json.dumps(memory, ensure_ascii=False)
-          json.dumps(runtime, ensure_ascii=False)
-          json.dumps(work, ensure_ascii=False)
+          # ------------------------------------------------------------
+          # Persist
+          # ------------------------------------------------------------
 
           save(MEMORY_FILE, memory)
           save(RUNTIME_FILE, runtime)
           save(WORK_FILE, work)
+          save(PRESENCE_FILE, presence)
 
-          print("=== CORE RESULT ===")
-          print("Feed:", len(feed))
-          print("Notifications:", len(notifications))
-          print("DMs:", len(dms))
-          print("Cases:", len(cases))
-          print("Pending actions:", len(pending_actions))
-          print("Work requests:", len(work_requests))
-          print("Research consumed:", consumed_research)
-          print("Presence outcomes:", consumed_outcomes)
-          print("===================")
-
+          print()
+          print("=== CORE SUMMARY ===")
+          print("RUN:", run_id)
+          print("Feed:", len(feed_items))
+          print("Notifications:", len(notification_items))
+          print("DMs:", dm_count)
+          print("Cases:", len(cognitive_cases))
+          print("New work:", len(new_work))
+          print("New actions:", len(new_actions))
+          print("Research results consumed:", consumed_results)
+          print("Presence outcomes consumed:", consumed_outcomes)
+          print("Policy: no payments / no spending")
+          print("=== CORE COMPLETE ===")
           PY
 
       - name: Validate state files
+        shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           import json
+          from pathlib import Path
 
           files = [
               "memory/nox_core_memory.json",
               "memory/nox_core_runtime.json",
               "memory/nox_work_factory.json",
+              "memory/nox_colony_presence.json",
           ]
 
-          for path in files:
-              with open(path, "r", encoding="utf-8") as f:
-                  json.load(f)
-              print("[OK]", path)
+          for filename in files:
+              path = Path(filename)
 
+              if not path.exists():
+                  raise SystemExit(f"Missing state file: {filename}")
+
+              with path.open("r", encoding="utf-8") as f:
+                  json.load(f)
+
+              print("VALID:", filename)
+
+          print("All Core state files valid.")
           PY
 
-      - name: Check diff
-        run: |
-          set -euo pipefail
-          git diff --check
-
       - name: Commit and push state
+        shell: bash
         run: |
           set -euo pipefail
-
-          git config user.name "NØX"
-          git config user.email "nox-origin@users.noreply.github.com"
 
           git add \
             memory/nox_core_memory.json \
             memory/nox_core_runtime.json \
-            memory/nox_work_factory.json
+            memory/nox_work_factory.json \
+            memory/nox_colony_presence.json
 
           if git diff --cached --quiet; then
-            echo "No state changes to commit."
+            echo "No state changes."
             exit 0
           fi
 
           git commit -m "chore(nox): update core state"
 
-          for attempt in 1 2 3; do
-            if git pull --rebase origin main && \
-               git push origin HEAD:main; then
-              echo "State pushed successfully."
-              exit 0
-            fi
+          git pull --rebase origin main
 
-            echo "Push attempt ${attempt} failed."
-            sleep 3
-          done
-
-          echo "Unable to push state after 3 attempts."
-          exit 1
+          git push origin HEAD:main
