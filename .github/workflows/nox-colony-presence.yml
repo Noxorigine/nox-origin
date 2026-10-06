@@ -31,7 +31,6 @@ env:
 
 jobs:
   presence:
-    name: presence
     runs-on: ubuntu-latest
 
     env:
@@ -40,1421 +39,1193 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Configure Git
+      - name: Install Colony SDK
         run: |
           set -euo pipefail
-
-          git config user.name "NØX"
-          git config user.email "nox@noreply.github.com"
-
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-
           python -m pip install --upgrade pip
           python -m pip install "colony-sdk>=1.37.0,<2.0.0"
 
-      - name: Verify Colony SDK
-        shell: bash
+      - name: Execute Presence
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from colony_sdk import ColonyClient
-
-          print("Colony SDK import: OK")
-          print("ColonyClient:", ColonyClient)
-          PY
-
-      - name: Run NØX Presence
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
+          python <<'PY'
           import json
           import os
-          import re
+          import subprocess
+          import sys
+          import uuid
           from datetime import datetime, timezone
-          from pathlib import Path
 
-          print("=== NØX PRESENCE ===")
+          from colony_sdk import ColonyClient
 
-          now = datetime.now(timezone.utc)
-          run_id = "presence-" + now.strftime("%Y%m%dT%H%M%SZ")
 
-          CORE_MEMORY_FILE = Path(
-              os.environ["CORE_MEMORY_FILE"]
-          )
-          CORE_RUNTIME_FILE = Path(
-              os.environ["CORE_RUNTIME_FILE"]
-          )
-          KNOWLEDGE_FILE = Path(
-              os.environ["KNOWLEDGE_FILE"]
-          )
-          PRESENCE_FILE = Path(
-              os.environ["PRESENCE_MEMORY_FILE"]
-          )
+          # ============================================================
+          # CONFIG
+          # ============================================================
 
-          MAX_ACTIONS = int(
-              os.environ["MAX_ACTIONS_PER_RUN"]
-          )
-          MAX_TRACKED = int(
-              os.environ["MAX_TRACKED"]
-          )
-          MAX_RUNS = int(
-              os.environ["MAX_RUNS"]
-          )
+          CORE_MEMORY_FILE = os.environ["CORE_MEMORY_FILE"]
+          CORE_RUNTIME_FILE = os.environ["CORE_RUNTIME_FILE"]
+          KNOWLEDGE_FILE = os.environ["KNOWLEDGE_FILE"]
+          PRESENCE_MEMORY_FILE = os.environ["PRESENCE_MEMORY_FILE"]
+
+          MAX_ACTIONS_PER_RUN = int(os.environ["MAX_ACTIONS_PER_RUN"])
+          MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
+          MAX_TRACKED = int(os.environ["MAX_TRACKED"])
+          MAX_RUNS = int(os.environ["MAX_RUNS"])
+
+          PROJECT_COST_EUR = os.environ["PROJECT_COST_EUR"]
+          GEMINI_USED = os.environ["GEMINI_USED"]
+          EXTERNAL_AI_USED = os.environ["EXTERNAL_AI_USED"]
+          AUTO_PAYMENT = os.environ["AUTO_PAYMENT"]
+          AUTO_SPENDING = os.environ["AUTO_SPENDING"]
+
+          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
+
+          if not API_KEY:
+              raise RuntimeError("COLONY_API_KEY is missing")
+
+          NOW = datetime.now(timezone.utc)
+          RUN_ID = "presence-" + NOW.strftime("%Y%m%dT%H%M%SZ")
+
+
+          # ============================================================
+          # HELPERS
+          # ============================================================
 
           def load(path, default):
-              if not path.exists():
+              if not os.path.exists(path):
                   return default
 
               try:
-                  with path.open(
-                      "r",
-                      encoding="utf-8",
-                  ) as f:
-                      return json.load(f)
+                  with open(path, "r", encoding="utf-8") as fh:
+                      value = json.load(fh)
+
+                  return value
+
               except Exception as exc:
-                  print(
-                      f"WARNING: cannot load {path}: {exc}"
-                  )
+                  print(f"WARNING: cannot load {path}: {exc}")
                   return default
 
+
           def save(path, value):
-              path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True,
-              )
+              directory = os.path.dirname(path)
 
-              tmp = path.with_suffix(
-                  path.suffix + ".tmp"
-              )
+              if directory:
+                  os.makedirs(directory, exist_ok=True)
 
-              with tmp.open(
-                  "w",
-                  encoding="utf-8",
-              ) as f:
+              temporary = path + ".tmp"
+
+              with open(temporary, "w", encoding="utf-8") as fh:
                   json.dump(
                       value,
-                      f,
+                      fh,
                       ensure_ascii=False,
                       indent=2,
+                      sort_keys=True,
                   )
-                  f.write("\n")
+                  fh.write("\n")
 
-              tmp.replace(path)
+              os.replace(temporary, path)
+
 
           def as_dict(value):
-              return value if isinstance(
-                  value,
-                  dict,
-              ) else {}
+              return value if isinstance(value, dict) else {}
+
 
           def as_list(value):
-              return value if isinstance(
-                  value,
-                  list,
-              ) else []
+              return value if isinstance(value, list) else []
+
 
           def text(value):
               if value is None:
                   return ""
 
-              if isinstance(value, str):
-                  return value.strip()
-
-              if isinstance(value, dict):
-                  for key in (
-                      "body",
-                      "content",
-                      "text",
-                      "message",
-                      "title",
-                      "username",
-                      "id",
-                  ):
-                      if value.get(key):
-                          return text(
-                              value[key]
-                          )
-
               return str(value).strip()
 
-          def ident(value):
-              if not isinstance(
-                  value,
-                  dict,
-              ):
-                  return ""
 
-              for key in (
-                  "id",
-                  "post_id",
-                  "comment_id",
-                  "message_id",
-                  "conversation_id",
-              ):
-                  if value.get(key) is not None:
-                      candidate = str(
-                          value.get(key)
-                      ).strip()
+          def first_nonempty(mapping, keys):
+              for key in keys:
+                  value = mapping.get(key)
 
-                      if candidate:
-                          return candidate
+                  if value is None:
+                      continue
 
-              return ""
+                  if isinstance(value, str):
+                      value = value.strip()
 
-          def make_id(*values):
-              raw = "|".join(
-                  str(value or "")
-                  for value in values
+                  if value != "":
+                      return value
+
+              return None
+
+
+          def make_id(prefix):
+              return f"{prefix}-{uuid.uuid4().hex[:22]}"
+
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", *args],
+                  check=False,
+                  capture_output=True,
+                  text=True,
               )
 
-              return re.sub(
-                  r"[^A-Za-z0-9_.:-]+",
-                  "-",
+
+          def clip(value, maximum):
+              value = text(value)
+
+              if len(value) <= maximum:
+                  return value
+
+              return value[: maximum - 1].rstrip() + "…"
+
+
+          # ============================================================
+          # POLICY
+          # ============================================================
+
+          if PROJECT_COST_EUR != "0":
+              raise RuntimeError("Unsafe policy: PROJECT_COST_EUR must be 0")
+
+          if GEMINI_USED.lower() != "false":
+              raise RuntimeError("Unsafe policy: GEMINI_USED must be false")
+
+          if EXTERNAL_AI_USED.lower() != "false":
+              raise RuntimeError("Unsafe policy: EXTERNAL_AI_USED must be false")
+
+          if AUTO_PAYMENT.lower() != "false":
+              raise RuntimeError("Unsafe policy: AUTO_PAYMENT must be false")
+
+          if AUTO_SPENDING.lower() != "false":
+              raise RuntimeError("Unsafe policy: AUTO_SPENDING must be false")
+
+
+          # ============================================================
+          # LOAD STATE
+          # ============================================================
+
+          runtime = as_dict(load(CORE_RUNTIME_FILE, {}))
+          memory = as_dict(load(CORE_MEMORY_FILE, {}))
+          knowledge = as_dict(load(KNOWLEDGE_FILE, {}))
+          presence = as_dict(load(PRESENCE_MEMORY_FILE, {}))
+
+          runtime.setdefault("pending_actions", [])
+          runtime.setdefault("actions", [])
+          runtime.setdefault("decisions", [])
+          runtime.setdefault("presence_outcomes", [])
+          runtime.setdefault("work_requests", [])
+
+          memory.setdefault("actions", [])
+          memory.setdefault("observations", [])
+          memory.setdefault("experiences", [])
+          memory.setdefault("learnings", [])
+
+          presence.setdefault("actions", [])
+          presence.setdefault("outcomes", [])
+          presence.setdefault("errors", [])
+          presence.setdefault("tracked_targets", [])
+          presence.setdefault("runs", [])
+
+
+          # ============================================================
+          # ACTION NORMALIZATION
+          # ============================================================
+
+          def normalize_action(raw):
+              """
+              Normalize all action schemas emitted by Core/runtime.
+
+              Supported action type fields:
+                type
+                action_type
+                kind
+                action
+
+              Supported target fields:
+                target_id
+                post_id
+                parent_id
+                conversation_id
+                recipient
+                username
+                target
+              """
+
+              if not isinstance(raw, dict):
+                  return None
+
+              action_id = first_nonempty(
                   raw,
-              )[:220]
-
-          core = as_dict(
-              load(
-                  CORE_MEMORY_FILE,
-                  {},
-              )
-          )
-
-          runtime = as_dict(
-              load(
-                  CORE_RUNTIME_FILE,
-                  {},
-              )
-          )
-
-          knowledge = as_dict(
-              load(
-                  KNOWLEDGE_FILE,
-                  {},
-              )
-          )
-
-          presence = as_dict(
-              load(
-                  PRESENCE_FILE,
-                  {},
-              )
-          )
-
-          runtime.setdefault(
-              "pending_actions",
-              [],
-          )
-
-          runtime.setdefault(
-              "decisions",
-              [],
-          )
-
-          runtime.setdefault(
-              "observations",
-              [],
-          )
-
-          presence.setdefault(
-              "runs",
-              [],
-          )
-
-          presence.setdefault(
-              "outcomes",
-              [],
-          )
-
-          presence.setdefault(
-              "actions",
-              [],
-          )
-
-          presence.setdefault(
-              "errors",
-              [],
-          )
-
-          presence.setdefault(
-              "tracked_targets",
-              [],
-          )
-
-          # ------------------------------------------------------------
-          # Policy safety
-          # ------------------------------------------------------------
-
-          if os.environ.get(
-              "AUTO_PAYMENT"
-          ) != "false":
-              raise RuntimeError(
-                  "AUTO_PAYMENT must remain false."
+                  [
+                      "id",
+                      "action_id",
+                      "actionId",
+                  ],
               )
 
-          if os.environ.get(
-              "AUTO_SPENDING"
-          ) != "false":
-              raise RuntimeError(
-                  "AUTO_SPENDING must remain false."
+              action_type = first_nonempty(
+                  raw,
+                  [
+                      "type",
+                      "action_type",
+                      "kind",
+                      "action",
+                      "actionType",
+                  ],
               )
 
-          if os.environ.get(
-              "GEMINI_USED"
-          ) != "false":
-              raise RuntimeError(
-                  "GEMINI_USED must remain false."
+              action_type = text(action_type).lower().replace("-", "_").replace(" ", "_")
+
+              aliases = {
+                  "dm": "dm_reply",
+                  "message": "dm_reply",
+                  "send_message": "dm_reply",
+                  "direct_message": "dm_reply",
+                  "reply_dm": "dm_reply",
+
+                  "comment": "reply",
+                  "create_comment": "reply",
+                  "reply_post": "reply",
+                  "research_reply": "reply",
+
+                  "create_post": "publish",
+                  "post": "publish",
+                  "new_post": "publish",
+              }
+
+              action_type = aliases.get(action_type, action_type)
+
+              target_id = first_nonempty(
+                  raw,
+                  [
+                      "target_id",
+                      "post_id",
+                      "target",
+                      "targetId",
+                  ],
               )
 
-          if os.environ.get(
-              "EXTERNAL_AI_USED"
-          ) != "false":
-              raise RuntimeError(
-                  "EXTERNAL_AI_USED must remain false."
+              parent_id = first_nonempty(
+                  raw,
+                  [
+                      "parent_id",
+                      "comment_id",
+                      "parentId",
+                  ],
               )
 
-          api_key = os.environ.get(
-              "COLONY_API_KEY",
-              "",
-          ).strip()
-
-          if not api_key:
-              raise RuntimeError(
-                  "COLONY_API_KEY is missing."
+              recipient = first_nonempty(
+                  raw,
+                  [
+                      "recipient",
+                      "username",
+                      "recipient_username",
+                      "recipientUsername",
+                      "conversation_id",
+                      "conversation",
+                  ],
               )
 
-          from colony_sdk import ColonyClient
-
-          client = ColonyClient(api_key)
-
-          print(
-              "ColonyClient initialized."
-          )
-
-          # ------------------------------------------------------------
-          # SDK helpers
-          # ------------------------------------------------------------
-
-          def sdk_call(
-              method_name,
-              *args,
-              **kwargs,
-          ):
-              method = getattr(
-                  client,
-                  method_name,
-                  None,
+              body = first_nonempty(
+                  raw,
+                  [
+                      "body",
+                      "reply_text",
+                      "message",
+                      "content",
+                      "text",
+                  ],
               )
 
-              if method is None:
-                  return {
-                      "ok": False,
-                      "error": (
-                          "SDK method unavailable: "
-                          + method_name
-                      ),
-                  }
+              title = first_nonempty(
+                  raw,
+                  [
+                      "title",
+                      "post_title",
+                  ],
+              )
 
-              try:
-                  value = method(
-                      *args,
-                      **kwargs,
+              colony = first_nonempty(
+                  raw,
+                  [
+                      "colony",
+                      "colony_name",
+                  ],
+              )
+
+              normalized = {
+                  "id": text(action_id) if action_id else make_id("action"),
+                  "type": action_type,
+                  "target_id": text(target_id) if target_id else None,
+                  "parent_id": text(parent_id) if parent_id else None,
+                  "recipient": text(recipient) if recipient else None,
+                  "body": text(body) if body else "",
+                  "title": text(title) if title else "",
+                  "colony": text(colony) if colony else None,
+                  "attempts": int(raw.get("attempts", 0) or 0),
+                  "created_at": raw.get("created_at") or now_iso(),
+                  "source": raw.get("source") or "core",
+                  "original": raw,
+              }
+
+              return normalized
+
+
+          def action_key(action):
+              return (
+                  text(action.get("id"))
+                  or "|".join(
+                      [
+                          text(action.get("type")),
+                          text(action.get("target_id")),
+                          text(action.get("recipient")),
+                          text(action.get("body")),
+                      ]
                   )
+              )
 
-                  return {
-                      "ok": True,
-                      "value": value,
-                  }
 
-              except TypeError:
-                  try:
-                      value = method(*args)
+          # ============================================================
+          # COLLECT PENDING ACTIONS
+          # ============================================================
 
-                      return {
-                          "ok": True,
-                          "value": value,
-                      }
+          raw_pending = as_list(runtime.get("pending_actions"))
 
-                  except Exception as exc:
-                      return {
-                          "ok": False,
-                          "error": str(exc),
-                      }
+          normalized_pending = []
 
-              except Exception as exc:
-                  return {
-                      "ok": False,
-                      "error": str(exc),
-                  }
+          for raw in raw_pending:
+              action = normalize_action(raw)
 
-          # ------------------------------------------------------------
-          # Bootstrap
-          # ------------------------------------------------------------
+              if action is not None:
+                  normalized_pending.append(action)
 
-          bootstrap = getattr(
-              client,
-              "bootstrap",
-              None,
-          )
 
-          if callable(bootstrap):
-              try:
-                  bootstrap()
-                  print(
-                      "Bootstrap: OK"
-                  )
-              except Exception as exc:
-                  print(
-                      "WARNING: bootstrap failed:",
-                      exc,
-                  )
+          # Also accept actions that Core may have stored in runtime["actions"]
+          # but which have not yet been copied to pending_actions.
+          existing_keys = {
+              action_key(action)
+              for action in normalized_pending
+          }
 
-          # ------------------------------------------------------------
-          # SDK capability check
-          # ------------------------------------------------------------
+          for raw in as_list(runtime.get("actions")):
+              action = normalize_action(raw)
 
-          required_methods = (
+              if action is None:
+                  continue
+
+              key = action_key(action)
+
+              if key not in existing_keys:
+                  status = text(
+                      raw.get("status")
+                      if isinstance(raw, dict)
+                      else ""
+                  ).lower()
+
+                  if status not in {
+                      "executed",
+                      "success",
+                      "completed",
+                      "blocked",
+                  }:
+                      normalized_pending.append(action)
+                      existing_keys.add(key)
+
+
+          print("=== NØX PRESENCE ===")
+          print(f"Run: {RUN_ID}")
+          print(f"Pending actions: {len(normalized_pending)}")
+
+
+          # ============================================================
+          # CLIENT
+          # ============================================================
+
+          client = ColonyClient(API_KEY)
+
+          print("ColonyClient initialized.")
+
+          bootstrap = client.bootstrap()
+
+          print("Bootstrap: OK")
+
+
+          # ============================================================
+          # SDK CAPABILITY CHECK
+          # ============================================================
+
+          required_methods = [
               "create_comment",
               "create_post",
               "send_message",
               "get_post",
-              "get_all_comments",
               "get_for_you_feed",
-          )
-
-          missing_methods = [
-              method
-              for method in required_methods
-              if not hasattr(
-                  client,
-                  method,
-              )
           ]
 
-          if missing_methods:
+          missing = [
+              name
+              for name in required_methods
+              if not hasattr(client, name)
+          ]
+
+          if missing:
               raise RuntimeError(
-                  "Required Colony SDK methods missing: "
-                  + ", ".join(
-                      missing_methods
-                  )
+                  "Missing required SDK capabilities: "
+                  + ", ".join(missing)
               )
 
-          print(
-              "SDK capabilities: OK"
-          )
+          print("SDK capabilities: OK")
 
-          # ------------------------------------------------------------
-          # Helpers for resolving targets
-          # ------------------------------------------------------------
 
-          def get_post(post_id):
-              if not post_id:
-                  return None
+          # ============================================================
+          # ACTION SELECTION
+          # ============================================================
 
-              result = sdk_call(
-                  "get_post",
-                  post_id,
-              )
+          selected = normalized_pending[:MAX_ACTIONS_PER_RUN]
 
-              if not result["ok"]:
-                  return None
+          print(f"Selected actions: {len(selected)}")
 
-              return result["value"]
 
-          def get_feed():
-              result = sdk_call(
-                  "get_for_you_feed"
-              )
+          # ============================================================
+          # SAFETY CLASSIFICATION
+          # ============================================================
 
-              if not result["ok"]:
-                  print(
-                      "WARNING: feed unavailable:",
-                      result["error"],
-                  )
-                  return []
+          FINANCIAL_TYPES = {
+              "pay",
+              "payment",
+              "send_payment",
+              "send_sats",
+              "invoice",
+              "withdraw",
+              "withdrawal",
+              "bid",
+              "place_bid",
+              "purchase",
+              "buy",
+              "spend",
+              "transfer",
+              "tip",
+              "lightning_payment",
+              "ln_payment",
+          }
 
-              value = result["value"]
+          PUBLIC_TYPES = {
+              "reply",
+              "publish",
+          }
 
-              if isinstance(
-                  value,
-                  list,
-              ):
-                  return value
+          DM_TYPES = {
+              "dm_reply",
+          }
 
-              if isinstance(
-                  value,
-                  dict,
-              ):
-                  for key in (
-                      "items",
-                      "data",
-                      "results",
-                      "posts",
-                  ):
-                      if isinstance(
-                          value.get(key),
-                          list,
-                      ):
-                          return value[key]
 
-              try:
-                  return list(value)
-              except Exception:
-                  return []
+          # ============================================================
+          # RESULT CONTAINERS
+          # ============================================================
 
-          def resolve_post_id(action):
-              target_id = text(
-                  action.get(
-                      "target_id"
-                  )
-              )
+          outcomes = []
+          executed_keys = set()
+          failed_keys = set()
 
-              if not target_id:
-                  return None
+          success_count = 0
+          failed_count = 0
+          blocked_count = 0
+          retry_count = 0
 
-              direct = get_post(
-                  target_id
-              )
 
-              if direct is not None:
-                  return target_id
-
-              # Search recent feed for the same target.
-              feed = get_feed()
-
-              for post in feed:
-                  if not isinstance(
-                      post,
-                      dict,
-                  ):
-                      continue
-
-                  candidate = ident(post)
-
-                  if candidate == target_id:
-                      return candidate
-
-              return None
-
-          def action_body(action):
-              return text(
-                  action.get("body")
-                  or action.get("reply_text")
-                  or action.get("content")
-              )
-
-          # ------------------------------------------------------------
-          # Existing state
-          # ------------------------------------------------------------
-
-          pending = [
-              item
-              for item in as_list(
-                  runtime.get(
-                      "pending_actions"
-                  )
-              )
-              if isinstance(
-                  item,
-                  dict,
-              )
-          ]
-
-          print(
-              "Pending actions:",
-              len(pending),
-          )
-
-          # Oldest pending actions first.
-          pending.sort(
-              key=lambda item: text(
-                  item.get(
-                      "created_at"
-                  )
-              )
-          )
-
-          selected = pending[
-              :MAX_ACTIONS
-          ]
-
-          print(
-              "Selected actions:",
-              len(selected),
-          )
-
-          executed_ids = set()
-
-          for item in as_list(
-              presence.get(
-                  "actions"
-              )
-          ):
-              if not isinstance(
-                  item,
-                  dict,
-              ):
-                  continue
-
-              action_id = text(
-                  item.get(
-                      "action_id"
-                  )
-              )
-
-              if action_id:
-                  executed_ids.add(
-                      action_id
-                  )
-
-          outcomes_this_run = []
-
-          # ------------------------------------------------------------
-          # Execute
-          # ------------------------------------------------------------
+          # ============================================================
+          # EXECUTION
+          # ============================================================
 
           for action in selected:
 
-              action_id = text(
-                  action.get(
-                      "action_id"
-                  )
-              )
-
-              action_type = text(
-                  action.get(
-                      "type"
-                  )
-              ).lower()
-
-              body = action_body(
-                  action
-              )
-
-              target_id = text(
-                  action.get(
-                      "target_id"
-                  )
-              )
-
-              recipient = text(
-                  action.get(
-                      "recipient"
-                  )
-              )
+              action_id = action["id"]
+              action_type = action["type"]
+              target_id = action.get("target_id")
+              parent_id = action.get("parent_id")
+              recipient = action.get("recipient")
+              body = action.get("body")
+              title = action.get("title")
+              colony = action.get("colony")
 
               print()
-              print(
-                  "=== ACTION "
-                  + action_id
-                  + " ==="
-              )
+              print(f"=== ACTION {action_id} ===")
+              print(f"Type: {action_type}")
+              print(f"Target: {target_id or recipient or ''}")
 
-              print(
-                  "Type:",
-                  action_type,
-              )
-
-              print(
-                  "Target:",
-                  target_id,
-              )
 
               # --------------------------------------------------------
-              # Safety: no financial action
+              # UNKNOWN TYPE
               # --------------------------------------------------------
 
-              if any(
-                  token in action_type
-                  for token in (
-                      "payment",
-                      "pay",
-                      "spend",
-                      "invoice",
-                      "withdraw",
-                  )
-              ):
-                  outcome = {
-                      "outcome_id": make_id(
-                          "outcome",
-                          action_id,
-                          run_id,
-                      ),
-                      "action_id": action_id,
-                      "timestamp": now.isoformat(),
-                      "status": "blocked",
-                      "error": (
-                          "Financial action blocked "
-                          "by Presence policy."
-                      ),
-                  }
+              if not action_type:
+                  print("ACTION BLOCKED: missing action type")
 
-                  outcomes_this_run.append(
-                      outcome
+                  blocked_count += 1
+                  failed_keys.add(action_key(action))
+
+                  outcomes.append(
+                      {
+                          "id": make_id("outcome"),
+                          "action_id": action_id,
+                          "run_id": RUN_ID,
+                          "type": "blocked",
+                          "success": False,
+                          "status": "blocked",
+                          "reason": "missing_action_type",
+                          "timestamp": now_iso(),
+                      }
                   )
 
-                  presence[
-                      "errors"
-                  ].append(
-                      outcome
-                  )
+                  continue
 
+
+              # --------------------------------------------------------
+              # FINANCIAL SAFETY BLOCK
+              # --------------------------------------------------------
+
+              if action_type in FINANCIAL_TYPES:
                   print(
-                      "BLOCKED: financial action"
+                      f"BLOCKED FINANCIAL ACTION: {action_type}"
+                  )
+
+                  blocked_count += 1
+                  failed_keys.add(action_key(action))
+
+                  outcomes.append(
+                      {
+                          "id": make_id("outcome"),
+                          "action_id": action_id,
+                          "run_id": RUN_ID,
+                          "type": "blocked",
+                          "success": False,
+                          "status": "blocked",
+                          "reason": "financial_action_forbidden",
+                          "action_type": action_type,
+                          "timestamp": now_iso(),
+                      }
                   )
 
                   continue
 
-              if not body:
-                  outcome = {
-                      "outcome_id": make_id(
-                          "outcome",
-                          action_id,
-                          run_id,
-                      ),
-                      "action_id": action_id,
-                      "timestamp": now.isoformat(),
-                      "status": "failed",
-                      "error": (
-                          "Action has no body."
-                      ),
-                  }
-
-                  outcomes_this_run.append(
-                      outcome
-                  )
-
-                  presence[
-                      "errors"
-                  ].append(
-                      outcome
-                  )
-
-                  continue
 
               # --------------------------------------------------------
-              # DM reply
+              # BODY VALIDATION
               # --------------------------------------------------------
 
-              if action_type in (
-                  "dm_reply",
-                  "message",
-                  "send_message",
-              ):
+              if action_type in PUBLIC_TYPES or action_type in DM_TYPES:
+                  if not body:
+                      print("ACTION BLOCKED: missing body")
+
+                      blocked_count += 1
+                      failed_keys.add(action_key(action))
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "blocked",
+                              "success": False,
+                              "status": "blocked",
+                              "reason": "missing_body",
+                              "action_type": action_type,
+                              "timestamp": now_iso(),
+                          }
+                      )
+
+                      continue
+
+
+              # --------------------------------------------------------
+              # DM
+              # --------------------------------------------------------
+
+              if action_type in DM_TYPES:
 
                   if not recipient:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "failed",
-                          "error": (
-                              "DM reply has no "
-                              "recipient."
-                          ),
-                      }
+                      print("ACTION FAILED: missing recipient")
 
-                      outcomes_this_run.append(
-                          outcome
-                      )
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
 
-                      presence[
-                          "errors"
-                      ].append(
-                          outcome
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "reason": "missing_recipient",
+                              "action_type": action_type,
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
                       )
 
                       continue
 
-                  result = sdk_call(
-                      "send_message",
-                      recipient,
-                      body,
-                  )
-
-                  if result["ok"]:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "success",
-                          "action_type": action_type,
-                          "recipient": recipient,
-                      }
-
-                      print(
-                          "DM reply: SUCCESS"
+                  try:
+                      result = client.send_message(
+                          recipient,
+                          body,
                       )
 
-                  else:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "failed",
-                          "action_type": action_type,
-                          "error": result[
-                              "error"
-                          ],
-                      }
+                      success_count += 1
+                      executed_keys.add(action_key(action))
 
-                      print(
-                          "DM reply: FAILED:",
-                          result["error"],
+                      print("SUCCESS: DM sent")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "success",
+                              "success": True,
+                              "status": "executed",
+                              "action_type": action_type,
+                              "recipient": recipient,
+                              "body": clip(body, 500),
+                              "result": result,
+                              "timestamp": now_iso(),
+                          }
                       )
 
-                  outcomes_this_run.append(
-                      outcome
-                  )
+                  except Exception as exc:
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
+
+                      print(f"FAILED DM: {exc}")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "action_type": action_type,
+                              "recipient": recipient,
+                              "error": clip(exc, 1000),
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
+                      )
 
                   continue
 
+
               # --------------------------------------------------------
-              # Public reply
+              # PUBLIC REPLY
               # --------------------------------------------------------
 
-              if action_type in (
-                  "reply",
-                  "research_reply",
-              ):
+              if action_type == "reply":
 
-                  resolved_post_id = (
-                      resolve_post_id(
-                          action
-                      )
-                  )
+                  if not target_id:
+                      print("ACTION FAILED: reply has no target post")
 
-                  if not resolved_post_id:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "retry",
-                          "action_type": action_type,
-                          "target_id": target_id,
-                          "error": (
-                              "Target post could "
-                              "not be resolved."
-                          ),
-                      }
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
 
-                      outcomes_this_run.append(
-                          outcome
-                      )
-
-                      print(
-                          "Reply: TARGET UNAVAILABLE"
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "reason": "missing_post_target",
+                              "action_type": action_type,
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
                       )
 
                       continue
 
-                  result = sdk_call(
-                      "create_comment",
-                      resolved_post_id,
-                      body,
-                  )
+                  try:
+                      # Verify the target post exists before commenting.
+                      post = client.get_post(target_id)
 
-                  if result["ok"]:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "success",
-                          "action_type": action_type,
-                          "target_id": resolved_post_id,
-                      }
+                      if not post:
+                          raise RuntimeError(
+                              f"target post not found: {target_id}"
+                          )
 
-                      print(
-                          "Reply: SUCCESS"
+                      if parent_id:
+                          result = client.create_comment(
+                              target_id,
+                              body,
+                              parent_id=parent_id,
+                          )
+                      else:
+                          result = client.create_comment(
+                              target_id,
+                              body,
+                          )
+
+                      success_count += 1
+                      executed_keys.add(action_key(action))
+
+                      print("SUCCESS: comment created")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "success",
+                              "success": True,
+                              "status": "executed",
+                              "action_type": action_type,
+                              "target_id": target_id,
+                              "parent_id": parent_id,
+                              "body": clip(body, 500),
+                              "result": result,
+                              "timestamp": now_iso(),
+                          }
                       )
 
-                  else:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "failed",
-                          "action_type": action_type,
-                          "target_id": resolved_post_id,
-                          "error": result[
-                              "error"
-                          ],
-                      }
+                  except Exception as exc:
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
 
-                      print(
-                          "Reply: FAILED:",
-                          result["error"],
+                      print(f"FAILED REPLY: {exc}")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "action_type": action_type,
+                              "target_id": target_id,
+                              "error": clip(exc, 1000),
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
                       )
-
-                  outcomes_this_run.append(
-                      outcome
-                  )
 
                   continue
 
+
               # --------------------------------------------------------
-              # Publish
+              # PUBLIC POST
               # --------------------------------------------------------
 
-              if action_type in (
-                  "publish",
-                  "post",
-                  "create_post",
-              ):
+              if action_type == "publish":
 
-                  title = text(
-                      action.get(
-                          "title"
+                  if not body:
+                      print("ACTION FAILED: publish has no body")
+
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "reason": "missing_body",
+                              "action_type": action_type,
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
                       )
-                  )
+
+                      continue
 
                   if not title:
-                      title = (
-                          "NØX research note"
-                      )
+                      title = "NØX observation"
 
-                  result = sdk_call(
-                      "create_post",
-                      title,
-                      body,
-                  )
-
-                  if result["ok"]:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "success",
-                          "action_type": action_type,
+                  try:
+                      kwargs = {
+                          "title": title,
+                          "body": body,
                       }
 
-                      print(
-                          "Publish: SUCCESS"
+                      if colony:
+                          kwargs["colony"] = colony
+
+                      result = client.create_post(**kwargs)
+
+                      success_count += 1
+                      executed_keys.add(action_key(action))
+
+                      print("SUCCESS: post created")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "success",
+                              "success": True,
+                              "status": "executed",
+                              "action_type": action_type,
+                              "title": clip(title, 300),
+                              "body": clip(body, 700),
+                              "colony": colony,
+                              "result": result,
+                              "timestamp": now_iso(),
+                          }
                       )
 
-                  else:
-                      outcome = {
-                          "outcome_id": make_id(
-                              "outcome",
-                              action_id,
-                              run_id,
-                          ),
-                          "action_id": action_id,
-                          "timestamp": now.isoformat(),
-                          "status": "failed",
-                          "action_type": action_type,
-                          "error": result[
-                              "error"
-                          ],
-                      }
+                  except Exception as exc:
+                      failed_count += 1
+                      retry_count += 1
+                      failed_keys.add(action_key(action))
 
-                      print(
-                          "Publish: FAILED:",
-                          result["error"],
+                      print(f"FAILED POST: {exc}")
+
+                      outcomes.append(
+                          {
+                              "id": make_id("outcome"),
+                              "action_id": action_id,
+                              "run_id": RUN_ID,
+                              "type": "retry",
+                              "success": False,
+                              "status": "retry",
+                              "action_type": action_type,
+                              "error": clip(exc, 1000),
+                              "attempts": action["attempts"] + 1,
+                              "timestamp": now_iso(),
+                          }
                       )
-
-                  outcomes_this_run.append(
-                      outcome
-                  )
 
                   continue
 
+
               # --------------------------------------------------------
-              # Unknown action
+              # UNKNOWN TYPE
               # --------------------------------------------------------
 
-              outcome = {
-                  "outcome_id": make_id(
-                      "outcome",
-                      action_id,
-                      run_id,
-                  ),
-                  "action_id": action_id,
-                  "timestamp": now.isoformat(),
-                  "status": "failed",
-                  "error": (
-                      "Unsupported action type: "
-                      + action_type
-                  ),
-              }
+              print(f"UNKNOWN ACTION TYPE: {action_type}")
 
-              outcomes_this_run.append(
-                  outcome
-              )
+              failed_count += 1
+              retry_count += 1
+              failed_keys.add(action_key(action))
 
-              print(
-                  "UNKNOWN ACTION TYPE:",
-                  action_type,
-              )
-
-          # ------------------------------------------------------------
-          # Update pending actions
-          # ------------------------------------------------------------
-
-          outcome_by_action = {
-              text(
-                  outcome.get(
-                      "action_id"
-                  )
-              ): outcome
-              for outcome in outcomes_this_run
-          }
-
-          remaining_actions = []
-
-          for action in pending:
-
-              action_id = text(
-                  action.get(
-                      "action_id"
-                  )
-              )
-
-              outcome = (
-                  outcome_by_action.get(
-                      action_id
-                  )
-              )
-
-              if outcome is None:
-                  remaining_actions.append(
-                      action
-                  )
-                  continue
-
-              status = text(
-                  outcome.get(
-                      "status"
-                  )
-              )
-
-              if status == "success":
-                  action["status"] = (
-                      "executed"
-                  )
-
-                  action[
-                      "executed_at"
-                  ] = now.isoformat()
-
-              elif status == "retry":
-                  action["status"] = (
-                      "pending"
-                  )
-
-                  action["attempts"] = (
-                      int(
-                          action.get(
-                              "attempts",
-                              0,
-                          )
-                      )
-                      + 1
-                  )
-
-                  remaining_actions.append(
-                      action
-                  )
-
-              else:
-                  action["status"] = (
-                      "failed"
-                  )
-
-                  action["attempts"] = (
-                      int(
-                          action.get(
-                              "attempts",
-                              0,
-                          )
-                      )
-                      + 1
-                  )
-
-                  action[
-                      "last_error"
-                  ] = text(
-                      outcome.get(
-                          "error"
-                      )
-                  )
-
-                  # Keep failed actions for retry.
-                  remaining_actions.append(
-                      action
-                  )
-
-          runtime[
-              "pending_actions"
-          ] = remaining_actions
-
-          # ------------------------------------------------------------
-          # Record outcomes
-          # ------------------------------------------------------------
-
-          presence[
-              "outcomes"
-          ].extend(
-              outcomes_this_run
-          )
-
-          for outcome in outcomes_this_run:
-              presence[
-                  "actions"
-              ].append(
+              outcomes.append(
                   {
-                      "action_id": outcome.get(
-                          "action_id"
-                      ),
-                      "run_id": run_id,
-                      "timestamp": outcome.get(
-                          "timestamp"
-                      ),
-                      "status": outcome.get(
-                          "status"
-                      ),
+                      "id": make_id("outcome"),
+                      "action_id": action_id,
+                      "run_id": RUN_ID,
+                      "type": "retry",
+                      "success": False,
+                      "status": "retry",
+                      "reason": "unknown_action_type",
+                      "action_type": action_type,
+                      "attempts": action["attempts"] + 1,
+                      "timestamp": now_iso(),
                   }
               )
 
-          # ------------------------------------------------------------
-          # Observe feed after execution
-          # ------------------------------------------------------------
 
-          feed_after = get_feed()
+          # ============================================================
+          # REBUILD PENDING ACTIONS
+          # ============================================================
 
-          feed_after = feed_after[
-              : int(
-                  os.environ[
-                      "MAX_FEED_ITEMS"
-                  ]
+          remaining_pending = []
+
+          for action in normalized_pending:
+
+              key = action_key(action)
+
+              if key in executed_keys:
+                  continue
+
+              if key in failed_keys:
+                  action["attempts"] = int(action.get("attempts", 0)) + 1
+                  action["last_attempt_at"] = now_iso()
+
+              remaining_pending.append(action)
+
+
+          # Keep pending actions bounded.
+          # Oldest retryable actions remain first.
+          remaining_pending = remaining_pending[:500]
+
+
+          # ============================================================
+          # UPDATE RUNTIME
+          # ============================================================
+
+          runtime["pending_actions"] = remaining_pending
+
+          runtime["presence_outcomes"] = (
+              as_list(runtime.get("presence_outcomes"))
+              + outcomes
+          )
+
+          runtime["last_presence_run"] = RUN_ID
+          runtime["last_presence_at"] = now_iso()
+
+
+          # Keep runtime outcomes bounded.
+          runtime["presence_outcomes"] = (
+              runtime["presence_outcomes"][-500:]
+          )
+
+
+          # ============================================================
+          # UPDATE MEMORY ACTIONS
+          # ============================================================
+
+          for outcome in outcomes:
+
+              memory["actions"].append(
+                  {
+                      "id": make_id("memory-action"),
+                      "action_id": outcome.get("action_id"),
+                      "run_id": RUN_ID,
+                      "type": outcome.get("action_type")
+                      or outcome.get("type"),
+                      "status": outcome.get("status"),
+                      "success": bool(outcome.get("success")),
+                      "target_id": outcome.get("target_id"),
+                      "recipient": outcome.get("recipient"),
+                      "timestamp": outcome.get("timestamp"),
+                  }
               )
-          ]
 
-          presence[
-              "tracked_targets"
-          ].extend(
-              ident(item)
-              for item in feed_after
-              if isinstance(
+
+          memory["actions"] = memory["actions"][-500:]
+
+
+          # ============================================================
+          # PRESENCE MEMORY
+          # ============================================================
+
+          presence["actions"].extend(
+              [
+                  {
+                      "action_id": outcome.get("action_id"),
+                      "run_id": RUN_ID,
+                      "action_type": outcome.get("action_type"),
+                      "status": outcome.get("status"),
+                      "success": outcome.get("success"),
+                      "target_id": outcome.get("target_id"),
+                      "recipient": outcome.get("recipient"),
+                      "timestamp": outcome.get("timestamp"),
+                  }
+                  for outcome in outcomes
+              ]
+          )
+
+          presence["outcomes"].extend(outcomes)
+
+
+          # Record errors separately.
+          for outcome in outcomes:
+              if not outcome.get("success"):
+                  presence["errors"].append(
+                      {
+                          "id": make_id("error"),
+                          "run_id": RUN_ID,
+                          "action_id": outcome.get("action_id"),
+                          "reason": outcome.get("reason"),
+                          "error": outcome.get("error"),
+                          "status": outcome.get("status"),
+                          "timestamp": outcome.get("timestamp"),
+                      }
+                  )
+
+
+          # ============================================================
+          # OBSERVE FEED AFTER ACTIONS
+          # ============================================================
+
+          observed_feed = []
+
+          try:
+              feed_result = client.get_for_you_feed(
+                  limit=MAX_FEED_ITEMS
+              )
+
+              if isinstance(feed_result, dict):
+                  observed_feed = (
+                      feed_result.get("items")
+                      or feed_result.get("posts")
+                      or feed_result.get("feed")
+                      or []
+                  )
+
+              elif isinstance(feed_result, list):
+                  observed_feed = feed_result
+
+          except Exception as exc:
+              print(f"WARNING: post-action feed observation failed: {exc}")
+
+
+          for item in as_list(observed_feed):
+
+              if not isinstance(item, dict):
+                  continue
+
+              item_id = first_nonempty(
                   item,
-                  dict,
-              )
-              and ident(item)
-          )
-
-          # ------------------------------------------------------------
-          # Semantic bounds
-          # ------------------------------------------------------------
-
-          def bound_list(
-              obj,
-              key,
-              limit,
-          ):
-              value = as_list(
-                  obj.get(key)
+                  [
+                      "id",
+                      "post_id",
+                  ],
               )
 
-              if len(value) > limit:
-                  obj[key] = value[
-                      -limit:
-                  ]
+              if not item_id:
+                  continue
 
-          bound_list(
-              presence,
-              "outcomes",
-              MAX_TRACKED,
-          )
+              presence["tracked_targets"].append(
+                  {
+                      "id": text(item_id),
+                      "observed_at": now_iso(),
+                      "kind": "post",
+                  }
+              )
 
-          bound_list(
-              presence,
-              "actions",
-              MAX_TRACKED,
-          )
 
-          bound_list(
-              presence,
-              "errors",
-              MAX_TRACKED,
-          )
+          # Deduplicate tracked targets by id.
+          tracked = {}
 
-          bound_list(
-              presence,
-              "tracked_targets",
-              MAX_TRACKED,
-          )
+          for item in presence["tracked_targets"]:
+              if not isinstance(item, dict):
+                  continue
+
+              item_id = text(item.get("id"))
+
+              if item_id:
+                  tracked[item_id] = item
+
+          presence["tracked_targets"] = list(
+              tracked.values()
+          )[-MAX_TRACKED:]
+
+
+          # ============================================================
+          # RUN RECORD
+          # ============================================================
 
           presence["runs"].append(
               {
-                  "run_id": run_id,
-                  "timestamp": now.isoformat(),
-                  "pending_before": len(
-                      pending
-                  ),
-                  "selected": len(
-                      selected
-                  ),
-                  "executed": sum(
-                      1
-                      for outcome
-                      in outcomes_this_run
-                      if outcome.get(
-                          "status"
-                      )
-                      == "success"
-                  ),
-                  "failed": sum(
-                      1
-                      for outcome
-                      in outcomes_this_run
-                      if outcome.get(
-                          "status"
-                      )
-                      == "failed"
-                  ),
-                  "retry": sum(
-                      1
-                      for outcome
-                      in outcomes_this_run
-                      if outcome.get(
-                          "status"
-                      )
-                      == "retry"
-                  ),
-                  "remaining": len(
-                      runtime[
-                          "pending_actions"
-                      ]
-                  ),
+                  "run_id": RUN_ID,
+                  "timestamp": now_iso(),
+                  "pending_before": len(normalized_pending),
+                  "selected": len(selected),
+                  "success": success_count,
+                  "failed": failed_count,
+                  "retry": retry_count,
+                  "blocked": blocked_count,
+                  "pending_after": len(remaining_pending),
+                  "observed_feed": len(observed_feed),
               }
           )
 
-          bound_list(
-              presence,
-              "runs",
-              MAX_RUNS,
-          )
+          presence["runs"] = presence["runs"][-MAX_RUNS:]
 
-          presence[
-              "last_run"
-          ] = now.isoformat()
+          presence["actions"] = presence["actions"][-MAX_TRACKED:]
+          presence["outcomes"] = presence["outcomes"][-MAX_TRACKED:]
+          presence["errors"] = presence["errors"][-MAX_TRACKED:]
 
-          presence[
-              "last_summary"
-          ] = {
-              "run_id": run_id,
-              "selected": len(
-                  selected
-              ),
-              "success": sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "success"
-              ),
-              "failed": sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "failed"
-              ),
-              "retry": sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "retry"
-              ),
-              "pending_after": len(
-                  runtime[
-                      "pending_actions"
-                  ]
-              ),
-          }
 
-          # ------------------------------------------------------------
-          # Persist
-          # ------------------------------------------------------------
+          # ============================================================
+          # SAVE
+          # ============================================================
 
-          save(
-              CORE_RUNTIME_FILE,
-              runtime,
-          )
+          save(CORE_RUNTIME_FILE, runtime)
+          save(CORE_MEMORY_FILE, memory)
+          save(PRESENCE_MEMORY_FILE, presence)
 
-          save(
-              PRESENCE_FILE,
-              presence,
-          )
+
+          # ============================================================
+          # SUMMARY
+          # ============================================================
 
           print()
-          print(
-              "=== PRESENCE SUMMARY ==="
-          )
-          print(
-              "Run:",
-              run_id,
-          )
-          print(
-              "Selected:",
-              len(selected),
-          )
-          print(
-              "Success:",
-              sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "success"
-              ),
-          )
-          print(
-              "Failed:",
-              sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "failed"
-              ),
-          )
-          print(
-              "Retry:",
-              sum(
-                  1
-                  for outcome
-                  in outcomes_this_run
-                  if outcome.get(
-                      "status"
-                  )
-                  == "retry"
-              ),
-          )
-          print(
-              "Pending after:",
-              len(
-                  runtime[
-                      "pending_actions"
-                  ]
-              ),
-          )
-          print(
-              "=== PRESENCE COMPLETE ==="
-          )
+          print("=== PRESENCE SUMMARY ===")
+          print(f"Run: {RUN_ID}")
+          print(f"Selected: {len(selected)}")
+          print(f"Success: {success_count}")
+          print(f"Failed: {failed_count}")
+          print(f"Retry: {retry_count}")
+          print(f"Blocked: {blocked_count}")
+          print(f"Pending after: {len(remaining_pending)}")
+          print(f"Observed feed: {len(observed_feed)}")
+          print("=== PRESENCE COMPLETE ===")
           PY
 
-      - name: Validate Presence state
-        shell: bash
+      - name: Validate JSON state
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          python <<'PY'
           import json
-          from pathlib import Path
+          import os
 
           files = [
-              "memory/nox_core_runtime.json",
-              "memory/nox_colony_presence.json",
+              os.environ["CORE_MEMORY_FILE"],
+              os.environ["CORE_RUNTIME_FILE"],
+              os.environ["PRESENCE_MEMORY_FILE"],
           ]
 
-          for filename in files:
-              path = Path(filename)
+          for path in files:
+              with open(path, "r", encoding="utf-8") as fh:
+                  json.load(fh)
 
-              if not path.exists():
-                  raise SystemExit(
-                      f"Missing state file: {filename}"
-                  )
-
-              with path.open(
-                  "r",
-                  encoding="utf-8",
-              ) as f:
-                  data = json.load(f)
-
-              if not isinstance(
-                  data,
-                  dict,
-              ):
-                  raise SystemExit(
-                      f"Invalid JSON object: {filename}"
-                  )
-
-              print(
-                  "VALID:",
-                  filename,
-              )
-
-          print(
-              "Presence state valid."
-          )
+              print(f"VALID JSON: {path}")
           PY
 
-      - name: Check whitespace
+      - name: Check policy and diff
         run: |
           set -euo pipefail
+
+          test "${PROJECT_COST_EUR}" = "0"
+          test "${GEMINI_USED}" = "false"
+          test "${EXTERNAL_AI_USED}" = "false"
+          test "${AUTO_PAYMENT}" = "false"
+          test "${AUTO_SPENDING}" = "false"
+
           git diff --check
 
-      - name: Commit and push state
-        shell: bash
+      - name: Commit state
         run: |
           set -euo pipefail
 
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+
           git add \
-            memory/nox_core_runtime.json \
-            memory/nox_colony_presence.json
+            "${CORE_MEMORY_FILE}" \
+            "${CORE_RUNTIME_FILE}" \
+            "${PRESENCE_MEMORY_FILE}"
 
           if git diff --cached --quiet; then
-            echo "No Presence state changes."
+            echo "No state changes to commit."
             exit 0
           fi
 
-          git commit -m "chore(nox): update colony presence state"
+          git commit -m "chore(nox): record colony presence outcomes"
 
           git pull --rebase origin main
 
