@@ -3,1337 +3,745 @@ name: NØX - Memory & Knowledge
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "27 */2 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: nox-memory-knowledge
+  group: nox-state
   cancel-in-progress: false
 
 env:
   CORE_MEMORY_FILE: memory/nox_core_memory.json
   CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  WORK_FILE: memory/nox_work_factory.json
   KNOWLEDGE_FILE: memory/nox_knowledge.json
-  INDEX_FILE: memory/nox_knowledge_index.json
+  KNOWLEDGE_INDEX_FILE: memory/nox_knowledge_index.json
 
-  MAX_KNOWLEDGE_ITEMS: "500"
-  MAX_INDEX_ITEMS: "500"
-  MAX_RESEARCH_QUERIES: "3"
-  MAX_WEB_RESULTS: "5"
-  WEB_TIMEOUT_SECONDS: "12"
+  MAX_OBSERVATIONS: "500"
+  MAX_FACTS: "300"
+  MAX_EXPERIENCES: "300"
+  MAX_HYPOTHESES: "200"
+  MAX_RESULTS: "300"
+  MAX_LEARNINGS: "300"
+  MAX_SOURCES: "300"
+  MAX_QUERIES: "300"
+
+  MAX_TEXT_CHARS: "12000"
+
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
 jobs:
   memory-knowledge:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+
+    env:
+      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Run NØX Memory & Knowledge
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ddgs>=9.16.0,<10.0.0"
+
+      - name: Build knowledge state
+        shell: bash
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
-          import hashlib
+          python <<'PY'
           import json
           import os
           import re
-          import urllib.parse
-          import urllib.request
+          import hashlib
           from datetime import datetime, timezone
           from pathlib import Path
+          from urllib.parse import urlparse
 
           CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
           CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
           KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          INDEX_FILE = Path(os.environ["INDEX_FILE"])
+          INDEX_FILE = Path(os.environ["KNOWLEDGE_INDEX_FILE"])
 
-          MAX_KNOWLEDGE_ITEMS = int(
-              os.environ["MAX_KNOWLEDGE_ITEMS"]
-          )
-          MAX_INDEX_ITEMS = int(
-              os.environ["MAX_INDEX_ITEMS"]
-          )
-          MAX_RESEARCH_QUERIES = int(
-              os.environ["MAX_RESEARCH_QUERIES"]
-          )
-          MAX_WEB_RESULTS = int(
-              os.environ["MAX_WEB_RESULTS"]
-          )
-          WEB_TIMEOUT = int(
-              os.environ["WEB_TIMEOUT_SECONDS"]
-          )
+          MAX_OBSERVATIONS = int(os.environ["MAX_OBSERVATIONS"])
+          MAX_FACTS = int(os.environ["MAX_FACTS"])
+          MAX_EXPERIENCES = int(os.environ["MAX_EXPERIENCES"])
+          MAX_HYPOTHESES = int(os.environ["MAX_HYPOTHESES"])
+          MAX_RESULTS = int(os.environ["MAX_RESULTS"])
+          MAX_LEARNINGS = int(os.environ["MAX_LEARNINGS"])
+          MAX_SOURCES = int(os.environ["MAX_SOURCES"])
+          MAX_QUERIES = int(os.environ["MAX_QUERIES"])
+          MAX_TEXT_CHARS = int(os.environ["MAX_TEXT_CHARS"])
 
-          NOW = datetime.now(timezone.utc).isoformat()
+          NOW = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-          EMPTY_CORE_MEMORY = {
-              "observations": [],
-              "decisions": [],
-              "actions": [],
-              "learnings": []
-          }
-
-          EMPTY_CORE_RUNTIME = {}
-
-          EMPTY_KNOWLEDGE = {
-              "version": 2,
-              "observations": [],
-              "facts": [],
-              "experiences": [],
-              "hypotheses": [],
-              "results": [],
-              "learnings": [],
-              "sources": [],
-              "last_run": None,
-              "run_count": 0
-          }
-
-          EMPTY_INDEX = {
-              "version": 2,
-              "terms": {},
-              "updated_at": None
-          }
-
-
-          def load_json(path, default):
+          def load(path, default):
               if not path.exists():
                   return default
-
               try:
-                  with path.open(
-                      "r",
-                      encoding="utf-8"
-                  ) as handle:
-                      return json.load(handle)
+                  with path.open("r", encoding="utf-8") as f:
+                      value = json.load(f)
+                  return value
               except Exception as exc:
-                  print(
-                      f"WARNING: impossible de lire "
-                      f"{path}: {exc}"
-                  )
+                  print(f"WARNING: cannot load {path}: {exc}")
                   return default
 
+          def save(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              with tmp.open("w", encoding="utf-8") as f:
+                  json.dump(value, f, ensure_ascii=False, indent=2)
+                  f.write("\n")
+              tmp.replace(path)
 
-          def save_json(path, data):
-              path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
 
-              temporary = path.with_suffix(
-                  path.suffix + ".tmp"
-              )
+          def as_list(value):
+              return value if isinstance(value, list) else []
 
-              with temporary.open(
-                  "w",
-                  encoding="utf-8"
-              ) as handle:
-                  json.dump(
-                      data,
-                      handle,
-                      ensure_ascii=False,
-                      indent=2
-                  )
-
-              temporary.replace(path)
-
-
-          def clean_text(value, limit=1000):
+          def text(value):
               if value is None:
                   return ""
+              if isinstance(value, str):
+                  return value.strip()
+              try:
+                  return json.dumps(value, ensure_ascii=False)
+              except Exception:
+                  return str(value)
 
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  str(value)
-              ).strip()
+          def clip(value, limit=MAX_TEXT_CHARS):
+              value = text(value)
+              return value if len(value) <= limit else value[:limit].rstrip() + "…"
 
-              return text[:limit]
+          def stable_id(prefix, value):
+              raw = text(value)
+              return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
-
-          def stable_id(kind, text):
-              raw = (
-                  f"{kind}|{text}"
-                  .strip()
-                  .lower()
-              )
-
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()[:16]
-
-
-          def add_unique(collection, item, item_id):
-              for existing in collection:
-                  if (
-                      isinstance(existing, dict)
-                      and existing.get("id") == item_id
-                  ):
-                      return False
-
-              item["id"] = item_id
-              collection.append(item)
-
-              return True
-
-
-          def ensure_list(container, key):
-              if not isinstance(
-                  container.get(key),
-                  list
-              ):
-                  container[key] = []
-
-              return container[key]
-
-
-          def item_summary(item):
+          def timestamp(item):
               if not isinstance(item, dict):
                   return ""
-
               for key in (
-                  "summary",
-                  "observation",
-                  "result",
-                  "lesson",
-                  "learning",
-                  "action"
+                  "timestamp",
+                  "created_at",
+                  "created",
+                  "updated_at",
+                  "observed_at",
+                  "completed_at",
+                  "date",
               ):
-                  value = clean_text(
-                      item.get(key)
-                  )
-
+                  value = item.get(key)
                   if value:
-                      return value
-
+                      return str(value)
               return ""
 
+          def newest_first(items):
+              return sorted(
+                  items,
+                  key=lambda x: timestamp(x),
+                  reverse=True,
+              )
 
-          def evidence_value(item):
+          def bounded(items, limit):
+              return newest_first(items)[:limit]
+
+          def normalize_item(item):
+              if isinstance(item, str):
+                  return {
+                      "id": stable_id("item", item),
+                      "text": clip(item),
+                      "timestamp": NOW,
+                  }
+
               if not isinstance(item, dict):
-                  return {}
+                  return None
 
-              evidence = item.get(
-                  "evidence",
-                  {}
-              )
+              result = dict(item)
 
-              return (
-                  evidence
-                  if isinstance(evidence, dict)
-                  else {}
-              )
+              if "timestamp" not in result:
+                  for key in ("created_at", "created", "updated_at"):
+                      if result.get(key):
+                          result["timestamp"] = result[key]
+                          break
 
+              result.setdefault("timestamp", NOW)
 
-          # ==========================================================
-          # 1. LOAD CORE STATE
-          # ==========================================================
+              for key, value in list(result.items()):
+                  if isinstance(value, str):
+                      result[key] = clip(value)
 
-          core_memory = load_json(
-              CORE_MEMORY_FILE,
-              EMPTY_CORE_MEMORY
-          )
+              if not result.get("id"):
+                  basis = (
+                      result.get("text")
+                      or result.get("content")
+                      or result.get("question")
+                      or result.get("title")
+                      or result
+                  )
+                  result["id"] = stable_id("item", basis)
 
-          if not isinstance(
-              core_memory,
-              dict
-          ):
-              core_memory = dict(
-                  EMPTY_CORE_MEMORY
-              )
+              return result
 
-          for key in (
-              "observations",
-              "decisions",
-              "actions",
-              "learnings"
-          ):
-              ensure_list(
-                  core_memory,
-                  key
-              )
+          def merge_unique(existing, incoming, limit):
+              result = []
 
-          core_runtime = load_json(
-              CORE_RUNTIME_FILE,
-              EMPTY_CORE_RUNTIME
-          )
+              for item in list(existing) + list(incoming):
+                  normalized = normalize_item(item)
+                  if not normalized:
+                      continue
 
-          if not isinstance(
-              core_runtime,
-              dict
-          ):
-              core_runtime = {}
+                  item_id = str(normalized.get("id"))
 
+                  duplicate = False
+                  for previous in result:
+                      if str(previous.get("id")) == item_id:
+                          duplicate = True
+                          break
 
-          # ==========================================================
-          # 2. LOAD KNOWLEDGE LIBRARY
-          # ==========================================================
+                  if not duplicate:
+                      result.append(normalized)
 
-          knowledge = load_json(
-              KNOWLEDGE_FILE,
-              EMPTY_KNOWLEDGE
-          )
+              return bounded(result, limit)
 
-          if not isinstance(
-              knowledge,
-              dict
-          ):
-              knowledge = dict(
-                  EMPTY_KNOWLEDGE
-              )
+          core_memory = as_dict(load(CORE_MEMORY_FILE, {}))
+          runtime = as_dict(load(CORE_RUNTIME_FILE, {}))
+          work = as_dict(load(WORK_FILE, {}))
+          knowledge = as_dict(load(KNOWLEDGE_FILE, {}))
 
-          knowledge["version"] = 2
+          observations = as_list(core_memory.get("observations"))
+          facts = as_list(core_memory.get("facts"))
+          experiences = as_list(core_memory.get("experiences"))
+          hypotheses = as_list(core_memory.get("hypotheses"))
+          results = as_list(core_memory.get("results"))
+          learnings = as_list(core_memory.get("learnings"))
 
-          for key in (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "results",
-              "learnings",
-              "sources"
-          ):
-              ensure_list(
-                  knowledge,
-                  key
-              )
+          k_observations = as_list(knowledge.get("observations"))
+          k_facts = as_list(knowledge.get("facts"))
+          k_experiences = as_list(knowledge.get("experiences"))
+          k_hypotheses = as_list(knowledge.get("hypotheses"))
+          k_results = as_list(knowledge.get("results"))
+          k_learnings = as_list(knowledge.get("learnings"))
+          sources = as_list(knowledge.get("sources"))
+          queries = as_list(knowledge.get("queries"))
 
+          runtime_observations = as_list(runtime.get("observations"))
+          runtime_decisions = as_list(runtime.get("decisions"))
+          runtime_actions = as_list(runtime.get("actions"))
+          runtime_outcomes = as_list(runtime.get("outcomes"))
+          runtime_web_queries = as_list(runtime.get("web_queries"))
 
-          # ==========================================================
-          # 3. CONSOLIDATE CORE OBSERVATIONS
-          #
-          # Observation remains an observation.
-          # It is NOT automatically promoted to a verified fact.
-          # ==========================================================
+          work_history = as_list(work.get("history"))
+          work_results = as_list(work.get("results"))
 
-          observations = core_memory[
-              "observations"
-          ]
+          new_observations = []
+          new_experiences = []
+          new_results = []
+          new_learnings = []
+          new_sources = []
+          new_queries = []
 
-          observation_count = 0
+          # ------------------------------------------------------------
+          # 1. Runtime observations
+          # ------------------------------------------------------------
 
-          for item in observations:
-              if not isinstance(
-                  item,
-                  dict
-              ):
+          for item in runtime_observations[-100:]:
+              obj = normalize_item(item)
+              if obj:
+                  obj.setdefault("source", "core_runtime")
+                  new_observations.append(obj)
+
+          # ------------------------------------------------------------
+          # 2. Decisions are not automatically facts.
+          #    They remain observations/decision records.
+          # ------------------------------------------------------------
+
+          for item in runtime_decisions[-100:]:
+              obj = normalize_item(item)
+              if obj:
+                  obj.setdefault("source", "core_runtime")
+                  obj["type"] = obj.get("type", "decision")
+                  new_observations.append(obj)
+
+          # ------------------------------------------------------------
+          # 3. Actions + outcomes become experiences.
+          #    No outcome = no experience claim.
+          # ------------------------------------------------------------
+
+          outcome_by_action = {}
+
+          for outcome in runtime_outcomes:
+              if not isinstance(outcome, dict):
                   continue
 
-              summary = clean_text(
-                  item.get("summary")
-                  or item.get("observation")
+              action_id = (
+                  outcome.get("action_id")
+                  or outcome.get("id")
+                  or outcome.get("action")
               )
 
-              if not summary:
+              if action_id:
+                  outcome_by_action[str(action_id)] = outcome
+
+          for action in runtime_actions[-200:]:
+              if not isinstance(action, dict):
                   continue
 
-              timestamp = item.get(
-                  "timestamp",
-                  NOW
-              )
+              action_id = action.get("id") or action.get("action_id")
 
-              source = clean_text(
-                  item.get(
-                      "source",
-                      "core"
+              if not action_id:
+                  continue
+
+              outcome = outcome_by_action.get(str(action_id))
+
+              if not outcome:
+                  continue
+
+              outcome_status = text(
+                  outcome.get("status")
+                  or outcome.get("result")
+                  or outcome.get("outcome")
+              ).lower()
+
+              experience = {
+                  "id": stable_id(
+                      "experience",
+                      f"{action_id}|{outcome_status}|{text(outcome)}",
                   ),
-                  300
-              )
-
-              evidence = evidence_value(
-                  item
-              )
-
-              item_id = stable_id(
-                  "observation",
-                  json.dumps(
-                      {
-                          "summary": summary,
-                          "source": source,
-                          "evidence": evidence
-                      },
-                      ensure_ascii=False,
-                      sort_keys=True
-                  )
-              )
-
-              added = add_unique(
-                  knowledge["observations"],
-                  {
-                      "timestamp": timestamp,
-                      "source": source,
-                      "summary": summary,
-                      "evidence": evidence
-                  },
-                  item_id
-              )
-
-              if added:
-                  observation_count += 1
-
-
-          # ==========================================================
-          # 4. EXPLICIT VERIFIED FACTS
-          #
-          # Only items explicitly represented as facts are stored as
-          # facts. Ordinary observations are never silently promoted.
-          # ==========================================================
-
-          fact_count = 0
-
-          for item in observations:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              fact = item.get(
-                  "fact"
-              )
-
-              verified = item.get(
-                  "verified",
-                  False
-              )
-
-              if not fact or verified is not True:
-                  continue
-
-              summary = clean_text(
-                  fact
-              )
-
-              if not summary:
-                  continue
-
-              evidence = evidence_value(
-                  item
-              )
-
-              item_id = stable_id(
-                  "fact",
-                  json.dumps(
-                      {
-                          "summary": summary,
-                          "evidence": evidence
-                      },
-                      ensure_ascii=False,
-                      sort_keys=True
-                  )
-              )
-
-              added = add_unique(
-                  knowledge["facts"],
-                  {
-                      "timestamp": item.get(
-                          "timestamp",
-                          NOW
-                      ),
-                      "summary": summary,
-                      "evidence": evidence,
-                      "source": clean_text(
-                          item.get(
-                              "source",
-                              "core"
-                          ),
-                          300
-                      )
-                  },
-                  item_id
-              )
-
-              if added:
-                  fact_count += 1
-
-
-          # ==========================================================
-          # 5. CONSOLIDATE ACTION EXPERIENCES
-          #
-          # An action and its result form an experience.
-          # The experience itself is not automatically a learning.
-          # ==========================================================
-
-          actions = core_memory[
-              "actions"
-          ]
-
-          experience_count = 0
-
-          for item in actions:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              action = clean_text(
-                  item.get("action")
-              )
-
-              if not action:
-                  continue
-
-              result = clean_text(
-                  item.get("result")
-              )
-
-              target = item.get(
-                  "target"
-              )
-
-              identity = {
-                  "action": action,
-                  "target": target,
-                  "result": result
+                  "timestamp": timestamp(outcome) or timestamp(action) or NOW,
+                  "source": "core_runtime",
+                  "action_id": action_id,
+                  "action_type": action.get("type"),
+                  "target_id": action.get("target_id"),
+                  "status": outcome_status,
+                  "action": clip(action),
+                  "outcome": clip(outcome),
               }
 
-              item_id = stable_id(
-                  "experience",
-                  json.dumps(
-                      identity,
-                      ensure_ascii=False,
-                      sort_keys=True
-                  )
-              )
+              new_experiences.append(experience)
 
-              added = add_unique(
-                  knowledge["experiences"],
-                  {
-                      "timestamp": item.get(
-                          "timestamp",
-                          NOW
-                      ),
-                      "action": action,
-                      "target": target,
-                      "result": result,
-                      "evidence": evidence_value(
-                          item
+          # ------------------------------------------------------------
+          # 4. Work Factory completed results
+          # ------------------------------------------------------------
+
+          for item in work_results[-100:]:
+              if not isinstance(item, dict):
+                  continue
+
+              status = text(item.get("status")).lower()
+
+              if status not in (
+                  "completed",
+                  "complete",
+                  "success",
+                  "multi_source_support",
+                  "partial_support",
+                  "insufficient_verification",
+                  "no_evidence",
+              ):
+                  continue
+
+              result_obj = {
+                  "id": item.get("id")
+                  or stable_id("result", item),
+                  "timestamp": timestamp(item) or NOW,
+                  "source": "work_factory",
+                  "work_id": item.get("work_id") or item.get("id"),
+                  "question": clip(item.get("question")),
+                  "status": status,
+                  "conclusion": clip(item.get("conclusion")),
+                  "uncertainty": clip(item.get("uncertainty")),
+                  "evidence": item.get("evidence", []),
+                  "sources": item.get("sources", []),
+              }
+
+              new_results.append(result_obj)
+
+              for source in as_list(item.get("sources")):
+                  if isinstance(source, str):
+                      url = source
+                  elif isinstance(source, dict):
+                      url = (
+                          source.get("url")
+                          or source.get("link")
+                          or source.get("source")
                       )
-                  },
-                  item_id
-              )
+                  else:
+                      url = ""
 
-              if added:
-                  experience_count += 1
-
-
-          # ==========================================================
-          # 6. EXPLICIT HYPOTHESES
-          # ==========================================================
-
-          hypothesis_count = 0
-
-          for item in observations:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              hypothesis = (
-                  item.get("hypothesis")
-                  or item.get("hypotheses")
-              )
-
-              if not hypothesis:
-                  continue
-
-              if isinstance(
-                  hypothesis,
-                  list
-              ):
-                  values = hypothesis
-              else:
-                  values = [hypothesis]
-
-              for value in values:
-                  summary = clean_text(
-                      value
-                  )
-
-                  if not summary:
-                      continue
-
-                  item_id = stable_id(
-                      "hypothesis",
-                      summary
-                  )
-
-                  added = add_unique(
-                      knowledge["hypotheses"],
-                      {
-                          "timestamp": item.get(
-                              "timestamp",
-                              NOW
-                          ),
-                          "summary": summary,
-                          "status": clean_text(
-                              item.get(
-                                  "hypothesis_status",
-                                  "unverified"
-                              )
-                          ) or "unverified",
-                          "evidence": evidence_value(
-                              item
-                          )
-                      },
-                      item_id
-                  )
-
-                  if added:
-                      hypothesis_count += 1
-
-
-          # ==========================================================
-          # 7. EXPLICIT TEST RESULTS
-          # ==========================================================
-
-          result_count = 0
-
-          for item in actions:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              result = item.get(
-                  "result"
-              )
-
-              result_status = (
-                  item.get("result_status")
-                  or item.get("outcome_status")
-              )
-
-              if (
-                  not result
-                  or not result_status
-              ):
-                  continue
-
-              summary = clean_text(
-                  result
-              )
-
-              if not summary:
-                  continue
-
-              item_id = stable_id(
-                  "result",
-                  json.dumps(
-                      {
-                          "summary": summary,
-                          "status": result_status
-                      },
-                      ensure_ascii=False,
-                      sort_keys=True
-                  )
-              )
-
-              added = add_unique(
-                  knowledge["results"],
-                  {
-                      "timestamp": item.get(
-                          "timestamp",
-                          NOW
-                      ),
-                      "summary": summary,
-                      "status": clean_text(
-                          result_status,
-                          100
-                      ),
-                      "action": clean_text(
-                          item.get("action")
-                      ),
-                      "evidence": evidence_value(
-                          item
-                      )
-                  },
-                  item_id
-              )
-
-              if added:
-                  result_count += 1
-
-
-          # ==========================================================
-          # 8. CONSOLIDATE CORE LEARNINGS
-          #
-          # Learnings remain explicit learnings and retain evidence.
-          # ==========================================================
-
-          learnings = core_memory[
-              "learnings"
-          ]
-
-          learning_count = 0
-
-          for item in learnings:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              summary = clean_text(
-                  item.get("summary")
-                  or item.get("learning")
-                  or item.get("lesson")
-              )
-
-              if not summary:
-                  continue
-
-              item_id = stable_id(
-                  "learning",
-                  json.dumps(
-                      {
-                          "summary": summary,
-                          "evidence": evidence_value(
-                              item
-                          )
-                      },
-                      ensure_ascii=False,
-                      sort_keys=True
-                  )
-              )
-
-              added = add_unique(
-                  knowledge["learnings"],
-                  {
-                      "timestamp": item.get(
-                          "timestamp",
-                          NOW
-                      ),
-                      "summary": summary,
-                      "evidence": evidence_value(
-                          item
-                      ),
-                      "confidence": item.get(
-                          "confidence"
-                      ),
-                      "source": clean_text(
-                          item.get(
-                              "source",
-                              "core"
-                          ),
-                          300
-                      )
-                  },
-                  item_id
-              )
-
-              if added:
-                  learning_count += 1
-
-
-          # ==========================================================
-          # 9. EXTRACT WEB SOURCES ALREADY USED BY CORE
-          # ==========================================================
-
-          sources_added = 0
-
-          for item in observations:
-              if not isinstance(
-                  item,
-                  dict
-              ):
-                  continue
-
-              evidence = evidence_value(
-                  item
-              )
-
-              results = evidence.get(
-                  "results",
-                  []
-              )
-
-              if not isinstance(
-                  results,
-                  list
-              ):
-                  continue
-
-              for result in results:
-                  if not isinstance(
-                      result,
-                      dict
-                  ):
-                      continue
-
-                  url = clean_text(
-                      result.get("url"),
-                      500
-                  )
-
-                  if not url:
-                      continue
-
-                  source_id = stable_id(
-                      "source",
-                      url
-                  )
-
-                  added = add_unique(
-                      knowledge["sources"],
-                      {
-                          "timestamp": item.get(
-                              "timestamp",
-                              NOW
-                          ),
+                  if url:
+                      new_sources.append({
+                          "id": stable_id("source", url),
                           "url": url,
-                          "title": clean_text(
-                              result.get(
-                                  "title"
-                              ),
-                              300
-                          ),
-                          "snippet": clean_text(
-                              result.get(
-                                  "snippet"
-                              ),
-                              500
-                          ),
-                          "source": "core"
-                      },
-                      source_id
-                  )
+                          "timestamp": timestamp(item) or NOW,
+                          "source": "work_factory",
+                          "work_id": item.get("work_id") or item.get("id"),
+                      })
 
-                  if added:
-                      sources_added += 1
+          # ------------------------------------------------------------
+          # 5. Work history: preserve learning signals, not raw noise
+          # ------------------------------------------------------------
 
+          for item in work_history[-100:]:
+              if not isinstance(item, dict):
+                  continue
 
-          # ==========================================================
-          # 10. WEB RESEARCH
-          #
-          # Research is a capability of Memory & Knowledge.
-          # No Gemini and no external AI.
-          #
-          # The Core provides research intent through web_queries.
-          # This workflow performs deterministic retrieval and stores
-          # the retrieved evidence for later cognitive use.
-          # ==========================================================
+              status = text(item.get("status")).lower()
 
-          web_queries = core_runtime.get(
-              "web_queries",
-              []
+              if status in (
+                  "invalid_input",
+                  "needs_retry",
+                  "failed",
+                  "no_evidence",
+              ):
+                  learning = {
+                      "id": stable_id("learning", item),
+                      "timestamp": timestamp(item) or NOW,
+                      "source": "work_factory",
+                      "type": "process_learning",
+                      "status": status,
+                      "question": clip(item.get("question")),
+                      "learning": clip(
+                          item.get("learning")
+                          or item.get("reason")
+                          or item.get("error")
+                          or "Research item did not produce usable evidence."
+                      ),
+                  }
+                  new_learnings.append(learning)
+
+          # ------------------------------------------------------------
+          # 6. Explicit learning records already present in Core
+          # ------------------------------------------------------------
+
+          for item in learnings[-100:]:
+              obj = normalize_item(item)
+              if obj:
+                  obj.setdefault("source", "core_memory")
+                  new_learnings.append(obj)
+
+          # ------------------------------------------------------------
+          # 7. URLs from runtime web queries
+          # ------------------------------------------------------------
+
+          for query in runtime_web_queries[-100:]:
+              obj = normalize_item(query)
+              if obj:
+                  obj.setdefault("source", "core_runtime")
+                  new_queries.append(obj)
+
+          # ------------------------------------------------------------
+          # 8. Query records already stored in knowledge
+          # ------------------------------------------------------------
+
+          for query in queries[-100:]:
+              obj = normalize_item(query)
+              if obj:
+                  new_queries.append(obj)
+
+          # ------------------------------------------------------------
+          # 9. Extract URLs from all research-related text.
+          # ------------------------------------------------------------
+
+          url_pattern = re.compile(r"https?://[^\s<>\"]+")
+
+          research_texts = []
+
+          for item in new_results:
+              research_texts.append(text(item))
+
+          for item in new_sources:
+              research_texts.append(text(item))
+
+          for item in work_history[-50:]:
+              research_texts.append(text(item))
+
+          for blob in research_texts:
+              for url in url_pattern.findall(blob):
+                  url = url.rstrip(".,);]}>")
+                  try:
+                      parsed = urlparse(url)
+                      if parsed.scheme not in ("http", "https"):
+                          continue
+                      if not parsed.netloc:
+                          continue
+                  except Exception:
+                      continue
+
+                  new_sources.append({
+                      "id": stable_id("source", url),
+                      "url": url,
+                      "timestamp": NOW,
+                      "source": "research_extraction",
+                  })
+
+          # ------------------------------------------------------------
+          # 10. Merge without inventing facts.
+          # ------------------------------------------------------------
+
+          merged_observations = merge_unique(
+              observations + k_observations,
+              new_observations,
+              MAX_OBSERVATIONS,
           )
 
-          if not isinstance(
-              web_queries,
-              list
-          ):
-              web_queries = []
+          merged_facts = merge_unique(
+              facts + k_facts,
+              [],
+              MAX_FACTS,
+          )
 
-          queries = []
-          seen_queries = set()
+          merged_experiences = merge_unique(
+              experiences + k_experiences,
+              new_experiences,
+              MAX_EXPERIENCES,
+          )
 
-          for item in reversed(
-              web_queries
-          ):
-              if isinstance(
-                  item,
-                  dict
+          merged_hypotheses = merge_unique(
+              hypotheses + k_hypotheses,
+              [],
+              MAX_HYPOTHESES,
+          )
+
+          merged_results = merge_unique(
+              results + k_results,
+              new_results,
+              MAX_RESULTS,
+          )
+
+          merged_learnings = merge_unique(
+              learnings + k_learnings,
+              new_learnings,
+              MAX_LEARNINGS,
+          )
+
+          merged_sources = merge_unique(
+              sources,
+              new_sources,
+              MAX_SOURCES,
+          )
+
+          merged_queries = merge_unique(
+              queries,
+              new_queries,
+              MAX_QUERIES,
+          )
+
+          # ------------------------------------------------------------
+          # 11. Knowledge facts remain conservative.
+          #
+          # We only retain existing explicit facts here.
+          # Research conclusions are results until independently verified.
+          # ------------------------------------------------------------
+
+          verified_facts = []
+
+          for item in merged_facts:
+              if not isinstance(item, dict):
+                  continue
+
+              verification = text(
+                  item.get("verification")
+                  or item.get("status")
+                  or item.get("evidence_status")
+              ).lower()
+
+              explicit = item.get("verified") is True
+
+              if explicit or verification in (
+                  "verified",
+                  "confirmed",
+                  "multi_source_verified",
               ):
-                  query = clean_text(
-                      item.get("query"),
-                      300
-                  )
-              else:
-                  query = clean_text(
-                      item,
-                      300
-                  )
+                  verified_facts.append(item)
 
-              if not query:
-                  continue
+          merged_facts = bounded(verified_facts, MAX_FACTS)
 
-              normalized = query.lower()
+          # ------------------------------------------------------------
+          # 12. Build knowledge object.
+          # ------------------------------------------------------------
 
-              if normalized in seen_queries:
-                  continue
+          knowledge = {
+              "schema_version": 2,
+              "updated_at": NOW,
+              "last_run": NOW,
+              "run_count": int(knowledge.get("run_count", 0) or 0) + 1,
 
-              seen_queries.add(
-                  normalized
-              )
-              queries.append(
-                  query
-              )
+              "observations": merged_observations,
+              "facts": merged_facts,
+              "experiences": merged_experiences,
+              "hypotheses": merged_hypotheses,
+              "results": merged_results,
+              "learnings": merged_learnings,
+              "sources": merged_sources,
+              "queries": merged_queries,
+          }
 
-              if (
-                  len(queries)
-                  >= MAX_RESEARCH_QUERIES
-              ):
-                  break
+          # ------------------------------------------------------------
+          # 13. Update Core memory conservatively.
+          #
+          # Never promote results/hypotheses to facts automatically.
+          # ------------------------------------------------------------
 
+          core_memory["observations"] = bounded(
+              merge_unique(observations, new_observations, MAX_OBSERVATIONS),
+              MAX_OBSERVATIONS,
+          )
 
-          def web_search(query):
-              encoded = urllib.parse.urlencode(
-                  {"q": query}
-              )
+          core_memory["facts"] = merged_facts
+          core_memory["experiences"] = bounded(
+              merge_unique(experiences, new_experiences, MAX_EXPERIENCES),
+              MAX_EXPERIENCES,
+          )
+          core_memory["hypotheses"] = merged_hypotheses
+          core_memory["results"] = merged_results
+          core_memory["learnings"] = merged_learnings
+          core_memory["updated_at"] = NOW
 
-              url = (
-                  "https://html.duckduckgo.com/html/?"
-                  + encoded
-              )
+          # ------------------------------------------------------------
+          # 14. Build compact searchable index.
+          # ------------------------------------------------------------
 
-              request = urllib.request.Request(
-                  url,
-                  headers={
-                      "User-Agent":
-                          "Mozilla/5.0 "
-                          "(compatible; "
-                          "NOX-Memory-Knowledge/2.0)"
-                  }
-              )
+          index_items = []
 
-              try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=WEB_TIMEOUT
-                  ) as response:
-                      html = response.read().decode(
-                          "utf-8",
-                          errors="ignore"
-                      )
-              except Exception as exc:
-                  print(
-                      f"WEB SEARCH unavailable: "
-                      f"{exc}"
-                  )
-                  return []
-
-              blocks = re.findall(
-                  r'<div[^>]+class="result[^"]*"'
-                  r'.*?</div>\s*</div>',
-                  html,
-                  flags=(
-                      re.IGNORECASE
-                      | re.DOTALL
-                  )
-              )
-
-              results = []
-
-              for block in blocks:
-                  if (
-                      len(results)
-                      >= MAX_WEB_RESULTS
-                  ):
-                      break
-
-                  title_match = re.search(
-                      r'class="result__a"'
-                      r'[^>]*>(.*?)</a>',
-                      block,
-                      flags=(
-                          re.IGNORECASE
-                          | re.DOTALL
-                      )
-                  )
-
-                  url_match = re.search(
-                      r'class="result__a"'
-                      r'[^>]*href="([^"]+)"',
-                      block,
-                      flags=re.IGNORECASE
-                  )
-
-                  snippet_match = re.search(
-                      r'class="result__snippet"'
-                      r'[^>]*>(.*?)</',
-                      block,
-                      flags=(
-                          re.IGNORECASE
-                          | re.DOTALL
-                      )
-                  )
-
-                  if (
-                      not title_match
-                      or not url_match
-                  ):
+          def add_index(collection, item_type):
+              for item in collection:
+                  if not isinstance(item, dict):
                       continue
 
-                  title = clean_text(
-                      re.sub(
-                          r"<[^>]+>",
-                          "",
-                          title_match.group(1)
-                      ),
-                      300
+                  content = (
+                      item.get("text")
+                      or item.get("content")
+                      or item.get("question")
+                      or item.get("conclusion")
+                      or item.get("learning")
+                      or item.get("title")
+                      or ""
                   )
 
-                  snippet = ""
+                  index_items.append({
+                      "id": item.get("id"),
+                      "type": item_type,
+                      "timestamp": item.get("timestamp") or NOW,
+                      "text": clip(content, 2000),
+                  })
 
-                  if snippet_match:
-                      snippet = clean_text(
-                          re.sub(
-                              r"<[^>]+>",
-                              "",
-                              snippet_match.group(1)
-                          ),
-                          500
-                      )
+          add_index(merged_observations, "observation")
+          add_index(merged_facts, "fact")
+          add_index(merged_experiences, "experience")
+          add_index(merged_hypotheses, "hypothesis")
+          add_index(merged_results, "result")
+          add_index(merged_learnings, "learning")
 
-                  result_url = urllib.parse.unquote(
-                      url_match.group(1)
-                  )
-
-                  if not result_url:
-                      continue
-
-                  results.append(
-                      {
-                          "title": title,
-                          "url": clean_text(
-                              result_url,
-                              500
-                          ),
-                          "snippet": snippet
-                      }
-                  )
-
-              return results
-
-
-          research_runs = 0
-          research_results = 0
-
-          for query in queries:
-              print(
-                  f"RESEARCH: {query}"
-              )
-
-              results = web_search(
-                  query
-              )
-
-              if not results:
-                  continue
-
-              research_runs += 1
-              research_results += len(
-                  results
-              )
-
-              for result in results:
-                  url = clean_text(
-                      result.get("url"),
-                      500
-                  )
-
-                  if not url:
-                      continue
-
-                  source_id = stable_id(
-                      "source",
-                      url
-                  )
-
-                  add_unique(
-                      knowledge["sources"],
-                      {
-                          "timestamp": NOW,
-                          "url": url,
-                          "title": clean_text(
-                              result.get(
-                                  "title"
-                              ),
-                              300
-                          ),
-                          "snippet": clean_text(
-                              result.get(
-                                  "snippet"
-                              ),
-                              500
-                          ),
-                          "query": query,
-                          "source": "web"
-                      },
-                      source_id
-                  )
-
-
-          # ==========================================================
-          # 11. KNOWLEDGE LIMITS
-          # ==========================================================
-
-          for key in (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "results",
-              "learnings",
-              "sources"
-          ):
-              knowledge[key] = (
-                  knowledge[key]
-                  [-MAX_KNOWLEDGE_ITEMS:]
-              )
-
-
-          # ==========================================================
-          # 12. SEARCH INDEX
-          # ==========================================================
+          index_items = newest_first(index_items)[:1200]
 
           index = {
-              "version": 2,
-              "terms": {},
-              "updated_at": NOW
+              "schema_version": 2,
+              "updated_at": NOW,
+              "count": len(index_items),
+              "items": index_items,
           }
 
-          stop_words = {
-              "avec",
-              "dans",
-              "pour",
-              "mais",
-              "plus",
-              "cette",
-              "sont",
-              "une",
-              "des",
-              "les",
-              "sur",
-              "par",
-              "que",
-              "qui",
-              "est",
-              "pas",
-              "aux",
-              "avec",
-              "the",
-              "and",
-              "for",
-              "with",
-              "from",
-              "this",
-              "that",
-              "are",
-              "was",
-              "were",
-              "not",
-              "has",
-              "have",
-              "but",
-              "you",
-              "your"
-          }
+          # ------------------------------------------------------------
+          # 15. Policy integrity.
+          # ------------------------------------------------------------
 
-          indexed_kinds = (
-              "observations",
-              "facts",
-              "experiences",
-              "hypotheses",
-              "results",
-              "learnings"
-          )
+          assert os.environ["PROJECT_COST_EUR"] == "0"
+          assert os.environ["GEMINI_USED"].lower() == "false"
+          assert os.environ["EXTERNAL_AI_USED"].lower() == "false"
+          assert os.environ["AUTO_PAYMENT"].lower() == "false"
+          assert os.environ["AUTO_SPENDING"].lower() == "false"
 
-          for kind in indexed_kinds:
-              for item in knowledge[kind]:
-                  if not isinstance(
-                      item,
-                      dict
-                  ):
-                      continue
+          save(KNOWLEDGE_FILE, knowledge)
+          save(INDEX_FILE, index)
+          save(CORE_MEMORY_FILE, core_memory)
 
-                  item_id = item.get(
-                      "id"
-                  )
-
-                  if not item_id:
-                      continue
-
-                  text = json.dumps(
-                      item,
-                      ensure_ascii=False
-                  ).lower()
-
-                  words = re.findall(
-                      r"[a-zà-ÿ0-9_-]{3,}",
-                      text,
-                      flags=re.IGNORECASE
-                  )
-
-                  for word in set(words):
-                      if word in stop_words:
-                          continue
-
-                      bucket = index[
-                          "terms"
-                      ].setdefault(
-                          word,
-                          []
-                      )
-
-                      if item_id not in bucket:
-                          bucket.append(
-                              item_id
-                          )
-
-          for word in list(
-              index["terms"]
-          ):
-              index["terms"][word] = (
-                  index["terms"][word]
-                  [-MAX_INDEX_ITEMS:]
-              )
-
-
-          # ==========================================================
-          # 13. PERSISTENCE
-          # ==========================================================
-
-          knowledge["last_run"] = NOW
-          knowledge["run_count"] = (
-              int(
-                  knowledge.get(
-                      "run_count",
-                      0
-                  )
-              )
-              + 1
-          )
-
-          save_json(
-              KNOWLEDGE_FILE,
-              knowledge
-          )
-
-          save_json(
-              INDEX_FILE,
-              index
-          )
-
-
-          # ==========================================================
-          # 14. RUN SUMMARY
-          # ==========================================================
-
-          print("")
-          print(
-              "=== NØX MEMORY & KNOWLEDGE ==="
-          )
-          print(
-              f"Core observations: "
-              f"{len(observations)}"
-          )
-          print(
-              f"Core decisions: "
-              f"{len(core_memory['decisions'])}"
-          )
-          print(
-              f"Core actions: "
-              f"{len(actions)}"
-          )
-          print(
-              f"Core learnings: "
-              f"{len(learnings)}"
-          )
-          print(
-              f"Observations added: "
-              f"{observation_count}"
-          )
-          print(
-              f"Verified facts added: "
-              f"{fact_count}"
-          )
-          print(
-              f"Experiences added: "
-              f"{experience_count}"
-          )
-          print(
-              f"Hypotheses added: "
-              f"{hypothesis_count}"
-          )
-          print(
-              f"Results added: "
-              f"{result_count}"
-          )
-          print(
-              f"Learnings added: "
-              f"{learning_count}"
-          )
-          print(
-              f"Core sources added: "
-              f"{sources_added}"
-          )
-          print(
-              f"Research runs: "
-              f"{research_runs}"
-          )
-          print(
-              f"Research results: "
-              f"{research_results}"
-          )
-          print(
-              f"Knowledge observations: "
-              f"{len(knowledge['observations'])}"
-          )
-          print(
-              f"Knowledge facts: "
-              f"{len(knowledge['facts'])}"
-          )
-          print(
-              f"Knowledge experiences: "
-              f"{len(knowledge['experiences'])}"
-          )
-          print(
-              f"Knowledge hypotheses: "
-              f"{len(knowledge['hypotheses'])}"
-          )
-          print(
-              f"Knowledge results: "
-              f"{len(knowledge['results'])}"
-          )
-          print(
-              f"Knowledge learnings: "
-              f"{len(knowledge['learnings'])}"
-          )
-          print(
-              f"Knowledge sources: "
-              f"{len(knowledge['sources'])}"
-          )
-          print(
-              f"Index terms: "
-              f"{len(index['terms'])}"
-          )
-          print("")
-          print(
-              "=== OBSERVE -> EVIDENCE -> "
-              "KNOWLEDGE -> INDEX ==="
-          )
-          print(
-              "=== NØX MEMORY & KNOWLEDGE TERMINÉ ==="
-          )
+          print("=== NØX MEMORY & KNOWLEDGE ===")
+          print(f"Run: {NOW}")
+          print(f"Observations: {len(merged_observations)}")
+          print(f"Verified facts: {len(merged_facts)}")
+          print(f"Experiences: {len(merged_experiences)}")
+          print(f"Hypotheses: {len(merged_hypotheses)}")
+          print(f"Results: {len(merged_results)}")
+          print(f"Learnings: {len(merged_learnings)}")
+          print(f"Sources: {len(merged_sources)}")
+          print(f"Queries: {len(merged_queries)}")
+          print(f"Index items: {len(index_items)}")
+          print("Research conclusions remain results unless explicitly verified.")
           PY
 
-      - name: Commit Memory & Knowledge
+      - name: Validate JSON and policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          files = [
+              Path(os.environ["CORE_MEMORY_FILE"]),
+              Path(os.environ["CORE_RUNTIME_FILE"]),
+              Path(os.environ["WORK_FILE"]),
+              Path(os.environ["KNOWLEDGE_FILE"]),
+              Path(os.environ["KNOWLEDGE_INDEX_FILE"]),
+          ]
+
+          for path in files:
+              if not path.exists():
+                  raise SystemExit(f"Missing JSON file: {path}")
+
+              with path.open("r", encoding="utf-8") as f:
+                  json.load(f)
+
+              print(f"VALID JSON: {path}")
+
+          assert os.environ["PROJECT_COST_EUR"] == "0"
+          assert os.environ["GEMINI_USED"].lower() == "false"
+          assert os.environ["EXTERNAL_AI_USED"].lower() == "false"
+          assert os.environ["AUTO_PAYMENT"].lower() == "false"
+          assert os.environ["AUTO_SPENDING"].lower() == "false"
+
+          print("POLICY: OK")
+          PY
+
+          git diff --check
+
+      - name: Commit and push
+        shell: bash
         run: |
           set -euo pipefail
 
           git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
+          git config user.email "nox@nox-origin.local"
 
-          git add memory/nox_knowledge.json
-          git add memory/nox_knowledge_index.json
-
-          if git diff --cached --quiet; then
-            echo "No Memory & Knowledge changes to commit."
+          if git diff --quiet; then
+            echo "No memory changes to commit."
             exit 0
           fi
 
-          git commit -m "NØX: update memory and knowledge"
-          git push
+          git add \
+            memory/nox_core_memory.json \
+            memory/nox_knowledge.json \
+            memory/nox_knowledge_index.json
+
+          git commit -m "chore(nox): update memory and knowledge"
+
+          git pull --rebase origin main
+          git push origin HEAD:main
