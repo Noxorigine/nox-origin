@@ -22,6 +22,7 @@ env:
   MAX_FEED_ITEMS: "20"
   MAX_TRACKED: "500"
   MAX_RUNS: "100"
+  MAX_RETRY_ATTEMPTS: "6"
 
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
@@ -56,7 +57,6 @@ jobs:
           import json
           import os
           import subprocess
-          import sys
           import uuid
           from datetime import datetime, timezone
 
@@ -76,6 +76,7 @@ jobs:
           MAX_FEED_ITEMS = int(os.environ["MAX_FEED_ITEMS"])
           MAX_TRACKED = int(os.environ["MAX_TRACKED"])
           MAX_RUNS = int(os.environ["MAX_RUNS"])
+          MAX_RETRY_ATTEMPTS = int(os.environ["MAX_RETRY_ATTEMPTS"])
 
           PROJECT_COST_EUR = os.environ["PROJECT_COST_EUR"]
           GEMINI_USED = os.environ["GEMINI_USED"]
@@ -234,6 +235,7 @@ jobs:
           presence.setdefault("errors", [])
           presence.setdefault("tracked_targets", [])
           presence.setdefault("runs", [])
+          presence.setdefault("permanent_failures", [])
 
 
           # ============================================================
@@ -244,20 +246,8 @@ jobs:
               """
               Normalize all action schemas emitted by Core/runtime.
 
-              Supported action type fields:
-                type
-                action_type
-                kind
-                action
-
-              Supported target fields:
-                target_id
-                post_id
-                parent_id
-                conversation_id
-                recipient
-                username
-                target
+              Both id and action_id are preserved so Core and Presence
+              use the same persistent action identity.
               """
 
               if not isinstance(raw, dict):
@@ -266,8 +256,8 @@ jobs:
               action_id = first_nonempty(
                   raw,
                   [
-                      "id",
                       "action_id",
+                      "id",
                       "actionId",
                   ],
               )
@@ -362,8 +352,22 @@ jobs:
                   ],
               )
 
+              try:
+                  attempts = int(
+                      raw.get("attempts", 0) or 0
+                  )
+              except (TypeError, ValueError):
+                  attempts = 0
+
+              persistent_id = (
+                  text(action_id)
+                  if action_id
+                  else make_id("action")
+              )
+
               normalized = {
-                  "id": text(action_id) if action_id else make_id("action"),
+                  "id": persistent_id,
+                  "action_id": persistent_id,
                   "type": action_type,
                   "target_id": text(target_id) if target_id else None,
                   "parent_id": text(parent_id) if parent_id else None,
@@ -371,18 +375,24 @@ jobs:
                   "body": text(body) if body else "",
                   "title": text(title) if title else "",
                   "colony": text(colony) if colony else None,
-                  "attempts": int(raw.get("attempts", 0) or 0),
+                  "attempts": attempts,
                   "created_at": raw.get("created_at") or now_iso(),
                   "source": raw.get("source") or "core",
                   "original": raw,
               }
+
+              if raw.get("last_attempt_at"):
+                  normalized["last_attempt_at"] = raw[
+                      "last_attempt_at"
+                  ]
 
               return normalized
 
 
           def action_key(action):
               return (
-                  text(action.get("id"))
+                  text(action.get("action_id"))
+                  or text(action.get("id"))
                   or "|".join(
                       [
                           text(action.get("type")),
@@ -436,9 +446,35 @@ jobs:
                       "success",
                       "completed",
                       "blocked",
+                      "permanent_failure",
                   }:
                       normalized_pending.append(action)
                       existing_keys.add(key)
+
+
+          # Remove actions already known as permanent failures.
+          permanent_failure_ids = {
+              text(
+                  failure.get("action_id")
+                  or failure.get("id")
+              )
+              for failure in as_list(
+                  presence.get("permanent_failures")
+              )
+              if isinstance(failure, dict)
+              and (
+                  failure.get("action_id")
+                  or failure.get("id")
+              )
+          }
+
+          if permanent_failure_ids:
+              normalized_pending = [
+                  action
+                  for action in normalized_pending
+                  if action_key(action)
+                  not in permanent_failure_ids
+              ]
 
 
           print("=== NØX PRESENCE ===")
@@ -535,11 +571,13 @@ jobs:
           outcomes = []
           executed_keys = set()
           failed_keys = set()
+          permanent_failure_keys = set()
 
           success_count = 0
           failed_count = 0
           blocked_count = 0
           retry_count = 0
+          permanent_failure_count = 0
 
 
           # ============================================================
@@ -760,7 +798,6 @@ jobs:
                       continue
 
                   try:
-                      # Verify the target post exists before commenting.
                       post = client.get_post(target_id)
 
                       if not post:
@@ -911,7 +948,6 @@ jobs:
                               "status": "retry",
                               "action_type": action_type,
                               "error": clip(exc, 1000),
-                              "attempts": action["attempts"] + 1,
                               "timestamp": now_iso(),
                           }
                       )
@@ -946,6 +982,95 @@ jobs:
 
 
           # ============================================================
+          # PERSIST ATTEMPTS AND CLASSIFY PERMANENT FAILURES
+          # ============================================================
+
+          selected_by_id = {
+              action["id"]: action
+              for action in selected
+          }
+
+          for outcome in outcomes:
+
+              if outcome.get("success"):
+                  continue
+
+              action_id = text(
+                  outcome.get("action_id")
+              )
+
+              action = selected_by_id.get(action_id)
+
+              if action is None:
+                  continue
+
+              next_attempt = (
+                  int(action.get("attempts", 0))
+                  + 1
+              )
+
+              action["attempts"] = next_attempt
+              action["last_attempt_at"] = now_iso()
+
+              outcome["attempts"] = next_attempt
+
+              if next_attempt >= MAX_RETRY_ATTEMPTS:
+
+                  outcome["type"] = "permanent_failure"
+                  outcome["status"] = "permanent_failure"
+                  outcome["permanent_failure"] = True
+
+                  permanent_failure_keys.add(
+                      action_key(action)
+                  )
+
+                  permanent_failure_count += 1
+
+                  failure_record = {
+                      "id": make_id(
+                          "permanent-failure"
+                      ),
+                      "action_id": action_id,
+                      "run_id": RUN_ID,
+                      "action_type": action.get(
+                          "type"
+                      ),
+                      "target_id": action.get(
+                          "target_id"
+                      ),
+                      "recipient": action.get(
+                          "recipient"
+                      ),
+                      "attempts": next_attempt,
+                      "reason": outcome.get(
+                          "reason"
+                      ),
+                      "error": outcome.get(
+                          "error"
+                      ),
+                      "created_at": action.get(
+                          "created_at"
+                      ),
+                      "last_attempt_at": action.get(
+                          "last_attempt_at"
+                      ),
+                      "timestamp": now_iso(),
+                  }
+
+                  presence[
+                      "permanent_failures"
+                  ].append(failure_record)
+
+                  print(
+                      "PERMANENT FAILURE:",
+                      action_id,
+                      "after",
+                      next_attempt,
+                      "attempts",
+                  )
+
+
+          # ============================================================
           # REBUILD PENDING ACTIONS
           # ============================================================
 
@@ -958,9 +1083,8 @@ jobs:
               if key in executed_keys:
                   continue
 
-              if key in failed_keys:
-                  action["attempts"] = int(action.get("attempts", 0)) + 1
-                  action["last_attempt_at"] = now_iso()
+              if key in permanent_failure_keys:
+                  continue
 
               remaining_pending.append(action)
 
@@ -985,7 +1109,6 @@ jobs:
           runtime["last_presence_at"] = now_iso()
 
 
-          # Keep runtime outcomes bounded.
           runtime["presence_outcomes"] = (
               runtime["presence_outcomes"][-500:]
           )
@@ -1053,6 +1176,15 @@ jobs:
                           "timestamp": outcome.get("timestamp"),
                       }
                   )
+
+
+          # ============================================================
+          # BOUND PERMANENT FAILURES
+          # ============================================================
+
+          presence["permanent_failures"] = (
+              presence["permanent_failures"][-MAX_TRACKED:]
+          )
 
 
           # ============================================================
@@ -1137,6 +1269,7 @@ jobs:
                   "failed": failed_count,
                   "retry": retry_count,
                   "blocked": blocked_count,
+                  "permanent_failures": permanent_failure_count,
                   "pending_after": len(remaining_pending),
                   "observed_feed": len(observed_feed),
               }
@@ -1170,8 +1303,19 @@ jobs:
           print(f"Failed: {failed_count}")
           print(f"Retry: {retry_count}")
           print(f"Blocked: {blocked_count}")
-          print(f"Pending after: {len(remaining_pending)}")
+          print(
+              f"Permanent failures: "
+              f"{permanent_failure_count}"
+          )
+          print(
+              f"Pending after: "
+              f"{len(remaining_pending)}"
+          )
           print(f"Observed feed: {len(observed_feed)}")
+          print(
+              f"Max retry attempts: "
+              f"{MAX_RETRY_ATTEMPTS}"
+          )
           print("=== PRESENCE COMPLETE ===")
           PY
 
