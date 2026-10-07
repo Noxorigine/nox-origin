@@ -26,8 +26,6 @@ env:
   MAX_WORK_REQUESTS: "50"
   MAX_HISTORY: "150"
 
-  MAX_RETRY_ATTEMPTS: "6"
-
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
@@ -94,10 +92,6 @@ jobs:
           WORK_FILE = Path(os.environ["WORK_FILE"])
           PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
 
-          MAX_RETRY_ATTEMPTS = int(
-              os.environ["MAX_RETRY_ATTEMPTS"]
-          )
-
           def load(path, default):
               if not path.exists():
                   return default
@@ -162,7 +156,6 @@ jobs:
 
               for key in (
                   "id",
-                  "action_id",
                   "post_id",
                   "comment_id",
                   "message_id",
@@ -253,58 +246,6 @@ jobs:
 
           runtime["last_run"] = now.isoformat()
 
-          # ============================================================
-          # PERMANENT FAILURE CLEANUP
-          # ============================================================
-
-          permanent_failure_ids = set()
-
-          for failure in as_list(
-              presence.get("permanent_failures")
-          ):
-              if not isinstance(failure, dict):
-                  continue
-
-              failure_id = text(
-                  failure.get("action_id")
-                  or failure.get("id")
-              )
-
-              if failure_id:
-                  permanent_failure_ids.add(
-                      failure_id
-                  )
-
-          if permanent_failure_ids:
-              cleaned_pending = []
-
-              for action in as_list(
-                  runtime.get("pending_actions")
-              ):
-                  if not isinstance(action, dict):
-                      continue
-
-                  action_id = text(
-                      action.get("action_id")
-                      or action.get("id")
-                  )
-
-                  if (
-                      action_id
-                      and action_id in permanent_failure_ids
-                  ):
-                      print(
-                          "Removing permanent failure from Core pending:",
-                          action_id,
-                      )
-                      continue
-
-                  cleaned_pending.append(action)
-
-              runtime["pending_actions"] = (
-                  cleaned_pending
-              )
-
           api_key = os.environ.get(
               "COLONY_API_KEY",
               "",
@@ -316,10 +257,8 @@ jobs:
                   "Add the GitHub Actions secret COLONY_API_KEY."
               )
 
-          # Official Colony SDK module.
           from colony_sdk import ColonyClient
 
-          # API key is required by ColonyClient.
           client = ColonyClient(api_key)
 
           print("ColonyClient initialized")
@@ -383,11 +322,66 @@ jobs:
               if x is not None
           )
 
-          pending_action_ids = set(
+          permanent_failure_ids = set(
               str(
                   get(x, "action_id")
                   or get(x, "id")
-                  or ""
+              )
+              for x in as_list(
+                  presence.get("permanent_failures")
+              )
+              if isinstance(x, dict)
+              and (
+                  get(x, "action_id")
+                  or get(x, "id")
+              )
+          )
+
+          original_pending_count = len(
+              as_list(
+                  runtime.get("pending_actions")
+              )
+          )
+
+          filtered_pending = []
+
+          for action in as_list(
+              runtime.get("pending_actions")
+          ):
+              if not isinstance(action, dict):
+                  filtered_pending.append(action)
+                  continue
+
+              action_id = text(
+                  get(action, "action_id")
+                  or get(action, "id")
+              )
+
+              if (
+                  action_id
+                  and action_id in permanent_failure_ids
+              ):
+                  continue
+
+              filtered_pending.append(action)
+
+          runtime["pending_actions"] = filtered_pending
+
+          permanent_failures_cleared = (
+              original_pending_count
+              - len(filtered_pending)
+          )
+
+          if permanent_failures_cleared:
+              print(
+                  "Permanent failures cleared from pending:",
+                  permanent_failures_cleared,
+              )
+
+          pending_action_ids = set(
+              text(
+                  get(x, "action_id")
+                  or get(x, "id")
               )
               for x in as_list(
                   runtime.get("pending_actions")
@@ -531,7 +525,8 @@ jobs:
 
               if action_id in permanent_failure_ids:
                   print(
-                      "Skipping permanently failed action:",
+                      "Action suppressed because it is "
+                      "permanently failed:",
                       action_id,
                   )
                   return None
@@ -738,24 +733,76 @@ jobs:
               ):
                   break
 
-              if isinstance(
+              if not isinstance(
                   conversation,
                   dict,
               ):
-                  conversation_id = ident(
-                      conversation
+                  continue
+
+              # IMPORTANT:
+              # Colony SDK conversation rows expose the other user
+              # and get_conversation() expects that username.
+              other_user = get(
+                  conversation,
+                  "other_user",
+              )
+
+              if isinstance(
+                  other_user,
+                  dict,
+              ):
+                  sender_name = (
+                      text(
+                          get(
+                              other_user,
+                              "username",
+                          )
+                      )
+                      or text(
+                          get(
+                              other_user,
+                              "handle",
+                          )
+                      )
                   )
               else:
-                  conversation_id = str(
-                      conversation
+                  sender_name = text(
+                      other_user
                   )
 
-              if not conversation_id:
+              if not sender_name:
+                  sender_name = (
+                      text(
+                          get(
+                              conversation,
+                              "username",
+                          )
+                      )
+                      or text(
+                          get(
+                              conversation,
+                              "other_username",
+                          )
+                      )
+                  )
+
+              if not sender_name:
+                  print(
+                      "WARNING: conversation has no "
+                      "other_user username; skipping"
+                  )
                   continue
+
+              conversation_id = text(
+                  get(
+                      conversation,
+                      "id",
+                  )
+              )
 
               conversation_data = call(
                   "get_conversation",
-                  conversation_id,
+                  sender_name,
               )
 
               messages = items(
@@ -769,7 +816,9 @@ jobs:
                   ):
                       continue
 
-                  message_id = ident(message)
+                  message_id = ident(
+                      message
+                  )
 
                   if not message_id:
                       continue
@@ -783,7 +832,7 @@ jobs:
                       {},
                   )
 
-                  sender_name = (
+                  message_sender = (
                       text(
                           get(
                               sender,
@@ -796,12 +845,7 @@ jobs:
                               "sender_username",
                           )
                       )
-                      or text(
-                          get(
-                              message,
-                              "from",
-                          )
-                      )
+                      or sender_name
                   )
 
                   body = text(
@@ -819,7 +863,7 @@ jobs:
                       {
                           "message_id": message_id,
                           "conversation_id": conversation_id,
-                          "sender": sender_name,
+                          "sender": message_sender,
                           "body": body[:2000],
                       },
                   )
@@ -830,7 +874,8 @@ jobs:
                       conversation_id,
                       body[:2000],
                       message_id=message_id,
-                      sender=sender_name,
+                      sender=message_sender,
+                      sender_username=sender_name,
                   )
 
                   add_work(
@@ -844,6 +889,16 @@ jobs:
                   )
 
                   dm_count += 1
+
+                  if dm_count >= int(
+                      os.environ["MAX_NOTIFICATIONS"]
+                  ):
+                      break
+
+              if dm_count >= int(
+                  os.environ["MAX_NOTIFICATIONS"]
+              ):
+                  break
 
           print("DMs:", dm_count)
 
@@ -1299,11 +1354,8 @@ jobs:
               "presence_outcomes_consumed": (
                   consumed_outcomes
               ),
-              "permanent_failures_known": len(
-                  permanent_failure_ids
-              ),
-              "max_retry_attempts": (
-                  MAX_RETRY_ATTEMPTS
+              "permanent_failures_cleared": (
+                  permanent_failures_cleared
               ),
           }
 
@@ -1357,12 +1409,8 @@ jobs:
               consumed_outcomes,
           )
           print(
-              "Permanent failures known:",
-              len(permanent_failure_ids),
-          )
-          print(
-              "Max retry attempts:",
-              MAX_RETRY_ATTEMPTS,
+              "Permanent failures cleared:",
+              permanent_failures_cleared,
           )
           print(
               "Policy: no payments / no spending"
