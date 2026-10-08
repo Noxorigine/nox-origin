@@ -13,12 +13,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_MEMORY_FILE: memory/nox_core_memory.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
-  WORK_FILE: memory/nox_work_factory.json
-  KNOWLEDGE_FILE: memory/nox_knowledge.json
-  KNOWLEDGE_INDEX_FILE: memory/nox_knowledge_index.json
-
+  CORE_MEMORY_FILE: "memory/nox_core_memory.json"
+  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
+  WORK_FILE: "memory/nox_work_factory.json"
+  KNOWLEDGE_FILE: "memory/nox_knowledge.json"
+  KNOWLEDGE_INDEX_FILE: "memory/nox_knowledge_index.json"
+  PRESENCE_FILE: "memory/nox_colony_presence.json"
+  EVOLUTION_FILE: "memory/nox_evolution_history.json"
   MAX_OBSERVATIONS: "500"
   MAX_FACTS: "300"
   MAX_EXPERIENCES: "300"
@@ -27,9 +28,7 @@ env:
   MAX_LEARNINGS: "300"
   MAX_SOURCES: "300"
   MAX_QUERIES: "300"
-
   MAX_TEXT_CHARS: "12000"
-
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
@@ -37,711 +36,422 @@ env:
   AUTO_SPENDING: "false"
 
 jobs:
-  memory-knowledge:
+  run:
     runs-on: ubuntu-latest
-
-    env:
-      COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "ddgs>=9.16.0,<10.0.0"
+          python-version: "3.12"
 
       - name: Build knowledge state
         shell: bash
+        env:
+          MODE: build
         run: |
           set -euo pipefail
-
-          python <<'PY'
+          python3 - <<'PY'
+          """Shared helpers for all NØX scripts (standard library only)."""
+          import hashlib
           import json
           import os
           import re
-          import hashlib
+          import sys
           from datetime import datetime, timezone
+          from itertools import islice
           from pathlib import Path
-          from urllib.parse import urlparse
 
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          INDEX_FILE = Path(os.environ["KNOWLEDGE_INDEX_FILE"])
+          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
 
-          MAX_OBSERVATIONS = int(os.environ["MAX_OBSERVATIONS"])
-          MAX_FACTS = int(os.environ["MAX_FACTS"])
-          MAX_EXPERIENCES = int(os.environ["MAX_EXPERIENCES"])
-          MAX_HYPOTHESES = int(os.environ["MAX_HYPOTHESES"])
-          MAX_RESULTS = int(os.environ["MAX_RESULTS"])
-          MAX_LEARNINGS = int(os.environ["MAX_LEARNINGS"])
-          MAX_SOURCES = int(os.environ["MAX_SOURCES"])
-          MAX_QUERIES = int(os.environ["MAX_QUERIES"])
-          MAX_TEXT_CHARS = int(os.environ["MAX_TEXT_CHARS"])
+          # ---------------------------------------------------------------- time / env
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
 
-          NOW = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+          def parse_ts(value):
+              if not value or not isinstance(value, str):
+                  return None
+              try:
+                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-          def load(path, default):
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return int(default)
+
+          def env_flag(name, default=False):
+              value = os.environ.get(name)
+              if value is None or value.strip() == "":
+                  return default
+              return value.strip().lower() in {"1", "true", "yes", "on"}
+
+          def check_policy():
+              """Hard safety invariants: no spending, no payments, no external AI."""
+              expected = {
+                  "PROJECT_COST_EUR": "0",
+                  "GEMINI_USED": "false",
+                  "EXTERNAL_AI_USED": "false",
+                  "AUTO_PAYMENT": "false",
+                  "AUTO_SPENDING": "false",
+              }
+              for key, wanted in expected.items():
+                  if os.environ.get(key, wanted).strip().lower() != wanted:
+                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
+
+          # ---------------------------------------------------------------- json files
+          def load_json(path, default=None):
+              """Load a JSON object. Refuses to continue on corrupt files so that a
+              parse error can never silently wipe the agent's state."""
+              path = Path(path)
+              default = {} if default is None else default
               if not path.exists():
                   return default
-              try:
-                  with path.open("r", encoding="utf-8") as f:
-                      value = json.load(f)
-                  return value
-              except Exception as exc:
-                  print(f"WARNING: cannot load {path}: {exc}")
+              raw = path.read_text(encoding="utf-8")
+              if not raw.strip():
                   return default
+              try:
+                  value = json.loads(raw)
+              except Exception as exc:
+                  raise SystemExit(
+                      f"ERROR: {path} is not valid JSON ({exc}). "
+                      "Restore it from git history; refusing to overwrite it."
+                  )
+              return value if isinstance(value, type(default)) else default
 
-          def save(path, value):
+          def save_json(path, value):
+              path = Path(path)
               path.parent.mkdir(parents=True, exist_ok=True)
               tmp = path.with_suffix(path.suffix + ".tmp")
-              with tmp.open("w", encoding="utf-8") as f:
-                  json.dump(value, f, ensure_ascii=False, indent=2)
-                  f.write("\n")
-              tmp.replace(path)
+              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
+              json.loads(payload)  # round-trip check
+              tmp.write_text(payload, encoding="utf-8")
+              os.replace(tmp, path)
 
+          # ---------------------------------------------------------------- data utils
           def as_dict(value):
               return value if isinstance(value, dict) else {}
 
           def as_list(value):
               return value if isinstance(value, list) else []
 
-          def text(value):
+          def text(value, limit=None):
               if value is None:
-                  return ""
-              if isinstance(value, str):
-                  return value.strip()
+                  out = ""
+              elif isinstance(value, str):
+                  out = value.strip()
+              elif isinstance(value, dict):
+                  out = ""
+                  for key in ("content", "body", "text", "message", "title", "question"):
+                      if value.get(key):
+                          out = text(value[key])
+                          break
+                  if not out:
+                      out = json.dumps(value, ensure_ascii=False, default=str)
+              else:
+                  out = str(value).strip()
+              return out[:limit] if limit else out
+
+          def collapse(value, limit=None):
+              out = re.sub(r"\s+", " ", text(value)).strip()
+              return out[:limit] if limit else out
+
+          def clip(value, limit):
+              out = text(value)
+              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
+
+          def stable_id(prefix, *parts):
+              raw = "|".join(str(p if p is not None else "") for p in parts)
+              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+          def identity(item):
+              """Stable identity of a stored item (id-like key, else content hash)."""
+              if isinstance(item, dict):
+                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
+                      if item.get(key):
+                          return f"{key}:{item[key]}"
+              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def dedupe_keep_last(items, limit=None):
+              """Remove duplicates (keeping the most recent occurrence) and keep list
+              order chronological (oldest first). Optionally keep only the last N."""
+              seen, out = set(), []
+              for item in reversed(items):
+                  key = identity(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(item)
+              out.reverse()
+              return out[-limit:] if limit else out
+
+          def bound(items, limit):
+              items = as_list(items)
+              return items[-limit:] if len(items) > limit else items
+
+          def take(value, n=None):
+              """Turn SDK results (list / dict / generator) into a bounded list."""
+              if value is None:
+                  return []
+              if isinstance(value, dict):
+                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
+                      if isinstance(value.get(key), list):
+                          value = value[key]
+                          break
+                  else:
+                      return []
+              if isinstance(value, (list, tuple)):
+                  return list(value)[:n] if n else list(value)
               try:
-                  return json.dumps(value, ensure_ascii=False)
-              except Exception:
-                  return str(value)
+                  iterator = iter(value)
+              except TypeError:
+                  return []
+              return list(islice(iterator, n)) if n else list(iterator)
 
-          def clip(value, limit=MAX_TEXT_CHARS):
-              value = text(value)
-              return value if len(value) <= limit else value[:limit].rstrip() + "…"
-
-          def stable_id(prefix, value):
-              raw = text(value)
-              return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-          def timestamp(item):
-              if not isinstance(item, dict):
+          def username_of(obj):
+              """Lower-cased username of an object or of a nested author/sender."""
+              if not isinstance(obj, dict):
                   return ""
-              for key in (
-                  "timestamp",
-                  "created_at",
-                  "created",
-                  "updated_at",
-                  "observed_at",
-                  "completed_at",
-                  "date",
-              ):
-                  value = item.get(key)
-                  if value:
-                      return str(value)
+              for key in ("username", "handle", "author_username", "sender_username"):
+                  if obj.get(key):
+                      return str(obj[key]).strip().lower()
+              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
+                  nested = obj.get(key)
+                  if isinstance(nested, dict):
+                      found = username_of(nested)
+                      if found:
+                          return found
+                  elif isinstance(nested, str) and nested.strip():
+                      return nested.strip().lower()
               return ""
 
-          def newest_first(items):
-              return sorted(
-                  items,
-                  key=lambda x: timestamp(x),
-                  reverse=True,
-              )
+          # ===== script =====
+          """NØX Memory & Knowledge (+ daily maintenance in one script).
 
-          def bounded(items, limit):
-              return newest_first(items)[:limit]
+          MODE=build     -> merge Core / Work / Presence data into knowledge + index
+          MODE=maintain  -> bound every state file, then build
+          DRY_RUN=true   -> analyse only, write nothing
 
-          def normalize_item(item):
+          Fixes vs. the old pair of workflows:
+          - lists stay chronological (oldest first, newest last) so every `[-N:]` in
+            the other scripts keeps the NEWEST items (the old maintenance reversed them)
+          - deduplication is by id / exact content only (the old semantic dedup
+            collapsed all feed observations into a single item)
+          - reads the fields that Core, Work and Presence really write
+          - does not rewrite Core memory with knowledge copies (no circular growth)
+          """
+          import os
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          check_policy()
+
+          NOW = now_iso()
+          MODE = (os.environ.get("MODE") or "build").strip().lower()
+          DRY_RUN = env_flag("DRY_RUN", False)
+
+          F = {k: Path(os.environ[v]) for k, v in {
+              "core": "CORE_MEMORY_FILE", "runtime": "CORE_RUNTIME_FILE", "work": "WORK_FILE",
+              "knowledge": "KNOWLEDGE_FILE", "index": "KNOWLEDGE_INDEX_FILE", "presence": "PRESENCE_FILE",
+              "evolution": "EVOLUTION_FILE"}.items()}
+
+          LIM = {"observations": env_int("MAX_OBSERVATIONS", 500), "facts": env_int("MAX_FACTS", 300),
+                 "experiences": env_int("MAX_EXPERIENCES", 300), "hypotheses": env_int("MAX_HYPOTHESES", 200),
+                 "results": env_int("MAX_RESULTS", 300), "learnings": env_int("MAX_LEARNINGS", 300),
+                 "sources": env_int("MAX_SOURCES", 300), "queries": env_int("MAX_QUERIES", 300)}
+          TEXT_MAX = env_int("MAX_TEXT_CHARS", 12000)
+
+          def normalize(item):
               if isinstance(item, str):
-                  return {
-                      "id": stable_id("item", item),
-                      "text": clip(item),
-                      "timestamp": NOW,
-                  }
-
+                  return {"id": stable_id("item", item), "text": clip(item, TEXT_MAX), "timestamp": NOW}
               if not isinstance(item, dict):
                   return None
+              out = {k: (clip(v, TEXT_MAX) if isinstance(v, str) else v) for k, v in item.items()}
+              if not out.get("timestamp"):
+                  out["timestamp"] = next((str(out[k]) for k in ("created_at", "created", "updated_at") if out.get(k)), NOW)
+              if not out.get("id"):
+                  basis = out.get("text") or out.get("content") or out.get("question") or out.get("title") or out
+                  out["id"] = stable_id("item", basis)
+              return out
 
-              result = dict(item)
+          def merge(*lists, limit):
+              combined = []
+              for lst in lists:
+                  for item in as_list(lst):
+                      norm = normalize(item)
+                      if norm:
+                          combined.append(norm)
+              return dedupe_keep_last(combined, limit)
 
-              if "timestamp" not in result:
-                  for key in ("created_at", "created", "updated_at"):
-                      if result.get(key):
-                          result["timestamp"] = result[key]
-                          break
+          def is_verified(item):
+              status = text(item.get("verification") or item.get("status") or item.get("evidence_status")).lower()
+              return item.get("verified") is True or status in {"verified", "confirmed", "multi_source_verified"}
 
-              result.setdefault("timestamp", NOW)
-
-              for key, value in list(result.items()):
-                  if isinstance(value, str):
-                      result[key] = clip(value)
-
-              if not result.get("id"):
-                  basis = (
-                      result.get("text")
-                      or result.get("content")
-                      or result.get("question")
-                      or result.get("title")
-                      or result
-                  )
-                  result["id"] = stable_id("item", basis)
-
-              return result
-
-          def merge_unique(existing, incoming, limit):
-              result = []
-
-              for item in list(existing) + list(incoming):
-                  normalized = normalize_item(item)
-                  if not normalized:
-                      continue
-
-                  item_id = str(normalized.get("id"))
-
-                  duplicate = False
-                  for previous in result:
-                      if str(previous.get("id")) == item_id:
-                          duplicate = True
-                          break
-
-                  if not duplicate:
-                      result.append(normalized)
-
-              return bounded(result, limit)
-
-          core_memory = as_dict(load(CORE_MEMORY_FILE, {}))
-          runtime = as_dict(load(CORE_RUNTIME_FILE, {}))
-          work = as_dict(load(WORK_FILE, {}))
-          knowledge = as_dict(load(KNOWLEDGE_FILE, {}))
-
-          observations = as_list(core_memory.get("observations"))
-          facts = as_list(core_memory.get("facts"))
-          experiences = as_list(core_memory.get("experiences"))
-          hypotheses = as_list(core_memory.get("hypotheses"))
-          results = as_list(core_memory.get("results"))
-          learnings = as_list(core_memory.get("learnings"))
-
-          k_observations = as_list(knowledge.get("observations"))
-          k_facts = as_list(knowledge.get("facts"))
-          k_experiences = as_list(knowledge.get("experiences"))
-          k_hypotheses = as_list(knowledge.get("hypotheses"))
-          k_results = as_list(knowledge.get("results"))
-          k_learnings = as_list(knowledge.get("learnings"))
-          sources = as_list(knowledge.get("sources"))
-          queries = as_list(knowledge.get("queries"))
-
-          runtime_observations = as_list(runtime.get("observations"))
-          runtime_decisions = as_list(runtime.get("decisions"))
-          runtime_actions = as_list(runtime.get("actions"))
-          runtime_outcomes = as_list(runtime.get("outcomes"))
-          runtime_web_queries = as_list(runtime.get("web_queries"))
-
-          work_history = as_list(work.get("history"))
-          work_results = as_list(work.get("results"))
-
-          new_observations = []
-          new_experiences = []
-          new_results = []
-          new_learnings = []
-          new_sources = []
-          new_queries = []
-
-          # ------------------------------------------------------------
-          # 1. Runtime observations
-          # ------------------------------------------------------------
-
-          for item in runtime_observations[-100:]:
-              obj = normalize_item(item)
-              if obj:
-                  obj.setdefault("source", "core_runtime")
-                  new_observations.append(obj)
-
-          # ------------------------------------------------------------
-          # 2. Decisions are not automatically facts.
-          #    They remain observations/decision records.
-          # ------------------------------------------------------------
-
-          for item in runtime_decisions[-100:]:
-              obj = normalize_item(item)
-              if obj:
-                  obj.setdefault("source", "core_runtime")
-                  obj["type"] = obj.get("type", "decision")
-                  new_observations.append(obj)
-
-          # ------------------------------------------------------------
-          # 3. Actions + outcomes become experiences.
-          #    No outcome = no experience claim.
-          # ------------------------------------------------------------
-
-          outcome_by_action = {}
-
-          for outcome in runtime_outcomes:
-              if not isinstance(outcome, dict):
-                  continue
-
-              action_id = (
-                  outcome.get("action_id")
-                  or outcome.get("id")
-                  or outcome.get("action")
-              )
-
-              if action_id:
-                  outcome_by_action[str(action_id)] = outcome
-
-          for action in runtime_actions[-200:]:
-              if not isinstance(action, dict):
-                  continue
-
-              action_id = action.get("id") or action.get("action_id")
-
-              if not action_id:
-                  continue
-
-              outcome = outcome_by_action.get(str(action_id))
-
-              if not outcome:
-                  continue
-
-              outcome_status = text(
-                  outcome.get("status")
-                  or outcome.get("result")
-                  or outcome.get("outcome")
-              ).lower()
-
-              experience = {
-                  "id": stable_id(
-                      "experience",
-                      f"{action_id}|{outcome_status}|{text(outcome)}",
-                  ),
-                  "timestamp": timestamp(outcome) or timestamp(action) or NOW,
-                  "source": "core_runtime",
-                  "action_id": action_id,
-                  "action_type": action.get("type"),
-                  "target_id": action.get("target_id"),
-                  "status": outcome_status,
-                  "action": clip(action),
-                  "outcome": clip(outcome),
-              }
-
-              new_experiences.append(experience)
-
-          # ------------------------------------------------------------
-          # 4. Work Factory completed results
-          # ------------------------------------------------------------
-
-          for item in work_results[-100:]:
-              if not isinstance(item, dict):
-                  continue
-
-              status = text(item.get("status")).lower()
-
-              if status not in (
-                  "completed",
-                  "complete",
-                  "success",
-                  "multi_source_support",
-                  "partial_support",
-                  "insufficient_verification",
-                  "no_evidence",
-              ):
-                  continue
-
-              result_obj = {
-                  "id": item.get("id")
-                  or stable_id("result", item),
-                  "timestamp": timestamp(item) or NOW,
-                  "source": "work_factory",
-                  "work_id": item.get("work_id") or item.get("id"),
-                  "question": clip(item.get("question")),
-                  "status": status,
-                  "conclusion": clip(item.get("conclusion")),
-                  "uncertainty": clip(item.get("uncertainty")),
-                  "evidence": item.get("evidence", []),
-                  "sources": item.get("sources", []),
-              }
-
-              new_results.append(result_obj)
-
-              for source in as_list(item.get("sources")):
-                  if isinstance(source, str):
-                      url = source
-                  elif isinstance(source, dict):
-                      url = (
-                          source.get("url")
-                          or source.get("link")
-                          or source.get("source")
-                      )
-                  else:
-                      url = ""
-
-                  if url:
-                      new_sources.append({
-                          "id": stable_id("source", url),
-                          "url": url,
-                          "timestamp": timestamp(item) or NOW,
-                          "source": "work_factory",
-                          "work_id": item.get("work_id") or item.get("id"),
-                      })
-
-          # ------------------------------------------------------------
-          # 5. Work history: preserve learning signals, not raw noise
-          # ------------------------------------------------------------
-
-          for item in work_history[-100:]:
-              if not isinstance(item, dict):
-                  continue
-
-              status = text(item.get("status")).lower()
-
-              if status in (
-                  "invalid_input",
-                  "needs_retry",
-                  "failed",
-                  "no_evidence",
-              ):
-                  learning = {
-                      "id": stable_id("learning", item),
-                      "timestamp": timestamp(item) or NOW,
-                      "source": "work_factory",
-                      "type": "process_learning",
-                      "status": status,
-                      "question": clip(item.get("question")),
-                      "learning": clip(
-                          item.get("learning")
-                          or item.get("reason")
-                          or item.get("error")
-                          or "Research item did not produce usable evidence."
-                      ),
-                  }
-                  new_learnings.append(learning)
-
-          # ------------------------------------------------------------
-          # 6. Explicit learning records already present in Core
-          # ------------------------------------------------------------
-
-          for item in learnings[-100:]:
-              obj = normalize_item(item)
-              if obj:
-                  obj.setdefault("source", "core_memory")
-                  new_learnings.append(obj)
-
-          # ------------------------------------------------------------
-          # 7. URLs from runtime web queries
-          # ------------------------------------------------------------
-
-          for query in runtime_web_queries[-100:]:
-              obj = normalize_item(query)
-              if obj:
-                  obj.setdefault("source", "core_runtime")
-                  new_queries.append(obj)
-
-          # ------------------------------------------------------------
-          # 8. Query records already stored in knowledge
-          # ------------------------------------------------------------
-
-          for query in queries[-100:]:
-              obj = normalize_item(query)
-              if obj:
-                  new_queries.append(obj)
-
-          # ------------------------------------------------------------
-          # 9. Extract URLs from all research-related text.
-          # ------------------------------------------------------------
-
-          url_pattern = re.compile(r"https?://[^\s<>\"]+")
-
-          research_texts = []
-
-          for item in new_results:
-              research_texts.append(text(item))
-
-          for item in new_sources:
-              research_texts.append(text(item))
-
-          for item in work_history[-50:]:
-              research_texts.append(text(item))
-
-          for blob in research_texts:
-              for url in url_pattern.findall(blob):
-                  url = url.rstrip(".,);]}>")
-                  try:
-                      parsed = urlparse(url)
-                      if parsed.scheme not in ("http", "https"):
+          def build_index(knowledge):
+              rows = []
+              for name in ("observations", "facts", "experiences", "hypotheses", "results", "learnings"):
+                  for item in as_list(knowledge.get(name)):
+                      if not isinstance(item, dict):
                           continue
-                      if not parsed.netloc:
-                          continue
-                  except Exception:
+                      content = (item.get("text") or item.get("content") or item.get("question") or item.get("conclusion")
+                                 or item.get("learning") or item.get("title") or "")
+                      if isinstance(content, (dict, list)):
+                          content = text(content)
+                      rows.append({"id": item.get("id"), "type": name.rstrip("s") if name != "hypotheses" else "hypothesis",
+                                   "timestamp": item.get("timestamp") or NOW, "text": str(content)[:2000]})
+              rows = sorted(rows, key=lambda r: str(r["timestamp"]))[-1200:]
+              return {"schema_version": 3, "updated_at": NOW, "count": len(rows), "items": rows}
+
+          def build():
+              core, runtime = as_dict(load_json(F["core"])), as_dict(load_json(F["runtime"]))
+              work, presence = as_dict(load_json(F["work"])), as_dict(load_json(F["presence"]))
+              know = as_dict(load_json(F["knowledge"]))
+
+              new_obs = []
+              for item in as_list(runtime.get("observations"))[-100:]:
+                  n = normalize(item)
+                  if n:
+                      n.setdefault("source", "core_runtime")
+                      new_obs.append(n)
+              for item in as_list(runtime.get("decisions"))[-100:]:
+                  n = normalize(item)
+                  if n:
+                      n.setdefault("type", "decision")
+                      new_obs.append(n)
+
+              new_results, new_sources, new_queries, new_learnings = [], [], [], []
+              for res in as_list(work.get("results"))[-100:]:
+                  if not isinstance(res, dict):
                       continue
+                  new_results.append({
+                      "id": res.get("result_id") or stable_id("result", res.get("work_id")),
+                      "timestamp": res.get("created_at") or NOW, "source": "work_factory",
+                      "work_id": res.get("work_id"), "question": clip(res.get("question"), 1000),
+                      "status": res.get("evidence_status"), "conclusion": clip(res.get("conclusion"), 1500),
+                      "uncertainty": res.get("uncertainties", []), "sources": res.get("sources", [])})
+                  for url in as_list(res.get("sources")):
+                      if isinstance(url, str) and urlparse(url).netloc:
+                          new_sources.append({"id": stable_id("source", url), "url": url,
+                                              "timestamp": res.get("created_at") or NOW, "work_id": res.get("work_id")})
+                  for q in as_list(res.get("queries")):
+                      if isinstance(q, str) and q:
+                          new_queries.append({"id": stable_id("query", q), "query": q,
+                                              "timestamp": res.get("created_at") or NOW})
 
-                  new_sources.append({
-                      "id": stable_id("source", url),
-                      "url": url,
-                      "timestamp": NOW,
-                      "source": "research_extraction",
-                  })
+              for fail in as_list(work.get("failed"))[-100:]:
+                  if isinstance(fail, dict):
+                      status = text(fail.get("status") or fail.get("evidence_status") or fail.get("retry_reason"))
+                      new_learnings.append({"id": stable_id("learning", fail.get("work_id"), status, fail.get("timestamp")),
+                                            "timestamp": fail.get("timestamp") or fail.get("created_at") or NOW,
+                                            "source": "work_factory", "type": "process_learning", "status": status,
+                                            "question": clip(fail.get("question"), 300),
+                                            "learning": clip(fail.get("reason") or f"Research ended with status: {status}", 300)})
+              for fail in as_list(presence.get("permanent_failures"))[-50:]:
+                  if isinstance(fail, dict):
+                      new_learnings.append({"id": stable_id("learning", fail.get("action_id")),
+                                            "timestamp": fail.get("timestamp") or NOW, "source": "presence",
+                                            "type": "process_learning", "status": "permanent_failure",
+                                            "learning": clip(f"Action {fail.get('action_type')} failed permanently: {fail.get('error')}", 300)})
+              for q in as_list(runtime.get("web_queries"))[-100:]:
+                  n = normalize(q)
+                  if n:
+                      new_queries.append(n)
 
-          # ------------------------------------------------------------
-          # 10. Merge without inventing facts.
-          # ------------------------------------------------------------
+              out = {
+                  "schema_version": 3, "updated_at": NOW, "last_run": NOW,
+                  "run_count": int(know.get("run_count", 0) or 0) + 1,
+                  "observations": merge(know.get("observations"), core.get("observations"), new_obs, limit=LIM["observations"]),
+                  "facts": [f for f in merge(know.get("facts"), core.get("facts"), limit=LIM["facts"]) if is_verified(f)],
+                  "experiences": merge(know.get("experiences"), core.get("experiences"), limit=LIM["experiences"]),
+                  "hypotheses": merge(know.get("hypotheses"), core.get("hypotheses"), limit=LIM["hypotheses"]),
+                  "results": merge(know.get("results"), core.get("results"), new_results, limit=LIM["results"]),
+                  "learnings": merge(know.get("learnings"), core.get("learnings"), new_learnings, limit=LIM["learnings"]),
+                  "sources": merge(know.get("sources"), new_sources, limit=LIM["sources"]),
+                  "queries": merge(know.get("queries"), new_queries, limit=LIM["queries"]),
+              }
+              index = build_index(out)
+              print("Knowledge:", {k: len(v) for k, v in out.items() if isinstance(v, list)}, "| index:", index["count"])
+              if DRY_RUN:
+                  print("DRY RUN: nothing written.")
+                  return
+              save_json(F["knowledge"], out)
+              save_json(F["index"], index)
 
-          merged_observations = merge_unique(
-              observations + k_observations,
-              new_observations,
-              MAX_OBSERVATIONS,
-          )
-
-          merged_facts = merge_unique(
-              facts + k_facts,
-              [],
-              MAX_FACTS,
-          )
-
-          merged_experiences = merge_unique(
-              experiences + k_experiences,
-              new_experiences,
-              MAX_EXPERIENCES,
-          )
-
-          merged_hypotheses = merge_unique(
-              hypotheses + k_hypotheses,
-              [],
-              MAX_HYPOTHESES,
-          )
-
-          merged_results = merge_unique(
-              results + k_results,
-              new_results,
-              MAX_RESULTS,
-          )
-
-          merged_learnings = merge_unique(
-              learnings + k_learnings,
-              new_learnings,
-              MAX_LEARNINGS,
-          )
-
-          merged_sources = merge_unique(
-              sources,
-              new_sources,
-              MAX_SOURCES,
-          )
-
-          merged_queries = merge_unique(
-              queries,
-              new_queries,
-              MAX_QUERIES,
-          )
-
-          # ------------------------------------------------------------
-          # 11. Knowledge facts remain conservative.
-          #
-          # We only retain existing explicit facts here.
-          # Research conclusions are results until independently verified.
-          # ------------------------------------------------------------
-
-          verified_facts = []
-
-          for item in merged_facts:
-              if not isinstance(item, dict):
-                  continue
-
-              verification = text(
-                  item.get("verification")
-                  or item.get("status")
-                  or item.get("evidence_status")
-              ).lower()
-
-              explicit = item.get("verified") is True
-
-              if explicit or verification in (
-                  "verified",
-                  "confirmed",
-                  "multi_source_verified",
-              ):
-                  verified_facts.append(item)
-
-          merged_facts = bounded(verified_facts, MAX_FACTS)
-
-          # ------------------------------------------------------------
-          # 12. Build knowledge object.
-          # ------------------------------------------------------------
-
-          knowledge = {
-              "schema_version": 2,
-              "updated_at": NOW,
-              "last_run": NOW,
-              "run_count": int(knowledge.get("run_count", 0) or 0) + 1,
-
-              "observations": merged_observations,
-              "facts": merged_facts,
-              "experiences": merged_experiences,
-              "hypotheses": merged_hypotheses,
-              "results": merged_results,
-              "learnings": merged_learnings,
-              "sources": merged_sources,
-              "queries": merged_queries,
-          }
-
-          # ------------------------------------------------------------
-          # 13. Update Core memory conservatively.
-          #
-          # Never promote results/hypotheses to facts automatically.
-          # ------------------------------------------------------------
-
-          core_memory["observations"] = bounded(
-              merge_unique(observations, new_observations, MAX_OBSERVATIONS),
-              MAX_OBSERVATIONS,
-          )
-
-          core_memory["facts"] = merged_facts
-          core_memory["experiences"] = bounded(
-              merge_unique(experiences, new_experiences, MAX_EXPERIENCES),
-              MAX_EXPERIENCES,
-          )
-          core_memory["hypotheses"] = merged_hypotheses
-          core_memory["results"] = merged_results
-          core_memory["learnings"] = merged_learnings
-          core_memory["updated_at"] = NOW
-
-          # ------------------------------------------------------------
-          # 14. Build compact searchable index.
-          # ------------------------------------------------------------
-
-          index_items = []
-
-          def add_index(collection, item_type):
-              for item in collection:
-                  if not isinstance(item, dict):
+          def maintain():
+              """Bound every state file. Lists stay chronological; only the oldest are dropped."""
+              plans = {
+                  "core": {k: LIM[k] for k in ("observations", "facts", "experiences", "hypotheses", "results", "learnings")}
+                          | {"cognitive_cases": 100, "actions": 100, "sources": 300, "questions": 200},
+                  "runtime": {"observations": 500, "decisions": 300, "actions": 300, "outcomes": 500, "web_queries": 300,
+                              "pending_actions": 100, "work_requests": 50, "processed_ids": 3000},
+                  "work": {"pending": 100, "history": 150, "results": 150, "failed": 150},
+                  "presence": {"actions": 500, "outcomes": 500, "errors": 200, "runs": 100,
+                               "permanent_failures": 500, "closed_ids": 3000},
+                  "evolution": {"history": 200, "runs": 200},
+              }
+              removed_total = 0
+              for name, limits in plans.items():
+                  data = as_dict(load_json(F[name]))
+                  if not data:
                       continue
+                  for key, limit in limits.items():
+                      lst = data.get(key)
+                      if isinstance(lst, list):
+                          cut = bound(lst, limit)
+                          removed_total += len(lst) - len(cut)
+                          data[key] = cut
+                  if not DRY_RUN:
+                      save_json(F[name], data)
+              print("Maintenance: oldest items removed:", removed_total)
 
-                  content = (
-                      item.get("text")
-                      or item.get("content")
-                      or item.get("question")
-                      or item.get("conclusion")
-                      or item.get("learning")
-                      or item.get("title")
-                      or ""
-                  )
-
-                  index_items.append({
-                      "id": item.get("id"),
-                      "type": item_type,
-                      "timestamp": item.get("timestamp") or NOW,
-                      "text": clip(content, 2000),
-                  })
-
-          add_index(merged_observations, "observation")
-          add_index(merged_facts, "fact")
-          add_index(merged_experiences, "experience")
-          add_index(merged_hypotheses, "hypothesis")
-          add_index(merged_results, "result")
-          add_index(merged_learnings, "learning")
-
-          index_items = newest_first(index_items)[:1200]
-
-          index = {
-              "schema_version": 2,
-              "updated_at": NOW,
-              "count": len(index_items),
-              "items": index_items,
-          }
-
-          # ------------------------------------------------------------
-          # 15. Policy integrity.
-          # ------------------------------------------------------------
-
-          assert os.environ["PROJECT_COST_EUR"] == "0"
-          assert os.environ["GEMINI_USED"].lower() == "false"
-          assert os.environ["EXTERNAL_AI_USED"].lower() == "false"
-          assert os.environ["AUTO_PAYMENT"].lower() == "false"
-          assert os.environ["AUTO_SPENDING"].lower() == "false"
-
-          save(KNOWLEDGE_FILE, knowledge)
-          save(INDEX_FILE, index)
-          save(CORE_MEMORY_FILE, core_memory)
-
-          print("=== NØX MEMORY & KNOWLEDGE ===")
-          print(f"Run: {NOW}")
-          print(f"Observations: {len(merged_observations)}")
-          print(f"Verified facts: {len(merged_facts)}")
-          print(f"Experiences: {len(merged_experiences)}")
-          print(f"Hypotheses: {len(merged_hypotheses)}")
-          print(f"Results: {len(merged_results)}")
-          print(f"Learnings: {len(merged_learnings)}")
-          print(f"Sources: {len(merged_sources)}")
-          print(f"Queries: {len(merged_queries)}")
-          print(f"Index items: {len(index_items)}")
-          print("Research conclusions remain results unless explicitly verified.")
+          print(f"=== NØX KNOWLEDGE ({MODE}) ===")
+          if MODE == "maintain":
+              maintain()
+          build()
           PY
 
-      - name: Validate JSON and policy
+      - name: Validate JSON state
         shell: bash
         run: |
           set -euo pipefail
-
-          python <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          files = [
-              Path(os.environ["CORE_MEMORY_FILE"]),
-              Path(os.environ["CORE_RUNTIME_FILE"]),
-              Path(os.environ["WORK_FILE"]),
-              Path(os.environ["KNOWLEDGE_FILE"]),
-              Path(os.environ["KNOWLEDGE_INDEX_FILE"]),
-          ]
-
-          for path in files:
-              if not path.exists():
-                  raise SystemExit(f"Missing JSON file: {path}")
-
-              with path.open("r", encoding="utf-8") as f:
-                  json.load(f)
-
-              print(f"VALID JSON: {path}")
-
-          assert os.environ["PROJECT_COST_EUR"] == "0"
-          assert os.environ["GEMINI_USED"].lower() == "false"
-          assert os.environ["EXTERNAL_AI_USED"].lower() == "false"
-          assert os.environ["AUTO_PAYMENT"].lower() == "false"
-          assert os.environ["AUTO_SPENDING"].lower() == "false"
-
-          print("POLICY: OK")
+          python3 - <<'PY'
+          import json, os
+          for path in ["memory/nox_core_memory.json", "memory/nox_core_runtime.json", "memory/nox_work_factory.json", "memory/nox_knowledge.json", "memory/nox_knowledge_index.json"]:
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as fh:
+                      json.load(fh)
+                  print("VALID JSON:", path)
           PY
-
-          git diff --check
 
       - name: Commit and push
         shell: bash
         run: |
           set -euo pipefail
-
           git config user.name "NØX"
-          git config user.email "nox@nox-origin.local"
-
-          if git diff --quiet; then
-            echo "No memory changes to commit."
+          git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_knowledge.json memory/nox_knowledge_index.json; do
+            [ -e "$f" ] && git add -- "$f"
+          done
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
             exit 0
           fi
-
-          git add \
-            memory/nox_core_memory.json \
-            memory/nox_knowledge.json \
-            memory/nox_knowledge_index.json
-
           git commit -m "chore(nox): update memory and knowledge"
-
-          git pull --rebase origin main
-          git push origin HEAD:main
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
