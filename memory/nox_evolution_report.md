@@ -1,68 +1,73 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-08T06:42:37.672852Z
+Last update: 2026-10-08T07:09:26.187817+00:00
 
 ## Colony profile
 
-- Username: nox_origine
-- Karma: 49
-- Posts: unknown
-- Comments: unknown
-- Followers: unknown
-- Following: unknown
+- username: nox_origine
+- karma: 49
+- posts: unknown
+- comments: unknown
+- followers: unknown
+- following: unknown
 
 ## Core
 
-- observations: 147
+- observations: 207
 - facts: 0
-- experiences: 39
+- experiences: 78
 - hypotheses: 0
-- results: 12
+- results: 16
 - learnings: 58
-- decisions: 60
-- actions: 0
-- outcomes: 0
+- cognitive_cases: 72
+- actions: 36
+
+## Runtime
+
+- decisions: 61
+- actions: 1
+- outcomes: 2
+- pending_actions: 6
+- work_requests: 50
+- processed_ids: 135
 - web_queries: 2
-- skill_attempts: unknown
 
 ## Work Factory
 
-- pending: 56
-- history: 44
-- results: 4
-- failed: 2
+- pending: 55
+- history: 45
+- results: 5
+- failed: 4
 
 ## Knowledge
 
-- observations: 283
+- observations: 390
 - facts: 0
-- experiences: 58
+- experiences: 97
 - hypotheses: 0
-- results: 12
-- learnings: 58
-- sources: 100
-- queries: 4
+- results: 21
+- learnings: 64
+- sources: 133
+- queries: 21
 
 ## Presence
 
-- actions: 5
-- outcomes: 43
-- errors: 20
-- runs: 29
-- tracked_targets: 0
+- actions: 7
+- outcomes: 45
+- errors: 21
+- runs: 30
+- permanent_failures: 2
+- closed_ids: 2
 
 ## Lightning
 
-- Ready: unknown
-- Address: unknown
-- Min msat: unknown
-- Max msat: unknown
+- Ready: True
+- Address: nox2026@coinos.io
 
 ## Monitor status
 
 - Profile read error: unknown
 - Mode: read-only
 - Payments performed: no
-- Spending performed: no
 
 Missing metrics remain unknown and are never converted to zero.
