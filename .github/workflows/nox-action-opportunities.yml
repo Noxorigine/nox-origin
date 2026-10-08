@@ -2,6 +2,12 @@ name: NØX - Action & Opportunities
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_bids:
+        description: "Allow submitting bids (otherwise observation only)"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "0 * * * *"
 
@@ -9,38 +15,33 @@ permissions:
   contents: write
 
 concurrency:
-  group: nox-action-opportunities
+  group: nox-state
   cancel-in-progress: false
 
 env:
-  CORE_MEMORY_FILE: memory/nox_core_memory.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
-  KNOWLEDGE_FILE: memory/nox_knowledge.json
-  ACTION_MEMORY_FILE: memory/nox_action_opportunities.json
-
+  ACTION_MEMORY_FILE: "memory/nox_action_opportunities.json"
   MAX_TASKS_PER_RUN: "50"
   MAX_BIDS_PER_RUN: "2"
   MAX_BID_CHECKS_PER_RUN: "10"
   MAX_TRACKED_ITEMS: "300"
-  MAX_CORE_ACTIONS: "50"
-
   MIN_OPPORTUNITY_SATS: "1"
   MIN_PLATFORM_BID_SATS: "21"
+  MIN_BID_SCORE: "8"
   REQUEST_TIMEOUT_SECONDS: "15"
-
+  NOX_USERNAME: "nox_origine"
+  PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
-  PROJECT_COST_EUR: "0"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
 
 jobs:
-  action-opportunities:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -52,494 +53,543 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "colony-sdk>=1.37.0" requests
+          python -m pip install requests
 
-      - name: Verify Colony SDK
+      - name: Run NØX Action & Opportunities
+        shell: bash
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+          BIDDING_ENABLED: ${{ inputs.enable_bids && 'true' || vars.NOX_BIDDING_ENABLED || 'false' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import inspect
-          from colony_sdk import ColonyClient
-          for name in ("bootstrap", "get_me"):
-              if not hasattr(ColonyClient, name):
-                  raise RuntimeError(f"Missing ColonyClient.{name}")
-          print("Colony SDK: OK")
-          print(inspect.signature(ColonyClient.bootstrap))
-          print(inspect.signature(ColonyClient.get_me))
-          PY
-
-      - name: Run NØX Action & Opportunities
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
-        run: |
-          set -euo pipefail
-          cat > /tmp/nox_action.py <<'PY'
-          import hashlib,json,os,re,subprocess,sys
-          from datetime import datetime,timezone
+          """Shared helpers for all NØX scripts (standard library only)."""
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from itertools import islice
           from pathlib import Path
+
+          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
+
+          # ---------------------------------------------------------------- time / env
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def parse_ts(value):
+              if not value or not isinstance(value, str):
+                  return None
+              try:
+                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return int(default)
+
+          def env_flag(name, default=False):
+              value = os.environ.get(name)
+              if value is None or value.strip() == "":
+                  return default
+              return value.strip().lower() in {"1", "true", "yes", "on"}
+
+          def check_policy():
+              """Hard safety invariants: no spending, no payments, no external AI."""
+              expected = {
+                  "PROJECT_COST_EUR": "0",
+                  "GEMINI_USED": "false",
+                  "EXTERNAL_AI_USED": "false",
+                  "AUTO_PAYMENT": "false",
+                  "AUTO_SPENDING": "false",
+              }
+              for key, wanted in expected.items():
+                  if os.environ.get(key, wanted).strip().lower() != wanted:
+                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
+
+          # ---------------------------------------------------------------- json files
+          def load_json(path, default=None):
+              """Load a JSON object. Refuses to continue on corrupt files so that a
+              parse error can never silently wipe the agent's state."""
+              path = Path(path)
+              default = {} if default is None else default
+              if not path.exists():
+                  return default
+              raw = path.read_text(encoding="utf-8")
+              if not raw.strip():
+                  return default
+              try:
+                  value = json.loads(raw)
+              except Exception as exc:
+                  raise SystemExit(
+                      f"ERROR: {path} is not valid JSON ({exc}). "
+                      "Restore it from git history; refusing to overwrite it."
+                  )
+              return value if isinstance(value, type(default)) else default
+
+          def save_json(path, value):
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
+              json.loads(payload)  # round-trip check
+              tmp.write_text(payload, encoding="utf-8")
+              os.replace(tmp, path)
+
+          # ---------------------------------------------------------------- data utils
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
+
+          def as_list(value):
+              return value if isinstance(value, list) else []
+
+          def text(value, limit=None):
+              if value is None:
+                  out = ""
+              elif isinstance(value, str):
+                  out = value.strip()
+              elif isinstance(value, dict):
+                  out = ""
+                  for key in ("content", "body", "text", "message", "title", "question"):
+                      if value.get(key):
+                          out = text(value[key])
+                          break
+                  if not out:
+                      out = json.dumps(value, ensure_ascii=False, default=str)
+              else:
+                  out = str(value).strip()
+              return out[:limit] if limit else out
+
+          def collapse(value, limit=None):
+              out = re.sub(r"\s+", " ", text(value)).strip()
+              return out[:limit] if limit else out
+
+          def clip(value, limit):
+              out = text(value)
+              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
+
+          def stable_id(prefix, *parts):
+              raw = "|".join(str(p if p is not None else "") for p in parts)
+              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+          def identity(item):
+              """Stable identity of a stored item (id-like key, else content hash)."""
+              if isinstance(item, dict):
+                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
+                      if item.get(key):
+                          return f"{key}:{item[key]}"
+              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def dedupe_keep_last(items, limit=None):
+              """Remove duplicates (keeping the most recent occurrence) and keep list
+              order chronological (oldest first). Optionally keep only the last N."""
+              seen, out = set(), []
+              for item in reversed(items):
+                  key = identity(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(item)
+              out.reverse()
+              return out[-limit:] if limit else out
+
+          def bound(items, limit):
+              items = as_list(items)
+              return items[-limit:] if len(items) > limit else items
+
+          def take(value, n=None):
+              """Turn SDK results (list / dict / generator) into a bounded list."""
+              if value is None:
+                  return []
+              if isinstance(value, dict):
+                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
+                      if isinstance(value.get(key), list):
+                          value = value[key]
+                          break
+                  else:
+                      return []
+              if isinstance(value, (list, tuple)):
+                  return list(value)[:n] if n else list(value)
+              try:
+                  iterator = iter(value)
+              except TypeError:
+                  return []
+              return list(islice(iterator, n)) if n else list(iterator)
+
+          def username_of(obj):
+              """Lower-cased username of an object or of a nested author/sender."""
+              if not isinstance(obj, dict):
+                  return ""
+              for key in ("username", "handle", "author_username", "sender_username"):
+                  if obj.get(key):
+                      return str(obj[key]).strip().lower()
+              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
+                  nested = obj.get(key)
+                  if isinstance(nested, dict):
+                      found = username_of(nested)
+                      if found:
+                          return found
+                  elif isinstance(nested, str) and nested.strip():
+                      return nested.strip().lower()
+              return ""
+
+          # ===== script =====
+          """NØX Action & Opportunities (marketplace).
+
+          Fixes vs. the old version:
+          - bidding is controlled by an explicit switch (BIDDING_ENABLED), not by
+            keyword matching on Core fields that Core never produced
+          - only relevant tasks are bid on (minimum score), never on a task already bid on
+          - reconciliation rotates through ALL open bids (oldest check first)
+          - opportunities are deduplicated; the file is only rewritten when something changed
+          - no payment / spending code path exists
+          """
+          import os
+          import re
+          from pathlib import Path
+
           import requests
-          from colony_sdk import ColonyAPIError,ColonyAuthError,ColonyClient
 
-          BASE="https://thecolony.cc/api/v1"
-          CORE=Path(os.environ["CORE_MEMORY_FILE"])
-          RUNTIME=Path(os.environ["CORE_RUNTIME_FILE"])
-          KNOW=Path(os.environ["KNOWLEDGE_FILE"])
-          MEM=Path(os.environ["ACTION_MEMORY_FILE"])
-          KEY=os.environ.get("COLONY_API_KEY","").strip()
-          MAXT=int(os.environ["MAX_TASKS_PER_RUN"])
-          MAXB=int(os.environ["MAX_BIDS_PER_RUN"])
-          MAXC=int(os.environ["MAX_BID_CHECKS_PER_RUN"])
-          MAXA=int(os.environ["MAX_CORE_ACTIONS"])
-          MIN=int(os.environ["MIN_OPPORTUNITY_SATS"])
-          FLOOR=int(os.environ["MIN_PLATFORM_BID_SATS"])
-          TIME=int(os.environ["REQUEST_TIMEOUT_SECONDS"])
-
+          check_policy()
+          BASE = "https://thecolony.cc/api/v1"
+          MEM_FILE = Path(os.environ["ACTION_MEMORY_FILE"])
+          KEY = os.environ.get("COLONY_API_KEY", "").strip()
+          ENABLED = env_flag("BIDDING_ENABLED", False)
+          MAXT, MAXB, MAXC = env_int("MAX_TASKS_PER_RUN", 50), env_int("MAX_BIDS_PER_RUN", 2), env_int("MAX_BID_CHECKS_PER_RUN", 10)
+          MIN_SATS, FLOOR = env_int("MIN_OPPORTUNITY_SATS", 1), env_int("MIN_PLATFORM_BID_SATS", 21)
+          MIN_SCORE, TRACKED, TIMEOUT = env_int("MIN_BID_SCORE", 8), env_int("MAX_TRACKED_ITEMS", 300), env_int("REQUEST_TIMEOUT_SECONDS", 15)
           if not KEY:
               raise SystemExit("COLONY_API_KEY is missing.")
 
-          def now():
-              return datetime.now(timezone.utc).isoformat()
+          NOW = now_iso()
+          mem = as_dict(load_json(MEM_FILE))
+          mem.setdefault("version", 7)
+          mem.setdefault("created_at", NOW)
+          for k in ("opportunities", "bids", "runs", "learnings"):
+              if not isinstance(mem.get(k), list):
+                  mem[k] = []
 
-          def load(p,d):
+          def http(method, path, token, payload=None, params=None):
+              url = path if path.startswith("http") else BASE + path
+              headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "NOX-Action/7.0"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
               try:
-                  x=json.loads(p.read_text(encoding="utf-8"))
-                  return x if isinstance(x,dict) else d
+                  r = requests.request(method, url, headers=headers, json=payload, params=params, timeout=TIMEOUT)
+              except requests.RequestException as exc:
+                  raise RuntimeError(f"{method} {url}: {exc}")
+              if r.status_code >= 400:
+                  raise RuntimeError(f"{method} {url} -> {r.status_code}: {r.text[:500]}")
+              if not r.content:
+                  return {}
+              try:
+                  return r.json()
               except Exception:
-                  return d
-
-          def save(p,x):
-              p.parent.mkdir(parents=True,exist_ok=True)
-              t=p.with_suffix(p.suffix+".tmp")
-              t.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding="utf-8")
-              t.replace(p)
-
-          def text(x,n=2000):
-              if x is None:return ""
-              if not isinstance(x,str):
-                  try:x=json.dumps(x,ensure_ascii=False)
-                  except Exception:x=str(x)
-              return re.sub(r"\s+"," ",str(x).strip())[:n]
-
-          def norm(x):
-              return text(x).lower()
-
-          def ident(x):
-              return hashlib.sha256(text(x,20000).lower().encode()).hexdigest()[:16]
-
-          core=load(CORE,{})
-          runtime=load(RUNTIME,{})
-          knowledge=load(KNOW,{})
-          mem=load(MEM,{"version":6,"created_at":now(),"updated_at":now(),
-                        "opportunities":[],"bids":[],"runs":[],"learnings":[]})
-          for k in ("opportunities","bids","runs","learnings"):
-              if not isinstance(mem.get(k),list):mem[k]=[]
-
-          def http(method,path,token,payload=None,params=None):
-              url=path if path.startswith("http") else BASE+path
-              h={"Accept":"application/json","Content-Type":"application/json",
-                 "User-Agent":"NOX-Action-Opportunities/6.0"}
-              if token:h["Authorization"]=f"Bearer {token}"
-              try:
-                  r=requests.request(method,url,headers=h,json=payload,
-                                     params=params,timeout=TIME)
-              except requests.RequestException as e:
-                  raise RuntimeError(f"{method} {url}: {e}")
-              if r.status_code>=400:
-                  try:d=r.json()
-                  except Exception:d=r.text[:2000]
-                  raise RuntimeError(f"{method} {url} -> {r.status_code}: {d}")
-              if not r.content:return {}
-              try:return r.json()
-              except Exception:return {"raw":r.text[:5000]}
-
-          # ---------- CORE AUTHORIZATION ----------
-
-          actions=[]
-          for k in ("actions","decisions"):
-              v=core.get(k,[])
-              if isinstance(v,list):
-                  actions += [x for x in v if isinstance(x,dict)]
-          cases=core.get("cognitive_cases",[])
-          if isinstance(cases,list):
-              for c in cases[-MAXA:]:
-                  if isinstance(c,dict) and c.get("decision"):
-                      actions.append({
-                          "timestamp":c.get("timestamp"),
-                          "decision":c.get("decision"),
-                          "summary":f"Core decision: {c.get('decision')}",
-                          "execution_layer":c.get("execution_layer"),
-                          "target_id":c.get("target_id"),
-                          "decision_reason":c.get("decision_reason")
-                      })
-          actions=actions[-MAXA:]
-
-          markers=("marketplace","opportunit","bid","bidding","paid_task",
-                   "paid task","submit_bid","submit bid","action_opportunities",
-                   "action / opportunities","action and opportunities")
-
-          authorized=[]
-          for a in actions:
-              s=norm(" ".join([
-                  text(a.get("execution_layer")),
-                  text(a.get("decision") or a.get("action") or a.get("summary"))
-              ]))
-              if any(m in s for m in markers):
-                  authorized.append(a)
-
-          marketplace_authorized=False
-          for a in reversed(authorized):
-              d=norm(a.get("decision") or a.get("action") or a.get("summary"))
-              if any(x in d for x in ("do_nothing","observe","wait")):
-                  continue
-              marketplace_authorized=True
-              break
+                  return {"raw": r.text[:2000]}
 
           print("=== NØX ACTION & OPPORTUNITIES ===")
-          print("Core authorization:",marketplace_authorized)
-          print("Gemini: false | External AI: false | Spending: false | Payments: false")
+          print("Bidding enabled:", ENABLED, "| spending: false | payments: false")
 
-          # ---------- IDENTITY ----------
-
-          try:
-              sdk=ColonyClient(KEY)
-              state=sdk.bootstrap()
-              profile=state.get("profile",{}) if isinstance(state,dict) else {}
-              username=profile.get("username") or profile.get("handle") or profile.get("name","")
-              if not username:
-                  me_sdk=sdk.get_me()
-                  if isinstance(me_sdk,dict):
-                      username=me_sdk.get("username") or me_sdk.get("handle") or me_sdk.get("name","")
-              if norm(username)!="nox_origine":
-                  raise RuntimeError(f"SDK identity mismatch: {username}")
-          except (ColonyAuthError,ColonyAPIError) as e:
-              raise SystemExit(f"Colony SDK authentication failed: {e}")
-          except Exception as e:
-              raise SystemExit(f"SDK bootstrap failed: {e}")
-
-          auth=http("POST","/auth/token","",{"api_key":KEY})
-          token=auth.get("access_token") or auth.get("token") or auth.get("jwt")
-          if not token:raise SystemExit("No marketplace access token.")
-
-          me=http("GET","/users/me",token)
-          username=me.get("username") or me.get("handle") or me.get("name") or username
-          if norm(username)!="nox_origine":
-              raise SystemExit(f"Marketplace identity mismatch: {username}")
-          pid=me.get("id") or me.get("user_id") or me.get("userId") or me.get("agent_id") or me.get("agentId")
-          print("Identity verified: @"+username)
-
-          # ---------- TASK HELPERS ----------
+          auth = http("POST", "/auth/token", "", {"api_key": KEY})
+          token = auth.get("access_token") or auth.get("token") or auth.get("jwt")
+          if not token:
+              raise SystemExit("No marketplace access token.")
+          me = http("GET", "/users/me", token)
+          username = text(me.get("username") or me.get("handle") or me.get("name")).lower()
+          if username != OWN_USERNAME:
+              raise SystemExit(f"Identity mismatch: {username!r}")
+          my_ids = {str(me.get(k)).lower() for k in ("id", "user_id", "userId", "agent_id", "agentId") if me.get(k) is not None}
+          print("Identity verified: @" + username)
 
           def tid(t):
               return t.get("id") or t.get("task_id") or t.get("listing_id") or t.get("uuid") or t.get("_id")
 
           def title(t):
-              return text(t.get("title") or t.get("name") or t.get("headline") or "Untitled",300)
-
-          def status(t):
-              return text(t.get("status") or t.get("state") or "unknown",100)
+              return collapse(t.get("title") or t.get("name") or t.get("headline") or "Untitled", 300)
 
           def number(v):
-              if isinstance(v,bool):return None
-              if isinstance(v,(int,float)) and v>=0:return int(v)
-              if not isinstance(v,str):return None
-              m=re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*",v.replace(",",""))
-              return int(float(m.group(1))) if m else None
+              if isinstance(v, bool):
+                  return None
+              if isinstance(v, (int, float)) and v >= 0:
+                  return int(v)
+              if isinstance(v, str):
+                  m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", v.replace(",", ""))
+                  return int(float(m.group(1))) if m else None
+              return None
 
-          MINKEY={"budget_min_sats","min_budget_sats","minimum_budget_sats",
-                  "reward_min_sats","min_reward_sats","min_bid_sats",
-                  "price_min_sats","minimum_bid_sats","bid_min_sats"}
-          MAXKEY={"budget_max_sats","max_budget_sats","maximum_budget_sats",
-                  "reward_max_sats","max_reward_sats","max_bid_sats",
-                  "price_max_sats","maximum_bid_sats","bid_max_sats"}
-          FIXKEY={"reward_sats","amount_sats","payment_sats","price_sats",
-                  "fixed_reward_sats","fixed_budget_sats","fixed_price_sats",
-                  "fixed_amount_sats","listed_rate_sats"}
+          MINK = {"budget_min_sats", "min_budget_sats", "minimum_budget_sats", "reward_min_sats", "min_reward_sats",
+                  "min_bid_sats", "price_min_sats", "minimum_bid_sats", "bid_min_sats"}
+          MAXK = {"budget_max_sats", "max_budget_sats", "maximum_budget_sats", "reward_max_sats", "max_reward_sats",
+                  "max_bid_sats", "price_max_sats", "maximum_bid_sats", "bid_max_sats"}
+          FIXK = {"reward_sats", "amount_sats", "payment_sats", "price_sats", "fixed_reward_sats", "fixed_budget_sats",
+                  "fixed_price_sats", "fixed_amount_sats", "listed_rate_sats"}
+
+          def walk(x):
+              if isinstance(x, dict):
+                  for k, v in x.items():
+                      yield str(k).lower(), v
+                      yield from walk(v)
+              elif isinstance(x, list):
+                  for v in x:
+                      yield from walk(v)
 
           def budget(t):
-              lo=hi=None
-              def walk(x):
-                  if isinstance(x,dict):
-                      for k,v in x.items():
-                          yield k.lower(),v
-                          yield from walk(v)
-                  elif isinstance(x,list):
-                      for v in x:yield from walk(v)
-              for k,v in walk(t):
-                  n=number(v)
-                  if n is None:continue
-                  if k in FIXKEY:lo=hi=n
-                  elif k in MINKEY:lo=n
-                  elif k in MAXKEY:hi=n
+              lo = hi = None
+              for k, v in walk(t):
+                  n = number(v)
+                  if n is None:
+                      continue
+                  if k in FIXK:
+                      lo = hi = n
+                  elif k in MINK:
+                      lo = n
+                  elif k in MAXK:
+                      hi = n
               if lo is not None or hi is not None:
-                  return lo if lo is not None else hi,hi if hi is not None else lo,"explicit"
-              s=text(" ".join(text(t.get(k)) for k in
-                       ("title","name","description","body","content","summary","budget","reward","payment","compensation")))
-              r=re.search(r"(\d[\d,]*)\s*(?:-|–|—|to)\s*(\d[\d,]*)\s*sats\b",s,re.I)
-              if r:return int(r.group(1).replace(",","")),int(r.group(2).replace(",","")),"text-range"
-              r=re.search(r"(\d[\d,]*)\s*sats\b",s,re.I)
-              if r:
-                  n=int(r.group(1).replace(",",""))
-                  return n,n,"text-fixed"
-              return None,None,None
+                  return (lo if lo is not None else hi), (hi if hi is not None else lo)
+              s = " ".join(text(t.get(k)) for k in ("title", "name", "description", "body", "content", "summary", "budget", "reward"))
+              m = re.search(r"(\d[\d,]*)\s*(?:-|–|—|to)\s*(\d[\d,]*)\s*sats\b", s, re.I)
+              if m:
+                  return int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
+              m = re.search(r"(\d[\d,]*)\s*sats\b", s, re.I)
+              if m:
+                  n = int(m.group(1).replace(",", ""))
+                  return n, n
+              return None, None
 
-          demand_types={"paid_task","task","bounty","human_request","human-request"}
-          supply_types={"service","service_offer","service-offer","for_hire","for-hire","offer"}
-          supply=("for hire","for-hire","available for","my services","service offer",
-                  "service listing","fixed-price service","fixed price service",
-                  "hire me","i can provide","i offer")
-          demand=("looking for","need an agent","need someone","seeking agent",
-                  "seeking someone","wanted","request","bounty","paid task",
-                  "human request","i need","we need","build","verify","audit",
-                  "research","write","develop","create","fix","test","analyze","analyse","deliver")
+          DEMAND_TYPES = {"paid_task", "task", "bounty", "human_request", "human-request"}
+          SUPPLY_TYPES = {"service", "service_offer", "service-offer", "for_hire", "for-hire", "offer"}
+          SUPPLY = ("for hire", "for-hire", "available for", "my services", "service offer", "service listing",
+                    "fixed-price service", "fixed price service", "hire me", "i can provide", "i offer")
+          DEMAND = ("looking for", "need an agent", "need someone", "seeking agent", "seeking someone", "wanted", "request",
+                    "bounty", "paid task", "human request", "i need", "we need", "build", "verify", "audit", "research",
+                    "write", "develop", "create", "fix", "test", "analyze", "analyse", "deliver")
 
           def classify(t):
-              typ=norm(t.get("post_type") or t.get("type") or t.get("listing_type") or t.get("kind"))
-              if typ in demand_types:return "demand","explicit:"+typ
-              if typ in supply_types:return "supply","explicit:"+typ
-              ti=norm(title(t))
-              body=norm(" ".join(text(t.get(k)) for k in
-                                ("title","body","description","content","summary")))
-              if any(x in ti for x in supply):return "supply","title"
-              if any(x in body for x in supply):return "supply","body"
-              if any(x in ti for x in demand):return "demand","title"
-              if any(x in body for x in demand):return "demand","body"
-              return "unknown","none"
-
-          caps={"research":5,"deep research":8,"research report":8,
-                "technical report":8,"technical":4,"python":6,"code":4,
-                "coding":4,"software":3,"data":5,"dataset":5,"json":4,
-                "csv":4,"verification":7,"verify":7,"audit":7,"citation":6,
-                "citations":6,"analysis":5,"analyze":5,"test":5,"testing":5,
-                "agent tooling":8,"tool development":8}
-
-          def score(t,lo,hi):
-              s=norm(t);n=sum(p for k,p in caps.items() if k in s)
-              if lo is not None:
-                  n += 8 if lo>=10000 else 6 if lo>=5000 else 4 if lo>=1000 else 2 if lo>=500 else 0
-              if hi is not None and hi>=10000:n+=3
-              return n
-
-          # ---------- MARKETPLACE ----------
-
-          raw=http("GET","/marketplace/tasks",token,
-                   params={"status":"open","sort":"new","limit":MAXT,"offset":0})
-          if isinstance(raw,list):tasks=raw
-          elif isinstance(raw,dict):
-              tasks=raw.get("tasks") or raw.get("items") or raw.get("results") or raw.get("data") or []
-              if isinstance(tasks,dict):
-                  tasks=tasks.get("tasks") or tasks.get("items") or tasks.get("results") or []
-          else:tasks=[]
-          if not isinstance(tasks,list):tasks=[]
-          print("Marketplace tasks:",len(tasks))
-
-          candidates=[]
-          for t in tasks:
-              if not isinstance(t,dict) or not tid(t):continue
-              cls,src=classify(t)
-              if cls!="demand":continue
-              lo,hi,bs=budget(t)
-              if hi is not None and hi<MIN:continue
-              candidates.append({
-                  "id":str(tid(t)),"title":title(t),"status":status(t),
-                  "classification":cls,"classification_source":src,
-                  "budget_min_sats":lo,"budget_max_sats":hi,
-                  "budget_source":bs,"score":score(t,lo,hi),"raw":t
-              })
-          candidates.sort(key=lambda x:(x["score"],x["budget_max_sats"] or 0),reverse=True)
-          print("Demand candidates:",len(candidates))
-
-          # ---------- BID STATE ----------
-
-          def collection(x):
-              if isinstance(x,list):return x
-              if not isinstance(x,dict):return []
-              for k in ("bids","items","results","data"):
-                  v=x.get(k)
-                  if isinstance(v,list):return v
-                  if isinstance(v,dict):
-                      for q in ("bids","items","results"):
-                          if isinstance(v.get(q),list):return v[q]
-              return []
-
-          ids={str(x).lower() for x in
-               (pid,me.get("id"),me.get("user_id"),me.get("userId"),
-                me.get("agent_id"),me.get("agentId")) if x is not None}
-          names={norm(username),"nox_origine"}
-
-          def mine(b):
-              if not isinstance(b,dict):return False
-              for k in ("user_id","agent_id","owner_id","bidder_id"):
-                  if b.get(k) is not None and str(b[k]).lower() in ids:return True
-              for k in ("username","handle","agent_username","agent_handle"):
-                  if b.get(k) is not None and norm(b[k]) in names:return True
-              for k in ("bidder","agent","user"):
-                  v=b.get(k)
-                  if isinstance(v,dict):
-                      if any(str(v.get(q)).lower() in ids for q in ("id","user_id","agent_id") if v.get(q) is not None):return True
-                      if any(norm(v.get(q)) in names for q in ("username","handle","name") if v.get(q) is not None):return True
-              return False
-
-          def lifecycle(b):
-              s=norm(b.get("platform_status") or b.get("status") or b.get("state")).replace("-","_").replace(" ","_")
-              if s in {"accepted","approved","awarded","won","selected","completed","complete","paid","success"}:return "won"
-              if s in {"rejected","declined","denied","lost","expired","cancelled","canceled","withdrawn"}:return "closed"
-              if s in {"pending","submitted","open","active","bidding","under_review","review","in_review","already_present"}:return "pending"
+              typ = text(t.get("post_type") or t.get("type") or t.get("listing_type") or t.get("kind")).lower()
+              if typ in DEMAND_TYPES:
+                  return "demand"
+              if typ in SUPPLY_TYPES:
+                  return "supply"
+              ti = title(t).lower()
+              body = " ".join(text(t.get(k)) for k in ("title", "body", "description", "content", "summary")).lower()
+              if any(x in ti for x in SUPPLY) or any(x in body for x in SUPPLY):
+                  return "supply"
+              if any(x in ti for x in DEMAND) or any(x in body for x in DEMAND):
+                  return "demand"
               return "unknown"
 
-          # ---------- RECONCILE FIRST ----------
+          CAPS = {"research": 5, "deep research": 8, "research report": 8, "technical report": 8, "technical": 4,
+                  "python": 6, "code": 4, "coding": 4, "software": 3, "data": 5, "dataset": 5, "json": 4, "csv": 4,
+                  "verification": 7, "verify": 7, "audit": 7, "citation": 6, "citations": 6, "analysis": 5, "analyze": 5,
+                  "test": 5, "testing": 5, "agent tooling": 8, "tool development": 8}
 
-          for b in [x for x in mem["bids"] if isinstance(x,dict)][-MAXC:]:
-              task_id=b.get("task_id")
-              if not task_id:continue
+          def score(t, lo, hi):
+              hay = " ".join(text(t.get(k)) for k in ("title", "name", "description", "body", "content", "summary")).lower()
+              n = sum(p for k, p in CAPS.items() if re.search(rf"\b{re.escape(k)}\b", hay))
+              if lo is not None:
+                  n += 8 if lo >= 10000 else 6 if lo >= 5000 else 4 if lo >= 1000 else 2 if lo >= 500 else 0
+              if hi is not None and hi >= 10000:
+                  n += 3
+              return n
+
+          def is_mine(obj):
+              if not isinstance(obj, dict):
+                  return False
+              for k in ("user_id", "agent_id", "owner_id", "bidder_id", "poster_id", "creator_id", "author_id", "requester_id"):
+                  if obj.get(k) is not None and str(obj[k]).lower() in my_ids:
+                      return True
+              for k in ("username", "handle", "agent_username", "poster_username"):
+                  if obj.get(k) is not None and text(obj[k]).lower() == OWN_USERNAME:
+                      return True
+              for k in ("bidder", "agent", "user", "poster", "author", "owner"):
+                  v = obj.get(k)
+                  if isinstance(v, dict):
+                      if any(str(v.get(q)).lower() in my_ids for q in ("id", "user_id", "agent_id") if v.get(q) is not None):
+                          return True
+                      if any(text(v.get(q)).lower() == OWN_USERNAME for q in ("username", "handle", "name") if v.get(q) is not None):
+                          return True
+              return False
+
+          def collection(x):
+              if isinstance(x, list):
+                  return x
+              if isinstance(x, dict):
+                  for k in ("bids", "items", "results", "data"):
+                      v = x.get(k)
+                      if isinstance(v, list):
+                          return v
+                      if isinstance(v, dict):
+                          for q in ("bids", "items", "results"):
+                              if isinstance(v.get(q), list):
+                                  return v[q]
+              return []
+
+          def lifecycle(b):
+              s = text(b.get("platform_status") or b.get("status") or b.get("state")).lower().replace("-", "_").replace(" ", "_")
+              if s in {"accepted", "approved", "awarded", "won", "selected", "completed", "complete", "paid", "success"}:
+                  return "won"
+              if s in {"rejected", "declined", "denied", "lost", "expired", "cancelled", "canceled", "withdrawn"}:
+                  return "closed"
+              if s in {"pending", "submitted", "open", "active", "bidding", "under_review", "review", "in_review", "already_present"}:
+                  return "pending"
+              return "unknown"
+
+          # ------------------------------------------------------------ fetch tasks
+          raw = http("GET", "/marketplace/tasks", token, params={"status": "open", "sort": "new", "limit": MAXT, "offset": 0})
+          tasks = raw if isinstance(raw, list) else (raw.get("tasks") or raw.get("items") or raw.get("results") or raw.get("data") or []) if isinstance(raw, dict) else []
+          if isinstance(tasks, dict):
+              tasks = tasks.get("tasks") or tasks.get("items") or tasks.get("results") or []
+          tasks = tasks if isinstance(tasks, list) else []
+          print("Marketplace tasks:", len(tasks))
+
+          candidates = []
+          for t in tasks:
+              if not isinstance(t, dict) or not tid(t) or classify(t) != "demand" or is_mine(t):
+                  continue
+              if text(t.get("status") or t.get("state") or "open").lower() not in {"open", "unknown", ""}:
+                  continue
+              lo, hi = budget(t)
+              if hi is not None and hi < MIN_SATS:
+                  continue
+              candidates.append({"id": str(tid(t)), "title": title(t), "status": "open", "budget_min_sats": lo,
+                                 "budget_max_sats": hi, "score": score(t, lo, hi)})
+          candidates.sort(key=lambda c: (c["score"], c["budget_max_sats"] or 0), reverse=True)
+          print("Demand candidates:", len(candidates))
+
+          changed = False
+
+          # ------------------------------------------------------------ reconcile open bids (rotating)
+          open_bids = [b for b in mem["bids"] if isinstance(b, dict) and b.get("task_id")
+                       and b.get("lifecycle_state", "pending") in ("pending", "unknown")]
+          open_bids.sort(key=lambda b: text(b.get("last_reconciled_at")))
+          for b in open_bids[:MAXC]:
               try:
-                  found=None
-                  for x in collection(http("GET",f"/marketplace/{task_id}/bids",token)):
-                      if mine(x):found=x;break
-                  b["last_reconciled_at"]=now()
+                  found = next((x for x in collection(http("GET", f"/marketplace/{b['task_id']}/bids", token)) if is_mine(x)), None)
+                  b["last_reconciled_at"] = NOW
                   if found:
-                      b["platform_bid"]=found
-                      b["bid_id"]=str(found.get("bid_id") or found.get("id") or b.get("bid_id") or "")
-                      b["platform_status"]=found.get("status") or found.get("state") or b.get("platform_status")
-                      b["lifecycle_state"]=lifecycle(b)
-                      b["next_action"]={
-                          "pending":"monitor_bid",
-                          "won":"await_task_or_delivery",
-                          "closed":"review_and_reassess"
-                      }.get(b["lifecycle_state"],"reconcile_again")
-                      print("BID RECONCILED",task_id,b["lifecycle_state"])
+                      before = b.get("lifecycle_state")
+                      b["platform_bid"] = found
+                      b["bid_id"] = str(found.get("bid_id") or found.get("id") or b.get("bid_id") or "")
+                      b["platform_status"] = found.get("status") or found.get("state") or b.get("platform_status")
+                      b["lifecycle_state"] = lifecycle(b)
+                      b["next_action"] = {"pending": "monitor_bid", "won": "await_task_or_delivery",
+                                          "closed": "review_and_reassess"}.get(b["lifecycle_state"], "reconcile_again")
+                      if b["lifecycle_state"] != before and b["lifecycle_state"] in ("won", "closed"):
+                          mem["learnings"].append({"timestamp": NOW, "type": "bid_outcome", "task_id": b["task_id"],
+                                                   "outcome": b["lifecycle_state"], "amount_sats": b.get("amount_sats")})
+                      print("BID RECONCILED", b["task_id"], b["lifecycle_state"])
                   else:
-                      b["lifecycle_state"]="unknown"
-                      b["next_action"]="reconcile_again"
-                      print("BID UNCERTAIN",task_id)
-              except Exception as e:
-                  b["lifecycle_state"]="unknown"
-                  b["next_action"]="reconcile_again"
-                  b["reconciliation_error"]=text(e,500)
-                  print("BID RECONCILE ERROR",task_id,e)
+                      b["lifecycle_state"] = "unknown"
+                  changed = True
+              except Exception as exc:
+                  b["lifecycle_state"] = "unknown"
+                  b["reconciliation_error"] = clip(exc, 300)
+                  changed = True
+                  print("BID RECONCILE ERROR", b["task_id"], exc)
 
-          # ---------- SELECT / ACT ----------
-
-          existing={str(b.get("task_id")):b for b in mem["bids"] if isinstance(b,dict)}
-          submitted=0
-          selected=[]
-
-          if marketplace_authorized:
+          # ------------------------------------------------------------ bid
+          existing = {str(b.get("task_id")) for b in mem["bids"] if isinstance(b, dict)}
+          submitted = 0
+          if ENABLED:
               for c in candidates:
-                  if submitted>=MAXB:break
-                  tid0=c["id"]
-                  old=existing.get(tid0)
-                  if old and lifecycle(old) in {"pending","won"}:
+                  if submitted >= MAXB:
+                      break
+                  if c["id"] in existing or c["score"] < MIN_SCORE:
                       continue
-                  lo=c["budget_min_sats"]
-                  hi=c["budget_max_sats"]
-                  bid=max(FLOOR,lo or FLOOR)
-                  if hi is not None and bid>hi:continue
-                  selected.append(c)
-
-              for c in selected:
-                  tid0=c["id"]
-                  bid=max(FLOOR,c["budget_min_sats"] or FLOOR)
-                  payload={
-                      "amount_sats":bid,
-                      "bid_sats":bid,
-                      "message":(
-                          "NØX proposes an evidence-first, reproducible approach. "
-                          "Verified findings and uncertainty will be separated "
-                          "and assumptions made explicit."
-                      )
-                  }
+                  bid = max(FLOOR, c["budget_min_sats"] or FLOOR)
+                  if c["budget_max_sats"] is not None and bid > c["budget_max_sats"]:
+                      continue
+                  payload = {"amount_sats": bid, "bid_sats": bid,
+                             "message": (f'NØX proposes an evidence-first, reproducible approach to "{c["title"][:80]}". '
+                                         "Verified findings and uncertainty will be reported separately and assumptions made explicit.")}
+                  rec = {"task_id": c["id"], "task_title": c["title"], "amount_sats": bid, "submitted_at": NOW,
+                         "status": "submitted", "expected_outcome": "bid_review", "actual_outcome": None,
+                         "lifecycle_state": "pending", "next_action": "monitor_bid"}
                   try:
-                      result=http("POST",f"/marketplace/{tid0}/bids",token,payload)
-                      rec={
-                          "task_id":tid0,"task_title":c["title"],"amount_sats":bid,
-                          "submitted_at":now(),"status":"submitted",
-                          "platform_status":result.get("status") if isinstance(result,dict) else None,
-                          "bid_id":str(result.get("bid_id") or result.get("id") or "") if isinstance(result,dict) else "",
-                          "expected_outcome":"bid_review",
-                          "actual_outcome":None,"lifecycle_state":"pending",
-                          "next_action":"monitor_bid"
-                      }
-                      mem["bids"].append(rec)
-                      submitted+=1
-                      print("BID SUBMITTED",tid0,bid)
-                  except Exception as e:
-                      mem["runs"].append({"timestamp":now(),"event":"bid_failed",
-                                          "task_id":tid0,"error":text(e,1000)})
-                      print("BID FAILED",tid0,e)
+                      result = http("POST", f"/marketplace/{c['id']}/bids", token, payload)
+                      if isinstance(result, dict):
+                          rec["platform_status"] = result.get("status")
+                          rec["bid_id"] = str(result.get("bid_id") or result.get("id") or "")
+                      submitted += 1
+                      print("BID SUBMITTED", c["id"], bid)
+                  except Exception as exc:
+                      msg = str(exc).lower()
+                      if "409" in msg or "already" in msg:
+                          rec["platform_status"] = "already_present"  # never retry this task
+                      else:
+                          mem["runs"].append({"timestamp": NOW, "event": "bid_failed", "task_id": c["id"], "error": clip(exc, 500)})
+                          changed = True
+                          print("BID FAILED", c["id"], exc)
+                          continue
+                  mem["bids"].append(rec)
+                  existing.add(c["id"])
+                  changed = True
           else:
-              print("No authorized marketplace action. Observation only.")
+              print("Bidding disabled (BIDDING_ENABLED=false): observation only.")
 
-          # ---------- MEMORY / LEARNING ----------
-
-          observed=[]
-          for c in candidates[:20]:
-              observed.append({
-                  "id":c["id"],"title":c["title"],
-                  "score":c["score"],
-                  "budget_min_sats":c["budget_min_sats"],
-                  "budget_max_sats":c["budget_max_sats"]
-              })
-
-          run={
-              "timestamp":now(),
-              "core_authorized":marketplace_authorized,
-              "tasks_observed":len(tasks),
-              "candidates":len(candidates),
-              "selected":len(selected),
-              "bids_submitted":submitted,
-              "bid_checks":min(MAXC,len(mem["bids"])),
-              "observation":"Marketplace demand was observed and reconciled before action.",
-              "result":"bids_submitted" if submitted else "no_bid",
-              "uncertainty":"Platform state remains unknown where reconciliation found no matching bid.",
-              "spending":False,
-              "payment":False
-          }
-          mem["runs"].append(run)
-
-          learning={
-              "timestamp":now(),
-              "type":"learning",
-              "source":"action_opportunities",
-              "statement":(
-                  "Marketplace action requires explicit Core authorization; "
-                  "existing bids are reconciled before new bids; "
-                  "uncertain platform state is preserved rather than inferred."
-              ),
-              "evidence":{
-                  "tasks_observed":len(tasks),
-                  "candidates":len(candidates),
-                  "bids_submitted":submitted
-              }
-          }
-          mem["learnings"].append(learning)
-          mem["opportunities"] += [{
-              k:c[k] for k in
-              ("id","title","status","classification","classification_source",
-               "budget_min_sats","budget_max_sats","budget_source","score")
-          } for c in candidates]
-          mem["opportunities"]=mem["opportunities"][-int(os.environ["MAX_TRACKED_ITEMS"]):]
-          mem["bids"]=mem["bids"][-int(os.environ["MAX_TRACKED_ITEMS"]):]
-          mem["runs"]=mem["runs"][-int(os.environ["MAX_TRACKED_ITEMS"]):]
-          mem["learnings"]=mem["learnings"][-int(os.environ["MAX_TRACKED_ITEMS"]):]
-          mem["updated_at"]=now()
-
-          save(MEM,mem)
-          print("Action memory saved.")
-          print("Submitted bids:",submitted)
-          print("Run completed.")
-
+          # ------------------------------------------------------------ memory
+          known = {o.get("id") for o in mem["opportunities"] if isinstance(o, dict)}
+          fresh = [c for c in candidates[:50] if c["id"] not in known]
+          if fresh:
+              mem["opportunities"] += fresh
+              changed = True
+          if changed or submitted:
+              mem["runs"].append({"timestamp": NOW, "bidding_enabled": ENABLED, "tasks_observed": len(tasks),
+                                  "candidates": len(candidates), "new_opportunities": len(fresh),
+                                  "bids_submitted": submitted, "spending": False, "payment": False})
+              mem["opportunities"] = dedupe_keep_last(mem["opportunities"], TRACKED)
+              for k in ("bids", "runs", "learnings"):
+                  mem[k] = bound(mem[k], TRACKED)
+              mem["updated_at"] = NOW
+              save_json(MEM_FILE, mem)
+              print("Action memory saved.")
+          else:
+              print("Nothing new; memory unchanged.")
+          print("Submitted bids:", submitted)
           PY
-          python3 /tmp/nox_action.py
 
-      - name: Commit Action memory
+      - name: Validate JSON state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          for path in ["memory/nox_action_opportunities.json"]:
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as fh:
+                      json.load(fh)
+                  print("VALID JSON:", path)
+          PY
+
+      - name: Commit and push
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name "NØX"
-          git config user.email "nox-origin@users.noreply.github.com"
-          git add memory/nox_action_opportunities.json
+          git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_action_opportunities.json; do
+            [ -e "$f" ] && git add -- "$f"
+          done
           if git diff --cached --quiet; then
-            echo "No Action memory changes to commit."
+            echo "No changes to commit."
             exit 0
           fi
           git commit -m "NØX: update action opportunities memory"
-          git push
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
