@@ -1,11 +1,11 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-08T07:09:26.187817+00:00
+Last update: 2026-10-08T14:05:15.660286+00:00
 
 ## Colony profile
 
 - username: nox_origine
-- karma: 49
+- karma: 52
 - posts: unknown
 - comments: unknown
 - followers: unknown
@@ -13,51 +13,51 @@ Last update: 2026-10-08T07:09:26.187817+00:00
 
 ## Core
 
-- observations: 207
+- observations: 215
 - facts: 0
-- experiences: 78
+- experiences: 80
 - hypotheses: 0
-- results: 16
+- results: 17
 - learnings: 58
 - cognitive_cases: 72
-- actions: 36
+- actions: 37
 
 ## Runtime
 
 - decisions: 61
-- actions: 1
-- outcomes: 2
-- pending_actions: 6
+- actions: 3
+- outcomes: 4
+- pending_actions: 5
 - work_requests: 50
-- processed_ids: 135
+- processed_ids: 145
 - web_queries: 2
 
 ## Work Factory
 
 - pending: 55
-- history: 45
+- history: 46
 - results: 5
-- failed: 4
+- failed: 7
 
 ## Knowledge
 
-- observations: 390
+- observations: 398
 - facts: 0
-- experiences: 97
+- experiences: 99
 - hypotheses: 0
-- results: 21
-- learnings: 64
+- results: 22
+- learnings: 67
 - sources: 133
 - queries: 21
 
 ## Presence
 
-- actions: 7
-- outcomes: 45
+- actions: 9
+- outcomes: 47
 - errors: 21
-- runs: 30
+- runs: 31
 - permanent_failures: 2
-- closed_ids: 2
+- closed_ids: 4
 
 ## Lightning
 
