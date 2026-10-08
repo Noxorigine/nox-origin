@@ -3,1432 +3,348 @@ name: NØX - Self Evolution
 on:
   workflow_dispatch:
   schedule:
-    - cron: "11 */2 * * *"
+    - cron: "11 */6 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: nox-self-evolution
+  group: nox-state
   cancel-in-progress: false
 
 env:
-  EVOLUTION_FILE: memory/nox_self_evolution.json
-  CORE_MEMORY_FILE: memory/nox_core_memory.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
-  WORK_FILE: memory/nox_work_factory.json
-  KNOWLEDGE_FILE: memory/nox_knowledge.json
-  PRESENCE_FILE: memory/nox_colony_presence.json
-
+  EVOLUTION_FILE: "memory/nox_self_evolution.json"
+  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
+  WORK_FILE: "memory/nox_work_factory.json"
+  PRESENCE_FILE: "memory/nox_colony_presence.json"
   MAX_HISTORY: "200"
-  MAX_CONTEXT_CHARS: "24000"
-
   MIN_REPEATED_FAILURES: "2"
-
-  MAX_PATCHES: "8"
-  MAX_TARGET_FILES: "3"
-  MAX_DIFF_CHARS: "120000"
-
-  MAX_OBSERVATIONS: "200"
-  MAX_DECISIONS: "200"
-  MAX_ACTIONS: "200"
-  MAX_RESULTS: "200"
-  MAX_FAILURES: "150"
-  MAX_LEARNINGS: "150"
-  MAX_COGNITIVE_CASES: "150"
-  MAX_PENDING_ACTIONS: "50"
-  MAX_WORK_REQUESTS: "50"
+  PENDING_BACKLOG_ALERT: "50"
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
 jobs:
-  self-evolution:
-    name: self-evolution
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install validation dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "pyyaml>=6.0,<7.0"
-
-      - name: Run deterministic self evolution
+      - name: Run self evolution diagnostics
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
+          """Shared helpers for all NØX scripts (standard library only)."""
           import hashlib
           import json
           import os
           import re
-          import subprocess
           import sys
           from datetime import datetime, timezone
+          from itertools import islice
           from pathlib import Path
 
-          import yaml
+          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
 
-          ROOT = Path.cwd()
-          NOW = datetime.now(timezone.utc).isoformat()
+          # ---------------------------------------------------------------- time / env
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
 
-          EVOLUTION_FILE = Path(os.environ["EVOLUTION_FILE"])
-          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
-          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
-          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
-
-          MAX_HISTORY = int(os.environ["MAX_HISTORY"])
-          MAX_CONTEXT_CHARS = int(os.environ["MAX_CONTEXT_CHARS"])
-          MIN_REPEATED_FAILURES = int(
-              os.environ["MIN_REPEATED_FAILURES"]
-          )
-          MAX_PATCHES = int(os.environ["MAX_PATCHES"])
-          MAX_TARGET_FILES = int(os.environ["MAX_TARGET_FILES"])
-          MAX_DIFF_CHARS = int(os.environ["MAX_DIFF_CHARS"])
-
-          LIMITS = {
-              "observations": int(os.environ["MAX_OBSERVATIONS"]),
-              "decisions": int(os.environ["MAX_DECISIONS"]),
-              "actions": int(os.environ["MAX_ACTIONS"]),
-              "results": int(os.environ["MAX_RESULTS"]),
-              "failures": int(os.environ["MAX_FAILURES"]),
-              "learnings": int(os.environ["MAX_LEARNINGS"]),
-              "cognitive_cases": int(os.environ["MAX_COGNITIVE_CASES"]),
-              "pending_actions": int(os.environ["MAX_PENDING_ACTIONS"]),
-              "work_requests": int(os.environ["MAX_WORK_REQUESTS"]),
-          }
-
-          ALLOWED_TARGETS = {
-              ".github/workflows/nox-core-general.yml",
-              ".github/workflows/nox-work-factory.yml",
-              ".github/workflows/nox-colony-presence.yml",
-              ".github/workflows/nox-evolution-monitor.yml",
-              "memory/nox_core_memory.json",
-              "memory/nox_core_runtime.json",
-              "memory/nox_work_factory.json",
-              "memory/nox_knowledge.json",
-              "memory/nox_colony_presence.json",
-              "memory/nox_evolution_report.md",
-          }
-
-          FORBIDDEN_TARGETS = {
-              ".github/workflows/nox-self-evolution.yml",
-              ".github/workflows/nox-action-opportunities.yml",
-              ".github/workflows/nox-memory-maintenance.yml",
-          }
-
-          CRITICAL_WORKFLOW_KEYS = {
-              "permissions",
-              "on",
-              "jobs",
-              "env",
-          }
-
-          FINANCIAL_GUARD_PATTERNS = (
-              r"auto_payment\s*:\s*true",
-              r"auto_spending\s*:\s*true",
-              r"automatic[_ -]?payment",
-              r"automatic[_ -]?spending",
-          )
-
-          def clean(value, limit=5000):
-              return re.sub(
-                  r"\s+",
-                  " ",
-                  str(value or ""),
-              ).strip()[:limit]
-
-          def stable(*parts):
-              raw = "|".join(
-                  clean(x, 12000)
-                  for x in parts
-              )
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()[:24]
-
-          def run_git(*args, check=True):
-              result = subprocess.run(
-                  ["git", *args],
-                  text=True,
-                  capture_output=True,
-                  check=False,
-              )
-
-              if check and result.returncode != 0:
-                  raise RuntimeError(
-                      f"git {' '.join(args)} failed: "
-                      f"{result.stdout[-2000:]} "
-                      f"{result.stderr[-2000:]}"
-                  )
-
-              return result
-
-          def load_json(path, default=None):
-              if not path.exists():
-                  return {} if default is None else default
-
+          def parse_ts(value):
+              if not value or not isinstance(value, str):
+                  return None
               try:
-                  value = json.loads(
-                      path.read_text(
-                          encoding="utf-8"
-                      )
-                  )
+                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return int(default)
+
+          def env_flag(name, default=False):
+              value = os.environ.get(name)
+              if value is None or value.strip() == "":
+                  return default
+              return value.strip().lower() in {"1", "true", "yes", "on"}
+
+          def check_policy():
+              """Hard safety invariants: no spending, no payments, no external AI."""
+              expected = {
+                  "PROJECT_COST_EUR": "0",
+                  "GEMINI_USED": "false",
+                  "EXTERNAL_AI_USED": "false",
+                  "AUTO_PAYMENT": "false",
+                  "AUTO_SPENDING": "false",
+              }
+              for key, wanted in expected.items():
+                  if os.environ.get(key, wanted).strip().lower() != wanted:
+                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
+
+          # ---------------------------------------------------------------- json files
+          def load_json(path, default=None):
+              """Load a JSON object. Refuses to continue on corrupt files so that a
+              parse error can never silently wipe the agent's state."""
+              path = Path(path)
+              default = {} if default is None else default
+              if not path.exists():
+                  return default
+              raw = path.read_text(encoding="utf-8")
+              if not raw.strip():
+                  return default
+              try:
+                  value = json.loads(raw)
               except Exception as exc:
-                  raise RuntimeError(
-                      f"Invalid JSON {path}: {exc}"
+                  raise SystemExit(
+                      f"ERROR: {path} is not valid JSON ({exc}). "
+                      "Restore it from git history; refusing to overwrite it."
                   )
-
-              if not isinstance(value, dict):
-                  raise RuntimeError(
-                      f"Expected JSON object: {path}"
-                  )
-
-              return value
+              return value if isinstance(value, type(default)) else default
 
           def save_json(path, value):
-              path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True,
-              )
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
+              json.loads(payload)  # round-trip check
+              tmp.write_text(payload, encoding="utf-8")
+              os.replace(tmp, path)
 
-              temp = path.with_suffix(
-                  path.suffix + ".tmp"
-              )
+          # ---------------------------------------------------------------- data utils
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
 
-              temp.write_text(
-                  json.dumps(
-                      value,
-                      ensure_ascii=False,
-                      indent=2,
-                  ) + "\n",
-                  encoding="utf-8",
-              )
+          def as_list(value):
+              return value if isinstance(value, list) else []
 
-              json.loads(
-                  temp.read_text(
-                      encoding="utf-8"
-                  )
-              )
+          def text(value, limit=None):
+              if value is None:
+                  out = ""
+              elif isinstance(value, str):
+                  out = value.strip()
+              elif isinstance(value, dict):
+                  out = ""
+                  for key in ("content", "body", "text", "message", "title", "question"):
+                      if value.get(key):
+                          out = text(value[key])
+                          break
+                  if not out:
+                      out = json.dumps(value, ensure_ascii=False, default=str)
+              else:
+                  out = str(value).strip()
+              return out[:limit] if limit else out
 
-              os.replace(temp, path)
+          def collapse(value, limit=None):
+              out = re.sub(r"\s+", " ", text(value)).strip()
+              return out[:limit] if limit else out
 
-          def file_hash(path):
-              if not path.exists():
-                  return None
+          def clip(value, limit):
+              out = text(value)
+              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
 
-              return hashlib.sha256(
-                  path.read_bytes()
-              ).hexdigest()
-
-          def normalize_target(path):
-              return (
-                  str(path)
-                  .replace("\\", "/")
-                  .lstrip("./")
-              )
-
-          def safe_target(path):
-              normalized = normalize_target(path)
-
-              if normalized in FORBIDDEN_TARGETS:
-                  return False
-
-              if normalized not in ALLOWED_TARGETS:
-                  return False
-
-              candidate = (
-                  ROOT / normalized
-              ).resolve()
-
-              try:
-                  candidate.relative_to(ROOT)
-              except ValueError:
-                  return False
-
-              return True
+          def stable_id(prefix, *parts):
+              raw = "|".join(str(p if p is not None else "") for p in parts)
+              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
           def identity(item):
-              if not isinstance(item, dict):
+              """Stable identity of a stored item (id-like key, else content hash)."""
+              if isinstance(item, dict):
+                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
+                      if item.get(key):
+                          return f"{key}:{item[key]}"
+              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def dedupe_keep_last(items, limit=None):
+              """Remove duplicates (keeping the most recent occurrence) and keep list
+              order chronological (oldest first). Optionally keep only the last N."""
+              seen, out = set(), []
+              for item in reversed(items):
+                  key = identity(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(item)
+              out.reverse()
+              return out[-limit:] if limit else out
+
+          def bound(items, limit):
+              items = as_list(items)
+              return items[-limit:] if len(items) > limit else items
+
+          def take(value, n=None):
+              """Turn SDK results (list / dict / generator) into a bounded list."""
+              if value is None:
+                  return []
+              if isinstance(value, dict):
+                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
+                      if isinstance(value.get(key), list):
+                          value = value[key]
+                          break
+                  else:
+                      return []
+              if isinstance(value, (list, tuple)):
+                  return list(value)[:n] if n else list(value)
+              try:
+                  iterator = iter(value)
+              except TypeError:
+                  return []
+              return list(islice(iterator, n)) if n else list(iterator)
+
+          def username_of(obj):
+              """Lower-cased username of an object or of a nested author/sender."""
+              if not isinstance(obj, dict):
                   return ""
-
-              for key in (
-                  "id",
-                  "action_id",
-                  "request_id",
-                  "work_id",
-                  "case_id",
-                  "post_id",
-                  "comment_id",
-                  "notification_id",
-                  "message_id",
-                  "signature",
-              ):
-                  value = item.get(key)
-
-                  if value:
-                      return f"{key}:{value}"
-
+              for key in ("username", "handle", "author_username", "sender_username"):
+                  if obj.get(key):
+                      return str(obj[key]).strip().lower()
+              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
+                  nested = obj.get(key)
+                  if isinstance(nested, dict):
+                      found = username_of(nested)
+                      if found:
+                          return found
+                  elif isinstance(nested, str) and nested.strip():
+                      return nested.strip().lower()
               return ""
 
-          def bounded_list(values, limit):
-              if not isinstance(values, list):
-                  return values
-
-              seen = set()
-              result = []
-
-              for item in reversed(values):
-                  key = identity(item)
-
-                  if key:
-                      if key in seen:
-                          continue
-                      seen.add(key)
-
-                  result.append(item)
-
-                  if len(result) >= limit:
-                      break
-
-              result.reverse()
-              return result
-
-          def maintain_memory(path):
-              if not path.exists():
-                  return False
-
-              data = load_json(path, {})
-              changed = False
-
-              for key, limit in LIMITS.items():
-                  value = data.get(key)
-
-                  if not isinstance(value, list):
-                      continue
-
-                  bounded = bounded_list(
-                      value,
-                      limit,
-                  )
-
-                  if bounded != value:
-                      data[key] = bounded
-                      changed = True
-
-              if changed:
-                  save_json(path, data)
-
-              return changed
-
-          def bounded_context(path):
-              if not path.exists():
-                  return ""
-
-              text = path.read_text(
-                  encoding="utf-8"
-              )
-
-              if len(text) <= MAX_CONTEXT_CHARS:
-                  return text
-
-              half = MAX_CONTEXT_CHARS // 2
-
-              return (
-                  text[:half]
-                  + "\n[... CONTEXT BOUNDED ...]\n"
-                  + text[-half:]
-              )
-
-          def collect_failures():
-              failures = []
-
-              memory = load_json(
-                  CORE_MEMORY_FILE,
-                  {},
-              )
-
-              runtime = load_json(
-                  CORE_RUNTIME_FILE,
-                  {},
-              )
-
-              presence = load_json(
-                  PRESENCE_FILE,
-                  {},
-              )
-
-              for item in memory.get(
-                  "failures",
-                  [],
-              ):
-                  if isinstance(item, dict):
-                      failures.append(item)
-
-              for item in presence.get(
-                  "outcomes",
-                  [],
-              ):
-                  if not isinstance(item, dict):
-                      continue
-
-                  status = str(
-                      item.get(
-                          "status",
-                          "",
-                      )
-                  ).lower()
-
-                  if status in {
-                      "failed",
-                      "error",
-                      "target_unavailable",
-                      "exception",
-                  }:
-                      failures.append(
-                          {
-                              "source": "presence",
-                              **item,
-                          }
-                      )
-
-              for item in runtime.get(
-                  "errors",
-                  [],
-              ):
-                  if isinstance(item, dict):
-                      failures.append(
-                          {
-                              "source": "runtime",
-                              **item,
-                          }
-                      )
-
-              return failures
-
-          def normalize_failures(failures):
-              groups = {}
-
-              for failure in failures[-200:]:
-                  error_type = clean(
-                      failure.get(
-                          "error_type",
-                          failure.get(
-                              "type",
-                              failure.get(
-                                  "status",
-                                  "unknown",
-                              ),
-                          ),
-                      ),
-                      200,
-                  ).lower()
-
-                  message = clean(
-                      failure.get(
-                          "error",
-                          failure.get(
-                              "message",
-                              failure.get(
-                                  "reason",
-                                  failure.get(
-                                      "detail",
-                                      "",
-                                  ),
-                              ),
-                          ),
-                      ),
-                      1000,
-                  ).lower()
-
-                  target = clean(
-                      failure.get(
-                          "file",
-                          failure.get(
-                              "path",
-                              failure.get(
-                                  "target",
-                                  "",
-                              ),
-                          ),
-                      ),
-                      300,
-                  )
-
-                  signature = stable(
-                      error_type,
-                      message,
-                      target,
-                  )
-
-                  group = groups.setdefault(
-                      signature,
-                      {
-                          "signature": signature,
-                          "error_type": error_type,
-                          "message": message,
-                          "target": target,
-                          "count": 0,
-                          "examples": [],
-                      },
-                  )
-
-                  group["count"] += 1
-
-                  if len(
-                      group["examples"]
-                  ) < 3:
-                      group["examples"].append(
-                          failure
-                      )
-
-              return [
-                  item
-                  for item in groups.values()
-                  if item["count"] >= MIN_REPEATED_FAILURES
-              ]
-
-          def patch(
-              path,
-              old,
-              new,
-              reason,
-          ):
-              return {
-                  "path": normalize_target(path),
-                  "old": old,
-                  "new": new,
-                  "reason": reason,
-              }
-
-          def validate_workflow_text(
-              path,
-              text,
-          ):
-              parsed = yaml.safe_load(text)
-
-              if not isinstance(
-                  parsed,
-                  dict,
-              ):
-                  raise RuntimeError(
-                      f"Workflow is not a YAML mapping: {path}"
-                  )
-
-              if "jobs" not in parsed:
-                  raise RuntimeError(
-                      f"Workflow has no jobs: {path}"
-                  )
-
-              permissions = parsed.get(
-                  "permissions",
-                  {},
-              )
-
-              if permissions:
-                  if not isinstance(
-                      permissions,
-                      dict,
-                  ):
-                      raise RuntimeError(
-                          f"Invalid permissions: {path}"
-                      )
-
-                  allowed_permission_values = {
-                      "read",
-                      "write",
-                      "none",
-                  }
-
-                  for value in permissions.values():
-                      if value not in allowed_permission_values:
-                          raise RuntimeError(
-                              f"Invalid permission value "
-                              f"in {path}: {value}"
-                          )
-
-              return parsed
-
-          def validate_embedded_python(
-              path,
-              text,
-          ):
-              blocks = re.findall(
-                  r"python3\s+-\s+<<['\"]?PY['\"]?\s*\n(.*?)\n\s*PY\s*$",
-                  text,
-                  flags=re.MULTILINE | re.DOTALL,
-              )
-
-              for index, block in enumerate(
-                  blocks,
-                  1,
-              ):
-                  compile(
-                      block,
-                      f"{path}:embedded-python:{index}",
-                      "exec",
-                  )
-
-          def validate_security(
-              changed_paths,
-          ):
-              for relative in changed_paths:
-                  path = ROOT / relative
-
-                  if not path.exists():
-                      raise RuntimeError(
-                          f"Changed file disappeared: {relative}"
-                      )
-
-                  text = path.read_text(
-                      encoding="utf-8",
-                  )
-
-                  lowered = text.lower()
-
-                  for pattern in FINANCIAL_GUARD_PATTERNS:
-                      if re.search(
-                          pattern,
-                          lowered,
-                      ):
-                          if (
-                              "auto_payment" in pattern
-                              or "auto_spending" in pattern
-                          ):
-                              if re.search(
-                                  pattern,
-                                  lowered,
-                              ):
-                                  raise RuntimeError(
-                                      "Financial safety invariant "
-                                      f"violated by {relative}"
-                                  )
-
-          def validate_patch_scope(
-              patches,
-          ):
-              if not patches:
-                  raise RuntimeError(
-                      "Evolution produced no patches."
-                  )
-
-              if len(patches) > MAX_PATCHES:
-                  raise RuntimeError(
-                      "Too many patches."
-                  )
-
-              target_paths = sorted(
-                  {
-                      normalize_target(
-                          item["path"]
-                      )
-                      for item in patches
-                  }
-              )
-
-              if len(target_paths) > MAX_TARGET_FILES:
-                  raise RuntimeError(
-                      "Too many target files."
-                  )
-
-              for item in patches:
-                  path = normalize_target(
-                      item.get("path", "")
-                  )
-
-                  if not safe_target(path):
-                      raise RuntimeError(
-                          f"Forbidden target: {path}"
-                      )
-
-                  old = str(
-                      item.get("old", "")
-                  )
-
-                  new = str(
-                      item.get("new", "")
-                  )
-
-                  if not old:
-                      raise RuntimeError(
-                          f"Empty patch: {path}"
-                      )
-
-                  if old == new:
-                      raise RuntimeError(
-                          f"No-op patch: {path}"
-                      )
-
-              return target_paths
-
-          def rule_duplicate_publish_title(
-              group,
-          ):
-              text = (
-                  group["message"]
-                  + " "
-                  + group["error_type"]
-              )
-
-              if not (
-                  "409" in text
-                  or "duplicate" in text
-              ):
-                  return None
-
-              path = (
-                  ".github/workflows/"
-                  "nox-core-general.yml"
-              )
-
-              target = ROOT / path
-
-              if not target.exists():
-                  return None
-
-              source = target.read_text(
-                  encoding="utf-8"
-              )
-
-              marker = (
-                  'MAX_HISTORY: "150"'
-              )
-
-              if marker not in source:
-                  return None
-
-              replacement = (
-                  'MAX_HISTORY: "120"'
-              )
-
-              return {
-                  "problem": (
-                      "Presence repeatedly receives "
-                      "duplicate publish conflicts."
-                  ),
-                  "hypothesis": (
-                      "Core retains excessive historical "
-                      "state while duplicate publication "
-                      "decisions are being regenerated."
-                  ),
-                  "decision": (
-                      "Reduce the bounded Core history before "
-                      "making broader behavioral changes."
-                  ),
-                  "patches": [
-                      patch(
-                          path,
-                          marker,
-                          replacement,
-                          "Reduce bounded Core history.",
-                      )
-                  ],
-                  "tests": [
-                      "YAML validation",
-                      "embedded Python compilation",
-                      "security invariants",
-                  ],
-                  "learning": (
-                      "Repeated duplicate publication conflicts "
-                      "must first be handled through bounded "
-                      "state and idempotent action generation."
-                  ),
-              }
-
-          def rule_oversized_presence(
-              group,
-          ):
-              text = (
-                  group["message"]
-                  + " "
-                  + group["error_type"]
-              )
-
-              if not any(
-                  token in text
-                  for token in (
-                      "too large",
-                      "target file too large",
-                      "oversized",
-                      "file size",
-                  )
-              ):
-                  return None
-
-              path = (
-                  ".github/workflows/"
-                  "nox-colony-presence.yml"
-              )
-
-              target = ROOT / path
-
-              if not target.exists():
-                  return None
-
-              source = target.read_text(
-                  encoding="utf-8"
-              )
-
-              marker = (
-                  'MAX_HISTORY: "200"'
-              )
-
-              if marker not in source:
-                  return None
-
-              return {
-                  "problem": (
-                      "Presence processing is repeatedly "
-                      "hitting an oversized-history boundary."
-                  ),
-                  "hypothesis": (
-                      "Presence history is larger than necessary "
-                      "for routine execution."
-                  ),
-                  "decision": (
-                      "Reduce the bounded Presence history."
-                  ),
-                  "patches": [
-                      patch(
-                          path,
-                          marker,
-                          'MAX_HISTORY: "120"',
-                          "Reduce bounded Presence history.",
-                      )
-                  ],
-                  "tests": [
-                      "YAML validation",
-                      "embedded Python compilation",
-                      "security invariants",
-                  ],
-                  "learning": (
-                      "Operational history should remain bounded "
-                      "without destructive whole-file truncation."
-                  ),
-              }
-
-          def rule_no_presence_outcomes():
-              runtime = load_json(
-                  CORE_RUNTIME_FILE,
-                  {},
-              )
-
-              presence = load_json(
-                  PRESENCE_FILE,
-                  {},
-              )
-
-              pending = runtime.get(
-                  "pending_actions",
-                  [],
-              )
-
-              outcomes = presence.get(
-                  "outcomes",
-                  [],
-              )
-
-              if not isinstance(
-                  pending,
-                  list,
-              ):
-                  return None
-
-              if not isinstance(
-                  outcomes,
-                  list,
-              ):
-                  return None
-
-              executable = [
-                  item
-                  for item in pending[-20:]
-                  if isinstance(item, dict)
-                  and str(
-                      item.get(
-                          "type",
-                          item.get(
-                              "kind",
-                              "",
-                          ),
-                      )
-                  ).lower()
-                  in {
-                      "reply",
-                      "research_reply",
-                      "publish",
-                      "dm_reply",
-                  }
-              ]
-
-              if len(executable) < 2:
-                  return None
-
-              recent_outcomes = [
-                  item
-                  for item in outcomes[-30:]
-                  if isinstance(item, dict)
-              ]
-
-              if recent_outcomes:
-                  return None
-
-              return {
-                  "signature": stable(
-                      "pending_actions_without_outcomes",
-                      len(executable),
-                  ),
-                  "error_type": (
-                      "pending_actions_without_outcomes"
-                  ),
-                  "message": (
-                      "Executable pending actions exist "
-                      "without Presence outcomes."
-                  ),
-                  "count": len(executable),
-                  "examples": executable[-3:],
-              }
-
-          # ============================================================
-          # LOAD STATE
-          # ============================================================
-
-          evolution = load_json(
-              EVOLUTION_FILE,
-              {
-                  "version": 5,
-                  "history": [],
-                  "runs": [],
-              },
-          )
-
-          evolution.setdefault(
-              "version",
-              5,
-          )
-          evolution.setdefault(
-              "history",
-              [],
-          )
-          evolution.setdefault(
-              "runs",
-              [],
-          )
-
-          # ============================================================
-          # SAFE MEMORY MAINTENANCE
-          # ============================================================
-
-          maintenance_changes = []
-
-          for path in (
-              CORE_MEMORY_FILE,
-              CORE_RUNTIME_FILE,
-              WORK_FILE,
-              KNOWLEDGE_FILE,
-              PRESENCE_FILE,
-          ):
-              if maintain_memory(path):
-                  maintenance_changes.append(
-                      str(path)
-                  )
-
-          # ============================================================
-          # ERROR COLLECTION
-          # ============================================================
-
-          failures = collect_failures()
-          repeated = normalize_failures(
-              failures
-          )
-
-          candidate = None
-
-          if repeated:
-              repeated.sort(
-                  key=lambda item: (
-                      -item["count"],
-                      item["signature"],
-                  )
-              )
-
-              candidate = repeated[0]
-
-          if candidate is None:
-              candidate = rule_no_presence_outcomes()
-
-          print(
-              f"Repeated error groups: {len(repeated)}"
-          )
-
-          print(
-              "Maintenance changes: "
-              + str(len(maintenance_changes))
-          )
-
-          if candidate:
-              print(
-                  "Evolution candidate: "
-                  + json.dumps(
-                      {
-                          "signature": candidate.get(
-                              "signature"
-                          ),
-                          "type": candidate.get(
-                              "error_type"
-                          ),
-                          "count": candidate.get(
-                              "count"
-                          ),
-                      },
-                      ensure_ascii=False,
-                  )
-              )
-          else:
-              print(
-                  "Evolution candidate: NONE"
-              )
-
-          # ============================================================
-          # BUILD EVOLUTION PLAN
-          # ============================================================
-
-          plan = None
-
-          if candidate:
-              plan = (
-                  rule_duplicate_publish_title(
-                      candidate
-                  )
-                  or rule_oversized_presence(
-                      candidate
-                  )
-              )
-
-          # ============================================================
-          # NO SAFE PATCH
-          # ============================================================
-
-          if plan is None:
-              evolution_id = stable(
-                  NOW,
-                  candidate.get(
-                      "signature",
-                      "no_candidate",
-                  )
-                  if candidate
-                  else "no_candidate",
-              )
-
-              evolution["runs"].append(
-                  {
-                      "timestamp": NOW,
-                      "status": (
-                          "observed"
-                          if candidate
-                          else "no_candidate"
-                      ),
-                      "evolution_id": evolution_id,
-                      "candidate": candidate,
-                      "maintenance": maintenance_changes,
-                      "decision": (
-                          "NO_SAFE_AUTOMATIC_PATCH"
-                          if candidate
-                          else "NO_EVOLUTION"
-                      ),
-                  }
-              )
-
-              evolution["runs"] = (
-                  evolution["runs"]
-              )[-MAX_HISTORY:]
-
-              evolution["updated_at"] = NOW
-
-              save_json(
-                  EVOLUTION_FILE,
-                  evolution,
-              )
-
-              run_git(
-                  "config",
-                  "user.name",
-                  "NØX",
-              )
-              run_git(
-                  "config",
-                  "user.email",
-                  "nox@users.noreply.github.com",
-              )
-
-              run_git(
-                  "add",
-                  str(EVOLUTION_FILE),
-                  *maintenance_changes,
-              )
-
-              staged = run_git(
-                  "diff",
-                  "--cached",
-                  "--quiet",
-                  check=False,
-              )
-
-              if staged.returncode != 0:
-                  run_git(
-                      "commit",
-                      "-m",
-                      f"NØX: self evolution observation {evolution_id}",
-                  )
-
-                  run_git(
-                      "push",
-                      "origin",
-                      "HEAD:main",
-                  )
-
-              print(
-                  "RESULT: "
-                  + (
-                      "NO_SAFE_AUTOMATIC_PATCH"
-                      if candidate
-                      else "NO_EVOLUTION"
-                  )
-              )
-
-              sys.exit(0)
-
-          patches = plan["patches"]
-
-          target_paths = validate_patch_scope(
-              patches
-          )
-
-          # ============================================================
-          # APPLY PATCHES
-          # ============================================================
-
-          before_hashes = {
-              path: file_hash(
-                  ROOT / path
-              )
-              for path in target_paths
-          }
-
-          for item in patches:
-              path = ROOT / item["path"]
-
-              current = path.read_text(
-                  encoding="utf-8"
-              )
-
-              occurrences = current.count(
-                  item["old"]
-              )
-
-              if occurrences != 1:
-                  raise RuntimeError(
-                      f"Expected exactly one patch match "
-                      f"for {item['path']}; found {occurrences}"
-                  )
-
-              updated = current.replace(
-                  item["old"],
-                  item["new"],
-                  1,
-              )
-
-              path.write_text(
-                  updated,
-                  encoding="utf-8",
-              )
-
-          # ============================================================
-          # VALIDATION
-          # ============================================================
-
-          for path in target_paths:
-              target = ROOT / path
-
-              if path.endswith(
-                  (".yml", ".yaml")
-              ):
-                  text = target.read_text(
-                      encoding="utf-8"
-                  )
-
-                  validate_workflow_text(
-                      path,
-                      text,
-                  )
-
-                  validate_embedded_python(
-                      path,
-                      text,
-                  )
-
-              elif path.endswith(".json"):
-                  json.loads(
-                      target.read_text(
-                          encoding="utf-8"
-                      )
-                  )
-
-          validate_security(
-              target_paths
-          )
-
-          run_git(
-              "diff",
-              "--check",
-          )
-
-          diff = run_git(
-              "diff",
-              "--",
-              *target_paths,
-          ).stdout
-
-          if not diff.strip():
-              raise RuntimeError(
-                  "No evolution diff."
-              )
-
-          if len(diff) > MAX_DIFF_CHARS:
-              raise RuntimeError(
-                  "Evolution diff too large."
-              )
-
-          after_hashes = {
-              path: file_hash(
-                  ROOT / path
-              )
-              for path in target_paths
-          }
-
-          # ============================================================
-          # RECORD EVOLUTION
-          # ============================================================
-
-          evolution_id = stable(
-              NOW,
-              candidate.get(
-                  "signature",
-                  "",
-              ),
-              json.dumps(
-                  patches,
-                  ensure_ascii=False,
-                  sort_keys=True,
-              ),
-          )
-
-          evolution["history"].append(
-              {
-                  "id": evolution_id,
-                  "timestamp": NOW,
-                  "status": "tested",
-                  "trigger": candidate,
-                  "problem": plan.get(
-                      "problem",
-                      "",
-                  ),
-                  "hypothesis": plan.get(
-                      "hypothesis",
-                      "",
-                  ),
-                  "decision": plan.get(
-                      "decision",
-                      "",
-                  ),
-                  "targets": target_paths,
-                  "patches": [
-                      {
-                          "path": item["path"],
-                          "reason": item["reason"],
-                      }
-                      for item in patches
-                  ],
-                  "before_hashes": before_hashes,
-                  "after_hashes": after_hashes,
-                  "tests": {
-                      "yaml": "passed",
-                      "embedded_python": "passed",
-                      "json": "passed",
-                      "security": "passed",
-                      "git_diff_check": "passed",
-                  },
-                  "learning": plan.get(
-                      "learning",
-                      "",
-                  ),
-              }
-          )
-
-          evolution["history"] = (
-              evolution["history"]
-          )[-MAX_HISTORY:]
-
+          # ===== script =====
+          """NØX Self Evolution (diagnostic mode).
+
+          The old version tried to patch .github/workflows files. That can never be pushed
+          with the default GITHUB_TOKEN (needs a PAT with `workflow` scope), and its rules
+          targeted fields that no longer exist. This version is deliberately safe:
+          it reads the real failure signals, groups repeated problems, and records
+          concrete recommendations. It never edits code or workflows.
+          """
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          check_policy()
+          NOW = now_iso()
+          EVO = Path(os.environ["EVOLUTION_FILE"])
+          PRESENCE = Path(os.environ["PRESENCE_FILE"])
+          WORK = Path(os.environ["WORK_FILE"])
+          RUNTIME = Path(os.environ["CORE_RUNTIME_FILE"])
+          MIN_REPEATED = env_int("MIN_REPEATED_FAILURES", 2)
+          MAX_HISTORY = env_int("MAX_HISTORY", 200)
+          BACKLOG_LIMIT = env_int("PENDING_BACKLOG_ALERT", 50)
+
+          evolution = as_dict(load_json(EVO))
+          evolution.setdefault("version", 6)
+          evolution.setdefault("history", [])
+          evolution.setdefault("runs", [])
+          presence, work, runtime = (as_dict(load_json(p)) for p in (PRESENCE, WORK, RUNTIME))
+
+          signals = []
+          for o in as_list(presence.get("outcomes"))[-200:]:
+              if isinstance(o, dict) and not o.get("success"):
+                  signals.append(("presence", text(o.get("status")), text(o.get("error"))))
+          for f in as_list(work.get("failed"))[-200:]:
+              if isinstance(f, dict):
+                  signals.append(("work", text(f.get("status") or f.get("evidence_status")), text(f.get("reason"))))
+
+          groups = {}
+          for source, status, error in signals:
+              norm_err = re.sub(r"\d+", "#", error.lower())[:80]
+              key = f"{source}|{status}|{norm_err}"
+              groups[key] = groups.get(key, 0) + 1
+
+          ADVICE = [
+              (("duplicate", "409", "already_replied"), "Duplicate publication attempts: check that Core ids are stable and that presence.closed_ids is being filled."),
+              (("self_reply", "self_message"), "NØX tried to answer itself: check OWN username filtering in Core."),
+              (("invalid_input", "truncated", "too_short", "too_few_words"), "Core produces incomplete research questions: review make_question in Core."),
+              (("no_evidence", "insufficient_verification", "weak_evidence"), "Searches return little relevant evidence: questions may be too vague or the search backend is degraded."),
+              (("permanent_failure", "not found", "404", "403", "forbidden"), "Targets deleted or forbidden: expected occasionally; investigate only if frequent."),
+              (("429", "rate"), "Rate limiting: lower MAX_PUBLIC_PER_HOUR / MAX_ACTIONS_PER_RUN."),
+              (("missing_body", "missing_recipient", "missing_post_target"), "Core generates incomplete actions: check add_action inputs."),
+          ]
+
+          findings = []
+          for key, count in sorted(groups.items(), key=lambda kv: -kv[1]):
+              if count < MIN_REPEATED:
+                  continue
+              source, status, err = key.split("|", 2)
+              advice = next((a for words, a in ADVICE if any(w in key.lower() for w in words)),
+                            "Repeated failure without a known rule; inspect the workflow logs.")
+              findings.append({"source": source, "status": status, "error": err, "count": count, "recommendation": advice})
+
+          pending = [a for a in as_list(runtime.get("pending_actions")) if isinstance(a, dict)]
+          if len(pending) > BACKLOG_LIMIT:
+              findings.append({"source": "runtime", "status": "backlog", "error": "", "count": len(pending),
+                               "recommendation": "Action backlog is growing: Core creates more actions than Presence executes. "
+                                                 "Lower MAX_NEW_CASES_PER_RUN or raise MAX_ACTIONS_PER_RUN."})
+
+          signature = hashlib.sha256(json.dumps([(f["source"], f["status"], f["error"]) for f in findings]).encode()).hexdigest()[:16]
+          last = as_list(evolution["runs"])[-1] if evolution["runs"] else {}
+          if isinstance(last, dict) and last.get("signature") == signature:
+              print("Findings unchanged; nothing to record.")
+              raise SystemExit(0)
+
+          run = {"timestamp": NOW, "status": "observed" if findings else "no_candidate", "signature": signature,
+                 "decision": "RECOMMENDATIONS_ONLY" if findings else "NO_EVOLUTION", "findings": findings}
+          evolution["runs"] = bound(evolution["runs"] + [run], MAX_HISTORY)
+          if findings:
+              evolution["history"] = bound(evolution["history"] + [run], MAX_HISTORY)
           evolution["updated_at"] = NOW
-
-          save_json(
-              EVOLUTION_FILE,
-              evolution,
-          )
-
-          # ============================================================
-          # COMMIT
-          # ============================================================
-
-          run_git(
-              "config",
-              "user.name",
-              "NØX",
-          )
-
-          run_git(
-              "config",
-              "user.email",
-              "nox@users.noreply.github.com",
-          )
-
-          run_git(
-              "add",
-              *target_paths,
-              str(EVOLUTION_FILE),
-              *maintenance_changes,
-          )
-
-          staged = run_git(
-              "diff",
-              "--cached",
-              "--quiet",
-              check=False,
-          )
-
-          if staged.returncode == 0:
-              raise RuntimeError(
-                  "Nothing staged."
-              )
-
-          run_git(
-              "commit",
-              "-m",
-              f"NØX: self evolution {evolution_id}",
-          )
-
-          commit_sha = run_git(
-              "rev-parse",
-              "HEAD",
-          ).stdout.strip()
-
-          run_git(
-              "push",
-              "origin",
-              "HEAD:main",
-          )
-
-          # ============================================================
-          # FINAL RECORD
-          # ============================================================
-
-          evolution = load_json(
-              EVOLUTION_FILE,
-              {},
-          )
-
-          for entry in reversed(
-              evolution.get(
-                  "history",
-                  [],
-              )
-          ):
-              if entry.get("id") == evolution_id:
-                  entry["status"] = "committed"
-                  entry["commit"] = commit_sha
-                  entry["result"] = (
-                      "modification_committed"
-                  )
-                  break
-
-          evolution.setdefault(
-              "runs",
-              [],
-          )
-
-          evolution["runs"].append(
-              {
-                  "timestamp": NOW,
-                  "status": "committed",
-                  "evolution_id": evolution_id,
-                  "commit": commit_sha,
-                  "changed_paths": target_paths,
-              }
-          )
-
-          evolution["runs"] = (
-              evolution["runs"]
-          )[-MAX_HISTORY:]
-
-          evolution["updated_at"] = NOW
-
-          save_json(
-              EVOLUTION_FILE,
-              evolution,
-          )
-
-          run_git(
-              "add",
-              str(EVOLUTION_FILE),
-          )
-
-          staged = run_git(
-              "diff",
-              "--cached",
-              "--quiet",
-              check=False,
-          )
-
-          if staged.returncode != 0:
-              run_git(
-                  "commit",
-                  "-m",
-                  f"NØX: record evolution result {evolution_id}",
-              )
-
-              run_git(
-                  "push",
-                  "origin",
-                  "HEAD:main",
-              )
-
-          print("")
+          save_json(EVO, evolution)
           print("=== NØX SELF EVOLUTION ===")
-          print(f"Evolution ID: {evolution_id}")
-          print(
-              "Changed files: "
-              + ", ".join(target_paths)
-          )
-          print("YAML: PASSED")
-          print("Embedded Python: PASSED")
-          print("JSON: PASSED")
-          print("Security: PASSED")
-          print("Git diff: PASSED")
-          print(f"Commit: {commit_sha}")
-          print("RESULT: MODIFICATION COMMITTED")
-          print(
-              "CYCLE: DETECT -> DIAGNOSE -> "
-              "PATCH -> TEST -> COMMIT -> OBSERVE"
-          )
+          for f in findings:
+              print(f"- [{f['count']}x] {f['source']}/{f['status']}: {f['recommendation']}")
+          print("RESULT:", run["decision"])
           PY
+
+      - name: Validate JSON state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          for path in ["memory/nox_self_evolution.json"]:
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as fh:
+                      json.load(fh)
+                  print("VALID JSON:", path)
+          PY
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_self_evolution.json; do
+            [ -e "$f" ] && git add -- "$f"
+          done
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(nox): self evolution diagnostics"
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
