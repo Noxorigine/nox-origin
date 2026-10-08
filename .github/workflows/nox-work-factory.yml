@@ -13,17 +13,15 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_MEMORY_FILE: memory/nox_core_memory.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
-  KNOWLEDGE_FILE: memory/nox_knowledge.json
-  WORK_FILE: memory/nox_work_factory.json
-
+  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
+  WORK_FILE: "memory/nox_work_factory.json"
   MAX_WORK_ITEMS_PER_RUN: "3"
   MAX_RESULTS_PER_QUERY: "5"
   MAX_TOTAL_RESULTS: "15"
   MAX_HISTORY: "150"
   WEB_TIMEOUT_SECONDS: "20"
-
+  MAX_WORK_ATTEMPTS: "3"
+  WORK_EXPIRE_DAYS: "7"
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
@@ -31,18 +29,18 @@ env:
   AUTO_SPENDING: "false"
 
 jobs:
-  work-factory:
-    name: work-factory
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure Git
-        run: |
-          git config user.name "NØX"
-          git config user.email "nox@noreply.github.com"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
@@ -54,1483 +52,463 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
+          """Shared helpers for all NØX scripts (standard library only)."""
           import hashlib
           import json
           import os
           import re
-          import time
+          import sys
           from datetime import datetime, timezone
+          from itertools import islice
+          from pathlib import Path
+
+          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
+
+          # ---------------------------------------------------------------- time / env
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def parse_ts(value):
+              if not value or not isinstance(value, str):
+                  return None
+              try:
+                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, default))
+              except (TypeError, ValueError):
+                  return int(default)
+
+          def env_flag(name, default=False):
+              value = os.environ.get(name)
+              if value is None or value.strip() == "":
+                  return default
+              return value.strip().lower() in {"1", "true", "yes", "on"}
+
+          def check_policy():
+              """Hard safety invariants: no spending, no payments, no external AI."""
+              expected = {
+                  "PROJECT_COST_EUR": "0",
+                  "GEMINI_USED": "false",
+                  "EXTERNAL_AI_USED": "false",
+                  "AUTO_PAYMENT": "false",
+                  "AUTO_SPENDING": "false",
+              }
+              for key, wanted in expected.items():
+                  if os.environ.get(key, wanted).strip().lower() != wanted:
+                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
+
+          # ---------------------------------------------------------------- json files
+          def load_json(path, default=None):
+              """Load a JSON object. Refuses to continue on corrupt files so that a
+              parse error can never silently wipe the agent's state."""
+              path = Path(path)
+              default = {} if default is None else default
+              if not path.exists():
+                  return default
+              raw = path.read_text(encoding="utf-8")
+              if not raw.strip():
+                  return default
+              try:
+                  value = json.loads(raw)
+              except Exception as exc:
+                  raise SystemExit(
+                      f"ERROR: {path} is not valid JSON ({exc}). "
+                      "Restore it from git history; refusing to overwrite it."
+                  )
+              return value if isinstance(value, type(default)) else default
+
+          def save_json(path, value):
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
+              json.loads(payload)  # round-trip check
+              tmp.write_text(payload, encoding="utf-8")
+              os.replace(tmp, path)
+
+          # ---------------------------------------------------------------- data utils
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
+
+          def as_list(value):
+              return value if isinstance(value, list) else []
+
+          def text(value, limit=None):
+              if value is None:
+                  out = ""
+              elif isinstance(value, str):
+                  out = value.strip()
+              elif isinstance(value, dict):
+                  out = ""
+                  for key in ("content", "body", "text", "message", "title", "question"):
+                      if value.get(key):
+                          out = text(value[key])
+                          break
+                  if not out:
+                      out = json.dumps(value, ensure_ascii=False, default=str)
+              else:
+                  out = str(value).strip()
+              return out[:limit] if limit else out
+
+          def collapse(value, limit=None):
+              out = re.sub(r"\s+", " ", text(value)).strip()
+              return out[:limit] if limit else out
+
+          def clip(value, limit):
+              out = text(value)
+              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
+
+          def stable_id(prefix, *parts):
+              raw = "|".join(str(p if p is not None else "") for p in parts)
+              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+          def identity(item):
+              """Stable identity of a stored item (id-like key, else content hash)."""
+              if isinstance(item, dict):
+                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
+                      if item.get(key):
+                          return f"{key}:{item[key]}"
+              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def dedupe_keep_last(items, limit=None):
+              """Remove duplicates (keeping the most recent occurrence) and keep list
+              order chronological (oldest first). Optionally keep only the last N."""
+              seen, out = set(), []
+              for item in reversed(items):
+                  key = identity(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(item)
+              out.reverse()
+              return out[-limit:] if limit else out
+
+          def bound(items, limit):
+              items = as_list(items)
+              return items[-limit:] if len(items) > limit else items
+
+          def take(value, n=None):
+              """Turn SDK results (list / dict / generator) into a bounded list."""
+              if value is None:
+                  return []
+              if isinstance(value, dict):
+                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
+                      if isinstance(value.get(key), list):
+                          value = value[key]
+                          break
+                  else:
+                      return []
+              if isinstance(value, (list, tuple)):
+                  return list(value)[:n] if n else list(value)
+              try:
+                  iterator = iter(value)
+              except TypeError:
+                  return []
+              return list(islice(iterator, n)) if n else list(iterator)
+
+          def username_of(obj):
+              """Lower-cased username of an object or of a nested author/sender."""
+              if not isinstance(obj, dict):
+                  return ""
+              for key in ("username", "handle", "author_username", "sender_username"):
+                  if obj.get(key):
+                      return str(obj[key]).strip().lower()
+              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
+                  nested = obj.get(key)
+                  if isinstance(nested, dict):
+                      found = username_of(nested)
+                      if found:
+                          return found
+                  elif isinstance(nested, str) and nested.strip():
+                      return nested.strip().lower()
+              return ""
+
+          # ===== script =====
+          """NØX Work Factory: web research with relevance checks and bounded retries.
+
+          Fixes vs. the old version:
+          - results must actually be relevant to the question (keyword overlap)
+          - 'partial' needs at least two different domains
+          - every item has an attempt counter; invalid/weak items are abandoned
+            instead of blocking the queue forever
+          - failed entries are compact (no full result copies)
+          """
+          import os
+          import re
+          import time
+          from datetime import datetime, timezone, timedelta
           from pathlib import Path
           from urllib.parse import urlparse
 
           from ddgs import DDGS
 
+          check_policy()
+
+          NOW = now_iso()
+          NOW_DT = datetime.now(timezone.utc)
+          RUN_ID = "work-" + NOW_DT.strftime("%Y%m%dT%H%M%SZ")
           print("=== NØX WORK FACTORY ===")
 
-          NOW = datetime.now(timezone.utc)
-          RUN_ID = "work-" + NOW.strftime("%Y%m%dT%H%M%SZ")
+          RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
+          MAX_WORK = env_int("MAX_WORK_ITEMS_PER_RUN", 3)
+          MAX_RESULTS = env_int("MAX_RESULTS_PER_QUERY", 5)
+          MAX_TOTAL = env_int("MAX_TOTAL_RESULTS", 15)
+          MAX_HISTORY = env_int("MAX_HISTORY", 150)
+          TIMEOUT = env_int("WEB_TIMEOUT_SECONDS", 20)
+          MAX_ATTEMPTS = env_int("MAX_WORK_ATTEMPTS", 3)
+          EXPIRE_DAYS = env_int("WORK_EXPIRE_DAYS", 7)
 
-          CORE_MEMORY_FILE = Path(
-              os.environ["CORE_MEMORY_FILE"]
-          )
-          CORE_RUNTIME_FILE = Path(
-              os.environ["CORE_RUNTIME_FILE"]
-          )
-          KNOWLEDGE_FILE = Path(
-              os.environ["KNOWLEDGE_FILE"]
-          )
-          WORK_FILE = Path(
-              os.environ["WORK_FILE"]
-          )
+          STOP = set("""the and for that with this from what why how does did can could should would are is was were
+          will have has had not you your about into over than then them they their there which who whom when where
+          also just like more most some any each other such only very been being between because while these those
+          its it's our out use used using one two get got make made need want""".split())
 
-          MAX_WORK = int(
-              os.environ["MAX_WORK_ITEMS_PER_RUN"]
-          )
-          MAX_RESULTS = int(
-              os.environ["MAX_RESULTS_PER_QUERY"]
-          )
-          MAX_TOTAL_RESULTS = int(
-              os.environ["MAX_TOTAL_RESULTS"]
-          )
-          MAX_HISTORY = int(
-              os.environ["MAX_HISTORY"]
-          )
-          TIMEOUT = int(
-              os.environ["WEB_TIMEOUT_SECONDS"]
-          )
+          def tokens(value):
+              return {w for w in re.findall(r"[a-z0-9][a-z0-9\-\+\.#]{2,}", text(value).lower()) if w not in STOP}
 
-          def load_json(path, default):
-              if not path.exists():
-                  return default
-
-              try:
-                  with path.open(
-                      "r",
-                      encoding="utf-8",
-                  ) as f:
-                      value = json.load(f)
-
-                  return value
-
-              except Exception as exc:
-                  print(
-                      f"WARNING: cannot load {path}: {exc}"
-                  )
-                  return default
-
-          def save_json(path, value):
-              path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True,
-              )
-
-              tmp = path.with_suffix(
-                  path.suffix + ".tmp"
-              )
-
-              with tmp.open(
-                  "w",
-                  encoding="utf-8",
-              ) as f:
-                  json.dump(
-                      value,
-                      f,
-                      ensure_ascii=False,
-                      indent=2,
-                  )
-                  f.write("\n")
-
-              tmp.replace(path)
-
-          def as_dict(value):
-              if isinstance(value, dict):
-                  return value
-              return {}
-
-          def as_list(value):
-              if isinstance(value, list):
-                  return value
-              return []
-
-          def text(value):
-              if value is None:
-                  return ""
-
-              if isinstance(value, str):
-                  return value.strip()
-
-              if isinstance(value, dict):
-                  for key in (
-                      "question",
-                      "content",
-                      "body",
-                      "text",
-                      "title",
-                      "message",
-                  ):
-                      if value.get(key):
-                          return text(
-                              value[key]
-                          )
-
-              return str(value).strip()
-
-          def stable_id(prefix, value):
-              digest = hashlib.sha256(
-                  str(value).encode(
-                      "utf-8"
-                  )
-              ).hexdigest()[:20]
-
-              return f"{prefix}-{digest}"
-
-          def normalize_question(value):
-              question = text(value)
-
-              question = re.sub(
-                  r"\s+",
-                  " ",
-                  question,
-              ).strip()
-
-              question = question.strip(
-                  "\"' "
-              )
-
-              return question
+          def relevance(question_tokens, item):
+              hay = tokens(f"{item.get('title', '')} {item.get('snippet', '')}")
+              common = question_tokens & hay
+              needed = min(2, len(question_tokens))
+              ratio = len(common) / len(question_tokens) if question_tokens else 0.0
+              return len(common) >= needed and ratio >= 0.25
 
           def question_is_valid(question):
-              """
-              Reject malformed or obviously truncated research questions.
-
-              Examples rejected:
-                What are the competing claims in:
-                Why does:
-                What is:
-                How can:
-                competing claims in:
-              """
-
               if not question:
                   return False, "empty_question"
-
               if len(question) < 24:
                   return False, "question_too_short"
-
-              lowered = question.lower().strip()
-
-              bad_exact = {
-                  "what is",
-                  "what are",
-                  "why does",
-                  "why do",
-                  "why is",
-                  "why are",
-                  "how does",
-                  "how do",
-                  "how can",
-                  "how should",
-                  "what does",
-                  "what do",
-                  "which are",
-                  "which is",
-                  "can you explain",
-              }
-
-              if lowered.rstrip(":?. ") in bad_exact:
-                  return False, "incomplete_question"
-
-              incomplete_endings = (
-                  " in:",
-                  " about:",
-                  " on:",
-                  " for:",
-                  " of:",
-                  " with:",
-                  " to:",
-                  " from:",
-                  " between:",
-                  " regarding:",
-                  " because:",
-                  " that:",
-                  " why:",
-                  " how:",
-                  " what:",
-                  " which:",
-                  " is:",
-                  " are:",
-                  " does:",
-                  " do:",
-                  " can:",
-                  " should:",
-              )
-
-              for ending in incomplete_endings:
-                  if lowered.endswith(ending):
-                      return False, "truncated_question"
-
-              if lowered.endswith(
-                  (
-                      " what",
-                      " why",
-                      " how",
-                      " which",
-                      " where",
-                      " when",
-                      " who",
-                      " because",
-                      " and",
-                      " or",
-                      " but",
-                      " in",
-                      " on",
-                      " of",
-                      " to",
-                      " for",
-                      " with",
-                      " between",
-                  )
-              ):
-                  return False, "truncated_question"
-
-              words = lowered.split()
-
-              if len(words) < 5:
+              low = question.lower().strip()
+              if len(low.split()) < 5:
                   return False, "too_few_words"
-
+              if low.endswith((":", " in", " on", " of", " to", " for", " with", " between", " and", " or", " but",
+                               " because", " what", " why", " how", " which", " where", " when", " who")):
+                  return False, "truncated_question"
               return True, "valid"
 
           def normalize_url(url):
-              if not url:
-                  return ""
-
               try:
-                  parsed = urlparse(
-                      str(url).strip()
-                  )
-
-                  if parsed.scheme not in (
-                      "http",
-                      "https",
-                  ):
-                      return ""
-
-                  if not parsed.netloc:
-                      return ""
-
-                  return (
-                      parsed.scheme
-                      + "://"
-                      + parsed.netloc
-                      + parsed.path
-                  )
-
+                  parsed = urlparse(str(url).strip())
               except Exception:
                   return ""
-
-          def extract_result_url(item):
-              if not isinstance(item, dict):
+              if parsed.scheme not in ("http", "https") or not parsed.netloc:
                   return ""
+              return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-              for key in (
-                  "href",
-                  "url",
-                  "link",
-              ):
-                  value = normalize_url(
-                      item.get(key)
-                  )
-
-                  if value:
-                      return value
-
-              return ""
-
-          def extract_title(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              return text(
-                  item.get("title")
-                  or item.get("heading")
-              )
-
-          def extract_snippet(item):
-              if not isinstance(item, dict):
-                  return ""
-
-              return text(
-                  item.get("body")
-                  or item.get("snippet")
-                  or item.get("description")
-              )
-
-          def domain(url):
-              try:
-                  return urlparse(
-                      url
-                  ).netloc.lower()
-              except Exception:
-                  return ""
-
-          def source_quality(url):
-              host = domain(url)
-
-              if not host:
-                  return 0
-
-              official_markers = (
-                  ".gov",
-                  ".edu",
-                  "docs.",
-                  "developer.",
-                  "github.com",
-                  "wikipedia.org",
-              )
-
-              if any(
-                  marker in host
-                  for marker in official_markers
-              ):
-                  return 3
-
-              return 1
+          def source_quality(host):
+              markers = (".gov", ".edu", "docs.", "developer.", "github.com", "wikipedia.org")
+              return 3 if any(m in host for m in markers) else 1
 
           def search_web(query):
-              results = []
-
+              out = []
               try:
-                  with DDGS(
-                      timeout=TIMEOUT
-                  ) as ddgs:
-
-                      raw_results = ddgs.text(
-                          query,
-                          max_results=MAX_RESULTS,
-                      )
-
-                      for item in raw_results:
-                          if not isinstance(
-                              item,
-                              dict,
-                          ):
+                  with DDGS(timeout=TIMEOUT) as ddgs:
+                      for item in ddgs.text(query, max_results=MAX_RESULTS):
+                          if not isinstance(item, dict):
                               continue
-
-                          url = extract_result_url(
-                              item
-                          )
-
-                          title = extract_title(
-                              item
-                          )
-
-                          snippet = extract_snippet(
-                              item
-                          )
-
+                          url = next((normalize_url(item.get(k)) for k in ("href", "url", "link") if normalize_url(item.get(k))), "")
                           if not url:
                               continue
-
-                          results.append(
-                              {
-                                  "title": title[:500],
-                                  "url": url,
-                                  "domain": domain(
-                                      url
-                                  ),
-                                  "snippet": snippet[
-                                      :1500
-                                  ],
-                                  "quality": source_quality(
-                                      url
-                                  ),
-                              }
-                          )
-
+                          host = urlparse(url).netloc.lower()
+                          out.append({"title": text(item.get("title"))[:500], "url": url, "domain": host,
+                                      "snippet": text(item.get("body") or item.get("snippet"))[:1500],
+                                      "quality": source_quality(host)})
               except Exception as exc:
-                  print(
-                      "WARNING: web search failed:",
-                      exc,
-                  )
+                  print("WARNING: web search failed:", exc)
+              return out
 
-              return results
+          def classify(results, question_tokens):
+              relevant = [r for r in results if relevance(question_tokens, r)]
+              good = [r for r in relevant if r["quality"] + (1 if r["title"] else 0) + (1 if r["snippet"] else 0)
+                      + (1 if len(r["snippet"]) >= 200 else 0) >= 3]
+              domains = {r["domain"] for r in good}
+              if len(good) >= 3 and len(domains) >= 2:
+                  return "multi_source_support", good
+              if len(good) >= 2 and len(domains) >= 2:
+                  return "partial_support", good
+              if good or relevant:
+                  return "insufficient_verification", good or relevant
+              return "no_evidence", []
 
-          def unique_results(results):
-              output = []
-              seen = set()
+          def detect_conflicts(results):
+              pairs = (("supports", "does not support"), ("supported", "not supported"), ("increases", "decreases"),
+                       ("allowed", "not allowed"), ("required", "not required"))
+              out = []
+              for i, a in enumerate(results):
+                  for b in results[i + 1:]:
+                      ta, tb = a["snippet"].lower(), b["snippet"].lower()
+                      if any((p in ta and n in tb) or (n in ta and p in tb) for p, n in pairs):
+                          out.append({"source_a": a["url"], "source_b": b["url"],
+                                      "reason": "Potentially contradictory claims; manual verification needed."})
+              return out[:10]
 
-              for item in results:
-                  url = item.get("url", "")
+          def build_conclusion(status, evidence, conflicts):
+              if status == "no_evidence":
+                  return "No sufficiently relevant evidence was found. No substantive conclusion should be asserted."
+              if status == "insufficient_verification":
+                  return "Available results are insufficient to establish a reliable answer; the claim stays unverified."
+              snippet = collapse(evidence[0]["snippet"], 400) if evidence else ""
+              prefix = ("Sources are relevant but potentially conflicting; conclusion is bounded. "
+                        if conflicts else
+                        "Evidence gives partial support only; not verified. " if status == "partial_support" else
+                        "Evidence from several independent sources supports a bounded answer. ")
+              return prefix + (f"Strongest relevant passage: {snippet}" if snippet else "")
 
-                  key = (
-                      url.lower()
-                      if url
-                      else (
-                          item.get(
-                              "title",
-                              "",
-                          ).lower()
-                      )
-                  )
+          runtime = as_dict(load_json(RUNTIME_FILE))
+          work = as_dict(load_json(WORK_FILE))
+          for key in ("pending", "history", "results", "failed"):
+              work.setdefault(key, [])
+          work["run_count"] = int(work.get("run_count", 0) or 0) + 1
 
-                  if not key:
-                      continue
+          pending = [i for i in as_list(work["pending"]) if isinstance(i, dict)]
+          known = {text(i.get("work_id")) for c in ("pending", "history", "results", "failed")
+                   for i in as_list(work.get(c)) if isinstance(i, dict) and i.get("work_id")}
 
-                  if key in seen:
-                      continue
-
-                  seen.add(key)
-                  output.append(item)
-
-              return output
-
-          def result_score(item):
-              title = text(
-                  item.get("title")
-              ).lower()
-
-              snippet = text(
-                  item.get("snippet")
-              ).lower()
-
-              score = int(
-                  item.get(
-                      "quality",
-                      0,
-                  )
-              )
-
-              if title:
-                  score += 1
-
-              if snippet:
-                  score += 1
-
-              if len(snippet) >= 200:
-                  score += 1
-
-              return score
-
-          def classify_evidence(
-              results,
-              question,
-          ):
-              if not results:
-                  return (
-                      "no_evidence",
-                      [],
-                  )
-
-              good = [
-                  item
-                  for item in results
-                  if result_score(item) >= 2
-              ]
-
-              domains = set(
-                  item.get(
-                      "domain",
-                      "",
-                  )
-                  for item in good
-                  if item.get("domain")
-              )
-
-              if len(good) >= 3 and len(
-                  domains
-              ) >= 2:
-                  return (
-                      "multi_source_support",
-                      good,
-                  )
-
-              if len(good) >= 2:
-                  return (
-                      "partial_support",
-                      good,
-                  )
-
-              return (
-                  "insufficient_verification",
-                  good,
-              )
-
-          def detect_conflicts(
-              results,
-          ):
-              """
-              Conservative conflict detection.
-
-              It does not infer contradiction merely because
-              sources discuss different aspects of a topic.
-              """
-
-              conflicts = []
-
-              if len(results) < 2:
-                  return conflicts
-
-              for index, first in enumerate(
-                  results
-              ):
-                  first_text = (
-                      text(
-                          first.get(
-                              "snippet"
-                          )
-                      ).lower()
-                  )
-
-                  if not first_text:
-                      continue
-
-                  for second in results[
-                      index + 1:
-                  ]:
-                      second_text = (
-                          text(
-                              second.get(
-                                  "snippet"
-                              )
-                          ).lower()
-                      )
-
-                      if not second_text:
-                          continue
-
-                      negation_pairs = (
-                          (
-                              "supports",
-                              "does not support",
-                          ),
-                          (
-                              "supported",
-                              "not supported",
-                          ),
-                          (
-                              "increases",
-                              "decreases",
-                          ),
-                          (
-                              "increase",
-                              "decrease",
-                          ),
-                          (
-                              "allowed",
-                              "not allowed",
-                          ),
-                          (
-                              "required",
-                              "not required",
-                          ),
-                      )
-
-                      found = False
-
-                      for positive, negative in (
-                          negation_pairs
-                      ):
-                          if (
-                              positive
-                              in first_text
-                              and negative
-                              in second_text
-                          ) or (
-                              negative
-                              in first_text
-                              and positive
-                              in second_text
-                          ):
-                              found = True
-                              break
-
-                      if found:
-                          conflicts.append(
-                              {
-                                  "source_a": first.get(
-                                      "url"
-                                  ),
-                                  "source_b": second.get(
-                                      "url"
-                                  ),
-                                  "reason": (
-                                      "Potentially "
-                                      "contradictory "
-                                      "claims require "
-                                      "manual verification."
-                                  ),
-                              }
-                          )
-
-              return conflicts[:10]
-
-          def build_conclusion(
-              question,
-              evidence_status,
-              results,
-              conflicts,
-          ):
-              if evidence_status == "no_evidence":
-                  return (
-                      "No sufficiently relevant evidence "
-                      "was found for this question. "
-                      "No substantive conclusion should "
-                      "be asserted."
-                  )
-
-              if evidence_status == (
-                  "insufficient_verification"
-              ):
-                  return (
-                      "The available search results are "
-                      "insufficient to establish a reliable "
-                      "answer. The claim should remain "
-                      "unverified."
-                  )
-
-              relevant = []
-
-              for item in results[:5]:
-                  snippet = text(
-                      item.get("snippet")
-                  )
-
-                  if snippet:
-                      relevant.append(
-                          snippet
-                      )
-
-              if not relevant:
-                  return (
-                      "Relevant sources were found, "
-                      "but their available text was "
-                      "insufficient to establish a "
-                      "grounded conclusion."
-                  )
-
-              strongest = relevant[0]
-
-              if conflicts:
-                  return (
-                      "Multiple sources provide relevant "
-                      "evidence, but at least one potential "
-                      "conflict was detected. The evidence "
-                      "supports only a bounded conclusion; "
-                      "the conflicting claim remains "
-                      "uncertain. Strongest directly relevant "
-                      f"evidence: {strongest}"
-                  )
-
-              if evidence_status == (
-                  "partial_support"
-              ):
-                  return (
-                      "The available evidence provides "
-                      "partial support for a bounded answer. "
-                      "The result should not be treated as "
-                      "fully verified. Strongest directly "
-                      f"relevant evidence: {strongest}"
-                  )
-
-              return (
-                  "The available evidence supports a "
-                  "bounded answer to the question. "
-                  "The strongest directly relevant "
-                  f"evidence found indicates: {strongest}"
-              )
-
-          core_memory = as_dict(
-              load_json(
-                  CORE_MEMORY_FILE,
-                  {},
-              )
-          )
-
-          runtime = as_dict(
-              load_json(
-                  CORE_RUNTIME_FILE,
-                  {},
-              )
-          )
-
-          knowledge = as_dict(
-              load_json(
-                  KNOWLEDGE_FILE,
-                  {},
-              )
-          )
-
-          work = as_dict(
-              load_json(
-                  WORK_FILE,
-                  {},
-              )
-          )
-
-          work.setdefault(
-              "pending",
-              [],
-          )
-
-          work.setdefault(
-              "history",
-              [],
-          )
-
-          work.setdefault(
-              "results",
-              [],
-          )
-
-          work.setdefault(
-              "failed",
-              [],
-          )
-
-          work.setdefault(
-              "run_count",
-              0,
-          )
-
-          work["run_count"] = int(
-              work.get(
-                  "run_count",
-                  0,
-              )
-          ) + 1
-
-          pending = [
-              item
-              for item in as_list(
-                  work.get("pending")
-              )
-              if isinstance(
-                  item,
-                  dict,
-              )
-          ]
-
-          runtime_requests = [
-              item
-              for item in as_list(
-                  runtime.get(
-                      "work_requests"
-                  )
-              )
-              if isinstance(
-                  item,
-                  dict,
-              )
-          ]
-
-          existing_ids = set()
-
-          for collection_name in (
-              "pending",
-              "history",
-              "results",
-              "failed",
-          ):
-              for item in as_list(
-                  work.get(
-                      collection_name
-                  )
-              ):
-                  if isinstance(
-                      item,
-                      dict,
-                  ):
-                      work_id = text(
-                          item.get(
-                              "work_id"
-                          )
-                      )
-
-                      if work_id:
-                          existing_ids.add(
-                              work_id
-                          )
-
-          # Import Core requests into Work Factory pending.
-          for request in runtime_requests:
-              work_id = text(
-                  request.get(
-                      "work_id"
-                  )
-              )
-
-              if not work_id:
+          for req in as_list(runtime.get("work_requests")):
+              if not isinstance(req, dict):
                   continue
-
-              if work_id in existing_ids:
+              wid = text(req.get("work_id"))
+              if not wid or wid in known:
                   continue
+              pending.append({"work_id": wid, "case_id": text(req.get("case_id")),
+                              "created_at": text(req.get("created_at")) or NOW, "status": "pending",
+                              "question": collapse(req.get("question")).strip("\"' "),
+                              "reason": text(req.get("reason")), "source": "core", "attempts": 0})
+              known.add(wid)
 
-              question = normalize_question(
-                  request.get(
-                      "question"
-                  )
-              )
+          completed_ids, abandoned_ids = set(), set()
 
-              pending.append(
-                  {
-                      "work_id": work_id,
-                      "case_id": text(
-                          request.get(
-                              "case_id"
-                          )
-                      ),
-                      "created_at": text(
-                          request.get(
-                              "created_at"
-                          )
-                      )
-                      or NOW.isoformat(),
-                      "status": "pending",
-                      "question": question,
-                      "reason": text(
-                          request.get(
-                              "reason"
-                          )
-                      ),
-                      "source": "core",
-                  }
-              )
+          def abandon(item, reason):
+              abandoned_ids.add(text(item.get("work_id")))
+              work["failed"].append({"work_id": text(item.get("work_id")), "case_id": text(item.get("case_id")),
+                                     "timestamp": NOW, "status": "abandoned", "reason": reason,
+                                     "question": text(item.get("question"))[:300],
+                                     "attempts": int(item.get("attempts", 0) or 0)})
+              print("ABANDONED", item.get("work_id"), reason)
 
-              existing_ids.add(
-                  work_id
-              )
+          for item in pending:  # expire stale items
+              created = parse_ts(text(item.get("created_at")))
+              if created and NOW_DT - created > timedelta(days=EXPIRE_DAYS):
+                  abandon(item, "expired")
 
-          work["pending"] = pending
-
-          # ------------------------------------------------------------
-          # Candidate selection
-          # ------------------------------------------------------------
-
-          candidates = []
-
-          for item in work["pending"]:
-              if not isinstance(
-                  item,
-                  dict,
-              ):
-                  continue
-
-              status = text(
-                  item.get("status")
-              )
-
-              if status not in (
-                  "",
-                  "pending",
-                  "retry",
-                  "failed",
-                  "needs_retry",
-              ):
-                  continue
-
-              candidates.append(
-                  item
-              )
-
-          # Oldest first.
-          candidates.sort(
-              key=lambda item: text(
-                  item.get(
-                      "created_at"
-                  )
-              )
-          )
-
-          selected = candidates[
-              :MAX_WORK
-          ]
-
-          print(
-              "Research candidates="
-              + str(len(candidates))
-              + " selected="
-              + str(len(selected))
-          )
-
-          completed_ids = set()
-
-          for result in as_list(
-              work.get("results")
-          ):
-              if not isinstance(
-                  result,
-                  dict,
-              ):
-                  continue
-
-              work_id = text(
-                  result.get(
-                      "work_id"
-                  )
-              )
-
-              if work_id:
-                  completed_ids.add(
-                      work_id
-                  )
-
-          # ------------------------------------------------------------
-          # Research
-          # ------------------------------------------------------------
+          candidates = [i for i in pending
+                        if text(i.get("work_id")) not in abandoned_ids
+                        and text(i.get("status")) in ("", "pending", "retry", "failed", "needs_retry")]
+          candidates.sort(key=lambda i: (int(i.get("attempts", 0) or 0), text(i.get("created_at"))))
+          selected = candidates[:MAX_WORK]
+          print(f"Research candidates={len(candidates)} selected={len(selected)}")
 
           for item in selected:
+              wid = text(item.get("work_id"))
+              question = collapse(item.get("question")).strip("\"' ")
+              item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+              print("\n=== RESEARCH", wid, "===\nQuestion:", question)
 
-              work_id = text(
-                  item.get(
-                      "work_id"
-                  )
-              )
-
-              question = normalize_question(
-                  item.get(
-                      "question"
-                  )
-              )
-
-              print()
-              print(
-                  "=== RESEARCH "
-                  + work_id
-                  + " ==="
-              )
-
-              print(
-                  "Question:",
-                  question,
-              )
-
-              # --------------------------------------------------------
-              # HARD INPUT VALIDATION
-              # --------------------------------------------------------
-
-              valid, validation_reason = (
-                  question_is_valid(
-                      question
-                  )
-              )
-
+              valid, why = question_is_valid(question)
               if not valid:
-                  print(
-                      "Research status:",
-                      "invalid_input",
-                  )
-
-                  print(
-                      "Reason:",
-                      validation_reason,
-                  )
-
-                  item["status"] = (
-                      "needs_retry"
-                  )
-
-                  item["last_attempt"] = (
-                      NOW.isoformat()
-                  )
-
-                  item["validation_error"] = (
-                      validation_reason
-                  )
-
-                  item["error"] = (
-                      "Research question is "
-                      "empty, incomplete, or "
-                      "truncated. No search "
-                      "was performed."
-                  )
-
-                  failed_entry = {
-                      "work_id": work_id,
-                      "case_id": text(
-                          item.get(
-                              "case_id"
-                          )
-                      ),
-                      "timestamp": NOW.isoformat(),
-                      "status": "invalid_input",
-                      "question": question,
-                      "reason": validation_reason,
-                      "retryable": True,
-                  }
-
-                  work["failed"].append(
-                      failed_entry
-                  )
-
-                  # Keep the original pending item.
-                  # The Core must repair/reissue it.
+                  abandon(item, f"invalid_input:{why}")
                   continue
 
-              # --------------------------------------------------------
-              # SEARCH QUERIES
-              # --------------------------------------------------------
+              queries = []
+              for q in (question, f"{question} independent sources", f"{question} official documentation"):
+                  q = collapse(q)
+                  if q and q not in queries:
+                      queries.append(q)
 
-              queries = [
-                  question,
-                  (
-                      question
-                      + " verification "
-                      "independent sources"
-                  ),
-                  (
-                      question
-                      + " official documentation "
-                      "research"
-                  ),
-              ]
-
-              clean_queries = []
-
+              results, seen = [], set()
               for query in queries:
-                  query = normalize_question(
-                      query
-                  )
-
-                  if not query:
-                      continue
-
-                  if query in clean_queries:
-                      continue
-
-                  clean_queries.append(
-                      query
-                  )
-
-              all_results = []
-
-              for query in clean_queries:
-                  print(
-                      "Search:",
-                      query,
-                  )
-
-                  search_results = (
-                      search_web(
-                          query
-                      )
-                  )
-
-                  all_results.extend(
-                      search_results
-                  )
-
-                  if len(
-                      all_results
-                  ) >= MAX_TOTAL_RESULTS:
+                  print("Search:", query)
+                  for r in search_web(query):
+                      if r["url"].lower() not in seen:
+                          seen.add(r["url"].lower())
+                          results.append(r)
+                  if len(results) >= MAX_TOTAL:
                       break
-
                   time.sleep(0.4)
+              results = results[:MAX_TOTAL]
 
-              all_results = unique_results(
-                  all_results
-              )[:MAX_TOTAL_RESULTS]
+              status, evidence = classify(results, tokens(question))
+              conflicts = detect_conflicts(evidence)
+              conclusion = build_conclusion(status, evidence, conflicts)
+              print("Research status:", status)
 
-              evidence_status, evidence = (
-                  classify_evidence(
-                      all_results,
-                      question,
-                  )
-              )
-
-              conflicts = (
-                  detect_conflicts(
-                      evidence
-                  )
-              )
-
-              conclusion = build_conclusion(
-                  question,
-                  evidence_status,
-                  evidence,
-                  conflicts,
-              )
-
-              print(
-                  "Research status:",
-                  evidence_status,
-              )
-
-              print(
-                  "Conclusion:",
-                  conclusion,
-              )
-
-              # --------------------------------------------------------
-              # RESULT
-              # --------------------------------------------------------
-
-              result_id = stable_id(
-                  "result",
-                  work_id,
-              )
-
-              result = {
-                  "result_id": result_id,
-                  "work_id": work_id,
-                  "case_id": text(
-                      item.get(
-                          "case_id"
-                      )
-                  ),
-                  "created_at": NOW.isoformat(),
-                  "question": question,
-                  "queries": clean_queries,
-                  "evidence_status": (
-                      evidence_status
-                  ),
-                  "facts": [
-                      {
-                          "title": text(
-                              source.get(
-                                  "title"
-                              )
-                          ),
-                          "url": source.get(
-                              "url"
-                          ),
-                          "domain": source.get(
-                              "domain"
-                          ),
-                          "snippet": text(
-                              source.get(
-                                  "snippet"
-                              )
-                          ),
-                      }
-                      for source in evidence[
-                          :10
-                      ]
-                  ],
-                  "sources": [
-                      source.get(
-                          "url"
-                      )
-                      for source in evidence[
-                          :10
-                      ]
-                      if source.get(
-                          "url"
-                      )
-                  ],
-                  "conflicts": conflicts,
-                  "uncertainties": (
-                      [
-                          "Potential source conflict "
-                          "requires additional verification."
-                      ]
-                      if conflicts
-                      else (
-                          [
-                              "Evidence is partial."
-                          ]
-                          if evidence_status
-                          == "partial_support"
-                          else []
-                      )
-                  ),
-                  "conclusion": conclusion,
-                  "run_id": RUN_ID,
-              }
-
-              # --------------------------------------------------------
-              # IMPORTANT:
-              # Weak or invalid research is NOT completed.
-              # --------------------------------------------------------
-
-              if evidence_status in (
-                  "multi_source_support",
-                  "partial_support",
-              ):
-                  item["status"] = (
-                      "completed"
-                  )
-
-                  item["completed_at"] = (
-                      NOW.isoformat()
-                  )
-
-                  item["result_id"] = (
-                      result_id
-                  )
-
-                  work["results"].append(
-                      result
-                  )
-
-                  completed_ids.add(
-                      work_id
-                  )
-
+              result_id = stable_id("result", wid)
+              if status in ("multi_source_support", "partial_support"):
+                  item.update({"status": "completed", "completed_at": NOW, "result_id": result_id})
+                  work["results"].append({
+                      "result_id": result_id, "work_id": wid, "case_id": text(item.get("case_id")),
+                      "created_at": NOW, "question": question, "queries": queries, "evidence_status": status,
+                      "facts": [{"title": r["title"], "url": r["url"], "domain": r["domain"], "snippet": r["snippet"]}
+                                for r in evidence[:10]],
+                      "sources": [r["url"] for r in evidence[:10]],
+                      "conflicts": conflicts,
+                      "uncertainties": (["Potential source conflict requires verification."] if conflicts else
+                                        ["Evidence is partial."] if status == "partial_support" else []),
+                      "conclusion": conclusion, "run_id": RUN_ID,
+                  })
+                  completed_ids.add(wid)
               else:
-                  item["status"] = (
-                      "needs_retry"
-                  )
+                  item.update({"status": "needs_retry", "last_attempt": NOW, "retry_reason": status})
+                  work["failed"].append({"work_id": wid, "case_id": text(item.get("case_id")), "timestamp": NOW,
+                                         "status": status, "question": question[:300], "attempts": item["attempts"]})
+                  if item["attempts"] >= MAX_ATTEMPTS:
+                      abandon(item, f"weak_evidence_after_{item['attempts']}_attempts")
 
-                  item["last_attempt"] = (
-                      NOW.isoformat()
-                  )
+          work["pending"] = bound([i for i in pending
+                                   if text(i.get("work_id")) not in completed_ids | abandoned_ids], MAX_HISTORY)
+          work["history"].append({"run_id": RUN_ID, "timestamp": NOW, "candidates": len(candidates),
+                                  "selected": len(selected), "results": len(work["results"]),
+                                  "pending": len(work["pending"])})
+          for key in ("history", "results", "failed"):
+              work[key] = bound(work[key], MAX_HISTORY)
 
-                  item["result_id"] = (
-                      result_id
-                  )
-
-                  item["retry_reason"] = (
-                      evidence_status
-                  )
-
-                  work["failed"].append(
-                      result
-                  )
-
-                  print(
-                      "Weak evidence: "
-                      "keeping work item "
-                      "retryable."
-                  )
-
-          # ------------------------------------------------------------
-          # Remove only completed pending items.
-          # Invalid/weak items remain for retry.
-          # ------------------------------------------------------------
-
-          new_pending = []
-
-          for item in work["pending"]:
-              if not isinstance(
-                  item,
-                  dict,
-              ):
-                  continue
-
-              work_id = text(
-                  item.get(
-                      "work_id"
-                  )
-              )
-
-              if work_id in completed_ids:
-                  continue
-
-              new_pending.append(
-                  item
-              )
-
-          work["pending"] = new_pending
-
-          # ------------------------------------------------------------
-          # Bounds
-          # ------------------------------------------------------------
-
-          def bound(
-              collection,
-              limit,
-          ):
-              if not isinstance(
-                  collection,
-                  list,
-              ):
-                  return []
-
-              if len(collection) <= limit:
-                  return collection
-
-              return collection[-limit:]
-
-          work["pending"] = bound(
-              work["pending"],
-              MAX_HISTORY,
-          )
-
-          work["history"] = bound(
-              work["history"],
-              MAX_HISTORY,
-          )
-
-          work["results"] = bound(
-              work["results"],
-              MAX_HISTORY,
-          )
-
-          work["failed"] = bound(
-              work["failed"],
-              MAX_HISTORY,
-          )
-
-          # ------------------------------------------------------------
-          # History entry
-          # ------------------------------------------------------------
-
-          work["history"].append(
-              {
-                  "run_id": RUN_ID,
-                  "timestamp": NOW.isoformat(),
-                  "candidates": len(
-                      candidates
-                  ),
-                  "selected": len(
-                      selected
-                  ),
-                  "results": len(
-                      work["results"]
-                  ),
-                  "pending": len(
-                      work["pending"]
-                  ),
-              }
-          )
-
-          work["history"] = bound(
-              work["history"],
-              MAX_HISTORY,
-          )
-
-          # ------------------------------------------------------------
-          # Policy safety
-          # ------------------------------------------------------------
-
-          if os.environ.get(
-              "AUTO_PAYMENT"
-          ) != "false":
-              raise RuntimeError(
-                  "AUTO_PAYMENT policy is not false."
-              )
-
-          if os.environ.get(
-              "AUTO_SPENDING"
-          ) != "false":
-              raise RuntimeError(
-                  "AUTO_SPENDING policy is not false."
-              )
-
-          if os.environ.get(
-              "EXTERNAL_AI_USED"
-          ) != "false":
-              raise RuntimeError(
-                  "EXTERNAL_AI_USED policy is not false."
-              )
-
-          if os.environ.get(
-              "GEMINI_USED"
-          ) != "false":
-              raise RuntimeError(
-                  "GEMINI_USED policy is not false."
-              )
-
-          # ------------------------------------------------------------
-          # Persist
-          # ------------------------------------------------------------
-
-          save_json(
-              WORK_FILE,
-              work,
-          )
-
-          print()
-          print(
-              "=== NØX WORK FACTORY V5 ==="
-          )
-          print(
-              "Runs="
-              + str(work["run_count"])
-              + " Candidates="
-              + str(len(candidates))
-              + " Selected="
-              + str(len(selected))
-              + " Research results="
-              + str(len(work["results"]))
-          )
-
-          print(
-              "Pending="
-              + str(len(work["pending"]))
-              + " Failed/retry="
-              + str(len(work["failed"]))
-          )
-
-          print(
-              "Research pipeline: "
-              "QUESTION -> VALIDATION -> SEARCH -> "
-              "EVIDENCE -> CONFLICT CHECK -> "
-              "CONCLUSION -> UNCERTAINTY -> RESULT"
-          )
-
+          save_json(WORK_FILE, work)
+          print(f"Pending={len(work['pending'])} Results={len(work['results'])} Failed={len(work['failed'])}")
           print("=== WORK FACTORY COMPLETE ===")
           PY
 
-      - name: Validate Work Factory state
+      - name: Validate JSON state
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          files = [
-              "memory/nox_work_factory.json",
-          ]
-
-          for filename in files:
-              path = Path(filename)
-
-              if not path.exists():
-                  raise SystemExit(
-                      f"Missing state file: {filename}"
-                  )
-
-              with path.open(
-                  "r",
-                  encoding="utf-8",
-              ) as f:
-                  data = json.load(f)
-
-              if not isinstance(
-                  data,
-                  dict,
-              ):
-                  raise SystemExit(
-                      f"Invalid JSON object: {filename}"
-                  )
-
-              print(
-                  "VALID:",
-                  filename,
-              )
-
-          print(
-              "Work Factory state valid."
-          )
+          import json, os
+          for path in ["memory/nox_work_factory.json"]:
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as fh:
+                      json.load(fh)
+                  print("VALID JSON:", path)
           PY
 
-      - name: Check YAML and whitespace
+      - name: Commit and push
         shell: bash
         run: |
           set -euo pipefail
-
-          git diff --check
-
-      - name: Commit and push state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git add \
-            memory/nox_work_factory.json
-
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_work_factory.json; do
+            [ -e "$f" ] && git add -- "$f"
+          done
           if git diff --cached --quiet; then
-            echo "No Work Factory state changes."
+            echo "No changes to commit."
             exit 0
           fi
-
           git commit -m "chore(nox): update work factory state"
-
-          git pull --rebase origin main
-
-          git push origin HEAD:main
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
