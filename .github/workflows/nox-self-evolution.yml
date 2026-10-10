@@ -13,1153 +13,272 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EVOLUTION_FILE: "memory/nox_self_evolution.json"
-  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
-  WORK_FILE: "memory/nox_work_factory.json"
-  PRESENCE_FILE: "memory/nox_colony_presence.json"
+  EVOLUTION_FILE: memory/nox_self_evolution.json
+  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  WORK_FILE: memory/nox_work_factory.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
   MAX_HISTORY: "200"
   MIN_REPEATED_FAILURES: "2"
   PENDING_BACKLOG_ALERT: "50"
-
   PROJECT_COST_EUR: "0"
   GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
 
-  MAX_HELP_REQUESTS: "3"
-  MAX_HELP_COMMENTS: "30"
-  MAX_PATCH_LINES: "120"
-  MAX_PATCH_FILES: "3"
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install Colony SDK
-        run: |
-          python -m pip install --disable-pip-version-check "colony-sdk>=1.37,<2"
-
-      - name: Run self evolution
+      - name: Run self-evolution diagnostics
         shell: bash
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
-          NOX_EVOLUTION_TOKEN: ${{ secrets.NOX_EVOLUTION_TOKEN }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           import hashlib
           import json
           import os
           import re
-          import subprocess
           from datetime import datetime, timezone
           from pathlib import Path
 
-          from colony_sdk import ColonyClient
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
 
-          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
-
-          EVOLUTION_FILE = Path(os.environ["EVOLUTION_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
-          WORK_FILE = Path(os.environ["WORK_FILE"])
-          RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-
-          MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "200"))
-          MIN_REPEATED = int(os.environ.get("MIN_REPEATED_FAILURES", "2"))
-          BACKLOG_LIMIT = int(os.environ.get("PENDING_BACKLOG_ALERT", "50"))
-          MAX_HELP_REQUESTS = int(os.environ.get("MAX_HELP_REQUESTS", "3"))
-          MAX_HELP_COMMENTS = int(os.environ.get("MAX_HELP_COMMENTS", "30"))
-          MAX_PATCH_LINES = int(os.environ.get("MAX_PATCH_LINES", "120"))
-          MAX_PATCH_FILES = int(os.environ.get("MAX_PATCH_FILES", "3"))
-
-          NOW = datetime.now(timezone.utc).isoformat()
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, str(default)))
+              except (TypeError, ValueError):
+                  return default
 
           def check_policy():
-              expected = {
+              required = {
                   "PROJECT_COST_EUR": "0",
                   "GEMINI_USED": "false",
                   "EXTERNAL_AI_USED": "false",
                   "AUTO_PAYMENT": "false",
                   "AUTO_SPENDING": "false",
               }
+              for key, expected in required.items():
+                  actual = os.environ.get(key, expected).strip().lower()
+                  if actual != expected:
+                      raise SystemExit(f"Unsafe policy: {key} must remain {expected}")
 
-              for key, wanted in expected.items():
-                  value = os.environ.get(key, wanted).strip().lower()
-                  if value != wanted:
-                      raise SystemExit(
-                          f"Unsafe policy: {key} must be {wanted}, got {value}"
-                      )
-
-          def load_json(path, default=None):
-              default = {} if default is None else default
+          def load_json(path):
+              path = Path(path)
               if not path.exists():
-                  return default
-
+                  return {}
               raw = path.read_text(encoding="utf-8")
-
               if not raw.strip():
-                  return default
-
+                  return {}
               try:
                   value = json.loads(raw)
-              except Exception as exc:
-                  raise SystemExit(
-                      f"ERROR: {path} is not valid JSON: {exc}"
-                  )
-
-              return value if isinstance(value, type(default)) else default
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"Invalid JSON in {path}: {exc}; refusing to overwrite state")
+              return value if isinstance(value, dict) else {}
 
           def save_json(path, value):
+              path = Path(path)
               path.parent.mkdir(parents=True, exist_ok=True)
               tmp = path.with_suffix(path.suffix + ".tmp")
-
-              payload = json.dumps(
-                  value,
-                  ensure_ascii=False,
-                  indent=2,
-                  default=str,
-              ) + "\n"
-
+              payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
               json.loads(payload)
               tmp.write_text(payload, encoding="utf-8")
               os.replace(tmp, path)
 
-          def as_dict(value):
-              return value if isinstance(value, dict) else {}
-
           def as_list(value):
               return value if isinstance(value, list) else []
 
-          def text(value):
+          def clean(value, limit=240):
               if value is None:
-                  return ""
+                  value = ""
+              elif isinstance(value, (dict, list)):
+                  value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+              else:
+                  value = str(value)
+              value = re.sub(r"\s+", " ", value).strip()
+              return value[:limit]
 
-              if isinstance(value, str):
-                  return value.strip()
-
-              if isinstance(value, dict):
-                  for key in (
-                      "content",
-                      "body",
-                      "text",
-                      "message",
-                      "title",
-                      "question",
-                  ):
-                      if value.get(key):
-                          return text(value[key])
-
-                  return json.dumps(
-                      value,
-                      ensure_ascii=False,
-                      default=str,
-                  )
-
-              return str(value).strip()
-
-          def collapse(value, limit=300):
-              return re.sub(r"\s+", " ", text(value)).strip()[:limit]
-
-          def identity(item):
-              if isinstance(item, dict):
-                  for key in (
-                      "id",
-                      "action_id",
-                      "work_id",
-                      "result_id",
-                      "message_id",
-                      "post_id",
-                      "url",
-                  ):
-                      if item.get(key):
-                          return f"{key}:{item[key]}"
-
-              raw = json.dumps(
-                  item,
-                  ensure_ascii=False,
-                  sort_keys=True,
-                  default=str,
-              )
-
-              return "hash:" + hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()
-
-          def bound(items, limit):
-              items = as_list(items)
-              return items[-limit:] if len(items) > limit else items
-
-          def username_of(obj):
-              if not isinstance(obj, dict):
-                  return ""
-
-              for key in (
-                  "username",
-                  "handle",
-                  "author_username",
-                  "sender_username",
-              ):
-                  if obj.get(key):
-                      return str(obj[key]).strip().lower()
-
-              for key in (
-                  "author",
-                  "user",
-                  "sender",
-                  "bidder",
-                  "agent",
-              ):
-                  nested = obj.get(key)
-
-                  if isinstance(nested, dict):
-                      found = username_of(nested)
-                      if found:
-                          return found
-
-                  elif isinstance(nested, str):
-                      return nested.strip().lower()
-
-              return ""
-
-          def normalize_failure(value):
-              value = text(value).lower()
+          def normalized_error(value):
+              value = clean(value, 500).lower()
               value = re.sub(r"\b[0-9a-f]{8,}\b", "#", value)
               value = re.sub(r"\d+", "#", value)
-              value = re.sub(r"\s+", " ", value)
-              return value[:160].strip()
-
-          def normalize_diff(diff):
-              lines = []
-
-              for line in diff.splitlines():
-                  if line.startswith(("diff --git", "index ", "--- ", "+++ ")):
-                      continue
-
-                  if line.startswith("@@"):
-                      continue
-
-                  line = re.sub(r"\b[0-9a-f]{7,40}\b", "<HASH>", line)
-                  line = re.sub(r"\d{4}-\d{2}-\d{2}T[^ ]+", "<TS>", line)
-
-                  lines.append(line.rstrip())
-
-              return "\n".join(lines).strip()
-
-          def extract_diff(body):
-              body = text(body)
-
-              matches = re.findall(
-                  r"```(?:diff|patch)\s*\n(.*?)```",
-                  body,
-                  flags=re.IGNORECASE | re.DOTALL,
-              )
-
-              if not matches:
-                  return ""
-
-              candidates = [
-                  item.strip()
-                  for item in matches
-                  if "diff --git" in item
-                  or "--- " in item
-                  or "+++ " in item
-              ]
-
-              if not candidates:
-                  return ""
-
-              return max(candidates, key=len)
-
-          def changed_files_from_diff(diff):
-              files = []
-
-              for line in diff.splitlines():
-                  if line.startswith("+++ "):
-                      path = line[4:].strip()
-
-                      if path == "/dev/null":
-                          continue
-
-                      if path.startswith("b/"):
-                          path = path[2:]
-
-                      files.append(path)
-
-              return sorted(set(files))
-
-          def validate_patch_scope(diff):
-              files = changed_files_from_diff(diff)
-
-              if not files:
-                  return False, "no_target_files"
-
-              if len(files) > MAX_PATCH_FILES:
-                  return False, "too_many_files"
-
-              forbidden_path_patterns = (
-                  "memory/",
-                  ".github/workflows/nox-self-evolution.yml",
-                  ".github/workflows/",
-              )
-
-              for path in files:
-                  if path.startswith("memory/"):
-                      return False, f"memory_file_forbidden:{path}"
-
-                  if path == ".github/workflows/nox-self-evolution.yml":
-                      return False, "self_modification_forbidden"
-
-                  if path.startswith(".github/workflows/"):
-                      if not path.endswith((".yml", ".yaml")):
-                          return False, f"invalid_workflow_path:{path}"
-                      continue
-
-                  if path.startswith("scripts/") and path.endswith(".py"):
-                      continue
-
-                  return False, f"target_not_allowed:{path}"
-
-              changed_lines = sum(
-                  1
-                  for line in diff.splitlines()
-                  if line.startswith(("+", "-"))
-                  and not line.startswith(("+++", "---"))
-              )
-
-              if changed_lines > MAX_PATCH_LINES:
-                  return False, "patch_too_large"
-
-              return True, "ok"
-
-          def validate_no_financial_change(diff):
-              forbidden = (
-                  "payment",
-                  "payments",
-                  "spending",
-                  "spend",
-                  "withdraw",
-                  "invoice",
-                  "send_sats",
-                  "lightning_payment",
-                  "ln_payment",
-                  "place_bid",
-                  "purchase",
-                  "buy",
-              )
-
-              lowered = diff.lower()
-
-              for word in forbidden:
-                  if word in lowered:
-                      return False, f"financial_keyword:{word}"
-
-              return True, "ok"
-
-          def validate_files_after_patch(files):
-              for path in files:
-                  file_path = Path(path)
-
-                  if not file_path.exists():
-                      return False, f"missing_after_patch:{path}"
-
-                  if file_path.suffix == ".py":
-                      result = subprocess.run(
-                          ["python", "-m", "py_compile", path],
-                          capture_output=True,
-                          text=True,
-                      )
-
-                      if result.returncode != 0:
-                          return False, f"python_compile_failed:{path}:{result.stderr[-500:]}"
-
-                  if file_path.suffix in (".yml", ".yaml"):
-                      result = subprocess.run(
-                          [
-                              "python",
-                              "-c",
-                              (
-                                  "import sys,yaml; "
-                                  "yaml.safe_load(open(sys.argv[1],encoding='utf-8'))"
-                              ),
-                          ],
-                          args=[path],
-                          capture_output=True,
-                          text=True,
-                      )
-
-                      if result.returncode != 0:
-                          return False, f"yaml_parse_failed:{path}:{result.stderr[-500:]}"
-
-              result = subprocess.run(
-                  ["git", "diff", "--check"],
-                  capture_output=True,
-                  text=True,
-              )
-
-              if result.returncode != 0:
-                  return False, f"git_diff_check_failed:{result.stderr[-500:]}"
-
-              return True, "ok"
-
-          def known_advice(key):
-              advice = [
-                  (
-                      ("duplicate", "409", "already_replied"),
-                      "Duplicate publication attempts: check stable action ids and closed_ids.",
-                  ),
-                  (
-                      ("self_reply", "self_message"),
-                      "NØX tried to answer itself: check username filtering.",
-                  ),
-                  (
-                      ("invalid_input", "truncated", "too_short", "too_few_words"),
-                      "Core produces incomplete research questions: review question creation and filtering.",
-                  ),
-                  (
-                      ("no_evidence", "insufficient_verification", "weak_evidence"),
-                      "Searches return little relevant evidence: distinguish external research from internal/contextual questions.",
-                  ),
-                  (
-                      ("permanent_failure", "not found", "404", "403", "forbidden"),
-                      "Targets deleted or forbidden: investigate only when recurring.",
-                  ),
-                  (
-                      ("429", "rate"),
-                      "Rate limiting: reduce action frequency or public action budgets.",
-                  ),
-                  (
-                      ("missing_body", "missing_recipient", "missing_post_target"),
-                      "Core generates incomplete actions: inspect action construction.",
-                  ),
-              ]
-
-              lowered = key.lower()
-
-              for words, message in advice:
-                  if any(word in lowered for word in words):
-                      return message
-
-              return "Repeated failure without a known rule; community review required."
+              return value[:160]
 
           check_policy()
-
-          evolution = as_dict(load_json(EVOLUTION_FILE))
-          evolution.setdefault("version", 7)
-          evolution.setdefault("history", [])
-          evolution.setdefault("runs", [])
-          evolution.setdefault("help_requests", [])
-          evolution.setdefault("modifications", [])
-
-          presence = as_dict(load_json(PRESENCE_FILE))
-          work = as_dict(load_json(WORK_FILE))
-          runtime = as_dict(load_json(RUNTIME_FILE))
+          now = now_iso()
+          evolution_path = Path(os.environ["EVOLUTION_FILE"])
+          evolution = load_json(evolution_path)
+          presence = load_json(os.environ["PRESENCE_FILE"])
+          work = load_json(os.environ["WORK_FILE"])
+          runtime = load_json(os.environ["CORE_RUNTIME_FILE"])
+          max_history = max(20, env_int("MAX_HISTORY", 200))
+          min_repeated = max(1, env_int("MIN_REPEATED_FAILURES", 2))
+          backlog_limit = max(1, env_int("PENDING_BACKLOG_ALERT", 50))
 
           signals = []
-
-          for outcome in as_list(presence.get("outcomes"))[-200:]:
-              if not isinstance(outcome, dict):
+          for item in as_list(presence.get("outcomes"))[-500:]:
+              if not isinstance(item, dict):
                   continue
+              success = item.get("success")
+              status = clean(item.get("status") or item.get("result") or "unknown", 80)
+              error = clean(item.get("error") or item.get("message") or item.get("reason"), 500)
+              if success is False or (not success and error):
+                  signals.append({"source": "presence", "status": status, "error": error})
 
-              if not outcome.get("success"):
-                  signals.append(
-                      (
-                          "presence",
-                          text(outcome.get("status")),
-                          text(outcome.get("error")),
-                      )
-                  )
-
-          for failed in as_list(work.get("failed"))[-200:]:
-              if not isinstance(failed, dict):
+          for item in as_list(work.get("failed"))[-500:]:
+              if not isinstance(item, dict):
                   continue
-
-              signals.append(
-                  (
-                      "work",
-                      text(
-                          failed.get("status")
-                          or failed.get("evidence_status")
-                      ),
-                      text(failed.get("reason")),
-                  )
-              )
+              status = clean(item.get("status") or item.get("evidence_status") or "failed", 80)
+              error = clean(item.get("reason") or item.get("error") or item.get("message"), 500)
+              signals.append({"source": "work", "status": status, "error": error})
 
           groups = {}
+          for signal in signals:
+              norm = normalized_error(signal["error"])
+              key = (signal["source"], signal["status"].lower(), norm)
+              groups.setdefault(key, {"count": 0, "examples": []})
+              groups[key]["count"] += 1
+              if signal["error"] and signal["error"] not in groups[key]["examples"] and len(groups[key]["examples"]) < 3:
+                  groups[key]["examples"].append(signal["error"])
 
-          for source, status, error in signals:
-              key = (
-                  f"{source}|"
-                  f"{status}|"
-                  f"{normalize_failure(error)}"
-              )
-
-              groups[key] = groups.get(key, 0) + 1
+          advice_rules = [
+              (("409", "duplicate", "already have a post", "already replied"),
+               "Duplicate publication conflict: use a stable action ID and make retries idempotent; do not retry the same payload blindly."),
+              (("self_message", "self_reply", "own username"),
+               "Self-reply filtering may be incomplete: compare normalized author and agent handles before creating a reply action."),
+              (("no_evidence", "insufficient_verification", "weak_evidence"),
+               "Research produced insufficient evidence: separate internal/contextual questions from questions requiring external sources."),
+              (("404", "not found", "403", "forbidden"),
+               "Target may be missing or inaccessible: verify target existence and permission before retrying."),
+              (("429", "rate limit", "too many requests"),
+               "Rate limiting: reduce action throughput and use bounded backoff."),
+              (("missing_body", "missing_recipient", "missing_post_target"),
+               "Action payload is incomplete: validate required fields before adding the action to the queue."),
+              (("timeout", "connection reset", "temporarily unavailable"),
+               "Transient network failure: retry only with a bounded backoff and an idempotency check."),
+          ]
 
           findings = []
-
-          for key, count in sorted(
-              groups.items(),
-              key=lambda item: -item[1],
-          ):
-              if count < MIN_REPEATED:
+          for (source, status, error), data in sorted(groups.items(), key=lambda pair: pair[1]["count"], reverse=True):
+              if data["count"] < min_repeated:
                   continue
-
-              source, status, error = key.split("|", 2)
-
-              findings.append(
-                  {
-                      "source": source,
-                      "status": status,
-                      "error": error,
-                      "count": count,
-                      "recommendation": known_advice(key),
-                  }
+              combined = f"{status} {error}".lower()
+              recommendation = next(
+                  (advice for terms, advice in advice_rules if any(term in combined for term in terms)),
+                  "Repeated failure without a deterministic rule: inspect the originating workflow logs and verify the source fields."
               )
+              findings.append({
+                  "source": source,
+                  "status": status,
+                  "error_signature": error,
+                  "count": data["count"],
+                  "examples": data["examples"],
+                  "recommendation": recommendation,
+              })
 
-          pending = [
-              action
-              for action in as_list(runtime.get("pending_actions"))
-              if isinstance(action, dict)
-          ]
+          pending = [item for item in as_list(runtime.get("pending_actions")) if isinstance(item, dict)]
+          if len(pending) >= backlog_limit:
+              findings.append({
+                  "source": "runtime",
+                  "status": "pending_backlog",
+                  "error_signature": "pending_actions_backlog",
+                  "count": len(pending),
+                  "examples": [],
+                  "recommendation": "Pending actions exceed the configured threshold: compare Core creation rate with Presence execution rate and expire stale actions safely.",
+              })
 
-          if len(pending) > BACKLOG_LIMIT:
-              findings.append(
-                  {
-                      "source": "runtime",
-                      "status": "backlog",
-                      "error": "",
-                      "count": len(pending),
-                      "recommendation": (
-                          "Action backlog is growing: Core creates more "
-                          "actions than Presence executes."
-                      ),
-                  }
-              )
-
-          signature_payload = [
-              (
-                  item["source"],
-                  item["status"],
-                  item["error"],
-              )
+          fingerprint_payload = [
+              (item["source"], item["status"], item["error_signature"], item["count"])
               for item in findings
           ]
+          fingerprint = hashlib.sha256(
+              json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+          ).hexdigest()[:20]
 
-          signature = hashlib.sha256(
-              json.dumps(
-                  signature_payload,
-                  sort_keys=True,
-              ).encode("utf-8")
-          ).hexdigest()[:16]
+          runs = as_list(evolution.get("runs"))
+          previous = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+          if previous.get("fingerprint") == fingerprint and previous.get("decision") == ("RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"):
+              print("No change in findings since the previous run; state not rewritten.")
+              print("Fingerprint:", fingerprint)
+              raise SystemExit(0)
 
-          last = (
-              as_list(evolution["runs"])[-1]
-              if evolution["runs"]
-              else {}
-          )
-
-          run = {
-              "timestamp": NOW,
+          decision = "RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"
+          record = {
+              "timestamp": now,
               "status": "observed" if findings else "no_candidate",
-              "signature": signature,
-              "decision": (
-                  "EVOLUTION_CANDIDATE"
-                  if findings
-                  else "NO_EVOLUTION"
-              ),
+              "decision": decision,
+              "fingerprint": fingerprint,
+              "findings_count": len(findings),
               "findings": findings,
-              "help_requests": [],
-              "modifications": [],
+              "policy": {
+                  "project_cost_eur": 0,
+                  "gemini_used": False,
+                  "external_ai_used": False,
+                  "auto_payment": False,
+                  "auto_spending": False,
+              },
           }
+          evolution["version"] = max(7, int(evolution.get("version", 0) or 0))
+          evolution["runs"] = (runs + [record])[-max_history:]
+          history = as_list(evolution.get("history"))
+          if findings:
+              history.append(record)
+          evolution["history"] = history[-max_history:]
+          evolution["updated_at"] = now
+          save_json(evolution_path, evolution)
 
           print("=== NØX SELF EVOLUTION ===")
-
-          if not findings:
-              print("No repeated evolution candidate.")
-          else:
-              for finding in findings:
-                  print(
-                      f"- [{finding['count']}x] "
-                      f"{finding['source']}/{finding['status']}: "
-                      f"{finding['recommendation']}"
-                  )
-
-          # ---------------------------------------------------------------
-          # COMMUNITY HELP
-          # ---------------------------------------------------------------
-
-          client = None
-          colony_key = os.environ.get("COLONY_API_KEY", "").strip()
-
-          if findings and colony_key:
-              try:
-                  client = ColonyClient(colony_key)
-              except Exception as exc:
-                  print("Colony SDK init failed:", exc)
-
-          if client and findings:
-              existing_help = {
-                  item.get("signature"): item
-                  for item in as_list(evolution["help_requests"])
-                  if isinstance(item, dict)
-                  and item.get("status") == "open"
-              }
-
-              for finding in findings[:MAX_HELP_REQUESTS]:
-                  finding_key = hashlib.sha256(
-                      json.dumps(
-                          finding,
-                          sort_keys=True,
-                      ).encode("utf-8")
-                  ).hexdigest()[:16]
-
-                  if finding_key in existing_help:
-                      run["help_requests"].append(
-                          existing_help[finding_key]
-                      )
-                      continue
-
-                  title = (
-                      f"NØX needs help: "
-                      f"{finding['source']}/{finding['status']}"
-                  )
-
-                  body = f"""
-          NØX is investigating a recurring technical failure.
-
-          Source: {finding['source']}
-          Status: {finding['status']}
-          Count: {finding['count']} occurrences
-          Error signature: {finding['error']}
-
-          Current interpretation:
-          {finding['recommendation']}
-
-          I am looking for reproducible solutions.
-
-          If you propose a code change, please provide:
-          1. the exact target file;
-          2. the reason for the change;
-          3. a minimal unified diff in a ```diff block;
-          4. the test that should prove the change works.
-
-          Financial policy:
-          PROJECT_COST_EUR=0
-          AUTO_PAYMENT=false
-          AUTO_SPENDING=false
-
-          NØX will validate any proposed change before applying it.
-          """
-
-                  try:
-                      post = client.create_post(
-                          title=title,
-                          body=body.strip(),
-                          colony="questions",
-                          post_type="question",
-                      )
-
-                      post_id = text(
-                          post.get("id")
-                          if isinstance(post, dict)
-                          else ""
-                      )
-
-                      help_item = {
-                          "signature": finding_key,
-                          "post_id": post_id,
-                          "title": title,
-                          "created_at": NOW,
-                          "status": "open",
-                          "last_checked": NOW,
-                          "answers": [],
-                      }
-
-                      evolution["help_requests"].append(help_item)
-                      run["help_requests"].append(help_item)
-
-                      print("HELP POST CREATED:", post_id)
-
-                  except Exception as exc:
-                      print("HELP POST FAILED:", repr(exc))
-
-          evolution["help_requests"] = bound(
-              evolution["help_requests"],
-              MAX_HISTORY,
-          )
-
-          # ---------------------------------------------------------------
-          # COMMUNITY ANSWERS / PATCH CANDIDATES
-          # ---------------------------------------------------------------
-
-          patch_candidates = []
-
-          if client:
-              open_requests = [
-                  item
-                  for item in as_list(evolution["help_requests"])
-                  if isinstance(item, dict)
-                  and item.get("status") == "open"
-                  and item.get("post_id")
-              ][-MAX_HELP_REQUESTS:]
-
-              for request in open_requests:
-                  try:
-                      comments = list(
-                          client.iter_comments(
-                              request["post_id"],
-                              max_results=MAX_HELP_COMMENTS,
-                          )
-                      )
-
-                      answers = []
-
-                      for comment in comments:
-                          author = username_of(comment)
-
-                          if not author or author == OWN_USERNAME:
-                              continue
-
-                          body = text(comment.get("body") or comment.get("content"))
-
-                          if not body:
-                              continue
-
-                          diff = extract_diff(body)
-
-                          answer = {
-                              "author": author,
-                              "comment_id": text(comment.get("id")),
-                              "body": body[:4000],
-                              "has_diff": bool(diff),
-                              "timestamp": NOW,
-                          }
-
-                          answers.append(answer)
-
-                          if diff:
-                              patch_candidates.append(
-                                  {
-                                      "signature": request["signature"],
-                                      "author": author,
-                                      "comment_id": answer["comment_id"],
-                                      "diff": diff,
-                                      "normalized": normalize_diff(diff),
-                                  }
-                              )
-
-                      request["answers"] = answers[-MAX_HELP_COMMENTS:]
-                      request["last_checked"] = NOW
-
-                  except Exception as exc:
-                      print(
-                          "HELP COMMENTS FAILED:",
-                          request.get("post_id"),
-                          repr(exc),
-                      )
-
-          # ---------------------------------------------------------------
-          # CONTROLLED EVOLUTION
-          #
-          # A patch is only eligible when:
-          # - at least two distinct non-NØX authors propose the same patch;
-          # - target files are explicitly allowed;
-          # - patch size is bounded;
-          # - financial safeguards are not weakened;
-          # - local syntax validation succeeds.
-          # ---------------------------------------------------------------
-
-          grouped_patches = {}
-
-          for candidate in patch_candidates:
-              normalized = candidate["normalized"]
-
-              if not normalized:
-                  continue
-
-              grouped_patches.setdefault(
-                  normalized,
-                  [],
-              ).append(candidate)
-
-          selected_patch = None
-
-          for normalized, candidates in grouped_patches.items():
-              authors = sorted(
-                  {
-                      item["author"]
-                      for item in candidates
-                      if item["author"] != OWN_USERNAME
-                  }
-              )
-
-              if len(authors) < 2:
-                  continue
-
-              selected_patch = candidates[0]
-              selected_patch["supporting_authors"] = authors
-              break
-
-          token = os.environ.get(
-              "NOX_EVOLUTION_TOKEN",
-              "",
-          ).strip()
-
-          if selected_patch and not token:
-              print(
-                  "PATCH CANDIDATE FOUND but NOX_EVOLUTION_TOKEN is not configured."
-              )
-              print(
-                  "NØX remains diagnostic-only for code modification."
-              )
-
-          if selected_patch and token:
-              diff = selected_patch["diff"]
-
-              scope_ok, scope_reason = validate_patch_scope(diff)
-              financial_ok, financial_reason = validate_no_financial_change(diff)
-
-              if not scope_ok:
-                  print(
-                      "PATCH REJECTED:",
-                      scope_reason,
-                  )
-              elif not financial_ok:
-                  print(
-                      "PATCH REJECTED:",
-                      financial_reason,
-                  )
-              else:
-                  before = subprocess.run(
-                      ["git", "diff", "--quiet"],
-                      capture_output=True,
-                  )
-
-                  if before.returncode != 0:
-                      print(
-                          "PATCH REJECTED: working tree already contains changes."
-                      )
-                  else:
-                      files = changed_files_from_diff(diff)
-
-                      print(
-                          "PATCH CANDIDATE:",
-                          files,
-                          "support:",
-                          selected_patch["supporting_authors"],
-                      )
-
-                      check = subprocess.run(
-                          ["git", "apply", "--check", "-"],
-                          input=diff,
-                          text=True,
-                          capture_output=True,
-                      )
-
-                      if check.returncode != 0:
-                          print(
-                              "PATCH REJECTED: git apply --check failed:",
-                              check.stderr[-1000:],
-                          )
-                      else:
-                          subprocess.run(
-                              ["git", "apply", "-"],
-                              input=diff,
-                              text=True,
-                              check=True,
-                          )
-
-                          valid, reason = validate_files_after_patch(files)
-
-                          if not valid:
-                              print(
-                                  "PATCH FAILED TEST:",
-                                  reason,
-                              )
-
-                              subprocess.run(
-                                  ["git", "reset", "--hard", "HEAD"],
-                                  check=True,
-                              )
-
-                              run["modifications"].append(
-                                  {
-                                      "status": "rollback",
-                                      "files": files,
-                                      "reason": reason,
-                                      "supporting_authors": selected_patch[
-                                          "supporting_authors"
-                                      ],
-                                      "timestamp": NOW,
-                                  }
-                              )
-
-                          else:
-                              print(
-                                  "PATCH VALIDATED:",
-                                  files,
-                              )
-
-                              commit_message = (
-                                  "chore(nox): autonomous self-evolution"
-                              )
-
-                              subprocess.run(
-                                  ["git", "config", "user.name", "NØX"],
-                                  check=True,
-                              )
-
-                              subprocess.run(
-                                  [
-                                      "git",
-                                      "config",
-                                      "user.email",
-                                      "nox@users.noreply.github.com",
-                                  ],
-                                  check=True,
-                              )
-
-                              subprocess.run(
-                                  ["git", "add", "--"] + files,
-                                  check=True,
-                              )
-
-                              subprocess.run(
-                                  [
-                                      "git",
-                                      "commit",
-                                      "-m",
-                                      commit_message,
-                                  ],
-                                  check=True,
-                              )
-
-                              remote = (
-                                  "https://x-access-token:"
-                                  + token
-                                  + "@github.com/"
-                                  + os.environ["GITHUB_REPOSITORY"]
-                                  + ".git"
-                              )
-
-                              subprocess.run(
-                                  [
-                                      "git",
-                                      "remote",
-                                      "set-url",
-                                      "origin",
-                                      remote,
-                                  ],
-                                  check=True,
-                              )
-
-                              pushed = False
-
-                              for attempt in range(1, 4):
-                                  pull = subprocess.run(
-                                      [
-                                          "git",
-                                          "pull",
-                                          "--rebase",
-                                          "origin",
-                                          os.environ["GITHUB_REF_NAME"],
-                                      ],
-                                      capture_output=True,
-                                      text=True,
-                                  )
-
-                                  if pull.returncode != 0:
-                                      subprocess.run(
-                                          ["git", "rebase", "--abort"],
-                                          capture_output=True,
-                                      )
-
-                                  push = subprocess.run(
-                                      [
-                                          "git",
-                                          "push",
-                                          "origin",
-                                          "HEAD:" + os.environ["GITHUB_REF_NAME"],
-                                      ],
-                                      capture_output=True,
-                                      text=True,
-                                  )
-
-                                  if push.returncode == 0:
-                                      pushed = True
-                                      break
-
-                              if pushed:
-                                  modification = {
-                                      "status": "applied",
-                                      "files": files,
-                                      "supporting_authors": selected_patch[
-                                          "supporting_authors"
-                                      ],
-                                      "source_post_signature": selected_patch[
-                                          "signature"
-                                      ],
-                                      "timestamp": NOW,
-                                  }
-
-                                  evolution["modifications"].append(
-                                      modification
-                                  )
-                                  run["modifications"].append(
-                                      modification
-                                  )
-
-                                  print(
-                                      "EVOLUTION APPLIED:",
-                                      files,
-                                  )
-
-                                  for request in evolution["help_requests"]:
-                                      if (
-                                          request.get("signature")
-                                          == selected_patch["signature"]
-                                      ):
-                                          request["status"] = "resolved"
-                                          request["resolved_at"] = NOW
-
-                              else:
-                                  print(
-                                      "PATCH VALIDATED but push failed; "
-                                      "resetting repository state."
-                                  )
-
-                                  subprocess.run(
-                                      ["git", "reset", "--hard", "HEAD~1"],
-                                      check=True,
-                                  )
-
-                                  run["modifications"].append(
-                                      {
-                                          "status": "rollback",
-                                          "files": files,
-                                          "reason": "push_failed",
-                                          "timestamp": NOW,
-                                      }
-                                  )
-
-          # ---------------------------------------------------------------
-          # RECORD RESULT
-          # ---------------------------------------------------------------
-
-          if run["modifications"]:
-              run["decision"] = "EVOLUTION_APPLIED"
-
-          elif run["help_requests"]:
-              run["decision"] = "RESEARCHING_COMMUNITY_SOLUTION"
-
-          elif findings:
-              run["decision"] = "EVOLUTION_CANDIDATE"
-
-          else:
-              run["decision"] = "NO_EVOLUTION"
-
-          if (
-              isinstance(last, dict)
-              and last.get("signature") == signature
-              and not run["help_requests"]
-              and not run["modifications"]
-          ):
-              print("Findings unchanged; no duplicate history entry.")
-          else:
-              evolution["runs"] = bound(
-                  evolution["runs"] + [run],
-                  MAX_HISTORY,
-              )
-
-              if findings or run["modifications"]:
-                  evolution["history"] = bound(
-                      evolution["history"] + [run],
-                      MAX_HISTORY,
-                  )
-
-          evolution["modifications"] = bound(
-              evolution["modifications"],
-              MAX_HISTORY,
-          )
-
-          evolution["updated_at"] = NOW
-
-          save_json(
-              EVOLUTION_FILE,
-              evolution,
-          )
-
-          print("RESULT:", run["decision"])
-          print("Findings:", len(findings))
-          print("Help requests:", len(run["help_requests"]))
-          print("Modifications:", len(run["modifications"]))
+          print("Signals:", len(signals), "| Findings:", len(findings), "| Fingerprint:", fingerprint)
+          for finding in findings:
+              print(f"- [{finding['count']}x] {finding['source']}/{finding['status']}: {finding['recommendation']}")
+          print("RESULT:", decision)
+          print("NOTE: this workflow records evidence-based recommendations; it does not yet apply arbitrary code patches.")
           PY
 
-      - name: Validate JSON state
+      - name: Validate evolution state
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json
-          import os
-
-          path = "memory/nox_self_evolution.json"
-
-          if os.path.exists(path):
-              with open(path, encoding="utf-8") as fh:
-                  json.load(fh)
-
+          from pathlib import Path
+          path = Path("memory/nox_self_evolution.json")
+          if path.exists():
+              json.loads(path.read_text(encoding="utf-8"))
               print("VALID JSON:", path)
+          else:
+              print("No state file was written; nothing to validate.")
           PY
 
-      - name: Commit and push evolution state
+      - name: Commit and push state
         shell: bash
-        env:
-          NOX_EVOLUTION_TOKEN: ${{ secrets.NOX_EVOLUTION_TOKEN }}
         run: |
           set -euo pipefail
-
           git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
-
           git add -- memory/nox_self_evolution.json
-
           if git diff --cached --quiet; then
-            echo "No evolution state changes to commit."
+            echo "No changes to commit."
             exit 0
           fi
-
-          git commit -m "chore(nox): record self evolution"
-
-          if [ -n "${NOX_EVOLUTION_TOKEN:-}" ]; then
-            git remote set-url origin \
-              "https://x-access-token:${NOX_EVOLUTION_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          fi
-
+          git commit -m "chore(nox): record self-evolution diagnostics"
           for attempt in 1 2 3 4; do
-            if git pull --rebase origin "${GITHUB_REF_NAME}" \
-              && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
               echo "Pushed."
               exit 0
             fi
-
             git rebase --abort 2>/dev/null || true
             sleep $((attempt * 3))
           done
-
           echo "Push failed after retries."
           exit 1
