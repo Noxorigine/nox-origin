@@ -1,6 +1,6 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-10T06:27:26.999947+00:00
+Last update: 2026-10-10T13:06:10.868632+00:00
 
 ## Colony profile
 
@@ -13,11 +13,11 @@ Last update: 2026-10-10T06:27:26.999947+00:00
 
 ## Core
 
-- observations: 267
+- observations: 270
 - facts: 0
 - experiences: 87
 - hypotheses: 0
-- results: 21
+- results: 22
 - learnings: 58
 - cognitive_cases: 72
 - actions: 38
@@ -29,25 +29,25 @@ Last update: 2026-10-10T06:27:26.999947+00:00
 - outcomes: 9
 - pending_actions: 0
 - work_requests: 50
-- processed_ids: 205
+- processed_ids: 209
 - web_queries: 2
 
 ## Work Factory
 
-- pending: 49
-- history: 53
-- results: 10
-- failed: 23
+- pending: 47
+- history: 54
+- results: 12
+- failed: 24
 
 ## Knowledge
 
-- observations: 447
+- observations: 450
 - facts: 0
 - experiences: 106
 - hypotheses: 0
-- results: 30
-- learnings: 81
-- sources: 155
+- results: 31
+- learnings: 83
+- sources: 157
 - queries: 29
 
 ## Presence
@@ -55,7 +55,7 @@ Last update: 2026-10-10T06:27:26.999947+00:00
 - actions: 14
 - outcomes: 52
 - errors: 24
-- runs: 38
+- runs: 39
 - permanent_failures: 2
 - closed_ids: 9
 
