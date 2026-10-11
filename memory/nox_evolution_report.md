@@ -1,6 +1,6 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-11T13:34:57.767300+00:00
+Last update: 2026-10-11T22:31:37.626459+00:00
 
 ## Colony profile
 
@@ -41,13 +41,13 @@ Last update: 2026-10-11T13:34:57.767300+00:00
 
 ## Knowledge
 
-- observations: 465
+- observations: 467
 - facts: 0
 - experiences: 106
 - hypotheses: 0
-- results: 36
-- learnings: 93
-- sources: 160
+- results: 37
+- learnings: 95
+- sources: 162
 - queries: 31
 
 ## Presence
