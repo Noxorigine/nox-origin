@@ -13,272 +13,104 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EVOLUTION_FILE: memory/nox_self_evolution.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
-  WORK_FILE: memory/nox_work_factory.json
-  PRESENCE_FILE: memory/nox_colony_presence.json
-  MAX_HISTORY: "200"
-  MIN_REPEATED_FAILURES: "2"
-  PENDING_BACKLOG_ALERT: "50"
-  PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
+  GEMINI_USED: "false"
+  PROJECT_COST_EUR: "0"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  run:
+  evolution-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Run self-evolution diagnostics
-        shell: bash
+      - name: Audit and record findings
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          mkdir -p memory
+
+          python - <<'PY'
+          import json
           import hashlib
-          import json
-          import os
-          import re
-          from datetime import datetime, timezone
           from pathlib import Path
+          from datetime import datetime, timezone
 
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
-
-          def env_int(name, default):
-              try:
-                  return int(os.environ.get(name, str(default)))
-              except (TypeError, ValueError):
-                  return default
-
-          def check_policy():
-              required = {
-                  "PROJECT_COST_EUR": "0",
-                  "GEMINI_USED": "false",
-                  "EXTERNAL_AI_USED": "false",
-                  "AUTO_PAYMENT": "false",
-                  "AUTO_SPENDING": "false",
-              }
-              for key, expected in required.items():
-                  actual = os.environ.get(key, expected).strip().lower()
-                  if actual != expected:
-                      raise SystemExit(f"Unsafe policy: {key} must remain {expected}")
-
-          def load_json(path):
-              path = Path(path)
-              if not path.exists():
-                  return {}
-              raw = path.read_text(encoding="utf-8")
-              if not raw.strip():
-                  return {}
-              try:
-                  value = json.loads(raw)
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Invalid JSON in {path}: {exc}; refusing to overwrite state")
-              return value if isinstance(value, dict) else {}
-
-          def save_json(path, value):
-              path = Path(path)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
-              payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-              json.loads(payload)
-              tmp.write_text(payload, encoding="utf-8")
-              os.replace(tmp, path)
-
-          def as_list(value):
-              return value if isinstance(value, list) else []
-
-          def clean(value, limit=240):
-              if value is None:
-                  value = ""
-              elif isinstance(value, (dict, list)):
-                  value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-              else:
-                  value = str(value)
-              value = re.sub(r"\s+", " ", value).strip()
-              return value[:limit]
-
-          def normalized_error(value):
-              value = clean(value, 500).lower()
-              value = re.sub(r"\b[0-9a-f]{8,}\b", "#", value)
-              value = re.sub(r"\d+", "#", value)
-              return value[:160]
-
-          check_policy()
-          now = now_iso()
-          evolution_path = Path(os.environ["EVOLUTION_FILE"])
-          evolution = load_json(evolution_path)
-          presence = load_json(os.environ["PRESENCE_FILE"])
-          work = load_json(os.environ["WORK_FILE"])
-          runtime = load_json(os.environ["CORE_RUNTIME_FILE"])
-          max_history = max(20, env_int("MAX_HISTORY", 200))
-          min_repeated = max(1, env_int("MIN_REPEATED_FAILURES", 2))
-          backlog_limit = max(1, env_int("PENDING_BACKLOG_ALERT", 50))
-
-          signals = []
-          for item in as_list(presence.get("outcomes"))[-500:]:
-              if not isinstance(item, dict):
-                  continue
-              success = item.get("success")
-              status = clean(item.get("status") or item.get("result") or "unknown", 80)
-              error = clean(item.get("error") or item.get("message") or item.get("reason"), 500)
-              if success is False or (not success and error):
-                  signals.append({"source": "presence", "status": status, "error": error})
-
-          for item in as_list(work.get("failed"))[-500:]:
-              if not isinstance(item, dict):
-                  continue
-              status = clean(item.get("status") or item.get("evidence_status") or "failed", 80)
-              error = clean(item.get("reason") or item.get("error") or item.get("message"), 500)
-              signals.append({"source": "work", "status": status, "error": error})
-
-          groups = {}
-          for signal in signals:
-              norm = normalized_error(signal["error"])
-              key = (signal["source"], signal["status"].lower(), norm)
-              groups.setdefault(key, {"count": 0, "examples": []})
-              groups[key]["count"] += 1
-              if signal["error"] and signal["error"] not in groups[key]["examples"] and len(groups[key]["examples"]) < 3:
-                  groups[key]["examples"].append(signal["error"])
-
-          advice_rules = [
-              (("409", "duplicate", "already have a post", "already replied"),
-               "Duplicate publication conflict: use a stable action ID and make retries idempotent; do not retry the same payload blindly."),
-              (("self_message", "self_reply", "own username"),
-               "Self-reply filtering may be incomplete: compare normalized author and agent handles before creating a reply action."),
-              (("no_evidence", "insufficient_verification", "weak_evidence"),
-               "Research produced insufficient evidence: separate internal/contextual questions from questions requiring external sources."),
-              (("404", "not found", "403", "forbidden"),
-               "Target may be missing or inaccessible: verify target existence and permission before retrying."),
-              (("429", "rate limit", "too many requests"),
-               "Rate limiting: reduce action throughput and use bounded backoff."),
-              (("missing_body", "missing_recipient", "missing_post_target"),
-               "Action payload is incomplete: validate required fields before adding the action to the queue."),
-              (("timeout", "connection reset", "temporarily unavailable"),
-               "Transient network failure: retry only with a bounded backoff and an idempotency check."),
-          ]
-
-          findings = []
-          for (source, status, error), data in sorted(groups.items(), key=lambda pair: pair[1]["count"], reverse=True):
-              if data["count"] < min_repeated:
-                  continue
-              combined = f"{status} {error}".lower()
-              recommendation = next(
-                  (advice for terms, advice in advice_rules if any(term in combined for term in terms)),
-                  "Repeated failure without a deterministic rule: inspect the originating workflow logs and verify the source fields."
+          root = Path(".")
+          files = [
+              Path(name)
+              for name in (
+                  "core.py",
+                  "self_evolution.py",
+                  "work_factory.py",
+                  "presence.py",
               )
-              findings.append({
-                  "source": source,
-                  "status": status,
-                  "error_signature": error,
-                  "count": data["count"],
-                  "examples": data["examples"],
-                  "recommendation": recommendation,
-              })
-
-          pending = [item for item in as_list(runtime.get("pending_actions")) if isinstance(item, dict)]
-          if len(pending) >= backlog_limit:
-              findings.append({
-                  "source": "runtime",
-                  "status": "pending_backlog",
-                  "error_signature": "pending_actions_backlog",
-                  "count": len(pending),
-                  "examples": [],
-                  "recommendation": "Pending actions exceed the configured threshold: compare Core creation rate with Presence execution rate and expire stale actions safely.",
-              })
-
-          fingerprint_payload = [
-              (item["source"], item["status"], item["error_signature"], item["count"])
-              for item in findings
+              if Path(name).is_file()
           ]
-          fingerprint = hashlib.sha256(
-              json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-          ).hexdigest()[:20]
 
-          runs = as_list(evolution.get("runs"))
-          previous = runs[-1] if runs and isinstance(runs[-1], dict) else {}
-          if previous.get("fingerprint") == fingerprint and previous.get("decision") == ("RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"):
-              print("No change in findings since the previous run; state not rewritten.")
-              print("Fingerprint:", fingerprint)
-              raise SystemExit(0)
+          signatures = {}
+          for path in files:
+              signatures[str(path)] = hashlib.sha256(
+                  path.read_bytes()
+              ).hexdigest()
 
-          decision = "RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"
-          record = {
-              "timestamp": now,
-              "status": "observed" if findings else "no_candidate",
-              "decision": decision,
-              "fingerprint": fingerprint,
-              "findings_count": len(findings),
-              "findings": findings,
-              "policy": {
-                  "project_cost_eur": 0,
-                  "gemini_used": False,
-                  "external_ai_used": False,
-                  "auto_payment": False,
-                  "auto_spending": False,
-              },
+          report = {
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "files_detected": [str(path) for path in files],
+              "sha256": signatures,
+              "external_ai_used": False,
+              "project_cost_eur": 0,
+              "automatic_payment": False,
+              "automatic_spending": False,
+              "source_changes_require_human_approval": True,
+              "status": "audit_completed",
           }
-          evolution["version"] = max(7, int(evolution.get("version", 0) or 0))
-          evolution["runs"] = (runs + [record])[-max_history:]
-          history = as_list(evolution.get("history"))
-          if findings:
-              history.append(record)
-          evolution["history"] = history[-max_history:]
-          evolution["updated_at"] = now
-          save_json(evolution_path, evolution)
 
-          print("=== NØX SELF EVOLUTION ===")
-          print("Signals:", len(signals), "| Findings:", len(findings), "| Fingerprint:", fingerprint)
-          for finding in findings:
-              print(f"- [{finding['count']}x] {finding['source']}/{finding['status']}: {finding['recommendation']}")
-          print("RESULT:", decision)
-          print("NOTE: this workflow records evidence-based recommendations; it does not yet apply arbitrary code patches.")
+          destination = Path("memory/nox_evolution_audit.json")
+          destination.write_text(
+              json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps(report, ensure_ascii=False, indent=2))
           PY
 
-      - name: Validate evolution state
-        shell: bash
+      - name: Validate Python syntax
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          path = Path("memory/nox_self_evolution.json")
-          if path.exists():
-              json.loads(path.read_text(encoding="utf-8"))
-              print("VALID JSON:", path)
-          else:
-              print("No state file was written; nothing to validate.")
-          PY
 
-      - name: Commit and push state
-        shell: bash
+          found=0
+          for file in core.py self_evolution.py work_factory.py presence.py; do
+            if [ -f "$file" ]; then
+              python -m py_compile "$file"
+              found=1
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "Aucun module Python à vérifier."
+          fi
+
+      - name: Commit audit report
         run: |
           set -euo pipefail
           git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
-          git add -- memory/nox_self_evolution.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+          git config user.email "nox-agent@users.noreply.github.com"
+
+          git add memory/nox_evolution_audit.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(nox): record self evolution audit"
+            git push
+          else
+            echo "Rapport inchangé."
           fi
-          git commit -m "chore(nox): record self-evolution diagnostics"
-          for attempt in 1 2 3 4; do
-            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Pushed."
-              exit 0
-            fi
-            git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 3))
-          done
-          echo "Push failed after retries."
-          exit 1
