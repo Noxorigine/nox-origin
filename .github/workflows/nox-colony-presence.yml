@@ -2,14 +2,8 @@ name: NØX - Colony Presence
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Analyze only, without writing or publishing"
-        required: false
-        default: false
-        type: boolean
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "23 */2 * * *"
 
 permissions:
   contents: write
@@ -19,514 +13,74 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
-  PRESENCE_FILE: "memory/nox_colony_presence.json"
-  MAX_ACTIONS_PER_RUN: "2"
-  MAX_PUBLIC_PER_HOUR: "3"
-  MAX_RETRY_ATTEMPTS: "4"
-  MAX_TRACKED: "500"
-  MAX_RUNS: "100"
-  NOX_USERNAME: "nox_origine"
-  PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
   EXTERNAL_AI_USED: "false"
+  GEMINI_USED: "false"
+  PROJECT_COST_EUR: "0"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  run:
+  presence:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Update heartbeat and log
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "colony-sdk>=1.37.0,<2.0.0"
+          mkdir -p data
 
-      - name: Execute Presence
-        shell: bash
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
-          PRESENCE_DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          """Shared helpers for all NØX scripts (standard library only)."""
-          import hashlib
+          python - <<'PY'
           import json
           import os
-          import re
-          import sys
+          from pathlib import Path
           from datetime import datetime, timezone
-          from itertools import islice
-          from pathlib import Path
 
-          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
+          now = datetime.now(timezone.utc).isoformat()
+          status = {
+              "agent": "NØX",
+              "state": "inactive",
+              "detail": "Présence vérifiée ; aucune action publique exécutée.",
+              "timestamp": now,
+              "external_ai_used": False,
+              "cost_eur": 0,
+              "automatic_payment": False,
+              "automatic_spending": False,
+          }
 
-          # ---------------------------------------------------------------- time / env
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
+          Path("data/heartbeat.json").write_text(
+              json.dumps(status, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
 
-          def parse_ts(value):
-              if not value or not isinstance(value, str):
-                  return None
-              try:
-                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-              except ValueError:
-                  return None
-              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+          with Path("data/presence.log").open("a", encoding="utf-8") as log:
+              log.write(
+                  f"{now} [INFO] Présence vérifiée ; aucune action publique.\n"
+              )
 
-          def env_int(name, default):
-              try:
-                  return int(os.environ.get(name, default))
-              except (TypeError, ValueError):
-                  return int(default)
-
-          def env_flag(name, default=False):
-              value = os.environ.get(name)
-              if value is None or value.strip() == "":
-                  return default
-              return value.strip().lower() in {"1", "true", "yes", "on"}
-
-          def check_policy():
-              """Hard safety invariants: no spending, no payments, no external AI."""
-              expected = {
-                  "PROJECT_COST_EUR": "0",
-                  "GEMINI_USED": "false",
-                  "EXTERNAL_AI_USED": "false",
-                  "AUTO_PAYMENT": "false",
-                  "AUTO_SPENDING": "false",
-              }
-              for key, wanted in expected.items():
-                  if os.environ.get(key, wanted).strip().lower() != wanted:
-                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
-
-          # ---------------------------------------------------------------- json files
-          def load_json(path, default=None):
-              """Load a JSON object. Refuses to continue on corrupt files so that a
-              parse error can never silently wipe the agent's state."""
-              path = Path(path)
-              default = {} if default is None else default
-              if not path.exists():
-                  return default
-              raw = path.read_text(encoding="utf-8")
-              if not raw.strip():
-                  return default
-              try:
-                  value = json.loads(raw)
-              except Exception as exc:
-                  raise SystemExit(
-                      f"ERROR: {path} is not valid JSON ({exc}). "
-                      "Restore it from git history; refusing to overwrite it."
-                  )
-              return value if isinstance(value, type(default)) else default
-
-          def save_json(path, value):
-              path = Path(path)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
-              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
-              json.loads(payload)  # round-trip check
-              tmp.write_text(payload, encoding="utf-8")
-              os.replace(tmp, path)
-
-          # ---------------------------------------------------------------- data utils
-          def as_dict(value):
-              return value if isinstance(value, dict) else {}
-
-          def as_list(value):
-              return value if isinstance(value, list) else []
-
-          def text(value, limit=None):
-              if value is None:
-                  out = ""
-              elif isinstance(value, str):
-                  out = value.strip()
-              elif isinstance(value, dict):
-                  out = ""
-                  for key in ("content", "body", "text", "message", "title", "question"):
-                      if value.get(key):
-                          out = text(value[key])
-                          break
-                  if not out:
-                      out = json.dumps(value, ensure_ascii=False, default=str)
-              else:
-                  out = str(value).strip()
-              return out[:limit] if limit else out
-
-          def collapse(value, limit=None):
-              out = re.sub(r"\s+", " ", text(value)).strip()
-              return out[:limit] if limit else out
-
-          def clip(value, limit):
-              out = text(value)
-              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
-
-          def stable_id(prefix, *parts):
-              raw = "|".join(str(p if p is not None else "") for p in parts)
-              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-          def identity(item):
-              """Stable identity of a stored item (id-like key, else content hash)."""
-              if isinstance(item, dict):
-                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
-                      if item.get(key):
-                          return f"{key}:{item[key]}"
-              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
-              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-          def dedupe_keep_last(items, limit=None):
-              """Remove duplicates (keeping the most recent occurrence) and keep list
-              order chronological (oldest first). Optionally keep only the last N."""
-              seen, out = set(), []
-              for item in reversed(items):
-                  key = identity(item)
-                  if key in seen:
-                      continue
-                  seen.add(key)
-                  out.append(item)
-              out.reverse()
-              return out[-limit:] if limit else out
-
-          def bound(items, limit):
-              items = as_list(items)
-              return items[-limit:] if len(items) > limit else items
-
-          def take(value, n=None):
-              """Turn SDK results (list / dict / generator) into a bounded list."""
-              if value is None:
-                  return []
-              if isinstance(value, dict):
-                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
-                      if isinstance(value.get(key), list):
-                          value = value[key]
-                          break
-                  else:
-                      return []
-              if isinstance(value, (list, tuple)):
-                  return list(value)[:n] if n else list(value)
-              try:
-                  iterator = iter(value)
-              except TypeError:
-                  return []
-              return list(islice(iterator, n)) if n else list(iterator)
-
-          def username_of(obj):
-              """Lower-cased username of an object or of a nested author/sender."""
-              if not isinstance(obj, dict):
-                  return ""
-              for key in ("username", "handle", "author_username", "sender_username"):
-                  if obj.get(key):
-                      return str(obj[key]).strip().lower()
-              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
-                  nested = obj.get(key)
-                  if isinstance(nested, dict):
-                      found = username_of(nested)
-                      if found:
-                          return found
-                  elif isinstance(nested, str) and nested.strip():
-                      return nested.strip().lower()
-              return ""
-
-          # ===== script =====
-          """NØX Presence: executes pending actions (reply / DM / post) safely.
-
-          Fixes vs. the old version:
-          - executed / blocked / duplicate / permanently failed actions are CLOSED
-            (presence.closed_ids) so Core can never regenerate them -> no more 409 loops
-          - blocked actions leave the queue (they used to sit at the head forever)
-          - no more nested 'original' payloads growing the file every run
-          - hourly cap on public actions, no replies to own posts, one reply per post
-          - queue order: fewest attempts first (a failing action cannot starve the rest)
-          - writes runtime.actions / runtime.outcomes so Knowledge & Monitor see real data
-          """
-          import os
-          from datetime import datetime, timezone, timedelta
-          from pathlib import Path
-
-          check_policy()
-
-          NOW = now_iso()
-          RUN_ID = "presence-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-          RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
-          PRESENCE_FILE = Path(os.environ["PRESENCE_FILE"])
-
-          MAX_ACTIONS = env_int("MAX_ACTIONS_PER_RUN", 2)
-          MAX_PUBLIC_PER_HOUR = env_int("MAX_PUBLIC_PER_HOUR", 3)
-          MAX_RETRY = env_int("MAX_RETRY_ATTEMPTS", 4)
-          MAX_TRACKED = env_int("MAX_TRACKED", 500)
-          MAX_RUNS = env_int("MAX_RUNS", 100)
-          DRY_RUN = env_flag("PRESENCE_DRY_RUN", False)
-
-          FINANCIAL = {"pay", "payment", "send_payment", "send_sats", "invoice", "withdraw", "withdrawal", "bid",
-                       "place_bid", "purchase", "buy", "spend", "transfer", "tip", "lightning_payment", "ln_payment"}
-          PUBLIC = {"reply", "publish"}
-          DM = {"dm_reply"}
-          ALIASES = {"dm": "dm_reply", "message": "dm_reply", "send_message": "dm_reply", "direct_message": "dm_reply",
-                     "reply_dm": "dm_reply", "comment": "reply", "create_comment": "reply", "reply_post": "reply",
-                     "research_reply": "reply", "create_post": "publish", "post": "publish", "new_post": "publish"}
-
-          runtime = as_dict(load_json(RUNTIME_FILE))
-          presence = as_dict(load_json(PRESENCE_FILE))
-          for key in ("pending_actions", "actions", "outcomes"):
-              runtime.setdefault(key, [])
-          for key in ("actions", "outcomes", "errors", "runs", "permanent_failures", "closed_ids"):
-              presence.setdefault(key, [])
-
-          def first(raw, keys):
-              for key in keys:
-                  value = raw.get(key)
-                  if isinstance(value, str):
-                      value = value.strip()
-                  if value not in (None, ""):
-                      return value
-              return None
-
-          def normalize(raw):
-              if not isinstance(raw, dict):
-                  return None
-              action_id = text(first(raw, ("action_id", "id", "actionId"))) or stable_id("action", raw)
-              kind = text(first(raw, ("type", "action_type", "kind", "action"))).lower().replace("-", "_").replace(" ", "_")
-              try:
-                  attempts = int(raw.get("attempts", 0) or 0)
-              except (TypeError, ValueError):
-                  attempts = 0
-              return {
-                  "id": action_id, "action_id": action_id, "type": ALIASES.get(kind, kind),
-                  "target_id": text(first(raw, ("target_id", "post_id", "target"))) or None,
-                  "parent_id": text(first(raw, ("parent_id", "comment_id"))) or None,
-                  "recipient": text(first(raw, ("recipient", "username", "recipient_username"))) or None,
-                  "body": text(first(raw, ("body", "reply_text", "message", "content", "text"))),
-                  "title": text(first(raw, ("title", "post_title"))),
-                  "colony": text(first(raw, ("colony", "colony_name"))) or None,
-                  "attempts": attempts, "created_at": raw.get("created_at") or NOW,
-                  "source": raw.get("source") or "core", "source_case": raw.get("source_case"),
-                  "metadata": raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None,
-              }
-
-          closed = {str(x) for x in as_list(presence["closed_ids"])}
-          closed |= {str(f.get("action_id")) for f in as_list(presence["permanent_failures"])
-                     if isinstance(f, dict) and f.get("action_id")}
-
-          queue, seen = [], set()
-          for raw in as_list(runtime["pending_actions"]):
-              action = normalize(raw)
-              if action and action["id"] not in closed and action["id"] not in seen:
-                  seen.add(action["id"])
-                  queue.append(action)
-
-          # public budget for the last hour
-          hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-          recent_public = 0
-          for outcome in as_list(presence["outcomes"]):
-              if isinstance(outcome, dict) and outcome.get("success") and outcome.get("action_type") in PUBLIC:
-                  ts = parse_ts(text(outcome.get("timestamp")))
-                  if ts and ts >= hour_ago:
-                      recent_public += 1
-          public_budget = max(0, MAX_PUBLIC_PER_HOUR - recent_public)
-
-          replied_targets = {text(a.get("target_id")) for a in as_list(presence["actions"])
-                             if isinstance(a, dict) and a.get("success") and a.get("action_type") == "reply" and a.get("target_id")}
-
-          queue.sort(key=lambda a: (a["attempts"], text(a["created_at"])))
-          selected = []
-          for action in queue:
-              if len(selected) >= MAX_ACTIONS:
-                  break
-              if action["type"] in PUBLIC:
-                  if public_budget <= 0:
-                      continue
-                  public_budget -= 1
-              selected.append(action)
-
-          print("=== NØX PRESENCE ===")
-          print(f"Run: {RUN_ID} | queue={len(queue)} selected={len(selected)} | public used last hour={recent_public}")
-
-          if DRY_RUN:
-              for a in selected:
-                  print("DRY RUN would execute:", a["type"], a["target_id"] or a["recipient"], clip(a["body"], 80))
-              print("DRY RUN: nothing executed, nothing saved.")
-              raise SystemExit(0)
-
-          outcomes, executed_records = [], []
-          closed_now, permanent_now = set(), []
-          counts = {"success": 0, "retry": 0, "blocked": 0, "duplicate": 0, "permanent": 0}
-          client = None
-
-          def get_client():
-              global client
-              if client is None:
-                  key = os.environ.get("COLONY_API_KEY", "").strip()
-                  if not key:
-                      raise SystemExit("COLONY_API_KEY is missing (GitHub secret).")
-                  from colony_sdk import ColonyClient
-                  client = ColonyClient(key)
-                  try:
-                      client.bootstrap()
-                  except Exception as exc:
-                      print("WARNING: bootstrap failed:", exc)
-              return client
-
-          def classify_error(exc):
-              msg = str(exc).lower()
-              if any(t in msg for t in ("409", "duplicate", "already")):
-                  return "duplicate"
-              if any(t in msg for t in ("404", "not found", "403", "forbidden", "410", "gone")):
-                  return "permanent"
-              return "retry"
-
-          def execute(action):
-              kind, body = action["type"], action["body"]
-              if not kind:
-                  return "blocked", "missing_action_type", None
-              if kind in FINANCIAL:
-                  return "blocked", "financial_action_forbidden", None
-              if kind in PUBLIC | DM and not body:
-                  return "blocked", "missing_body", None
-              if kind not in PUBLIC | DM:
-                  return "blocked", f"unknown_action_type:{kind}", None
-              api = get_client()
-              if kind in DM:
-                  if not action["recipient"]:
-                      return "blocked", "missing_recipient", None
-                  if action["recipient"].strip().lower() == OWN_USERNAME:
-                      return "blocked", "self_message", None
-                  return "executed", None, api.send_message(action["recipient"], body)
-              if kind == "reply":
-                  target = action["target_id"]
-                  if not target:
-                      return "blocked", "missing_post_target", None
-                  if target in replied_targets:
-                      return "blocked", "already_replied_to_target", None
-                  post = api.get_post(target)
-                  if not post:
-                      return "permanent", f"target post not found: {target}", None
-                  if username_of(post) == OWN_USERNAME:
-                      return "blocked", "self_reply", None
-                  if action["parent_id"]:
-                      result = api.create_comment(target, body, parent_id=action["parent_id"])
-                  else:
-                      result = api.create_comment(target, body)
-                  replied_targets.add(target)
-                  return "executed", None, result
-              kwargs = {"title": action["title"] or "NØX observation", "body": body}
-              if action["colony"]:
-                  kwargs["colony"] = action["colony"]
-              return "executed", None, api.create_post(**kwargs)
-
-          for action in selected:
-              print(f"\n=== ACTION {action['id']} ({action['type']}) ===")
-              try:
-                  status, reason, result = execute(action)
-                  error = reason if status != "executed" else None
-              except Exception as exc:
-                  status, error, result = classify_error(exc), clip(exc, 600), None
-                  print("FAILED:", error)
-
-              attempts = action["attempts"] + (0 if status in ("executed", "blocked") else 1)
-              action["attempts"] = attempts
-              action["last_attempt_at"] = NOW
-              final = status
-              if status == "retry" and attempts >= MAX_RETRY:
-                  final = "permanent"
-
-              outcome_status = {"executed": "executed", "blocked": "blocked", "duplicate": "duplicate",
-                                "permanent": "permanent_failure", "retry": "retry"}[final]
-              outcome = {"id": stable_id("outcome", RUN_ID, action["id"]), "action_id": action["id"], "run_id": RUN_ID,
-                         "type": outcome_status, "status": outcome_status, "success": final == "executed",
-                         "action_type": action["type"], "target_id": action["target_id"],
-                         "recipient": action["recipient"], "attempts": attempts, "timestamp": now_iso()}
-              if action["body"]:
-                  outcome["body"] = clip(action["body"], 300)
-              if error:
-                  outcome["error"] = error
-              if final == "executed":
-                  counts["success"] += 1
-                  executed_records.append({k: action[k] for k in ("id", "action_id", "type", "target_id", "recipient", "source_case")}
-                                          | {"executed_at": NOW})
-              else:
-                  counts[{"blocked": "blocked", "duplicate": "duplicate", "permanent": "permanent", "retry": "retry"}[final]] += 1
-              if final in ("executed", "blocked", "duplicate", "permanent"):
-                  closed_now.add(action["id"])
-              if final == "permanent":
-                  permanent_now.append({"id": stable_id("permanent-failure", action["id"]), "action_id": action["id"],
-                                        "run_id": RUN_ID, "action_type": action["type"], "target_id": action["target_id"],
-                                        "recipient": action["recipient"], "attempts": attempts, "error": error,
-                                        "timestamp": NOW})
-              outcomes.append(outcome)
-              print("RESULT:", outcome_status, error or "")
-
-          remaining = [a for a in queue if a["id"] not in closed_now]
-          runtime["pending_actions"] = bound(remaining, 100)
-          runtime["actions"] = bound(as_list(runtime["actions"]) + executed_records, 300)
-          runtime["outcomes"] = bound(as_list(runtime["outcomes"]) + outcomes, 500)
-          runtime["last_presence_run"] = RUN_ID
-          runtime["last_presence_at"] = NOW
-
-          presence["closed_ids"] = bound(as_list(presence["closed_ids"]) + sorted(closed_now), 3000)
-          presence["permanent_failures"] = bound(as_list(presence["permanent_failures"]) + permanent_now, MAX_TRACKED)
-          presence["outcomes"] = bound(as_list(presence["outcomes"]) + outcomes, MAX_TRACKED)
-          presence["actions"] = bound(as_list(presence["actions"]) + [
-              {"action_id": o["action_id"], "run_id": RUN_ID, "action_type": o["action_type"], "status": o["status"],
-               "success": o["success"], "target_id": o["target_id"], "recipient": o["recipient"], "timestamp": o["timestamp"]}
-              for o in outcomes], MAX_TRACKED)
-          presence["errors"] = bound(as_list(presence["errors"]) + [
-              {"id": stable_id("error", o["id"]), "run_id": RUN_ID, "action_id": o["action_id"], "status": o["status"],
-               "error": o.get("error"), "timestamp": o["timestamp"]} for o in outcomes if not o["success"]], 200)
-          presence["runs"] = bound(as_list(presence["runs"]) + [
-              {"run_id": RUN_ID, "timestamp": NOW, "queue": len(queue), "selected": len(selected),
-               "pending_after": len(remaining), **counts}], MAX_RUNS)
-
-          save_json(RUNTIME_FILE, runtime)
-          save_json(PRESENCE_FILE, presence)
-          print("\n=== PRESENCE SUMMARY ===", counts, "pending_after:", len(remaining))
+          print(json.dumps(status, ensure_ascii=False, indent=2))
           PY
 
-      - name: Validate JSON state
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os
-          for path in ["memory/nox_core_runtime.json", "memory/nox_colony_presence.json"]:
-              if os.path.exists(path):
-                  with open(path, encoding="utf-8") as fh:
-                      json.load(fh)
-                  print("VALID JSON:", path)
-          PY
-
-      - name: Commit and push
-        if: ${{ inputs.dry_run != true }}
-        shell: bash
+      - name: Commit presence state
         run: |
           set -euo pipefail
           git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
-          for f in memory/nox_core_runtime.json memory/nox_colony_presence.json; do
-            [ -e "$f" ] && git add -- "$f"
-          done
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+          git config user.email "nox-agent@users.noreply.github.com"
+
+          git add data/heartbeat.json data/presence.log
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(nox): update presence heartbeat"
+            git push
+          else
+            echo "État de présence inchangé."
           fi
-          git commit -m "chore(nox): record colony presence outcomes"
-          for attempt in 1 2 3 4; do
-            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Pushed."
-              exit 0
-            fi
-            git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 3))
-          done
-          echo "Push failed after retries."
-          exit 1
