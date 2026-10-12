@@ -1,3 +1,4 @@
+
 name: NØX - Work Factory
 
 on:
@@ -6,19 +7,11 @@ on:
     - cron: "17 */3 * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: nox-state
   cancel-in-progress: false
-
-env:
-  EXTERNAL_AI_USED: "false"
-  GEMINI_USED: "false"
-  PROJECT_COST_EUR: "0"
-  AUTO_PAYMENT: "false"
-  AUTO_SPENDING: "false"
-  PYTHONUNBUFFERED: "1"
 
 jobs:
   work-factory:
@@ -26,47 +19,267 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Validate modules
+      - name: Install search dependency
+        run: python -m pip install --disable-pip-version-check ddgs
+
+      - name: Process research queue
         run: |
           set -euo pipefail
 
-          found=0
-          for file in core.py self_evolution.py work_factory.py presence.py; do
-            if [ -f "$file" ]; then
-              python -m py_compile "$file"
-              found=1
-            fi
-          done
+          python - <<'PY'
+          import hashlib
+          import json
+          import traceback
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-          if [ "$found" -eq 0 ]; then
-            echo "Aucun module Python détecté."
+          from ddgs import DDGS
+
+          ROOT = Path.cwd()
+          FACTORY_PATH = ROOT / "memory/nox_work_factory.json"
+          MEMORY_PATH = ROOT / "memory/nox_core_memory.json"
+          MAX_TASKS = 2
+          MAX_HISTORY = 300
+          MAX_RESULTS = 5
+          NOW = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+          def read_object(path):
+              if not path.exists():
+                  return {}
+              with path.open("r", encoding="utf-8") as file:
+                  value = json.load(file)
+              if not isinstance(value, dict):
+                  raise ValueError(f"{path}: la racine JSON doit être un objet")
+              return value
+
+          def write_object(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              temporary = path.with_suffix(path.suffix + ".tmp")
+              with temporary.open("w", encoding="utf-8") as file:
+                  json.dump(value, file, ensure_ascii=False, indent=2)
+                  file.write("\n")
+              temporary.replace(path)
+
+          def stable_id(value):
+              raw = json.dumps(
+                  value, sort_keys=True, ensure_ascii=False, default=str
+              )
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+          def get_queue(factory):
+              # Même priorité de clés que le Core #138.
+              for key in ("pending_work", "pending", "tasks"):
+                  if isinstance(factory.get(key), list):
+                      return key, factory[key]
+              factory["pending"] = []
+              return "pending", factory["pending"]
+
+          def task_text(task):
+              for key in ("query", "description", "title", "content"):
+                  value = task.get(key)
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()[:1000]
+              return ""
+
+          def is_human_review(task):
+              return (
+                  task.get("requires_human_review") is True
+                  or task.get("status") == "needs_human_review"
+                  or task.get("type") in {
+                      "dm_review", "human_review", "code_change"
+                  }
+              )
+
+          def save_history(factory, entry):
+              history = factory.get("history")
+              if not isinstance(history, list):
+                  history = []
+                  factory["history"] = history
+              history.append(entry)
+              del history[:-MAX_HISTORY]
+
+          factory = read_object(FACTORY_PATH)
+          memory = read_object(MEMORY_PATH)
+          queue_key, queue = get_queue(factory)
+
+          results_log = factory.get("results")
+          if not isinstance(results_log, list):
+              results_log = []
+              factory["results"] = results_log
+
+          errors_log = factory.get("errors")
+          if not isinstance(errors_log, list):
+              errors_log = []
+              factory["errors"] = errors_log
+
+          completed = 0
+          failed = 0
+          skipped = 0
+
+          for task in queue:
+              if completed + failed >= MAX_TASKS:
+                  break
+
+              if not isinstance(task, dict):
+                  continue
+
+              if task.get("status", "pending") not in {
+                  "pending", "queued", "retry"
+              }:
+                  continue
+
+              if is_human_review(task):
+                  skipped += 1
+                  continue
+
+              task_type = task.get("type", "research")
+              if task_type != "research":
+                  task["status"] = "needs_human_review"
+                  task["requires_human_review"] = True
+                  task["updated_at"] = NOW
+                  task["review_reason"] = (
+                      "Type de tâche non pris en charge automatiquement."
+                  )
+                  skipped += 1
+                  continue
+
+              query = task_text(task)
+              if not query:
+                  task["status"] = "failed"
+                  task["updated_at"] = NOW
+                  task["error"] = "Tâche sans requête exploitable."
+                  failed += 1
+                  entry = {
+                      "task_id": task.get("id"),
+                      "timestamp": NOW,
+                      "status": "failed",
+                      "error": task["error"],
+                  }
+                  errors_log.append(entry)
+                  save_history(factory, entry)
+                  continue
+
+              task_id = task.get("id") or stable_id(task)
+              task["id"] = task_id
+              task["status"] = "running"
+              task["started_at"] = NOW
+              task["updated_at"] = NOW
+
+              try:
+                  raw_results = DDGS().text(
+                      query,
+                      max_results=MAX_RESULTS,
+                  )
+
+                  sources = []
+                  for item in raw_results or []:
+                      if not isinstance(item, dict):
+                          continue
+                      sources.append({
+                          "title": str(item.get("title", ""))[:300],
+                          "url": str(item.get("href", ""))[:1000],
+                          "snippet": str(item.get("body", ""))[:1500],
+                          "verified": False,
+                      })
+
+                  result_id = stable_id({
+                      "task_id": task_id,
+                      "sources": sources,
+                  })
+
+                  result = {
+                      "id": result_id,
+                      "task_id": task_id,
+                      "timestamp": NOW,
+                      "query": query,
+                      "status": "completed",
+                      "source_count": len(sources),
+                      "sources": sources,
+                      "verified": False,
+                      "verification_required": True,
+                  }
+
+                  results_log.append(result)
+                  del results_log[:-MAX_HISTORY]
+
+                  task["status"] = "completed"
+                  task["completed_at"] = NOW
+                  task["result_id"] = result_id
+                  task["result_summary"] = (
+                      f"{len(sources)} résultat(s) collecté(s). "
+                      "Les sources ne sont pas encore vérifiées."
+                  )
+
+                  save_history(factory, {
+                      "task_id": task_id,
+                      "timestamp": NOW,
+                      "status": "completed",
+                      "task": task.copy(),
+                      "result_id": result_id,
+                      "source_count": len(sources),
+                  })
+                  completed += 1
+
+              except Exception as exc:
+                  task["status"] = "failed"
+                  task["updated_at"] = NOW
+                  task["error"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+
+                  error_entry = {
+                      "task_id": task_id,
+                      "timestamp": NOW,
+                      "status": "failed",
+                      "error": task["error"],
+                  }
+                  errors_log.append(error_entry)
+                  del errors_log[:-MAX_HISTORY]
+                  save_history(factory, error_entry)
+                  failed += 1
+
+                  print(
+                      f"Échec de la tâche {task_id}: {task['error']}"
+                  )
+
+          factory["last_run_at"] = NOW
+          factory["last_run"] = {
+              "timestamp": NOW,
+              "queue_key": queue_key,
+              "completed": completed,
+              "failed": failed,
+              "needs_human_review": skipped,
+              "external_ai_used": False,
+              "project_cost_eur": 0,
+          }
+
+          write_object(FACTORY_PATH, factory)
+
+          print("=== NØX WORK FACTORY ===")
+          print("File:", queue_key)
+          print("Terminées:", completed)
+          print("Échecs:", failed)
+          print("À examiner / non prises en charge:", skipped)
+          print("IA externe: désactivée")
+          PY
+
+      - name: Commit work results
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memory/nox_work_factory.json
+          if git diff --cached --quiet; then
+            echo "Aucun changement à enregistrer."
             exit 0
           fi
-
-      - name: Run repository tests if available
-        run: |
-          set -euo pipefail
-
-          if [ -d tests ]; then
-            python -m unittest discover -s tests -v
-          elif [ -f test_core.py ]; then
-            python -m unittest -v test_core
-          else
-            echo "Aucun test automatisé trouvé."
-          fi
-
-      - name: Report work factory policy
-        run: |
-          echo "=== NØX WORK FACTORY ==="
-          echo "Python syntax checks completed."
-          echo "External AI disabled."
-          echo "No payment or spending operations."
-          echo "No source files generated automatically."
+          git commit -m "chore(nox): process research tasks"
+          git push
