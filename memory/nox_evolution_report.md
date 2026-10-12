@@ -1,6 +1,6 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-12T06:38:23.754826+00:00
+Last update: 2026-10-12T16:11:28.566981+00:00
 
 ## Colony profile
 
@@ -13,7 +13,7 @@ Last update: 2026-10-12T06:38:23.754826+00:00
 
 ## Core
 
-- observations: 403
+- observations: 429
 - facts: 0
 - experiences: 87
 - hypotheses: 0
@@ -34,8 +34,8 @@ Last update: 2026-10-12T06:38:23.754826+00:00
 
 ## Work Factory
 
-- pending: 54
-- history: 62
+- pending: 71
+- history: 64
 - results: 13
 - failed: 35
 
