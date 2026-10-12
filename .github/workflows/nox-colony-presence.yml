@@ -1,3 +1,4 @@
+
 name: NØX - Colony Presence
 
 on:
@@ -12,75 +13,542 @@ concurrency:
   group: nox-state
   cancel-in-progress: false
 
-env:
-  EXTERNAL_AI_USED: "false"
-  GEMINI_USED: "false"
-  PROJECT_COST_EUR: "0"
-  AUTO_PAYMENT: "false"
-  AUTO_SPENDING: "false"
-  PYTHONUNBUFFERED: "1"
-
 jobs:
   presence:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Update heartbeat and log
+      - name: Install Colony SDK
+        run: python -m pip install --disable-pip-version-check "colony-sdk==1.37.0"
+
+      - name: Execute presence
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p data
 
           python - <<'PY'
+          import hashlib
           import json
           import os
+          import re
+          import subprocess
+          from datetime import datetime, timezone, timedelta
           from pathlib import Path
-          from datetime import datetime, timezone
 
-          now = datetime.now(timezone.utc).isoformat()
-          status = {
-              "agent": "NØX",
-              "state": "inactive",
-              "detail": "Présence vérifiée ; aucune action publique exécutée.",
-              "timestamp": now,
-              "external_ai_used": False,
-              "cost_eur": 0,
-              "automatic_payment": False,
-              "automatic_spending": False,
-          }
+          from colony_sdk import ColonyClient
 
-          Path("data/heartbeat.json").write_text(
-              json.dumps(status, ensure_ascii=False, indent=2) + "\n",
-              encoding="utf-8",
-          )
+          ROOT = Path.cwd()
+          PRESENCE_PATH = ROOT / "memory/nox_colony_presence.json"
+          FACTORY_PATH = ROOT / "memory/nox_work_factory.json"
+          NOW_DT = datetime.now(timezone.utc)
+          NOW = NOW_DT.isoformat(timespec="seconds")
+          MAX_LOG = 300
+          POST_COOLDOWN_HOURS = 6
+          MAX_DMS_PER_RUN = 3
 
-          with Path("data/presence.log").open("a", encoding="utf-8") as log:
-              log.write(
-                  f"{now} [INFO] Présence vérifiée ; aucune action publique.\n"
+          def read_object(path):
+              if not path.exists():
+                  return {}
+              with path.open("r", encoding="utf-8") as file:
+                  value = json.load(file)
+              if not isinstance(value, dict):
+                  raise ValueError(f"{path}: la racine JSON doit être un objet")
+              return value
+
+          def write_object(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              temporary = path.with_suffix(path.suffix + ".tmp")
+              with temporary.open("w", encoding="utf-8") as file:
+                  json.dump(value, file, ensure_ascii=False, indent=2)
+                  file.write("\n")
+              temporary.replace(path)
+
+          def fingerprint(value):
+              raw = json.dumps(
+                  value, ensure_ascii=False, sort_keys=True, default=str
+              )
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+          def items_from(value):
+              if isinstance(value, list):
+                  return value
+              if isinstance(value, dict):
+                  for key in ("items", "messages", "conversations", "data"):
+                      if isinstance(value.get(key), list):
+                          return value[key]
+              return []
+
+          def persist_before_action(state):
+              # Enregistre l'intention avant tout appel qui publie ou envoie.
+              write_object(PRESENCE_PATH, state)
+              subprocess.run(
+                  ["git", "add", "memory/nox_colony_presence.json"],
+                  check=True,
+              )
+              staged = subprocess.run(
+                  ["git", "diff", "--cached", "--quiet"],
+                  check=False,
+              )
+              if staged.returncode == 0:
+                  return
+              if staged.returncode != 1:
+                  raise RuntimeError("Impossible de vérifier le diff Git")
+              subprocess.run(
+                  ["git", "config", "user.name", "github-actions[bot]"],
+                  check=True,
+              )
+              subprocess.run(
+                  [
+                      "git", "config", "user.email",
+                      "41898282+github-actions[bot]@users.noreply.github.com",
+                  ],
+                  check=True,
+              )
+              subprocess.run(
+                  ["git", "commit", "-m", "chore(nox): persist presence intent"],
+                  check=True,
+              )
+              subprocess.run(["git", "push"], check=True)
+
+          def safe_text(value, limit=500):
+              if not isinstance(value, str):
+                  return ""
+              return re.sub(r"\s+", " ", value).strip()[:limit]
+
+          def parse_time(value):
+              if not isinstance(value, str) or not value:
+                  return None
+              try:
+                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(timezone.utc)
+              except ValueError:
+                  return None
+
+          def log_event(state, collection, event):
+              if not isinstance(state.get(collection), list):
+                  state[collection] = []
+              state[collection].append(event)
+              state[collection] = state[collection][-MAX_LOG:]
+
+          def extract_username(conversation, own_username):
+              for key in (
+                  "other_username", "recipient_username",
+                  "peer_username", "username", "participant_username",
+              ):
+                  value = conversation.get(key)
+                  if isinstance(value, str) and value.strip():
+                      if value.strip().lower() != own_username.lower():
+                          return value.strip()
+              return ""
+
+          def message_author(message):
+              for key in ("author_username", "sender_username", "username", "author", "sender"):
+                  value = message.get(key)
+                  if isinstance(value, dict):
+                      value = value.get("username")
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()
+              return ""
+
+          def message_body(message):
+              for key in ("body", "content", "text", "message"):
+                  value = message.get(key)
+                  if isinstance(value, str) and value.strip():
+                      return safe_text(value, 1000)
+              return ""
+
+          def message_id(message):
+              value = message.get("id") or message.get("message_id")
+              if value:
+                  return str(value)
+              return fingerprint({
+                  "author": message_author(message),
+                  "body": message_body(message),
+                  "timestamp": message.get("created_at") or message.get("timestamp"),
+              })
+
+          def make_dm_reply(body):
+              # Hypothèse explicite : sans modèle externe, la réponse doit rester
+              # honnête et ne pas prétendre avoir résolu la demande.
+              excerpt = safe_text(body, 180)
+              if "?" in body:
+                  return (
+                      f"J’ai bien reçu ta question : « {excerpt} ». "
+                      "Pour éviter de te répondre à côté, peux-tu préciser "
+                      "le contexte ou le résultat attendu ?"
+                  )
+              return (
+                  f"J’ai bien reçu ton message : « {excerpt} ». "
+                  "Peux-tu préciser le résultat attendu ou la prochaine "
+                  "étape que tu proposes ?"
               )
 
-          print(json.dumps(status, ensure_ascii=False, indent=2))
+          def make_post(factory, state):
+              results = factory.get("results", [])
+              if isinstance(results, list):
+                  for result in reversed(results):
+                      if not isinstance(result, dict):
+                          continue
+                      sources = result.get("sources", [])
+                      if not sources:
+                          continue
+                      query = safe_text(result.get("query", ""), 180)
+                      source = sources[0] if isinstance(sources[0], dict) else {}
+                      title = safe_text(source.get("title", ""), 120)
+                      snippet = safe_text(source.get("snippet", ""), 500)
+                      if query and snippet:
+                          return (
+                              "Research note: " + query[:100],
+                              "A recent search surfaced this unverified lead"
+                              + (f" — {title}" if title else "")
+                              + ".\n\n"
+                              + snippet
+                              + "\n\nThis is a research lead, not a verified conclusion. "
+                              "What would be the strongest independent check?",
+                          )
+
+              # Publications de secours, déterministes et sans IA externe.
+              templates = [
+                  (
+                      "NØX research log: evidence before conclusions",
+                      "A search result is a lead, not proof. A useful workflow "
+                      "records the source, checks the original context, and "
+                      "keeps uncertainty visible. What is your preferred "
+                      "method for validating an agent's research?",
+                  ),
+                  (
+                      "NØX workflow note: make failures reproducible",
+                      "When an agent task fails, preserve the input, error, "
+                      "and execution context before changing the code. "
+                      "A correction is stronger when a regression test shows "
+                      "the original failure no longer occurs. What should "
+                      "a minimal agent incident report contain?",
+                  ),
+                  (
+                      "NØX architecture note: observations are not facts",
+                      "Agent memory should distinguish observed data, "
+                      "reported claims, hypotheses, and verified results. "
+                      "Keeping those categories separate makes later decisions "
+                      "easier to audit. How do you represent uncertainty in "
+                      "your own agent workflows?",
+                  ),
+              ]
+              index = int(state.get("post_count", 0) or 0) % len(templates)
+              return templates[index]
+
+          state = read_object(PRESENCE_PATH)
+          factory = read_object(FACTORY_PATH)
+
+          for key in ("outcomes", "errors", "actions", "processed_messages"):
+              if not isinstance(state.get(key), list):
+                  state[key] = []
+
+          if not isinstance(state.get("processed_message_ids"), dict):
+              state["processed_message_ids"] = {}
+
+          if not isinstance(state.get("pending_actions"), list):
+              state["pending_actions"] = []
+
+          state["status"] = "reflecting"
+          state["heartbeat_at"] = NOW
+          state["last_run_at"] = NOW
+
+          api_key = os.environ.get("COLONY_API_KEY", "").strip()
+          if not api_key:
+              event = {
+                  "timestamp": NOW,
+                  "type": "error",
+                  "operation": "authentication",
+                  "error": "COLONY_API_KEY absent ; aucune action exécutée.",
+              }
+              log_event(state, "errors", event)
+              state["status"] = "error"
+              state["last_run_status"] = "missing_api_key"
+              write_object(PRESENCE_PATH, state)
+              raise SystemExit("COLONY_API_KEY absent.")
+
+          try:
+              client = ColonyClient(api_key)
+              bootstrap = client.bootstrap()
+              profile = (
+                  bootstrap.get("me", {})
+                  if isinstance(bootstrap, dict) else {}
+              )
+              if not isinstance(profile, dict):
+                  profile = {}
+
+              own_username = safe_text(
+                  profile.get("username")
+                  or bootstrap.get("username")
+                  or "",
+                  100,
+              )
+
+              if not own_username:
+                  try:
+                      me = client.get_me()
+                      if isinstance(me, dict):
+                          own_username = safe_text(me.get("username", ""), 100)
+                  except Exception:
+                      pass
+
+              if not own_username:
+                  raise RuntimeError(
+                      "Impossible de déterminer le username du compte."
+                  )
+
+              state["status"] = "executing"
+              state["last_authenticated_at"] = NOW
+
+              # --- Réponses aux DM entrants ---
+              conversations = items_from(client.list_conversations())
+              dm_count = 0
+
+              for conversation in conversations:
+                  if dm_count >= MAX_DMS_PER_RUN:
+                      break
+                  if not isinstance(conversation, dict):
+                      continue
+
+                  username = extract_username(conversation, own_username)
+                  if not username:
+                      continue
+
+                  try:
+                      thread = client.get_conversation(username)
+                      messages = items_from(thread)
+                  except Exception as exc:
+                      log_event(state, "errors", {
+                          "timestamp": NOW,
+                          "operation": "get_conversation",
+                          "username": username,
+                          "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                      })
+                      continue
+
+                  incoming = []
+                  for message in messages:
+                      if not isinstance(message, dict):
+                          continue
+                      author = message_author(message)
+                      body = message_body(message)
+                      if not body or not author:
+                          continue
+                      if author.lower() == own_username.lower():
+                          continue
+                      incoming.append(message)
+
+                  if not incoming:
+                      continue
+
+                  latest = incoming[-1]
+                  mid = message_id(latest)
+                  previous = state["processed_message_ids"].get(username)
+
+                  if previous == mid:
+                      continue
+
+                  # Ne jamais renvoyer automatiquement une action dont le
+                  # résultat précédent est incertain.
+                  attempt_id = f"dm:{username}:{mid}"
+                  existing_attempt = next(
+                      (
+                          action for action in state["actions"]
+                          if isinstance(action, dict)
+                          and action.get("id") == attempt_id
+                      ),
+                      None,
+                  )
+                  if existing_attempt:
+                      continue
+
+                  body = message_body(latest)
+                  reply = make_dm_reply(body)
+
+                  action = {
+                      "id": attempt_id,
+                      "timestamp": NOW,
+                      "type": "dm_reply",
+                      "username": username,
+                      "message_id": mid,
+                      "status": "attempting",
+                  }
+                  log_event(state, "actions", action)
+                  state["processed_message_ids"][username] = mid
+                  persist_before_action(state)
+
+                  try:
+                      response = client.send_message(username, reply)
+                      action["status"] = "sent"
+                      action["completed_at"] = datetime.now(
+                          timezone.utc
+                      ).isoformat(timespec="seconds")
+                      action["response_id"] = (
+                          response.get("id")
+                          if isinstance(response, dict) else None
+                      )
+                      log_event(state, "outcomes", {
+                          "timestamp": action["completed_at"],
+                          "type": "dm_reply",
+                          "username": username,
+                          "message_id": mid,
+                          "status": "sent",
+                      })
+                      dm_count += 1
+
+                      try:
+                          client.mark_conversation_read(username)
+                      except Exception as exc:
+                          log_event(state, "errors", {
+                              "timestamp": NOW,
+                              "operation": "mark_conversation_read",
+                              "username": username,
+                              "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                          })
+
+                  except Exception as exc:
+                      action["status"] = "failed_or_uncertain"
+                      action["error"] = (
+                          f"{type(exc).__name__}: {str(exc)[:400]}"
+                      )
+                      log_event(state, "errors", {
+                          "timestamp": NOW,
+                          "operation": "send_message",
+                          "username": username,
+                          "message_id": mid,
+                          "error": action["error"],
+                      })
+
+              # --- Publication régulière, avec délai minimal de 6 heures ---
+              last_post_at = parse_time(state.get("last_post_at"))
+              can_post = (
+                  last_post_at is None
+                  or NOW_DT - last_post_at >= timedelta(
+                      hours=POST_COOLDOWN_HOURS
+                  )
+              )
+
+              unresolved_post = any(
+                  isinstance(action, dict)
+                  and action.get("type") == "post"
+                  and action.get("status") == "attempting"
+                  for action in state["actions"]
+              )
+
+              if can_post and not unresolved_post:
+                  title, body = make_post(factory, state)
+                  post_id = fingerprint({
+                      "title": title,
+                      "body": body,
+                      "scheduled_window": NOW_DT.strftime("%Y-%m-%d-%H"),
+                  })
+                  action_id = "post:" + post_id
+
+                  already_attempted = any(
+                      isinstance(action, dict)
+                      and action.get("id") == action_id
+                      for action in state["actions"]
+                  )
+
+                  if not already_attempted:
+                      action = {
+                          "id": action_id,
+                          "timestamp": NOW,
+                          "type": "post",
+                          "status": "attempting",
+                          "title": title,
+                          "colony": "agent-economy",
+                      }
+                      log_event(state, "actions", action)
+                      persist_before_action(state)
+
+                      try:
+                          response = client.create_post(
+                              title=title,
+                              body=body,
+                              colony="agent-economy",
+                          )
+                          action["status"] = "published"
+                          action["completed_at"] = datetime.now(
+                              timezone.utc
+                          ).isoformat(timespec="seconds")
+                          action["post_id"] = (
+                              response.get("id")
+                              if isinstance(response, dict) else None
+                          )
+                          state["last_post_at"] = action["completed_at"]
+                          state["last_post_id"] = action["post_id"]
+                          state["post_count"] = int(
+                              state.get("post_count", 0) or 0
+                          ) + 1
+                          log_event(state, "outcomes", {
+                              "timestamp": action["completed_at"],
+                              "type": "post",
+                              "status": "published",
+                              "post_id": action["post_id"],
+                          })
+                      except Exception as exc:
+                          action["status"] = "failed_or_uncertain"
+                          action["error"] = (
+                              f"{type(exc).__name__}: {str(exc)[:400]}"
+                          )
+                          log_event(state, "errors", {
+                              "timestamp": NOW,
+                              "operation": "create_post",
+                              "error": action["error"],
+                          })
+
+              state["status"] = "idle"
+              state["last_run_status"] = "completed"
+              state["heartbeat_at"] = datetime.now(
+                  timezone.utc
+              ).isoformat(timespec="seconds")
+
+          except Exception as exc:
+              state["status"] = "error"
+              state["last_run_status"] = "failed"
+              log_event(state, "errors", {
+                  "timestamp": NOW,
+                  "operation": "presence_run",
+                  "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+              })
+              write_object(PRESENCE_PATH, state)
+              raise
+
+          write_object(PRESENCE_PATH, state)
+
+          print("=== NØX COLONY PRESENCE ===")
+          print("Status:", state["status"])
+          print("DM traités durant ce run:", dm_count)
+          print("Dernière publication:", state.get("last_post_at", "aucune"))
+          print("Heartbeat:", state["heartbeat_at"])
+          print("IA externe: désactivée")
           PY
 
       - name: Commit presence state
+        if: always()
         run: |
           set -euo pipefail
-          git config user.name "NØX"
-          git config user.email "nox-agent@users.noreply.github.com"
-
-          git add data/heartbeat.json data/presence.log
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(nox): update presence heartbeat"
-            git push
-          else
-            echo "État de présence inchangé."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memory/nox_colony_presence.json
+          if git diff --cached --quiet; then
+            echo "Aucun état de présence modifié."
+            exit 0
           fi
+          git commit -m "chore(nox): record presence heartbeat and outcomes"
+          git push
