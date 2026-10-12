@@ -18,7 +18,10 @@ env:
   PROJECT_COST_EUR: "0"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
-  PYTHONUNBUFFERED: "1"
+  MEMORY_FILE: memory/nox_core_memory.json
+  RUNTIME_FILE: memory/nox_core_runtime.json
+  FACTORY_FILE: memory/nox_work_factory.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
 
 jobs:
   core:
@@ -28,256 +31,542 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install Colony SDK
         run: python -m pip install --disable-pip-version-check "colony-sdk==1.37.0"
 
-      - name: Observe, contextualize and route work
+      - name: Run NØX Core
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
         run: |
           set -euo pipefail
+
           python - <<'PY'
           import hashlib
           import json
           import os
+          import re
+          import sys
           from datetime import datetime, timezone
           from pathlib import Path
+          from typing import Any
 
-          MEMORY = Path("memory/nox_core_memory.json")
-          RUNTIME = Path("memory/nox_core_runtime.json")
-          FACTORY = Path("memory/nox_work_factory.json")
-          PRESENCE = Path("memory/nox_colony_presence.json")
+          ROOT = Path.cwd()
+          MEMORY_PATH = ROOT / os.environ["MEMORY_FILE"]
+          RUNTIME_PATH = ROOT / os.environ["RUNTIME_FILE"]
+          FACTORY_PATH = ROOT / os.environ["FACTORY_FILE"]
+          PRESENCE_PATH = ROOT / os.environ["PRESENCE_FILE"]
 
-          def now():
-              return datetime.now(timezone.utc).isoformat()
+          MAX_ITEMS = 500
+          MAX_TEXT = 4000
+          now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-          def read_object(path, default):
+          counters = {
+              "observations_added": 0,
+              "tasks_added": 0,
+              "api_calls_ok": 0,
+          }
+
+          errors = []
+          api_status = "not_configured"
+
+          def read_object(path: Path) -> dict:
               if not path.exists():
-                  return default.copy()
-              data = json.loads(path.read_text(encoding="utf-8"))
-              if not isinstance(data, dict):
-                  raise ValueError(f"{path} doit contenir un objet JSON")
-              return data
+                  return {}
 
-          def write_object(path, data):
+              with path.open("r", encoding="utf-8") as handle:
+                  value = json.load(handle)
+
+              if not isinstance(value, dict):
+                  raise ValueError(
+                      f"{path.name}: JSON root must be an object; "
+                      "refusing to overwrite the file"
+                  )
+
+              return value
+
+          def write_object(path: Path, value: dict) -> None:
               path.parent.mkdir(parents=True, exist_ok=True)
               temporary = path.with_suffix(path.suffix + ".tmp")
-              temporary.write_text(
-                  json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                  encoding="utf-8",
+
+              with temporary.open("w", encoding="utf-8") as handle:
+                  json.dump(value, handle, ensure_ascii=False, indent=2)
+                  handle.write("\n")
+
+              temporary.replace(path)
+
+          def stable_id(prefix: str, value: Any) -> str:
+              raw = json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  default=str,
               )
-              os.replace(temporary, path)
+              digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+              return f"{prefix}_{digest}"
 
-          def bounded_append(data, key, item, limit=500):
-              values = data.get(key)
-              if not isinstance(values, list):
-                  values = []
-                  data[key] = values
-              values.append(item)
-              del values[:-limit]
+          def as_dict(value: Any) -> dict:
+              return value if isinstance(value, dict) else {}
 
-          def items_from(value):
+          def extract_items(value: Any) -> list:
               if isinstance(value, list):
                   return value
+
               if isinstance(value, dict):
-                  for key in ("items", "posts", "notifications", "conversations", "data"):
-                      if isinstance(value.get(key), list):
-                          return value[key]
+                  for key in (
+                      "items",
+                      "posts",
+                      "notifications",
+                      "conversations",
+                      "messages",
+                      "data",
+                      "results",
+                  ):
+                      candidate = value.get(key)
+                      if isinstance(candidate, list):
+                          return candidate
+
               return []
 
-          def text_of(item):
+          def text_of(item: Any) -> str:
+              if isinstance(item, str):
+                  return item.strip()[:MAX_TEXT]
+
               if not isinstance(item, dict):
-                  return str(item)[:2000]
+                  return str(item).strip()[:MAX_TEXT]
+
               parts = []
-              for key in ("title", "body", "content", "text", "message", "preview"):
+
+              for key in (
+                  "title",
+                  "body",
+                  "content",
+                  "text",
+                  "message",
+                  "subject",
+                  "preview",
+                  "summary",
+              ):
                   value = item.get(key)
                   if isinstance(value, str) and value.strip():
                       parts.append(value.strip())
-              return "\n".join(parts)[:3000]
 
-          def stable_id(source, item):
-              if isinstance(item, dict):
-                  identity = item.get("id") or item.get("uuid") or item.get("url")
-              else:
-                  identity = None
-              basis = str(identity or text_of(item) or json.dumps(item, sort_keys=True, default=str))
-              return hashlib.sha256(f"{source}:{basis}".encode()).hexdigest()[:24]
+              nested = item.get("post")
+              if isinstance(nested, dict):
+                  for key in ("title", "body", "content", "text"):
+                      value = nested.get(key)
+                      if isinstance(value, str) and value.strip():
+                          parts.append(value.strip())
 
-          memory = read_object(MEMORY, {})
-          runtime = read_object(RUNTIME, {})
-          factory = read_object(FACTORY, {})
-          presence = read_object(PRESENCE, {})
+              return "\n".join(dict.fromkeys(parts))[:MAX_TEXT]
 
-          for key in ("observations", "experiences", "results", "learnings"):
-              if not isinstance(memory.get(key), list):
-                  memory[key] = []
+          def append_bounded(
+              container: dict,
+              key: str,
+              item: dict,
+              limit: int = MAX_ITEMS,
+          ) -> bool:
+              current = container.get(key)
 
-          if not isinstance(runtime.get("processed_ids"), list):
-              runtime["processed_ids"] = []
+              if current is None:
+                  current = []
+                  container[key] = current
 
-          pending_key = (
-              "pending" if isinstance(factory.get("pending"), list)
-              else "pending_work" if isinstance(factory.get("pending_work"), list)
-              else "pending"
-          )
-          if not isinstance(factory.get(pending_key), list):
-              factory[pending_key] = []
+              if not isinstance(current, list):
+                  errors.append(
+                      f"Memory field '{key}' is not a list; left unchanged"
+                  )
+                  return False
 
-          existing_tasks = {
-              task.get("task_id")
-              for task in factory[pending_key]
-              if isinstance(task, dict)
-          }
+              item_id = item.get("id")
 
-          processed = set(runtime["processed_ids"])
-          observations_added = 0
-          tasks_added = 0
-          errors = []
-          api_summary = {"connected": False, "feed": 0, "notifications": 0, "conversations": 0}
+              if item_id and any(
+                  isinstance(old, dict) and old.get("id") == item_id
+                  for old in current
+              ):
+                  return False
 
-          def observe(source, item):
-              nonlocal observations_added
-              identifier = stable_id(source, item)
-              if identifier in processed:
-                  return identifier
-              record = {
-                  "id": identifier,
-                  "timestamp": now(),
-                  "source": source,
-                  "classification": "observation",
-                  "content": text_of(item),
-                  "source_data": item if isinstance(item, dict) else {"value": str(item)},
-                  "confidence": "observed",
-                  "external_ai_used": False,
-              }
-              bounded_append(memory, "observations", record)
-              processed.add(identifier)
-              observations_added += 1
-              return identifier
+              current.append(item)
 
-          def queue_research(source, item, identifier):
-              nonlocal tasks_added
+              if len(current) > limit:
+                  del current[:-limit]
+
+              return True
+
+          def observe(
+              memory: dict,
+              source: str,
+              item: Any,
+              category: str = "observed_fact",
+          ) -> None:
               content = text_of(item)
-              if not content or "?" not in content:
+
+              if not content:
+                  content = json.dumps(
+                      item,
+                      ensure_ascii=False,
+                      sort_keys=True,
+                      default=str,
+                  )[:MAX_TEXT]
+
+              record = {
+                  "id": stable_id(
+                      "obs",
+                      {"source": source, "item": item},
+                  ),
+                  "timestamp": now,
+                  "type": category,
+                  "source": source,
+                  "content": content,
+                  "confidence": "unverified",
+                  "verified": False,
+              }
+
+              if append_bounded(memory, "observations", record):
+                  counters["observations_added"] += 1
+
+          def get_queue(factory: dict) -> tuple[str, list]:
+              for key in ("pending_work", "pending", "tasks"):
+                  if isinstance(factory.get(key), list):
+                      return key, factory[key]
+
+              factory["pending"] = []
+              return "pending", factory["pending"]
+
+          def queue_research(
+              factory: dict,
+              source: str,
+              item: Any,
+              identifier: str,
+          ) -> None:
+              content = text_of(item)
+
+              if not content:
                   return
-              task_id = f"research-{identifier}"
-              if task_id in existing_tasks:
+
+              needs_research = re.search(
+                  r"\?|\b(how|why|what|which|when|where|"
+                  r"research|investigate|verify|compare|test|find)\b",
+                  content,
+                  re.IGNORECASE,
+              )
+
+              if not needs_research:
                   return
-              factory[pending_key].append({
-                  "task_id": task_id,
+
+              queue_key, queue = get_queue(factory)
+
+              task_id = stable_id(
+                  "task",
+                  {
+                      "source": source,
+                      "identifier": identifier,
+                      "content": content,
+                  },
+              )
+
+              if any(
+                  isinstance(old, dict) and old.get("id") == task_id
+                  for old in queue
+              ):
+                  return
+
+              task = {
+                  "id": task_id,
+                  "created_at": now,
+                  "source": source,
                   "type": "research",
                   "status": "pending",
-                  "created_at": now(),
-                  "source": source,
-                  "source_id": identifier,
                   "query": content[:1000],
-                  "external_ai_allowed": False,
-              })
-              existing_tasks.add(task_id)
-              tasks_added += 1
+                  "description": (
+                      f"Research and verify an item observed from {source}."
+                  ),
+                  "evidence_required": True,
+                  "requires_human_review": False,
+              }
 
+              queue.append(task)
+
+              if len(queue) > MAX_ITEMS:
+                  del queue[:-MAX_ITEMS]
+
+              counters["tasks_added"] += 1
+
+          def queue_dm_review(factory: dict, conversation: dict) -> None:
+              unread = conversation.get("unread_count", 0)
+
+              try:
+                  has_unread = int(unread or 0) > 0
+              except (TypeError, ValueError):
+                  has_unread = False
+
+              if not has_unread:
+                  return
+
+              conversation_id = str(
+                  conversation.get("id")
+                  or conversation.get("conversation_id")
+                  or stable_id("conversation", conversation)
+              )
+
+              task_id = stable_id("dm_review", conversation_id)
+              queue_key, queue = get_queue(factory)
+
+              if any(
+                  isinstance(old, dict) and old.get("id") == task_id
+                  for old in queue
+              ):
+                  return
+
+              queue.append({
+                  "id": task_id,
+                  "created_at": now,
+                  "source": "colony_conversation_metadata",
+                  "type": "dm_review",
+                  "status": "needs_human_review",
+                  "description": (
+                      "Unread conversation detected. Review it and decide "
+                      "whether a reply is appropriate."
+                  ),
+                  "conversation_id": conversation_id,
+                  "requires_human_review": True,
+              })
+
+              if len(queue) > MAX_ITEMS:
+                  del queue[:-MAX_ITEMS]
+
+              counters["tasks_added"] += 1
+
+          def record_error(label: str, exc: Exception) -> None:
+              message = (
+                  f"{label}: {type(exc).__name__}: {str(exc)[:500]}"
+              )
+              errors.append(message)
+              print("ERROR:", message, file=sys.stderr)
+
+          # Load every existing file before modifying anything.
+          # Invalid JSON causes the workflow to fail rather than overwrite data.
+          memory = read_object(MEMORY_PATH)
+          runtime = read_object(RUNTIME_PATH)
+          factory = read_object(FACTORY_PATH)
+          presence = read_object(PRESENCE_PATH)
+
+          # Observe Presence outcomes and errors idempotently.
+          for key in ("outcomes", "errors"):
+              values = presence.get(key, [])
+
+              if not isinstance(values, list):
+                  continue
+
+              for entry in values[-100:]:
+                  if isinstance(entry, dict):
+                      category = (
+                          "execution_outcome"
+                          if key == "outcomes"
+                          else "reported_error"
+                      )
+
+                      observe(
+                          memory,
+                          f"presence_{key}",
+                          entry,
+                          category,
+                      )
+
+          # Colony operations in this workflow are read-only.
+          # This workflow never posts, comments, messages, votes or pays.
           api_key = os.environ.get("COLONY_API_KEY", "").strip()
+
           if api_key:
               try:
                   from colony_sdk import ColonyClient
+
                   client = ColonyClient(api_key)
+                  bootstrap = client.bootstrap()
+
+                  counters["api_calls_ok"] += 1
+                  api_status = "authenticated"
+
+                  observe(
+                      memory,
+                      "colony_bootstrap",
+                      as_dict(bootstrap),
+                      "platform_state",
+                  )
 
                   try:
-                      client.bootstrap()
-                      api_summary["connected"] = True
+                      feed = client.get_for_you_feed(limit=12)
+                      counters["api_calls_ok"] += 1
+
+                      for entry in extract_items(feed):
+                          observe(memory, "colony_feed", entry)
+
+                          identifier = str(
+                              as_dict(entry).get("id")
+                              or stable_id("feed", entry)
+                          )
+
+                          queue_research(
+                              factory,
+                              "colony_feed",
+                              entry,
+                              identifier,
+                          )
+
                   except Exception as exc:
-                      errors.append(f"bootstrap: {type(exc).__name__}: {exc}")
+                      record_error("get_for_you_feed", exc)
 
                   try:
-                      feed = items_from(client.get_for_you_feed(limit=12))
-                      api_summary["feed"] = len(feed)
-                      for post in feed:
-                          identifier = observe("colony_feed", post)
-                          queue_research("colony_feed", post, identifier)
-                  except Exception as exc:
-                      errors.append(f"feed: {type(exc).__name__}: {exc}")
-
-                  try:
-                      notifications = items_from(
-                          client.get_notifications(unread_only=True, limit=20)
+                      notifications = client.get_notifications(
+                          unread_only=True,
+                          limit=20,
                       )
-                      api_summary["notifications"] = len(notifications)
-                      for notification in notifications:
-                          identifier = observe("colony_notification", notification)
-                          queue_research("colony_notification", notification, identifier)
+                      counters["api_calls_ok"] += 1
+
+                      for entry in extract_items(notifications):
+                          observe(
+                              memory,
+                              "colony_notification",
+                              entry,
+                              "notification",
+                          )
+
+                          identifier = str(
+                              as_dict(entry).get("id")
+                              or stable_id("notification", entry)
+                          )
+
+                          queue_research(
+                              factory,
+                              "colony_notification",
+                              entry,
+                              identifier,
+                          )
+
                   except Exception as exc:
-                      errors.append(f"notifications: {type(exc).__name__}: {exc}")
+                      record_error("get_notifications", exc)
 
                   try:
-                      conversations = items_from(client.list_conversations())
-                      api_summary["conversations"] = len(conversations)
-                      for conversation in conversations[:20]:
-                          identifier = observe("colony_conversation", conversation)
-                          # Les conversations sont enregistrées pour analyse.
-                          # Le Core n'envoie pas de réponse improvisée.
+                      conversations = client.list_conversations()
+                      counters["api_calls_ok"] += 1
+
+                      for entry in extract_items(conversations):
+                          conversation = as_dict(entry)
+
+                          observe(
+                              memory,
+                              "colony_conversation_metadata",
+                              conversation,
+                              "conversation_metadata",
+                          )
+
+                          queue_dm_review(factory, conversation)
+
                   except Exception as exc:
-                      errors.append(f"conversations: {type(exc).__name__}: {exc}")
+                      record_error("list_conversations", exc)
 
               except Exception as exc:
-                  errors.append(f"sdk: {type(exc).__name__}: {exc}")
+                  api_status = "failed"
+                  record_error("colony_bootstrap_or_client", exc)
+
           else:
-              print("COLONY_API_KEY absent : observation distante ignorée.")
+              print(
+                  "COLONY_API_KEY is not configured; "
+                  "remote observations skipped."
+              )
 
-          runtime["run_count"] = int(runtime.get("run_count", 0)) + 1
-          runtime["last_run"] = now()
-          runtime["last_run_status"] = "completed_with_errors" if errors else "completed"
-          runtime["last_observations_added"] = observations_added
-          runtime["last_tasks_added"] = tasks_added
-          runtime["last_api_summary"] = api_summary
-          runtime["external_ai_used"] = False
-          runtime["gemini_used"] = False
-          runtime["project_cost_eur"] = 0
-          runtime["auto_payment"] = False
-          runtime["auto_spending"] = False
-          runtime["last_errors"] = errors[-20:]
+          # A partial API failure must not be reported as full success.
+          if errors:
+              run_status = "partial"
+          elif api_status == "authenticated":
+              run_status = "success"
+          else:
+              run_status = "local_only"
 
-          for error in errors:
-              bounded_append(runtime, "errors", {
-                  "timestamp": now(),
-                  "component": "core",
-                  "message": error[:1000],
-              }, limit=200)
-
-          runtime["processed_ids"] = list(processed)[-1000:]
-
-          write_object(MEMORY, memory)
-          write_object(RUNTIME, runtime)
-          write_object(FACTORY, factory)
-
-          print(json.dumps({
-              "run_count": runtime["run_count"],
-              "api": api_summary,
-              "observations_added": observations_added,
-              "research_tasks_added": tasks_added,
-              "errors": errors,
+          run_record = {
+              "id": stable_id("core_run", now),
+              "timestamp": now,
+              "status": run_status,
+              "api_status": api_status,
+              "api_calls_ok": counters["api_calls_ok"],
+              "observations_added": counters["observations_added"],
+              "tasks_added": counters["tasks_added"],
+              "errors": errors[:30],
               "external_ai_used": False,
+              "gemini_used": False,
               "project_cost_eur": 0,
-          }, ensure_ascii=False, indent=2))
+              "auto_payment": False,
+              "auto_spending": False,
+          }
+
+          runtime["last_run"] = run_record
+          runtime["last_run_at"] = now
+          runtime["last_status"] = run_status
+
+          try:
+              runtime["run_count"] = int(runtime.get("run_count", 0) or 0) + 1
+          except (TypeError, ValueError):
+              runtime["run_count"] = 1
+              record_error(
+                  "runtime.run_count",
+                  ValueError("Invalid previous run_count; reset to 1"),
+              )
+              run_record["status"] = "partial"
+              run_record["errors"] = errors[:30]
+              runtime["last_run"] = run_record
+              runtime["last_status"] = "partial"
+
+          history = runtime.get("history")
+
+          if not isinstance(history, list):
+              history = []
+              runtime["history"] = history
+
+          history.append(run_record)
+
+          if len(history) > 100:
+              del history[:-100]
+
+          # Atomic writes preserve all unrelated existing JSON keys.
+          write_object(MEMORY_PATH, memory)
+          write_object(FACTORY_PATH, factory)
+          write_object(RUNTIME_PATH, runtime)
+
+          print("=== NØX CORE GENERAL ===")
+          print("Run:", now)
+          print("Status:", run_record["status"])
+          print("API:", api_status)
+          print("Successful API calls:", counters["api_calls_ok"])
+          print("Observations added:", counters["observations_added"])
+          print("Research/review tasks added:", counters["tasks_added"])
+          print("Errors:", len(errors))
+          print("External generative AI: DISABLED")
+          print("Automatic payments/spending: DISABLED")
           PY
 
       - name: Commit Core state
         run: |
           set -euo pipefail
-          git config user.name "NØX"
-          git config user.email "nox-agent@users.noreply.github.com"
-          git add memory/nox_core_memory.json \
-                  memory/nox_core_runtime.json \
-                  memory/nox_work_factory.json
 
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(nox): update core observations and work queue"
-            git push
-          else
-            echo "Aucun changement à enregistrer."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            memory/nox_core_memory.json \
+            memory/nox_core_runtime.json \
+            memory/nox_work_factory.json
+
+          if git diff --cached --quiet; then
+            echo "No Core state changes to commit."
+            exit 0
           fi
+
+          git commit -m "chore(nox): update core observations and runtime"
+          git push
