@@ -1,10 +1,9 @@
-
 name: NØX - Self Evolution
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "11 */2 * * *"
+    - cron: "11 */6 * * *"
 
 permissions:
   contents: write
@@ -13,273 +12,291 @@ concurrency:
   group: nox-state
   cancel-in-progress: false
 
-jobs:
-  self-evolution:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+env:
+  EVOLUTION_FILE: memory/nox_self_evolution.json
+  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  WORK_FILE: memory/nox_work_factory.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
+  MAX_HISTORY: "200"
+  MIN_REPEATED_FAILURES: "2"
+  PENDING_BACKLOG_ALERT: "50"
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Extract lessons and proposals
+      - name: Run self-evolution diagnostics
+        shell: bash
         run: |
           set -euo pipefail
-
-          python - <<'PY'
+          python3 - <<'PY'
           import hashlib
           import json
+          import os
+          import re
           from datetime import datetime, timezone
           from pathlib import Path
 
-          ROOT = Path.cwd()
-          FACTORY_PATH = ROOT / "memory/nox_work_factory.json"
-          PRESENCE_PATH = ROOT / "memory/nox_colony_presence.json"
-          RUNTIME_PATH = ROOT / "memory/nox_core_runtime.json"
-          EVOLUTION_PATH = ROOT / "memory/nox_self_evolution.json"
-          NOW = datetime.now(timezone.utc).isoformat(timespec="seconds")
-          MAX_ITEMS = 500
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
 
-          def read_object(path):
+          def env_int(name, default):
+              try:
+                  return int(os.environ.get(name, str(default)))
+              except (TypeError, ValueError):
+                  return default
+
+          def check_policy():
+              required = {
+                  "PROJECT_COST_EUR": "0",
+                  "GEMINI_USED": "false",
+                  "EXTERNAL_AI_USED": "false",
+                  "AUTO_PAYMENT": "false",
+                  "AUTO_SPENDING": "false",
+              }
+              for key, expected in required.items():
+                  actual = os.environ.get(key, expected).strip().lower()
+                  if actual != expected:
+                      raise SystemExit(f"Unsafe policy: {key} must remain {expected}")
+
+          def load_json(path):
+              path = Path(path)
               if not path.exists():
                   return {}
-              with path.open("r", encoding="utf-8") as file:
-                  value = json.load(file)
-              if not isinstance(value, dict):
-                  raise ValueError(f"{path}: la racine JSON doit être un objet")
-              return value
+              raw = path.read_text(encoding="utf-8")
+              if not raw.strip():
+                  return {}
+              try:
+                  value = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"Invalid JSON in {path}: {exc}; refusing to overwrite state")
+              return value if isinstance(value, dict) else {}
 
-          def write_object(path, value):
+          def save_json(path, value):
+              path = Path(path)
               path.parent.mkdir(parents=True, exist_ok=True)
-              temporary = path.with_suffix(path.suffix + ".tmp")
-              with temporary.open("w", encoding="utf-8") as file:
-                  json.dump(value, file, ensure_ascii=False, indent=2)
-                  file.write("\n")
-              temporary.replace(path)
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+              json.loads(payload)
+              tmp.write_text(payload, encoding="utf-8")
+              os.replace(tmp, path)
 
-          def fingerprint(value):
-              raw = json.dumps(
-                  value, ensure_ascii=False, sort_keys=True, default=str
-              )
-              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+          def as_list(value):
+              return value if isinstance(value, list) else []
 
-          factory = read_object(FACTORY_PATH)
-          presence = read_object(PRESENCE_PATH)
-          runtime = read_object(RUNTIME_PATH)
-          evolution = read_object(EVOLUTION_PATH)
+          def clean(value, limit=240):
+              if value is None:
+                  value = ""
+              elif isinstance(value, (dict, list)):
+                  value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+              else:
+                  value = str(value)
+              value = re.sub(r"\s+", " ", value).strip()
+              return value[:limit]
 
-          for key in ("lessons", "proposals", "processed_signatures", "runs"):
-              if not isinstance(evolution.get(key), list):
-                  evolution[key] = []
+          def normalized_error(value):
+              value = clean(value, 500).lower()
+              value = re.sub(r"\b[0-9a-f]{8,}\b", "#", value)
+              value = re.sub(r"\d+", "#", value)
+              return value[:160]
 
-          known = set(evolution["processed_signatures"])
-          new_lessons = 0
-          new_proposals = 0
+          check_policy()
+          now = now_iso()
+          evolution_path = Path(os.environ["EVOLUTION_FILE"])
+          evolution = load_json(evolution_path)
+          presence = load_json(os.environ["PRESENCE_FILE"])
+          work = load_json(os.environ["WORK_FILE"])
+          runtime = load_json(os.environ["CORE_RUNTIME_FILE"])
+          max_history = max(20, env_int("MAX_HISTORY", 200))
+          min_repeated = max(1, env_int("MIN_REPEATED_FAILURES", 2))
+          backlog_limit = max(1, env_int("PENDING_BACKLOG_ALERT", 50))
 
-          history = factory.get("history", [])
-          if not isinstance(history, list):
-              history = []
-
-          for entry in history[-200:]:
-              if not isinstance(entry, dict):
+          signals = []
+          for item in as_list(presence.get("outcomes"))[-500:]:
+              if not isinstance(item, dict):
                   continue
+              success = item.get("success")
+              status = clean(item.get("status") or item.get("result") or "unknown", 80)
+              error = clean(item.get("error") or item.get("message") or item.get("reason"), 500)
+              if success is False or (not success and error):
+                  signals.append({"source": "presence", "status": status, "error": error})
 
-              status = str(entry.get("status", "unknown"))
-              task_id = entry.get("task_id") or (
-                  entry.get("task", {}).get("id")
-                  if isinstance(entry.get("task"), dict) else None
+          # Work Factory V4 writes outcomes to history, not to a top-level failed list.
+          # Inspect both the current schema and the legacy schema without treating
+          # weak search coverage as a verified factual contradiction.
+          work_items = as_list(work.get("history"))[-500:] + as_list(work.get("failed"))[-500:]
+          for item in work_items:
+              if not isinstance(item, dict):
+                  continue
+              status = clean(item.get("status") or item.get("evidence_status") or "unknown", 80)
+              error = clean(item.get("reason") or item.get("error") or item.get("message"), 500)
+              evidence_status = clean(item.get("evidence_status"), 80)
+              if status.lower() in ("failed", "error", "manual_review") or evidence_status in ("no_evidence", "insufficient_verification"):
+                  detail = error or f"research evidence status={evidence_status or status}"
+                  signals.append({"source": "work", "status": evidence_status or status, "error": detail})
+
+          groups = {}
+          for signal in signals:
+              norm = normalized_error(signal["error"])
+              key = (signal["source"], signal["status"].lower(), norm)
+              groups.setdefault(key, {"count": 0, "examples": []})
+              groups[key]["count"] += 1
+              if signal["error"] and signal["error"] not in groups[key]["examples"] and len(groups[key]["examples"]) < 3:
+                  groups[key]["examples"].append(signal["error"])
+
+          advice_rules = [
+              (("409", "duplicate", "already have a post", "already replied"),
+               "Duplicate publication conflict: use a stable action ID and make retries idempotent; do not retry the same payload blindly."),
+              (("self_message", "self_reply", "own username"),
+               "Self-reply filtering may be incomplete: compare normalized author and agent handles before creating a reply action."),
+              (("no_evidence", "insufficient_verification", "weak_evidence"),
+               "Research produced insufficient evidence: separate internal/contextual questions from questions requiring external sources."),
+              (("404", "not found", "403", "forbidden"),
+               "Target may be missing or inaccessible: verify target existence and permission before retrying."),
+              (("429", "rate limit", "too many requests"),
+               "Rate limiting: reduce action throughput and use bounded backoff."),
+              (("missing_body", "missing_recipient", "missing_post_target"),
+               "Action payload is incomplete: validate required fields before adding the action to the queue."),
+              (("timeout", "connection reset", "temporarily unavailable"),
+               "Transient network failure: retry only with a bounded backoff and an idempotency check."),
+          ]
+
+          findings = []
+          for (source, status, error), data in sorted(groups.items(), key=lambda pair: pair[1]["count"], reverse=True):
+              if data["count"] < min_repeated:
+                  continue
+              combined = f"{status} {error}".lower()
+              recommendation = next(
+                  (advice for terms, advice in advice_rules if any(term in combined for term in terms)),
+                  "Repeated failure without a deterministic rule: inspect the originating workflow logs and verify the source fields."
               )
-              signature = fingerprint({
-                  "source": "work_factory",
-                  "task_id": task_id,
+              findings.append({
+                  "source": source,
                   "status": status,
-                  "error": entry.get("error"),
-                  "result_id": entry.get("result_id"),
+                  "error_signature": error,
+                  "count": data["count"],
+                  "examples": data["examples"],
+                  "recommendation": recommendation,
               })
 
-              if signature in known:
-                  continue
+          pending = [item for item in as_list(runtime.get("pending_actions")) if isinstance(item, dict)]
+          if len(pending) >= backlog_limit:
+              findings.append({
+                  "source": "runtime",
+                  "status": "pending_backlog",
+                  "error_signature": "pending_actions_backlog",
+                  "count": len(pending),
+                  "examples": [],
+                  "recommendation": "Pending actions exceed the configured threshold: compare Core creation rate with Presence execution rate and expire stale actions safely.",
+              })
 
-              known.add(signature)
+          fingerprint_payload = sorted(
+              (item["source"], item["status"], item["error_signature"], item["count"])
+              for item in findings
+          )
+          fingerprint = hashlib.sha256(
+              json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+          ).hexdigest()[:20]
 
-              if status == "completed":
-                  lesson = {
-                      "id": "lesson_" + signature,
-                      "timestamp": NOW,
-                      "source": "work_factory",
-                      "category": "successful_algorithm",
-                      "task_id": task_id,
-                      "lesson": (
-                          "La recherche a terminé sans erreur. "
-                          "Conserver la requête, les sources et le résultat "
-                          "pour pouvoir reproduire et vérifier cette méthode."
-                      ),
-                      "evidence": {
-                          "source_count": entry.get("source_count"),
-                          "result_id": entry.get("result_id"),
-                      },
-                      "confidence": "limited",
+          runs = as_list(evolution.get("runs"))
+          previous = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+          if previous.get("fingerprint") == fingerprint and previous.get("decision") == ("RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"):
+              print("No change in findings since the previous run; state not rewritten.")
+              print("Fingerprint:", fingerprint)
+              raise SystemExit(0)
+
+          decision = "RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"
+          record = {
+              "timestamp": now,
+              "status": "observed" if findings else "no_candidate",
+              "decision": decision,
+              "fingerprint": fingerprint,
+              "findings_count": len(findings),
+              "findings": findings,
+              "patch_proposals": [
+                  {
+                      "proposal_id": hashlib.sha256((fingerprint + "|" + item["source"] + "|" + item["error_signature"]).encode("utf-8")).hexdigest()[:20],
+                      "target_area": {"presence":".github/workflows/nox-colony-presence.yml", "work":".github/workflows/nox-work-factory.yml", "runtime":".github/workflows/nox-core-general.yml"}.get(item["source"], ".github/workflows/nox-core-general.yml"),
+                      "problem": item["error_signature"],
+                      "recommendation": item["recommendation"],
+                      "status": "requires_human_review",
+                      "automatic_patch_applied": False,
                   }
-                  evolution["lessons"].append(lesson)
-                  new_lessons += 1
-
-              elif status == "failed":
-                  lesson = {
-                      "id": "lesson_" + signature,
-                      "timestamp": NOW,
-                      "source": "work_factory",
-                      "category": "error",
-                      "task_id": task_id,
-                      "lesson": (
-                          "La tâche a échoué. Examiner le message d'erreur "
-                          "avant de réessayer ; ne pas considérer l'échec "
-                          "comme un résultat de recherche."
-                      ),
-                      "error": str(entry.get("error", "Erreur non détaillée"))[:500],
-                      "confidence": "observed",
-                  }
-                  evolution["lessons"].append(lesson)
-                  new_lessons += 1
-
-                  proposal_id = "proposal_" + signature
-                  if not any(
-                      item.get("id") == proposal_id
-                      for item in evolution["proposals"]
-                      if isinstance(item, dict)
-                  ):
-                      evolution["proposals"].append({
-                          "id": proposal_id,
-                          "created_at": NOW,
-                          "status": "pending_human_review",
-                          "source": "work_factory",
-                          "problem": lesson["error"],
-                          "suggestion": (
-                              "Analyser la cause de l'échec et proposer "
-                              "un test de régression avant toute modification."
-                          ),
-                          "requires_human_approval": True,
-                          "code_modified": False,
-                      })
-                      new_proposals += 1
-
-          presence_errors = presence.get("errors", [])
-          if isinstance(presence_errors, list):
-              for error in presence_errors[-100:]:
-                  if not isinstance(error, dict):
-                      continue
-
-                  signature = fingerprint({
-                      "source": "presence",
-                      "error": error,
-                  })
-                  if signature in known:
-                      continue
-                  known.add(signature)
-
-                  evolution["lessons"].append({
-                      "id": "lesson_" + signature,
-                      "timestamp": NOW,
-                      "source": "presence",
-                      "category": "error",
-                      "lesson": (
-                          "Une opération de présence a signalé une erreur. "
-                          "Examiner le contexte et vérifier si elle se répète."
-                      ),
-                      "evidence": error,
-                      "confidence": "observed",
-                  })
-                  new_lessons += 1
-
-          # Détecter les répétitions sans prétendre connaître leur cause.
-          error_counts = {}
-          for lesson in evolution["lessons"]:
-              if not isinstance(lesson, dict):
-                  continue
-              if lesson.get("category") != "error":
-                  continue
-              message = str(
-                  lesson.get("error")
-                  or lesson.get("evidence", {}).get("error", "")
-              ).strip()
-              if message:
-                  error_counts[message] = error_counts.get(message, 0) + 1
-
-          for message, count in error_counts.items():
-              if count < 3:
-                  continue
-
-              signature = fingerprint({
-                  "repeated_error": message,
-                  "count_threshold": 3,
-              })
-              proposal_id = "proposal_" + signature
-
-              if any(
-                  item.get("id") == proposal_id
-                  for item in evolution["proposals"]
-                  if isinstance(item, dict)
-              ):
-                  continue
-
-              evolution["proposals"].append({
-                  "id": proposal_id,
-                  "created_at": NOW,
-                  "status": "pending_human_review",
-                  "source": "repeated_error_analysis",
-                  "problem": message[:500],
-                  "occurrences": count,
-                  "suggestion": (
-                      "Reproduire l'erreur, identifier sa cause et ajouter "
-                      "un test de régression avant de proposer un correctif."
-                  ),
-                  "requires_human_approval": True,
-                  "code_modified": False,
-              })
-              new_proposals += 1
-
-          evolution["processed_signatures"] = list(known)[-MAX_ITEMS:]
-          evolution["lessons"] = evolution["lessons"][-MAX_ITEMS:]
-          evolution["proposals"] = evolution["proposals"][-MAX_ITEMS:]
-
-          run = {
-              "timestamp": NOW,
-              "status": "success",
-              "new_lessons": new_lessons,
-              "new_proposals": new_proposals,
-              "core_last_status": runtime.get("last_status"),
-              "external_ai_used": False,
-              "code_modified": False,
-              "requires_human_approval": True,
+                  for item in findings
+              ],
+              "policy": {
+                  "project_cost_eur": 0,
+                  "gemini_used": False,
+                  "external_ai_used": False,
+                  "auto_payment": False,
+                  "auto_spending": False,
+              },
           }
-          evolution["runs"].append(run)
-          evolution["runs"] = evolution["runs"][-100:]
-          evolution["last_run"] = run
-
-          write_object(EVOLUTION_PATH, evolution)
+          evolution["version"] = max(7, int(evolution.get("version", 0) or 0))
+          evolution["runs"] = (runs + [record])[-max_history:]
+          history = as_list(evolution.get("history"))
+          if findings:
+              history.append(record)
+          evolution["history"] = history[-max_history:]
+          evolution["updated_at"] = now
+          save_json(evolution_path, evolution)
 
           print("=== NØX SELF EVOLUTION ===")
-          print("Nouvelles leçons:", new_lessons)
-          print("Nouvelles propositions:", new_proposals)
-          print("Modifications de code: aucune")
-          print("Validation humaine: obligatoire")
+          print("Signals:", len(signals), "| Findings:", len(findings), "| Fingerprint:", fingerprint)
+          for finding in findings:
+              print(f"- [{finding['count']}x] {finding['source']}/{finding['status']}: {finding['recommendation']}")
+          print("RESULT:", decision)
+          print("NOTE: patch proposals are recorded for review; no workflow code is changed automatically by this diagnostic run.")
           PY
 
-      - name: Commit evolution memory
+      - name: Validate evolution state
+        shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add memory/nox_self_evolution.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("memory/nox_self_evolution.json")
+          if path.exists():
+              json.loads(path.read_text(encoding="utf-8"))
+              print("VALID JSON:", path)
+          else:
+              print("No state file was written; nothing to validate.")
+          PY
+
+      - name: Commit and push state
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          git add -- memory/nox_self_evolution.json
           if git diff --cached --quiet; then
-            echo "Aucune nouvelle leçon à enregistrer."
+            echo "No changes to commit."
             exit 0
           fi
-          git commit -m "chore(nox): record evolution lessons"
-          git push
+          git commit -m "chore(nox): record self-evolution diagnostics"
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
