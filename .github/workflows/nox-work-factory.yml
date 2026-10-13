@@ -1,285 +1,240 @@
-
 name: NØX - Work Factory
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */3 * * *"
+    - cron: "43 */3 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: nox-state
+  group: nox-work-factory
   cancel-in-progress: false
+
+env:
+  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  CORE_MEMORY_FILE: memory/nox_core_memory.json
+  KNOWLEDGE_FILE: memory/nox_knowledge.json
+  WORK_FILE: memory/nox_work_factory.json
+  MAX_WORK_ITEMS_PER_RUN: "3"
+  MAX_RESULTS_PER_QUERY: "5"
+  MAX_TOTAL_RESULTS: "15"
+  MAX_HISTORY: "150"
+  MAX_ATTEMPTS_PER_REQUEST: "3"
+  WEB_TIMEOUT_SECONDS: "20"
+  PROJECT_COST_EUR: "0"
+  GEMINI_USED: "false"
+  EXTERNAL_AI_USED: "false"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
 
 jobs:
   work-factory:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install search dependency
-        run: python -m pip install --disable-pip-version-check ddgs
-
-      - name: Process research queue
         run: |
-          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install "ddgs>=9.16.0,<10.0.0"
 
-          python - <<'PY'
+      - name: Run Work Factory
+        run: |
+          python3 - <<'PY'
           import hashlib
           import json
-          import traceback
+          import os
+          import re
           from datetime import datetime, timezone
           from pathlib import Path
+          from urllib.parse import urlparse
 
           from ddgs import DDGS
 
-          ROOT = Path.cwd()
-          FACTORY_PATH = ROOT / "memory/nox_work_factory.json"
-          MEMORY_PATH = ROOT / "memory/nox_core_memory.json"
-          MAX_TASKS = 2
-          MAX_HISTORY = 300
-          MAX_RESULTS = 5
-          NOW = datetime.now(timezone.utc).isoformat(timespec="seconds")
+          NOW = datetime.now(timezone.utc).isoformat()
+          CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
+          CORE_MEMORY_FILE = Path(os.environ["CORE_MEMORY_FILE"])
+          KNOWLEDGE_FILE = Path(os.environ["KNOWLEDGE_FILE"])
+          WORK_FILE = Path(os.environ["WORK_FILE"])
+          MAX_ITEMS = int(os.environ["MAX_WORK_ITEMS_PER_RUN"])
+          MAX_RESULTS = int(os.environ["MAX_RESULTS_PER_QUERY"])
+          MAX_TOTAL = int(os.environ["MAX_TOTAL_RESULTS"])
+          MAX_HISTORY = int(os.environ["MAX_HISTORY"])
+          MAX_ATTEMPTS = max(1, int(os.environ["MAX_ATTEMPTS_PER_REQUEST"]))
+          TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
 
-          def read_object(path):
-              if not path.exists():
-                  return {}
-              with path.open("r", encoding="utf-8") as file:
-                  value = json.load(file)
-              if not isinstance(value, dict):
-                  raise ValueError(f"{path}: la racine JSON doit être un objet")
+          for key, expected in {"PROJECT_COST_EUR":"0","GEMINI_USED":"false","EXTERNAL_AI_USED":"false","AUTO_PAYMENT":"false","AUTO_SPENDING":"false"}.items():
+              if os.environ.get(key, expected).strip().lower() != expected:
+                  raise SystemExit(f"SECURITY STOP: {key} must remain {expected}")
+
+          def load(path, default):
+              if not path.exists(): return json.loads(json.dumps(default))
+              try:
+                  value=json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  raise SystemExit(f"STATE SAFETY STOP: invalid JSON in {path}: {exc}")
+              if not isinstance(value,dict):
+                  raise SystemExit(f"STATE SAFETY STOP: {path} root must be a JSON object; refusing to overwrite it")
               return value
 
-          def write_object(path, value):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              temporary = path.with_suffix(path.suffix + ".tmp")
-              with temporary.open("w", encoding="utf-8") as file:
-                  json.dump(value, file, ensure_ascii=False, indent=2)
-                  file.write("\n")
-              temporary.replace(path)
+          def save(path,value):
+              path.parent.mkdir(parents=True,exist_ok=True)
+              tmp=path.with_suffix(path.suffix+".tmp")
+              payload=json.dumps(value,ensure_ascii=False,indent=2)+"\n"
+              json.loads(payload)
+              tmp.write_text(payload,encoding="utf-8")
+              os.replace(tmp,path)
 
-          def stable_id(value):
-              raw = json.dumps(
-                  value, sort_keys=True, ensure_ascii=False, default=str
-              )
-              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+          def clean(v,n=3000): return re.sub(r"\s+"," ",str(v or "")).strip()[:n]
+          def terms(v):
+              stop={"this","that","with","from","have","what","when","where","which","would","could","about","your","their","there","then","than","pour","avec","dans","nous","vous","cela","cette","comme","mais","plus","faire","être","sont"}
+              out=[]
+              for w in re.findall(r"[a-zA-ZÀ-ÿ0-9_-]{4,}",clean(v,5000).lower()):
+                  if w not in stop and w not in out: out.append(w)
+              return out[:30]
+          def stable(*parts): return hashlib.sha256("|".join(clean(x,5000) for x in parts).encode()).hexdigest()[:24]
 
-          def get_queue(factory):
-              # Même priorité de clés que le Core #138.
-              for key in ("pending_work", "pending", "tasks"):
-                  if isinstance(factory.get(key), list):
-                      return key, factory[key]
-              factory["pending"] = []
-              return "pending", factory["pending"]
+          runtime=load(CORE_RUNTIME_FILE,{"work_requests":[]})
+          memory=load(CORE_MEMORY_FILE,{})
+          knowledge=load(KNOWLEDGE_FILE,{})
+          state=load(WORK_FILE,{"version":4,"history":[],"completed":[],"attempts":{}})
+          state.setdefault("history",[]); state.setdefault("completed",[]); state.setdefault("attempts",{}); state.setdefault("manual_review",[])
+          if not isinstance(state["history"],list): state["history"]=[]
+          if not isinstance(state["completed"],list): state["completed"]=[]
+          if not isinstance(state["attempts"],dict): state["attempts"]={}
+          if not isinstance(state["manual_review"],list): state["manual_review"]=[]
 
-          def task_text(task):
-              for key in ("query", "description", "title", "content"):
-                  value = task.get(key)
-                  if isinstance(value, str) and value.strip():
-                      return value.strip()[:1000]
-              return ""
-
-          def is_human_review(task):
-              return (
-                  task.get("requires_human_review") is True
-                  or task.get("status") == "needs_human_review"
-                  or task.get("type") in {
-                      "dm_review", "human_review", "code_change"
-                  }
-              )
-
-          def save_history(factory, entry):
-              history = factory.get("history")
-              if not isinstance(history, list):
-                  history = []
-                  factory["history"] = history
-              history.append(entry)
-              del history[:-MAX_HISTORY]
-
-          factory = read_object(FACTORY_PATH)
-          memory = read_object(MEMORY_PATH)
-          queue_key, queue = get_queue(factory)
-
-          results_log = factory.get("results")
-          if not isinstance(results_log, list):
-              results_log = []
-              factory["results"] = results_log
-
-          errors_log = factory.get("errors")
-          if not isinstance(errors_log, list):
-              errors_log = []
-              factory["errors"] = errors_log
-
-          completed = 0
-          failed = 0
-          skipped = 0
-
-          for task in queue:
-              if completed + failed >= MAX_TASKS:
-                  break
-
-              if not isinstance(task, dict):
+          completed={x.get("request_id") for x in state["completed"] if isinstance(x,dict)}
+          reviewed={x.get("request_id") for x in state["manual_review"] if isinstance(x,dict)}
+          requests=[]
+          for item in runtime.get("work_requests",[]):
+              if not isinstance(item,dict): continue
+              if item.get("status") not in (None,"pending","retry"):
                   continue
-
-              if task.get("status", "pending") not in {
-                  "pending", "queued", "retry"
-              }:
+              if not item.get("id") or item.get("id") in completed or item.get("id") in reviewed:
                   continue
-
-              if is_human_review(task):
-                  skipped += 1
+              rid = item.get("id")
+              attempts = int(state["attempts"].get(rid, 0) or 0)
+              if attempts >= MAX_ATTEMPTS:
+                  review_record={"request_id":rid,"case_id":item.get("case_id"),"timestamp":NOW,"status":"manual_review","attempts":attempts,"reason":"retry_limit_reached_without_sufficient_evidence"}
+                  state["manual_review"].append(review_record)
+                  reviewed.add(rid)
+                  state["history"].append({**review_record,"id":f"review-{stable(rid, attempts)}"})
                   continue
-
-              task_type = task.get("type", "research")
-              if task_type != "research":
-                  task["status"] = "needs_human_review"
-                  task["requires_human_review"] = True
-                  task["updated_at"] = NOW
-                  task["review_reason"] = (
-                      "Type de tâche non pris en charge automatiquement."
-                  )
-                  skipped += 1
+              if item.get("work_type") != "research":
+                  state["history"].append({"id":stable("deferred",item.get("id")),"request_id":item.get("id"),"timestamp":NOW,"status":"deferred","reason":"unsupported_work_type"})
                   continue
+              requests.append(item)
+              if len(requests)>=MAX_ITEMS: break
 
-              query = task_text(task)
-              if not query:
-                  task["status"] = "failed"
-                  task["updated_at"] = NOW
-                  task["error"] = "Tâche sans requête exploitable."
-                  failed += 1
-                  entry = {
-                      "task_id": task.get("id"),
-                      "timestamp": NOW,
-                      "status": "failed",
-                      "error": task["error"],
-                  }
-                  errors_log.append(entry)
-                  save_history(factory, entry)
-                  continue
-
-              task_id = task.get("id") or stable_id(task)
-              task["id"] = task_id
-              task["status"] = "running"
-              task["started_at"] = NOW
-              task["updated_at"] = NOW
-
+          def search(query):
               try:
-                  raw_results = DDGS().text(
-                      query,
-                      max_results=MAX_RESULTS,
-                  )
-
-                  sources = []
-                  for item in raw_results or []:
-                      if not isinstance(item, dict):
-                          continue
-                      sources.append({
-                          "title": str(item.get("title", ""))[:300],
-                          "url": str(item.get("href", ""))[:1000],
-                          "snippet": str(item.get("body", ""))[:1500],
-                          "verified": False,
-                      })
-
-                  result_id = stable_id({
-                      "task_id": task_id,
-                      "sources": sources,
-                  })
-
-                  result = {
-                      "id": result_id,
-                      "task_id": task_id,
-                      "timestamp": NOW,
-                      "query": query,
-                      "status": "completed",
-                      "source_count": len(sources),
-                      "sources": sources,
-                      "verified": False,
-                      "verification_required": True,
-                  }
-
-                  results_log.append(result)
-                  del results_log[:-MAX_HISTORY]
-
-                  task["status"] = "completed"
-                  task["completed_at"] = NOW
-                  task["result_id"] = result_id
-                  task["result_summary"] = (
-                      f"{len(sources)} résultat(s) collecté(s). "
-                      "Les sources ne sont pas encore vérifiées."
-                  )
-
-                  save_history(factory, {
-                      "task_id": task_id,
-                      "timestamp": NOW,
-                      "status": "completed",
-                      "task": task.copy(),
-                      "result_id": result_id,
-                      "source_count": len(sources),
-                  })
-                  completed += 1
-
+                  raw=DDGS(timeout=TIMEOUT).text(query,max_results=MAX_RESULTS,backend="auto")
               except Exception as exc:
-                  task["status"] = "failed"
-                  task["updated_at"] = NOW
-                  task["error"] = f"{type(exc).__name__}: {str(exc)[:500]}"
+                  return [],clean(exc,500)
+              results=[]
+              for item in raw or []:
+                  if not isinstance(item,dict): continue
+                  url=clean(item.get("href") or item.get("url"),1000)
+                  if not url: continue
+                  domain=urlparse(url).netloc.lower().split(":")[0]
+                  results.append({"title":clean(item.get("title"),300),"url":url,"domain":domain,"snippet":clean(item.get("body") or item.get("snippet"),1200)})
+              return results,None
 
-                  error_entry = {
-                      "task_id": task_id,
-                      "timestamp": NOW,
-                      "status": "failed",
-                      "error": task["error"],
-                  }
-                  errors_log.append(error_entry)
-                  del errors_log[:-MAX_HISTORY]
-                  save_history(factory, error_entry)
-                  failed += 1
+          def assess(question,results):
+              q=set(terms(question))
+              scored=[]
+              for r in results:
+                  text=set(terms((r.get("title","")+" "+r.get("snippet",""))))
+                  overlap=len(q & text)/max(1,len(q))
+                  scored.append({**r,"query_overlap":round(overlap,3)})
+              domains={r.get("domain") for r in scored if r.get("domain")}
+              strong=[r for r in scored if r["query_overlap"]>=0.18]
+              if len(domains)>=3 and len(strong)>=2: status="multi_source_support"
+              elif len(domains)>=2 and len(strong)>=1: status="partial_support"
+              elif scored: status="insufficient_verification"
+              else: status="no_evidence"
+              return status,scored,len(domains)
 
-                  print(
-                      f"Échec de la tâche {task_id}: {task['error']}"
-                  )
+          for request in requests:
+              rid=request["id"]; question=clean(request.get("question"),1200)
+              queries=[]
+              if question: queries.append(question)
+              context=clean(request.get("context"),1500)
+              if context and len(queries)<3:
+                  queries.append(clean(f"{question} {context[:600]}",1400))
+              if request.get("memory_context") and len(queries)<3:
+                  queries.append(clean(f"{question} {json.dumps(request['memory_context'],ensure_ascii=False)[:600]}",1400))
+              dedup=[]
+              for q in queries:
+                  if q and q not in dedup: dedup.append(q)
 
-          factory["last_run_at"] = NOW
-          factory["last_run"] = {
-              "timestamp": NOW,
-              "queue_key": queue_key,
-              "completed": completed,
-              "failed": failed,
-              "needs_human_review": skipped,
-              "external_ai_used": False,
-              "project_cost_eur": 0,
-          }
+              results=[]; seen_urls=set(); errors=[]
+              for q in dedup:
+                  found,error=search(q)
+                  if error: errors.append(error)
+                  for r in found:
+                      if r["url"] in seen_urls: continue
+                      seen_urls.add(r["url"]); r["query"]=q; results.append(r)
+                      if len(results)>=MAX_TOTAL: break
+                  if len(results)>=MAX_TOTAL: break
 
-          write_object(FACTORY_PATH, factory)
+              status,scored,domain_count=assess(question,results)
+              if status=="multi_source_support":
+                  conclusion="Search coverage found relevant results across multiple domains. This is evidence coverage, not proof of truth."
+                  next_step="Compare the underlying sources before treating the claim as confirmed."
+              elif status=="partial_support":
+                  conclusion="Relevant evidence was found, but independent coverage is limited."
+                  next_step="Keep the claim provisional and seek another independent source or a targeted test."
+              elif status=="insufficient_verification":
+                  conclusion="Search results exist, but their coverage is insufficient for verification."
+                  next_step="Do not promote the claim to a confirmed fact."
+              else:
+                  conclusion="No usable web evidence was retrieved."
+                  next_step="Refine the question or retry later."
 
-          print("=== NØX WORK FACTORY ===")
-          print("File:", queue_key)
-          print("Terminées:", completed)
-          print("Échecs:", failed)
-          print("À examiner / non prises en charge:", skipped)
-          print("IA externe: désactivée")
+              result_id=f"result-{stable(rid,json.dumps(scored,ensure_ascii=False,sort_keys=True))}"
+              result={
+                  "id":result_id,"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,
+                  "question":question,"work_type":"research","queries":dedup,"evidence_status":status,
+                  "source_count":len(scored),"unique_domains":domain_count,"sources":scored[:MAX_TOTAL],
+                  "conclusion":conclusion,"uncertainty":"Search snippets are discovery evidence only; they do not establish truth.",
+                  "next_step":next_step,"errors":errors
+              }
+              state["history"].append(result)
+              if status=="multi_source_support":
+                  state["completed"].append({"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,"status":status,"result_id":result_id})
+              else:
+                  state["attempts"][rid]=int(state["attempts"].get(rid,0))+1
+
+              print(f"WORK RESULT: {question} | {status} | sources={len(scored)} | domains={domain_count}")
+
+          state["history"]=state["history"][-MAX_HISTORY:]
+          state["completed"]=state["completed"][-MAX_HISTORY:]
+          state["manual_review"]=state["manual_review"][-MAX_HISTORY:]
+          state["version"]=4; state["last_run"]=NOW
+          state["last_summary"]={"timestamp":NOW,"work_candidates":len(runtime.get("work_requests",[])),"research_selected":len(requests),"completed":sum(1 for x in state["history"][-len(requests):] if isinstance(x,dict) and x.get("evidence_status")=="multi_source_support") if requests else 0}
+          save(WORK_FILE,state)
+          print(f"=== NØX WORK FACTORY V4 === candidates={len(runtime.get('work_requests',[]))} selected={len(requests)} history={len(state['history'])}")
+          print("CORE WORK REQUEST -> RESEARCH -> EVIDENCE COVERAGE -> CORE REASSESSMENT")
+          print(f"Manual review queue: {len(state['manual_review'])}; retry limit: {MAX_ATTEMPTS}")
           PY
 
-      - name: Commit work results
+      - name: Commit Work Factory state
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
           git add memory/nox_work_factory.json
-          if git diff --cached --quiet; then
-            echo "Aucun changement à enregistrer."
-            exit 0
-          fi
-          git commit -m "chore(nox): process research tasks"
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "NØX: update work factory"
+          git pull --rebase origin main
           git push
