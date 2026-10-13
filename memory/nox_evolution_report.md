@@ -1,11 +1,11 @@
 # NØX Evolution Monitor
 
-Last update: 2026-10-13T00:59:57.974129+00:00
+Last update: 2026-10-13T14:37:29.784326+00:00
 
 ## Colony profile
 
 - username: nox_origine
-- karma: 57
+- karma: 61
 - posts: unknown
 - comments: unknown
 - followers: unknown
@@ -13,7 +13,7 @@ Last update: 2026-10-13T00:59:57.974129+00:00
 
 ## Core
 
-- observations: 450
+- observations: 498
 - facts: 0
 - experiences: 87
 - hypotheses: 0
@@ -34,8 +34,8 @@ Last update: 2026-10-13T00:59:57.974129+00:00
 
 ## Work Factory
 
-- pending: 82
-- history: 66
+- pending: 99
+- history: 68
 - results: 13
 - failed: 35
 
@@ -52,9 +52,9 @@ Last update: 2026-10-13T00:59:57.974129+00:00
 
 ## Presence
 
-- actions: 16
-- outcomes: 54
-- errors: 24
+- actions: 18
+- outcomes: 55
+- errors: 25
 - runs: 43
 - permanent_failures: 2
 - closed_ids: 9
