@@ -3,7 +3,7 @@ name: NØX - Evolution Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "53 */6 * * *"
+    - cron: "23 */6 * * *"
 
 permissions:
   contents: write
@@ -12,358 +12,40 @@ concurrency:
   group: nox-state
   cancel-in-progress: false
 
-env:
-  CORE_MEMORY_FILE: "memory/nox_core_memory.json"
-  CORE_RUNTIME_FILE: "memory/nox_core_runtime.json"
-  WORK_FILE: "memory/nox_work_factory.json"
-  KNOWLEDGE_FILE: "memory/nox_knowledge.json"
-  PRESENCE_FILE: "memory/nox_colony_presence.json"
-  EVOLUTION_FILE: "memory/nox_evolution_history.json"
-  REPORT_FILE: "memory/nox_evolution_report.md"
-  MAX_HISTORY: "100"
-  MAX_REPORT_CHARS: "12000"
-  PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
-  AUTO_PAYMENT: "false"
-  AUTO_SPENDING: "false"
-
 jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+  monitor-evolution:
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Run read-only evolution audit
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "colony-sdk>=1.37.0,<2.0.0"
-
-      - name: Collect evolution metrics
-        shell: bash
-        env:
-          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          """Shared helpers for all NØX scripts (standard library only)."""
-          import hashlib
-          import json
-          import os
-          import re
-          import sys
-          from datetime import datetime, timezone
-          from itertools import islice
-          from pathlib import Path
-
-          OWN_USERNAME = (os.environ.get("NOX_USERNAME") or "nox_origine").strip().lower()
-
-          # ---------------------------------------------------------------- time / env
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
-
-          def parse_ts(value):
-              if not value or not isinstance(value, str):
-                  return None
-              try:
-                  dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-              except ValueError:
-                  return None
-              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-          def env_int(name, default):
-              try:
-                  return int(os.environ.get(name, default))
-              except (TypeError, ValueError):
-                  return int(default)
-
-          def env_flag(name, default=False):
-              value = os.environ.get(name)
-              if value is None or value.strip() == "":
-                  return default
-              return value.strip().lower() in {"1", "true", "yes", "on"}
-
-          def check_policy():
-              """Hard safety invariants: no spending, no payments, no external AI."""
-              expected = {
-                  "PROJECT_COST_EUR": "0",
-                  "GEMINI_USED": "false",
-                  "EXTERNAL_AI_USED": "false",
-                  "AUTO_PAYMENT": "false",
-                  "AUTO_SPENDING": "false",
-              }
-              for key, wanted in expected.items():
-                  if os.environ.get(key, wanted).strip().lower() != wanted:
-                      raise SystemExit(f"Unsafe policy: {key} must be {wanted}")
-
-          # ---------------------------------------------------------------- json files
-          def load_json(path, default=None):
-              """Load a JSON object. Refuses to continue on corrupt files so that a
-              parse error can never silently wipe the agent's state."""
-              path = Path(path)
-              default = {} if default is None else default
-              if not path.exists():
-                  return default
-              raw = path.read_text(encoding="utf-8")
-              if not raw.strip():
-                  return default
-              try:
-                  value = json.loads(raw)
-              except Exception as exc:
-                  raise SystemExit(
-                      f"ERROR: {path} is not valid JSON ({exc}). "
-                      "Restore it from git history; refusing to overwrite it."
-                  )
-              return value if isinstance(value, type(default)) else default
-
-          def save_json(path, value):
-              path = Path(path)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
-              payload = json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n"
-              json.loads(payload)  # round-trip check
-              tmp.write_text(payload, encoding="utf-8")
-              os.replace(tmp, path)
-
-          # ---------------------------------------------------------------- data utils
-          def as_dict(value):
-              return value if isinstance(value, dict) else {}
-
-          def as_list(value):
-              return value if isinstance(value, list) else []
-
-          def text(value, limit=None):
-              if value is None:
-                  out = ""
-              elif isinstance(value, str):
-                  out = value.strip()
-              elif isinstance(value, dict):
-                  out = ""
-                  for key in ("content", "body", "text", "message", "title", "question"):
-                      if value.get(key):
-                          out = text(value[key])
-                          break
-                  if not out:
-                      out = json.dumps(value, ensure_ascii=False, default=str)
-              else:
-                  out = str(value).strip()
-              return out[:limit] if limit else out
-
-          def collapse(value, limit=None):
-              out = re.sub(r"\s+", " ", text(value)).strip()
-              return out[:limit] if limit else out
-
-          def clip(value, limit):
-              out = text(value)
-              return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
-
-          def stable_id(prefix, *parts):
-              raw = "|".join(str(p if p is not None else "") for p in parts)
-              return f"{prefix}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-          def identity(item):
-              """Stable identity of a stored item (id-like key, else content hash)."""
-              if isinstance(item, dict):
-                  for key in ("id", "action_id", "work_id", "result_id", "message_id", "post_id", "url"):
-                      if item.get(key):
-                          return f"{key}:{item[key]}"
-              raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
-              return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-          def dedupe_keep_last(items, limit=None):
-              """Remove duplicates (keeping the most recent occurrence) and keep list
-              order chronological (oldest first). Optionally keep only the last N."""
-              seen, out = set(), []
-              for item in reversed(items):
-                  key = identity(item)
-                  if key in seen:
-                      continue
-                  seen.add(key)
-                  out.append(item)
-              out.reverse()
-              return out[-limit:] if limit else out
-
-          def bound(items, limit):
-              items = as_list(items)
-              return items[-limit:] if len(items) > limit else items
-
-          def take(value, n=None):
-              """Turn SDK results (list / dict / generator) into a bounded list."""
-              if value is None:
-                  return []
-              if isinstance(value, dict):
-                  for key in ("items", "data", "results", "posts", "notifications", "messages", "conversations"):
-                      if isinstance(value.get(key), list):
-                          value = value[key]
-                          break
-                  else:
-                      return []
-              if isinstance(value, (list, tuple)):
-                  return list(value)[:n] if n else list(value)
-              try:
-                  iterator = iter(value)
-              except TypeError:
-                  return []
-              return list(islice(iterator, n)) if n else list(iterator)
-
-          def username_of(obj):
-              """Lower-cased username of an object or of a nested author/sender."""
-              if not isinstance(obj, dict):
-                  return ""
-              for key in ("username", "handle", "author_username", "sender_username"):
-                  if obj.get(key):
-                      return str(obj[key]).strip().lower()
-              for key in ("author", "user", "sender", "bidder", "agent", "other_user"):
-                  nested = obj.get(key)
-                  if isinstance(nested, dict):
-                      found = username_of(nested)
-                      if found:
-                          return found
-                  elif isinstance(nested, str) and nested.strip():
-                      return nested.strip().lower()
-              return ""
-
-          # ===== script =====
-          """NØX Evolution Monitor (read-only). Reads the real fields written by the other workflows."""
-          import os
-          from pathlib import Path
-
-          check_policy()
-          NOW = now_iso()
-          P = {k: Path(os.environ[v]) for k, v in {
-              "core": "CORE_MEMORY_FILE", "runtime": "CORE_RUNTIME_FILE", "work": "WORK_FILE", "knowledge": "KNOWLEDGE_FILE",
-              "presence": "PRESENCE_FILE", "evolution": "EVOLUTION_FILE", "report": "REPORT_FILE"}.items()}
-          MAX_HISTORY = env_int("MAX_HISTORY", 100)
-          MAX_REPORT = env_int("MAX_REPORT_CHARS", 12000)
-
-          core, runtime, work = (as_dict(load_json(P[k])) for k in ("core", "runtime", "work"))
-          knowledge, presence, evolution = (as_dict(load_json(P[k])) for k in ("knowledge", "presence", "evolution"))
-
-          def counts(obj, keys):
-              return {k: (len(obj[k]) if isinstance(obj.get(k), list) else None) for k in keys}
-
-          metrics = {
-              "core": counts(core, ("observations", "facts", "experiences", "hypotheses", "results", "learnings",
-                                    "cognitive_cases", "actions")),
-              "runtime": counts(runtime, ("decisions", "actions", "outcomes", "pending_actions", "work_requests",
-                                          "processed_ids", "web_queries")),
-              "work_factory": counts(work, ("pending", "history", "results", "failed")),
-              "knowledge": counts(knowledge, ("observations", "facts", "experiences", "hypotheses", "results",
-                                              "learnings", "sources", "queries")),
-              "presence": counts(presence, ("actions", "outcomes", "errors", "runs", "permanent_failures", "closed_ids")),
-          }
-
-          def dig(obj, keys, depth=3):
-              if depth < 0 or not isinstance(obj, dict):
-                  return None
-              for key in keys:
-                  if obj.get(key) is not None:
-                      return obj[key]
-              for value in obj.values():
-                  if isinstance(value, dict):
-                      found = dig(value, keys, depth - 1)
-                      if found is not None:
-                          return found
-              return None
-
-          profile = {k: None for k in ("username", "karma", "posts", "comments", "followers", "following")}
-          profile_error, lightning = None, {"ready": None, "address": None}
-          key = os.environ.get("COLONY_API_KEY", "").strip()
-          if not key:
-              profile_error = "COLONY_API_KEY missing"
-          else:
-              try:
-                  from colony_sdk import ColonyClient
-                  client = ColonyClient(key)
-                  me = client.get_me()
-                  if hasattr(me, "model_dump"):
-                      me = me.model_dump()
-                  me = me if isinstance(me, dict) else {}
-                  if not me:
-                      profile_error = "get_me returned no data"
-                  profile["username"] = dig(me, ("username", "handle", "name"))
-                  profile["karma"] = dig(me, ("karma", "score", "reputation"))
-                  profile["posts"] = dig(me, ("post_count", "posts"))
-                  profile["comments"] = dig(me, ("comment_count", "comments"))
-                  profile["followers"] = dig(me, ("follower_count", "followers"))
-                  profile["following"] = dig(me, ("following_count", "following"))
-                  addr = dig(me, ("lightning_address", "ln_address"))
-                  lightning = {"ready": bool(addr) if addr is not None else None, "address": addr}
-              except Exception as exc:
-                  profile_error = str(exc)[:300]
-
-          snapshot = {"timestamp": NOW, **metrics, "profile": profile, "profile_error": profile_error,
-                      "lightning": lightning, "pending_oldest": min(
-                          (text(a.get("created_at")) for a in as_list(runtime.get("pending_actions"))
-                           if isinstance(a, dict) and a.get("created_at")), default=None)}
-
-          history = [h for h in as_list(evolution.get("history")) if isinstance(h, dict)]
-          history.append(snapshot)
-          history = bound(sorted(history, key=lambda h: str(h.get("timestamp", ""))), MAX_HISTORY)
-          evolution = {"schema_version": 3, "updated_at": NOW, "run_count": int(evolution.get("run_count", 0) or 0) + 1,
-                       "history": history, "latest": snapshot}
-          save_json(P["evolution"], evolution)
-
-          def fmt(v):
-              return "unknown" if v is None else str(v)
-
-          lines = ["# NØX Evolution Monitor", "", f"Last update: {NOW}", "", "## Colony profile", ""]
-          lines += [f"- {k}: {fmt(v)}" for k, v in profile.items()]
-          for title, section in (("Core", "core"), ("Runtime", "runtime"), ("Work Factory", "work_factory"),
-                                 ("Knowledge", "knowledge"), ("Presence", "presence")):
-              lines += ["", f"## {title}", ""] + [f"- {k}: {fmt(v)}" for k, v in metrics[section].items()]
-          lines += ["", "## Lightning", "", f"- Ready: {fmt(lightning['ready'])}", f"- Address: {fmt(lightning['address'])}",
-                    "", "## Monitor status", "", f"- Profile read error: {fmt(profile_error)}", "- Mode: read-only",
-                    "- Payments performed: no", "", "Missing metrics remain unknown and are never converted to zero.", ""]
-          report = "\n".join(lines)[:MAX_REPORT].rstrip() + "\n"
-          P["report"].parent.mkdir(parents=True, exist_ok=True)
-          P["report"].write_text(report, encoding="utf-8")
-          print("=== NØX EVOLUTION MONITOR ===", "| profile error:", profile_error, "| snapshots:", len(history))
-          PY
-
-      - name: Validate JSON state
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 - <<'PY'
           import json, os
-          for path in ["memory/nox_evolution_history.json"]:
-              if os.path.exists(path):
-                  with open(path, encoding="utf-8") as fh:
-                      json.load(fh)
-                  print("VALID JSON:", path)
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from hashlib import sha256
+          policy={"PROJECT_COST_EUR":"0","AUTO_PAYMENT":"false","AUTO_SPENDING":"false","GEMINI_USED":"false","EXTERNAL_AI_USED":"false"}
+          for k,v in policy.items():
+              if os.environ.get(k,v).lower()!=v: raise SystemExit(f"SECURITY STOP: {k} must remain {v}")
+          files=[Path("memory/nox_core_memory.json"),Path("memory/nox_core_runtime.json"),Path("memory/nox_work_factory.json"),Path("memory/nox_colony_presence.json"),Path("memory/nox_knowledge.json"),Path("memory/nox_self_evolution.json")]
+          def load(p):
+              if not p.exists(): return None
+              try: obj=json.loads(p.read_text(encoding="utf-8"))
+              except Exception as e: raise SystemExit(f"STATE SAFETY STOP: invalid JSON in {p}: {e}")
+              if not isinstance(obj,dict): raise SystemExit(f"STATE SAFETY STOP: {p} root is not object")
+              return obj
+          checks=[]
+          for p in files:
+              obj=load(p)
+              checks.append({"file":str(p),"exists":obj is not None,"bytes":p.stat().st_size if obj is not None else 0,"version":obj.get("version") if obj else None,"root_type":"object" if obj is not None else "missing"})
+          now=datetime.now(timezone.utc).isoformat()
+          report={"timestamp":now,"mode":"read_only","files":checks,"automatic_patching":False,"external_ai":False,"payments":False,"spending":False}
+          signature=sha256(json.dumps(report,sort_keys=True).encode()).hexdigest()[:20]
+          print(json.dumps({"signature":signature,**report},ensure_ascii=False,indent=2))
+          # Deliberately does not modify source files or create an automatic patch.
           PY
-
-      - name: Commit and push
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "NØX"
-          git config user.email "nox@users.noreply.github.com"
-          for f in memory/nox_evolution_history.json memory/nox_evolution_report.md; do
-            [ -e "$f" ] && git add -- "$f"
-          done
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "chore(nox): update evolution monitor"
-          for attempt in 1 2 3 4; do
-            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Pushed."
-              exit 0
-            fi
-            git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 3))
-          done
-          echo "Push failed after retries."
-          exit 1
