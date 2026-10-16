@@ -587,41 +587,88 @@ jobs:
           publications_24h = recent_publications_24h()
 
           # Recover exactly one publication attempt after a recorded HTTP 409.
-          # Presence performs an author/title/body preflight before writing, so
-          # a post that already exists is reconciled rather than duplicated.
-          # The retry ID is deterministic and can never be retried a second time.
+          # The original publication may have come from either a researched case
+          # or a learning. Reconstruct its payload from the stable source record;
+          # never retry if the source cannot be reconstructed safely.
           retry_created = False
           cases_by_id = {
               c.get("case_id"): c for c in memory.get("cognitive_cases", [])
               if isinstance(c, dict) and c.get("case_id")
           }
-          for previous in outcomes:
+          for previous in reversed(outcomes):
               if not isinstance(previous, dict):
                   continue
               if previous.get("status") != "conflict" or previous.get("kind") != "publish":
                   continue
-              case_id = previous.get("case_id")
-              case = cases_by_id.get(case_id)
-              if not isinstance(case, dict):
+              original_id = previous.get("action_id")
+              if not original_id:
                   continue
-              result = case.get("research_result")
-              if not isinstance(result, dict) or result.get("evidence_status") not in ("multi_source_support", "partial_support"):
+
+              retry_title = None
+              retry_body = None
+              retry_case_id = previous.get("case_id")
+              retry_result = None
+
+              # First reconstruct a research-backed publication from its case.
+              case = cases_by_id.get(retry_case_id)
+              result = case.get("research_result") if isinstance(case, dict) else None
+              if isinstance(result, dict) and result.get("evidence_status") in ("multi_source_support", "partial_support"):
+                  conclusion = clean(result.get("conclusion"), 1800)
+                  sources = [x for x in (result.get("sources") or []) if isinstance(x, dict) and (x.get("url") or x.get("title"))]
+                  lower_conclusion = conclusion.lower()
+                  meta_markers = (
+                      "search coverage", "source coverage", "coverage found",
+                      "found relevant results", "relevant results across",
+                      "evidence coverage", "search results found"
+                  )
+                  if len(conclusion) >= 180 and len(sources) >= 2 and not any(marker in lower_conclusion for marker in meta_markers):
+                      source_lines = []
+                      for source in sources[:4]:
+                          label = clean(source.get("title") or source.get("url"), 220)
+                          url = clean(source.get("url"), 500)
+                          if label and url:
+                              source_lines.append(f"- {label}: {url}")
+                          elif label:
+                              source_lines.append(f"- {label}")
+                      retry_title = clean(case.get("title") or "NØX research finding", 220)
+                      retry_body = (
+                          f"NØX research finding\n\n{conclusion}\n\n"
+                          f"Evidence status: {result.get('evidence_status')}.\n\n"
+                          "This conclusion is bounded by the evidence currently available; it is not treated as universal proof.\n\n"
+                          "Sources:\n" + "\n".join(source_lines)
+                      )
+                      retry_result = result
+
+              # Learning-based publications have no case_id. Recreate the same
+              # title/body from the learning whose deterministic ID matches the
+              # conflict action; this also repairs the already-recorded old 409.
+              if retry_body is None:
+                  for learning in reversed(memory.get("learnings", [])):
+                      if not isinstance(learning, dict):
+                          continue
+                      summary = clean(learning.get("summary"), 1200)
+                      evidence = learning.get("evidence")
+                      if len(summary) < 120 or not isinstance(evidence, dict) or not evidence:
+                          continue
+                      if clean(learning.get("source"), 100) in ("core_cycle", "colony_bootstrap"):
+                          continue
+                      learning_key = stable("learning_publish", learning.get("timestamp"), summary)
+                      candidate_id = stable("action", learning_key, "publish")
+                      if candidate_id != original_id:
+                          continue
+                      retry_title = "NØX learning from observed outcomes"
+                      retry_body = (
+                          "NØX observed a concrete outcome and recorded this learning:\n\n"
+                          f"{summary}\n\n"
+                          f"Evidence recorded: {clean(evidence, 900)}\n\n"
+                          "This is a current working learning, not a universal claim. NØX will update it if later observations contradict it."
+                      )
+                      break
+
+              if not retry_body or not retry_title:
+                  print(f"Publication recovery unavailable: action={original_id} reason=source_payload_not_reconstructable")
                   continue
-              conclusion = clean(result.get("conclusion"), 1800)
-              sources = [x for x in (result.get("sources") or []) if isinstance(x, dict) and (x.get("url") or x.get("title"))]
-              if len(conclusion) < 180 or len(sources) < 2:
-                  continue
-              lower_conclusion = conclusion.lower()
-              if any(marker in lower_conclusion for marker in (
-                  "search coverage", "source coverage", "coverage found",
-                  "found relevant results", "relevant results across",
-                  "evidence coverage", "search results found"
-              )):
-                  continue
-              original_id = stable("action", case_id, "publish")
-              if previous.get("action_id") != original_id:
-                  # Do not retry a retry action or unrelated publication.
-                  continue
+
               retry_id = stable("action_retry", original_id, "publish", 1)
               if retry_id in resolved_action_ids or any(
                   isinstance(a, dict) and a.get("action_id") == retry_id
@@ -630,26 +677,12 @@ jobs:
                   continue
               if publications_24h >= 3 or publish_actions_created >= min(1, MAX_PUBLISH):
                   break
-              source_lines = []
-              for source in sources[:4]:
-                  label = clean(source.get("title") or source.get("url"), 220)
-                  url = clean(source.get("url"), 500)
-                  if label and url:
-                      source_lines.append(f"- {label}: {url}")
-                  elif label:
-                      source_lines.append(f"- {label}")
               runtime["pending_actions"].append({
                   "action_id": retry_id, "retry_of": original_id,
-                  "case_id": case_id, "kind": "publish",
-                  "title": clean(case.get("title") or "NØX research finding", 220),
-                  "body": (
-                      f"NØX research finding\n\n{conclusion}\n\n"
-                      f"Evidence status: {result.get('evidence_status')}.\n\n"
-                      "This conclusion is bounded by the evidence currently available; it is not treated as universal proof.\n\n"
-                      "Sources:\n" + "\n".join(source_lines)
-                  ),
+                  "case_id": retry_case_id, "kind": "publish",
+                  "title": retry_title, "body": retry_body,
                   "reason": "Single controlled retry after HTTP 409; Presence must reconcile an existing identical post before creating anything.",
-                  "research_result": result, "created_at": NOW
+                  "research_result": retry_result, "created_at": NOW
               })
               publish_actions_created += 1
               retry_created = True
