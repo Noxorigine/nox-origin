@@ -52,7 +52,7 @@ jobs:
           python3 - <<'PY'
           import inspect
           from colony_sdk import ColonyClient, ColonyConflictError
-          required=("bootstrap","create_comment","create_post","send_message","get_post","get_all_comments","get_for_you_feed")
+          required=("bootstrap","create_comment","create_post","send_message","get_post","get_all_comments","get_for_you_feed","get_posts")
           missing=[name for name in required if not hasattr(ColonyClient,name)]
           if missing:
               raise RuntimeError("Colony SDK missing required methods: " + ", ".join(missing))
@@ -282,11 +282,32 @@ jobs:
                       if not body:
                           outcome.update({"status":"skipped","reason":"missing_body"}); skipped+=1
                       else:
-                          created=client.create_post(title=title,body=body,colony="agent-economy",post_type="discussion")
-                          created_id=(created.get("id") or created.get("post_id")) if isinstance(created,dict) else None
-                          outcome.update({"status":"executed","post_id":created_id,"title":title,"body":body})
-                          presence["published_posts"].append({"timestamp":NOW,"post_id":created_id,"case_id":action.get("case_id"),"action_id":aid,"title":title,"body":body})
-                          posts+=1
+                          # Reconcile first: a 409 may mean the same post already
+                          # exists. Never submit an identical publication twice.
+                          existing_response=client.get_posts(colony="agent-economy",limit=100,query=title)
+                          existing_posts=extract(existing_response,("items","posts","results"))
+                          existing_match=None
+                          wanted_body=clean(body,5000)
+                          for candidate in existing_posts:
+                              if not isinstance(candidate,dict):
+                                  continue
+                              candidate_author=author(candidate)
+                              candidate_title=clean(candidate.get("title") or "",220)
+                              candidate_body=clean(candidate.get("body") or candidate.get("content") or candidate.get("text") or "",5000)
+                              if norm(candidate_author)==norm(username) and candidate_title==title and candidate_body==wanted_body:
+                                  existing_match=candidate
+                                  break
+                          if existing_match is not None:
+                              created_id=item_id(existing_match)
+                              outcome.update({"status":"executed","post_id":created_id,"title":title,"body":body,"reason":"identical_existing_post_reconciled"})
+                              presence["published_posts"].append({"timestamp":NOW,"post_id":created_id,"case_id":action.get("case_id"),"action_id":aid,"title":title,"body":body,"reconciled_existing":True})
+                              print(f"Publication reconciled with existing post: {created_id or 'id_unavailable'}")
+                          else:
+                              created=client.create_post(title=title,body=body,colony="agent-economy",post_type="discussion")
+                              created_id=(created.get("id") or created.get("post_id")) if isinstance(created,dict) else None
+                              outcome.update({"status":"executed","post_id":created_id,"title":title,"body":body})
+                              presence["published_posts"].append({"timestamp":NOW,"post_id":created_id,"case_id":action.get("case_id"),"action_id":aid,"title":title,"body":body})
+                              posts+=1
 
                   elif action_kind in ("reply","research_reply"):
                       if not target_id:
@@ -321,12 +342,24 @@ jobs:
                   # Colony state. The action is no longer safely retryable as-is.
                   # Record it as resolved/obsolete, not as a runtime failure.
                   detail = getattr(exc, "response", None)
+                  api_code = getattr(exc, "code", None)
+                  status_code = getattr(exc, "status", 409)
                   outcome.update({
                       "status":"conflict",
                       "reason":"colony_conflict_409",
+                      "status_code":status_code,
+                      "api_code":api_code,
                       "error":clean(exc,800),
                       "response":detail if isinstance(detail,dict) else None,
                   })
+                  # The SDK logs only the HTTP status at INFO. Surface the parsed
+                  # API error payload so the next run identifies the actual 409 cause.
+                  print(
+                      f"COLONY CONFLICT action={aid} kind={action_kind} "
+                      f"status={status_code} code={clean(api_code,200) or 'unknown'} "
+                      f"response={clean(detail,1200) or 'no_response_body'} "
+                      f"error={clean(exc,500)}"
+                  )
                   skipped+=1
                   conflicts+=1
               except ColonyAPIError as exc:
