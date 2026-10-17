@@ -29,7 +29,8 @@ GUARD_MODEL = os.environ.get("NOX_AI_GUARD_MODEL", "meta-llama/llama-prompt-guar
 MAX_CALLS = int(os.environ.get("NOX_AI_MAX_CALLS_PER_RUN", "3"))
 MAX_GUARD_CALLS = int(os.environ.get("NOX_AI_MAX_GUARD_CALLS_PER_RUN", "10"))
 MAX_TOKENS_PER_RUN = int(os.environ.get("NOX_AI_MAX_TOKENS_PER_RUN", "6000"))
-TIMEOUT = int(os.environ.get("NOX_AI_TIMEOUT_SECONDS", "30"))GUARD_THRESHOLD = float(os.environ.get("NOX_AI_GUARD_THRESHOLD", "0.5"))
+TIMEOUT = int(os.environ.get("NOX_AI_TIMEOUT_SECONDS", "30"))
+GUARD_THRESHOLD = float(os.environ.get("NOX_AI_GUARD_THRESHOLD", "0.5"))
 
 _state = {"calls": 0, "guard_calls": 0, "tokens": 0, "last_model": None, "last_error": None}
 
