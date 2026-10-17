@@ -30,8 +30,8 @@ env:
   MAX_PUBLISH_ACTIONS: "3"
   ENABLE_LIGHTNING_CHECK: "true"
   PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
+  FREE_AI_ONLY: "true"
+  ENABLE_RESEARCH_REPLY: "false"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
 
@@ -74,8 +74,8 @@ jobs:
 
           NOW = datetime.now(timezone.utc).isoformat()
           policy = {
-              "PROJECT_COST_EUR": "0", "GEMINI_USED": "false",
-              "EXTERNAL_AI_USED": "false", "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false",
+              "PROJECT_COST_EUR": "0", "FREE_AI_ONLY": "true",
+              "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false",
           }
           for key, expected in policy.items():
               if os.environ.get(key, expected).strip().lower() != expected:
@@ -96,6 +96,7 @@ jobs:
           MAX_WORK = int(os.environ["MAX_WORK_REQUESTS"])
           MAX_PUBLISH = int(os.environ["MAX_PUBLISH_ACTIONS"])
           ENABLE_LIGHTNING = os.environ["ENABLE_LIGHTNING_CHECK"].lower() == "true"
+          ENABLE_RESEARCH_REPLY = os.environ.get("ENABLE_RESEARCH_REPLY", "false").lower() == "true"
 
           EMPTY_MEMORY = {
               "version": 7,
@@ -171,6 +172,8 @@ jobs:
                   runtime[key] = json.loads(json.dumps(value))
           memory["version"] = max(7, int(memory.get("version", 1) or 1))
           runtime["version"] = 7
+          VOLATILE = ("run_count", "last_run", "last_rate_limit", "payout_health", "last_cycle")
+          previous_payout_status = (runtime.get("payout_health") or {}).get("status") if isinstance(runtime.get("payout_health"), dict) else None
 
           if not MEMORY_FILE.exists() and LEGACY_FILE.exists():
               legacy = load(LEGACY_FILE, {})
@@ -238,12 +241,10 @@ jobs:
               raise SystemExit(f"SECURITY STOP: profil inattendu '{username}'.")
           runtime["last_rate_limit"] = rate_limit(client)
 
-          remember(memory, "observations", "Colony bootstrap completed.", {
-              "username": username, "karma": profile.get("karma"),
-              "capabilities": state.get("capabilities", {}) if isinstance(state, dict) else {},
-              "unread_notifications": state.get("unread_notifications", 0) if isinstance(state, dict) else 0,
-              "unread_direct_messages": state.get("unread_direct_messages", 0) if isinstance(state, dict) else 0
-          }, "colony_bootstrap")
+          # No per-run bootstrap observation: it changed the state file on every
+          # run and caused a useless commit every 30 minutes.
+          memory_before = json.dumps(memory, sort_keys=True, ensure_ascii=False)
+          runtime_before = json.dumps({k: v for k, v in runtime.items() if k not in VOLATILE}, sort_keys=True, ensure_ascii=False)
 
           payout = {"status": "NOT_CHECKED", "lightning_address": None}
           if ENABLE_LIGHTNING:
@@ -476,6 +477,18 @@ jobs:
               consumed_presence.add(oid)
           runtime["consumed_presence_outcome_ids"] = list(consumed_presence)[-500:]
 
+          # Requests already completed or sent to manual review must never be
+          # re-created, and must stop occupying the 20 slots of the queue.
+          done_request_ids = {
+              x.get("request_id") for key in ("completed", "manual_review")
+              for x in (work.get(key, []) if isinstance(work, dict) else [])
+              if isinstance(x, dict) and x.get("request_id")
+          }
+          runtime["work_requests"] = [
+              w for w in runtime.get("work_requests", [])
+              if isinstance(w, dict) and w.get("id") not in done_request_ids
+          ]
+
           # Remove actions already resolved by Presence.
           pending = []
           # Every recorded Presence outcome is terminal for automatic execution.
@@ -516,7 +529,7 @@ jobs:
                   reason = "The public post contains a concrete question; research is required before asserting an answer."
                   action_kind = "research"
                   work_id = stable("work", case["id"], question)
-                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                  if work_id not in done_request_ids and not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
                       new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"recipient":case.get("recipient",""),"created_at":NOW,"status":"pending"})
               elif case["intent"] == "verify_claim" and case["evidence_signals"]:
                   decision = "research_claim"
@@ -524,7 +537,7 @@ jobs:
                   action_kind = "research"
                   question = case["questions"][0] if case["questions"] else f"What evidence supports or contradicts: {case['title']}"
                   work_id = stable("work", case["id"], question)
-                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                  if work_id not in done_request_ids and not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
                       new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"recipient":case.get("recipient",""),"created_at":NOW,"status":"pending"})
               elif case["intent"] == "reconcile_conflict" and case["conflict_signals"]:
                   decision = "reconstruct_before_reply"
@@ -532,7 +545,7 @@ jobs:
                   action_kind = "research"
                   question = case["questions"][0] if case["questions"] else f"What are the competing claims in: {case['title']}"
                   work_id = stable("work", case["id"], question)
-                  if not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
+                  if work_id not in done_request_ids and not any(isinstance(w,dict) and w.get("id") == work_id for w in runtime["work_requests"]):
                       new_work.append({"id":work_id,"case_id":case["id"],"work_type":"research","question":clean(question,1200),"context":clean(text,2500),"memory_context":memory_context,"recipient":case.get("recipient",""),"created_at":NOW,"status":"pending"})
               elif case["intent"] == "contextual_observation" and case["memory_hits"] and len(case["body"]) >= 180:
                   decision = "contextual_reply"
@@ -689,10 +702,62 @@ jobs:
               print(f"Publication recovery queued: retry_of={original_id} attempt=1")
               break
 
+          # A researched answer goes back to the person who asked, as a reply on
+          # their post. A new standalone post is only the fallback.
+          reply_actions_created = 0
+          REPLY_META_MARKERS = (
+              "search coverage", "source coverage", "coverage found",
+              "found relevant results", "relevant results across",
+              "evidence coverage", "search results found"
+          )
+          if ENABLE_RESEARCH_REPLY:
+              for case in reversed(memory.get("cognitive_cases", [])):
+                  if reply_actions_created >= 2:
+                      break
+                  if not isinstance(case, dict) or not isinstance(case.get("research_result"), dict):
+                      continue
+                  result = case["research_result"]
+                  if result.get("evidence_status") not in ("multi_source_support", "partial_support"):
+                      continue
+                  if case.get("source") not in ("for_you", "suggestion", "notification"):
+                      continue
+                  if not case.get("target_id") or case.get("author") == username:
+                      continue
+                  if case.get("outcome") not in (None, "research_returned"):
+                      continue
+                  conclusion = clean(result.get("conclusion"), 1800)
+                  sources = [x for x in (result.get("sources") or []) if isinstance(x, dict) and (x.get("url") or x.get("title"))]
+                  if len(conclusion) < 180 or len(sources) < 2:
+                      continue
+                  if any(marker in conclusion.lower() for marker in REPLY_META_MARKERS):
+                      continue
+                  reply_id = stable("action", case.get("case_id"), "research_reply")
+                  if any(isinstance(a, dict) and a.get("action_id") == reply_id for a in runtime["pending_actions"]):
+                      case["reply_queued"] = True
+                      continue
+                  if reply_id in resolved_action_ids:
+                      continue
+                  runtime["pending_actions"].append({
+                      "action_id": reply_id, "case_id": case.get("case_id"), "kind": "research_reply",
+                      "target_id": case.get("target_id"), "title": case.get("title"), "body": case.get("body"),
+                      "author": case.get("author"), "question": (case.get("questions") or [None])[0],
+                      "conclusion": conclusion, "sources": sources[:4], "research_result": result,
+                      "reason": "A research result answers a question or claim from this post; reply where it was asked.",
+                      "created_at": NOW
+                  })
+                  case["decision"] = "reply_after_research"
+                  case["action_kind"] = "research_reply"
+                  case["reply_queued"] = True
+                  reply_actions_created += 1
+                  print(f"Research reply queued: case={case.get('case_id')}")
+          runtime["pending_actions"] = runtime["pending_actions"][-MAX_PENDING:]
+
           for case in memory.get("cognitive_cases", []):
               if publish_actions_created >= min(1, MAX_PUBLISH):
                   break
               if not isinstance(case, dict) or not case.get("research_result"):
+                  continue
+              if case.get("reply_queued"):
                   continue
               result = case["research_result"]
               status = result.get("evidence_status")
@@ -807,8 +872,15 @@ jobs:
           runtime["processed_post_ids"] = list(dict.fromkeys(runtime.get("processed_post_ids",[]) + [c["target_id"] for c in cases if c["source"]=="for_you" and c["target_id"]]))[-1000:]
           runtime["seen_event_ids"] = list(dict.fromkeys(runtime.get("seen_event_ids",[]) + [c["target_id"] for c in cases if c["source"] in ("notification","dm") and c["target_id"]]))[-1000:]
 
-          save(MEMORY_FILE,memory)
-          save(RUNTIME_FILE,runtime)
+          memory_changed = json.dumps(memory, sort_keys=True, ensure_ascii=False) != memory_before
+          runtime_changed = json.dumps({k: v for k, v in runtime.items() if k not in VOLATILE}, sort_keys=True, ensure_ascii=False) != runtime_before
+          payout_changed = payout.get("status") != previous_payout_status
+          if memory_changed or runtime_changed or payout_changed or not MEMORY_FILE.exists() or not RUNTIME_FILE.exists():
+              save(MEMORY_FILE,memory)
+              save(RUNTIME_FILE,runtime)
+              print("State saved.")
+          else:
+              print("Idle cycle: nothing changed, state files left untouched (no commit).")
 
           print("=== NØX CORE GENERAL V7 ===")
           print(f"Feed={len(feed)} Notifications={len(notifications)} DMs={len(messages)}")
@@ -829,5 +901,13 @@ jobs:
             exit 0
           fi
           git commit -m "NØX: update cognitive core"
-          git pull --rebase origin main
-          git push
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            echo "Push attempt $attempt failed, retrying."
+            sleep $((attempt * 5))
+          done
+          echo "Push failed after 4 attempts."
+          exit 1
