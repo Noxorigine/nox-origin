@@ -19,10 +19,9 @@ env:
   PRESENCE_FILE: memory/nox_colony_presence.json
   MAX_HISTORY: "200"
   MIN_REPEATED_FAILURES: "2"
-  PENDING_BACKLOG_ALERT: "50"
+  PENDING_BACKLOG_ALERT: "15"
   PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
+  FREE_AI_ONLY: "true"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
 
@@ -39,8 +38,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run self-evolution diagnostics
         shell: bash
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -60,11 +64,18 @@ jobs:
               except (TypeError, ValueError):
                   return default
 
+          import sys
+          sys.path.insert(0, "scripts")
+          import nox_ai
+
+          # Normal behaviour of a healthy agent, not failures: skipping a post
+          # already answered or written by NØX itself.
+          BENIGN_SKIPS = {"already_participated", "own_post"}
+
           def check_policy():
               required = {
                   "PROJECT_COST_EUR": "0",
-                  "GEMINI_USED": "false",
-                  "EXTERNAL_AI_USED": "false",
+                  "FREE_AI_ONLY": "true",
                   "AUTO_PAYMENT": "false",
                   "AUTO_SPENDING": "false",
               }
@@ -132,6 +143,10 @@ jobs:
               success = item.get("success")
               status = clean(item.get("status") or item.get("result") or "unknown", 80)
               error = clean(item.get("error") or item.get("message") or item.get("reason"), 500)
+              if status.lower() == "executed":
+                  continue
+              if status.lower() == "skipped" and clean(item.get("reason"), 80).lower() in BENIGN_SKIPS:
+                  continue
               if success is False or (not success and error):
                   signals.append({"source": "presence", "status": status, "error": error})
 
@@ -193,6 +208,21 @@ jobs:
                   "recommendation": recommendation,
               })
 
+          # Bounded, advisory-only AI analysis of the top findings. Error text
+          # is treated as untrusted data; nothing is applied automatically.
+          ai_notes = 0
+          if findings and nox_ai.available():
+              for finding in findings[:2]:
+                  note = nox_ai.ask_ai(
+                      "You review GitHub Actions workflows of an autonomous agent. In 2 to 3 sentences in French, give the probable cause of the "
+                      "repeated failure and one concrete code-level fix. Never suggest spending money, weakening security checks or disabling policy flags.",
+                      f"Source: {finding['source']}\nStatus: {finding['status']}\nOccurrences: {finding['count']}\nStatic hint: {finding['recommendation']}",
+                      untrusted=" | ".join(finding["examples"]) or finding["error_signature"],
+                      max_tokens=300, temperature=0.2)
+                  if note:
+                      finding["ai_analysis"] = clean(note, 700)
+                      ai_notes += 1
+
           pending = [item for item in as_list(runtime.get("pending_actions")) if isinstance(item, dict)]
           if len(pending) >= backlog_limit:
               findings.append({
@@ -240,8 +270,7 @@ jobs:
               ],
               "policy": {
                   "project_cost_eur": 0,
-                  "gemini_used": False,
-                  "external_ai_used": False,
+                  "free_ai_only": True,
                   "auto_payment": False,
                   "auto_spending": False,
               },
@@ -259,6 +288,7 @@ jobs:
           print("Signals:", len(signals), "| Findings:", len(findings), "| Fingerprint:", fingerprint)
           for finding in findings:
               print(f"- [{finding['count']}x] {finding['source']}/{finding['status']}: {finding['recommendation']}")
+          print("AI analyses:", ai_notes, "|", nox_ai.usage())
           print("RESULT:", decision)
           print("NOTE: patch proposals are recorded for review; no workflow code is changed automatically by this diagnostic run.")
           PY
