@@ -24,10 +24,11 @@ env:
   MAX_ATTEMPTS_PER_REQUEST: "3"
   WEB_TIMEOUT_SECONDS: "20"
   PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
+  FREE_AI_ONLY: "true"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
+  NOX_AI_MAX_CALLS_PER_RUN: "3"
+  NOX_AI_MAX_TOKENS_PER_RUN: "6000"
 
 jobs:
   work-factory:
@@ -41,23 +42,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install search dependency
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "ddgs>=9.16.0,<10.0.0"
+          pip install "ddgs>=9.16.0,<10.0.0" requests
 
       - name: Run Work Factory
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           python3 - <<'PY'
           import hashlib
           import json
           import os
           import re
+          import sys
           from datetime import datetime, timezone
           from pathlib import Path
           from urllib.parse import urlparse
 
           from ddgs import DDGS
+
+          sys.path.insert(0, "scripts")
+          import nox_ai
 
           NOW = datetime.now(timezone.utc).isoformat()
           CORE_RUNTIME_FILE = Path(os.environ["CORE_RUNTIME_FILE"])
@@ -71,7 +78,7 @@ jobs:
           MAX_ATTEMPTS = max(1, int(os.environ["MAX_ATTEMPTS_PER_REQUEST"]))
           TIMEOUT = int(os.environ["WEB_TIMEOUT_SECONDS"])
 
-          for key, expected in {"PROJECT_COST_EUR":"0","GEMINI_USED":"false","EXTERNAL_AI_USED":"false","AUTO_PAYMENT":"false","AUTO_SPENDING":"false"}.items():
+          for key, expected in {"PROJECT_COST_EUR":"0","FREE_AI_ONLY":"true","AUTO_PAYMENT":"false","AUTO_SPENDING":"false"}.items():
               if os.environ.get(key, expected).strip().lower() != expected:
                   raise SystemExit(f"SECURITY STOP: {key} must remain {expected}")
 
@@ -164,6 +171,36 @@ jobs:
               else: status="no_evidence"
               return status,scored,len(domains)
 
+          # Mots que Core refuse dans une conclusion publiable (phrase sur la recherche elle-même).
+          META_MARKERS = ("search coverage","source coverage","coverage found","found relevant results","relevant results across","evidence coverage","search results found")
+
+          def ai_conclusion(question, status, scored):
+              """Conclusion rédigée par l'IA à partir des extraits. None si indisponible ou invalide."""
+              if status not in ("multi_source_support","partial_support"):
+                  return None
+              ranked=sorted(scored,key=lambda r:r.get("query_overlap",0),reverse=True)[:4]
+              blocks=[f"[{i+1}] {clean(r.get('title'),160)} ({r.get('domain')}): {clean(r.get('snippet'),380)}" for i,r in enumerate(ranked)]
+              untrusted=f"Question: {clean(question,500)}\n\nSource excerpts:\n"+"\n".join(blocks)
+              text=nox_ai.ask_ai(
+                  system=("You are NØX's research summarizer. Using ONLY the source excerpts provided, write a careful, "
+                          "bounded conclusion of 2 to 4 sentences (between 220 and 600 characters) that answers the question. "
+                          "Say what the sources support and what remains uncertain. Never claim certainty. "
+                          "Do not mention searching, search results or coverage. Reply in the language of the question. "
+                          "Output plain text only, no title, no list."),
+                  user="Write the conclusion for the question and sources below.",
+                  untrusted=untrusted,
+                  max_tokens=700,
+              )
+              if not text: return None
+              text=clean(text,900)
+              if len(text)<180 or any(m in text.lower() for m in META_MARKERS):
+                  print("AI conclusion rejected: too short or meta wording; using template.")
+                  return None
+              return text
+
+          ai_ok = nox_ai.available()
+          print(f"AI helper: {'enabled' if ai_ok else 'disabled (no GROQ_API_KEY)'} | models={nox_ai.MODELS}")
+
           for request in requests:
               rid=request["id"]; question=clean(request.get("question"),1200)
               queries=[]
@@ -201,12 +238,18 @@ jobs:
                   conclusion="No usable web evidence was retrieved."
                   next_step="Refine the question or retry later."
 
+              conclusion_source="template"
+              written=ai_conclusion(question,status,scored) if ai_ok else None
+              if written:
+                  conclusion=written; conclusion_source="ai:"+str(nox_ai.usage().get("last_model"))
+
               result_id=f"result-{stable(rid,json.dumps(scored,ensure_ascii=False,sort_keys=True))}"
               result={
                   "id":result_id,"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,
                   "question":question,"work_type":"research","queries":dedup,"evidence_status":status,
                   "source_count":len(scored),"unique_domains":domain_count,"sources":scored[:MAX_TOTAL],
-                  "conclusion":conclusion,"uncertainty":"Search snippets are discovery evidence only; they do not establish truth.",
+                  "conclusion":conclusion,"conclusion_source":conclusion_source,
+                  "uncertainty":"Search snippets are discovery evidence only; they do not establish truth.",
                   "next_step":next_step,"errors":errors
               }
               state["history"].append(result)
@@ -215,16 +258,17 @@ jobs:
               else:
                   state["attempts"][rid]=int(state["attempts"].get(rid,0))+1
 
-              print(f"WORK RESULT: {question} | {status} | sources={len(scored)} | domains={domain_count}")
+              print(f"WORK RESULT: {question} | {status} | sources={len(scored)} | domains={domain_count} | conclusion={conclusion_source}")
 
           state["history"]=state["history"][-MAX_HISTORY:]
           state["completed"]=state["completed"][-MAX_HISTORY:]
           state["manual_review"]=state["manual_review"][-MAX_HISTORY:]
           state["version"]=4; state["last_run"]=NOW
-          state["last_summary"]={"timestamp":NOW,"work_candidates":len(runtime.get("work_requests",[])),"research_selected":len(requests),"completed":sum(1 for x in state["history"][-len(requests):] if isinstance(x,dict) and x.get("evidence_status")=="multi_source_support") if requests else 0}
+          state["last_summary"]={"timestamp":NOW,"work_candidates":len(runtime.get("work_requests",[])),"research_selected":len(requests),"completed":sum(1 for x in state["history"][-len(requests):] if isinstance(x,dict) and x.get("evidence_status")=="multi_source_support") if requests else 0,"ai_usage":nox_ai.usage()}
           save(WORK_FILE,state)
-          print(f"=== NØX WORK FACTORY V4 === candidates={len(runtime.get('work_requests',[]))} selected={len(requests)} history={len(state['history'])}")
-          print("CORE WORK REQUEST -> RESEARCH -> EVIDENCE COVERAGE -> CORE REASSESSMENT")
+          print(f"=== NØX WORK FACTORY V5 === candidates={len(runtime.get('work_requests',[]))} selected={len(requests)} history={len(state['history'])}")
+          print("CORE WORK REQUEST -> RESEARCH -> AI-WRITTEN CONCLUSION (free tier, template fallback) -> CORE REASSESSMENT")
+          print(f"AI usage this run: {nox_ai.usage()}")
           print(f"Manual review queue: {len(state['manual_review'])}; retry limit: {MAX_ATTEMPTS}")
           PY
 
@@ -236,5 +280,13 @@ jobs:
           git add memory/nox_work_factory.json
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "NØX: update work factory"
-          git pull --rebase origin main
-          git push
+          for attempt in 1 2 3 4; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Pushed."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+          echo "Push failed after retries."
+          exit 1
