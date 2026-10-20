@@ -142,6 +142,24 @@ jobs:
               requests.append(item)
               if len(requests)>=MAX_ITEMS: break
 
+          # --- relevance guards -------------------------------------------------
+          # Words from the research template itself must never count as topic matches:
+          # they made unrelated "evidence supports claim" pages look relevant.
+          GENERIC_TERMS = {"evidence","supports","support","supported","contradicts","contradict","claim","claims","competing","proof","verify","verified",
+                           "research","result","results","data","study","studies","what","does","answer","question","about","between","using","used","uses","into","over","under"}
+          DENY_DOMAINS = ("fiveable.me","quizlet.com","coursehero.com","brainly.com","chegg.com","studocu.com")
+          SENSITIVE_SOURCE_TERMS = ("jewish famil","zionist","great replacement","white genocide","illuminati","new world order","holocaust denial","qanon","q-anon")
+          NON_ANSWER_MARKERS = ("do not contain", "does not contain", "no information", "not address", "unrelated", "remains unresolved", "remain unresolved", "cannot be determined", "no relevant", "do not provide", "does not provide", "irrelevant", "not enough information", "insufficient evidence", "you provided")
+          PREFIX_RE = re.compile(r"^\s*(what evidence supports or contradicts(?: claims that)?|what are the competing claims in)\s*:?\s*", re.I)
+
+          def topic_of(question):
+              """The real subject of a question, without the research-template wording."""
+              topic = PREFIX_RE.sub("", clean(question, 1200)).strip(" :?")
+              return topic or clean(question, 1200)
+
+          def topic_terms(question):
+              return [t for t in terms(topic_of(question)) if t not in GENERIC_TERMS]
+
           def search(query):
               try:
                   raw=DDGS(timeout=TIMEOUT).text(query,max_results=MAX_RESULTS,backend="auto")
@@ -153,18 +171,24 @@ jobs:
                   url=clean(item.get("href") or item.get("url"),1000)
                   if not url: continue
                   domain=urlparse(url).netloc.lower().split(":")[0]
+                  if any(domain==d or domain.endswith("."+d) for d in DENY_DOMAINS): continue
+                  blob=(clean(item.get("title"),300)+" "+clean(item.get("body") or item.get("snippet"),1200)).lower()
+                  if any(t in blob and t not in query.lower() for t in SENSITIVE_SOURCE_TERMS): continue
                   results.append({"title":clean(item.get("title"),300),"url":url,"domain":domain,"snippet":clean(item.get("body") or item.get("snippet"),1200)})
               return results,None
 
           def assess(question,results):
-              q=set(terms(question))
+              q=set(topic_terms(question))
+              need=2 if len(q)>=3 else 1
               scored=[]
               for r in results:
                   text=set(terms((r.get("title","")+" "+r.get("snippet",""))))
-                  overlap=len(q & text)/max(1,len(q))
-                  scored.append({**r,"query_overlap":round(overlap,3)})
-              domains={r.get("domain") for r in scored if r.get("domain")}
-              strong=[r for r in scored if r["query_overlap"]>=0.18]
+                  shared=q & text
+                  overlap=len(shared)/max(1,len(q))
+                  relevant=overlap>=0.18 and len(shared)>=need
+                  scored.append({**r,"query_overlap":round(overlap,3),"shared_terms":sorted(shared)[:8],"relevant":relevant})
+              strong=[r for r in scored if r["relevant"]]
+              domains={r.get("domain") for r in strong if r.get("domain")}
               if len(domains)>=3 and len(strong)>=2: status="multi_source_support"
               elif len(domains)>=2 and len(strong)>=1: status="partial_support"
               elif scored: status="insufficient_verification"
@@ -178,13 +202,16 @@ jobs:
               """Conclusion rédigée par l'IA à partir des extraits. None si indisponible ou invalide."""
               if status not in ("multi_source_support","partial_support"):
                   return None
-              ranked=sorted(scored,key=lambda r:r.get("query_overlap",0),reverse=True)[:4]
+              ranked=sorted([r for r in scored if r.get("relevant")],key=lambda r:r.get("query_overlap",0),reverse=True)[:4]
+              if len(ranked)<2: return "INSUFFICIENT"
               blocks=[f"[{i+1}] {clean(r.get('title'),160)} ({r.get('domain')}): {clean(r.get('snippet'),380)}" for i,r in enumerate(ranked)]
               untrusted=f"Question: {clean(question,500)}\n\nSource excerpts:\n"+"\n".join(blocks)
               text=nox_ai.ask_ai(
                   system=("You are NØX's research summarizer. Using ONLY the source excerpts provided, write a careful, "
                           "bounded conclusion of 2 to 4 sentences (between 220 and 600 characters) that answers the question. "
                           "Say what the sources support and what remains uncertain. Never claim certainty. "
+                          "If the excerpts do not actually address the question, reply with exactly the single word INSUFFICIENT. "
+                          "Write as NØX's own finding: never say 'the sources you provided' and never address the reader as having supplied anything. "
                           "Do not mention searching, search results or coverage. Reply in the language of the question. "
                           "Output plain text only, no title, no list."),
                   user="Write the conclusion for the question and sources below.",
@@ -193,6 +220,9 @@ jobs:
               )
               if not text: return None
               text=clean(text,900)
+              if text.upper().startswith("INSUFFICIENT") or any(m in text.lower() for m in NON_ANSWER_MARKERS):
+                  print("AI conclusion: sources do not address the question -> insufficient (nothing will be published).")
+                  return "INSUFFICIENT"
               if len(text)<180 or any(m in text.lower() for m in META_MARKERS):
                   print("AI conclusion rejected: too short or meta wording; using template.")
                   return None
@@ -204,12 +234,13 @@ jobs:
           for request in requests:
               rid=request["id"]; question=clean(request.get("question"),1200)
               queries=[]
-              if question: queries.append(question)
+              topic=topic_of(question)
+              if topic: queries.append(topic)
               context=clean(request.get("context"),1500)
               if context and len(queries)<3:
-                  queries.append(clean(f"{question} {context[:600]}",1400))
+                  queries.append(clean(f"{topic} {context[:600]}",1400))
               if request.get("memory_context") and len(queries)<3:
-                  queries.append(clean(f"{question} {json.dumps(request['memory_context'],ensure_ascii=False)[:600]}",1400))
+                  queries.append(clean(f"{topic} {json.dumps(request['memory_context'],ensure_ascii=False)[:600]}",1400))
               dedup=[]
               for q in queries:
                   if q and q not in dedup: dedup.append(q)
@@ -240,6 +271,12 @@ jobs:
 
               conclusion_source="template"
               written=ai_conclusion(question,status,scored) if ai_ok else None
+              if written=="INSUFFICIENT":
+                  status="insufficient_verification"
+                  conclusion="The sources found do not address the question; nothing is published."
+                  next_step="Do not promote the claim to a confirmed fact."
+                  conclusion_source="ai_insufficient"
+                  written=None
               if written:
                   conclusion=written; conclusion_source="ai:"+str(nox_ai.usage().get("last_model"))
 
@@ -247,7 +284,7 @@ jobs:
               result={
                   "id":result_id,"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,
                   "question":question,"work_type":"research","queries":dedup,"evidence_status":status,
-                  "source_count":len(scored),"unique_domains":domain_count,"sources":scored[:MAX_TOTAL],
+                  "source_count":len(scored),"unique_domains":domain_count,"sources":([r for r in scored if r.get("relevant")] if status in ("multi_source_support","partial_support") else scored)[:MAX_TOTAL],
                   "conclusion":conclusion,"conclusion_source":conclusion_source,
                   "uncertainty":"Search snippets are discovery evidence only; they do not establish truth.",
                   "next_step":next_step,"errors":errors
