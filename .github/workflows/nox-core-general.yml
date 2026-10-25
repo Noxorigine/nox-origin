@@ -2,6 +2,15 @@ name: NØX - Core General
 
 on:
   workflow_dispatch:
+    inputs:
+      topic:
+        description: "Sujet imposé pour aujourd'hui (une question de recherche). Laisser vide en usage normal."
+        required: false
+        default: ""
+      queue_followup:
+        description: "Sujet de suivi à ajouter à la file (traité avant le sujet automatique du jour suivant)."
+        required: false
+        default: ""
   schedule:
     - cron: "*/30 * * * *"
 
@@ -28,6 +37,13 @@ env:
   MAX_PENDING_ACTIONS: "20"
   MAX_WORK_REQUESTS: "20"
   MAX_PUBLISH_ACTIONS: "3"
+  COMMENT_SCAN_POSTS: "8"
+  COMMENT_WINDOW_DAYS: "21"
+  MAX_COMMENT_REPLIES_PER_RUN: "2"
+  # Au premier passage, les commentaires déjà présents sont considérés comme traités,
+  # sauf ceux publiés depuis moins de N heures (0 = aucun). À remettre à 0 après le premier passage.
+  COMMENT_BACKFILL_HOURS: "0"
+  DEFAULT_COLONY: "agent-economy"
   ENABLE_LIGHTNING_CHECK: "true"
   PROJECT_COST_EUR: "0"
   FREE_AI_ONLY: "true"
@@ -56,6 +72,8 @@ jobs:
       - name: Run NØX Core
         env:
           COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+          TOPIC_OVERRIDE: ${{ github.event.inputs.topic }}
+          QUEUE_FOLLOWUP: ${{ github.event.inputs.queue_followup }}
         run: |
           python3 - <<'PY'
           import json
@@ -96,9 +114,31 @@ jobs:
           MAX_PENDING = int(os.environ["MAX_PENDING_ACTIONS"])
           MAX_WORK = int(os.environ["MAX_WORK_REQUESTS"])
           MAX_PUBLISH = int(os.environ["MAX_PUBLISH_ACTIONS"])
+          COMMENT_SCAN_POSTS = int(os.environ.get("COMMENT_SCAN_POSTS", "8"))
+          COMMENT_WINDOW_DAYS = int(os.environ.get("COMMENT_WINDOW_DAYS", "21"))
+          MAX_COMMENT_REPLIES = int(os.environ.get("MAX_COMMENT_REPLIES_PER_RUN", "2"))
+          COMMENT_BACKFILL_HOURS = int(os.environ.get("COMMENT_BACKFILL_HOURS", "0") or 0)
+          DEFAULT_COLONY = (os.environ.get("DEFAULT_COLONY", "agent-economy").strip() or "agent-economy")
           ENABLE_LIGHTNING = os.environ["ENABLE_LIGHTNING_CHECK"].lower() == "true"
           ENABLE_RESEARCH_REPLY = os.environ.get("ENABLE_RESEARCH_REPLY", "false").lower() == "true"
           ENABLE_SELF_TOPICS = os.environ.get("ENABLE_SELF_TOPICS", "true").lower() == "true"
+          TOPIC_OVERRIDE = re.sub(r"\s+", " ", os.environ.get("TOPIC_OVERRIDE", "")).strip()[:300]
+          QUEUE_FOLLOWUP = re.sub(r"\s+", " ", os.environ.get("QUEUE_FOLLOWUP", "")).strip()[:300]
+
+          # Colonie de publication par domaine. Remplace les valeurs par les identifiants
+          # (slugs) réels des colonies de The Colony quand tu veux router un domaine ailleurs.
+          COLONY_BY_AREA = {
+              "algorithms": DEFAULT_COLONY,
+              "security": DEFAULT_COLONY,
+              "agent_economy": DEFAULT_COLONY,
+              "free_choice": DEFAULT_COLONY,
+              "followup": DEFAULT_COLONY,
+              "manual": DEFAULT_COLONY,
+          }
+
+          def colony_for_case(case):
+              area = case.get("topic_area") if isinstance(case, dict) else None
+              return COLONY_BY_AREA.get(area, DEFAULT_COLONY)
 
           EMPTY_MEMORY = {
               "version": 7,
@@ -113,6 +153,8 @@ jobs:
               "last_rate_limit": None, "payout_health": None,
               "pending_actions": [], "work_requests": [],
               "consumed_work_result_ids": [], "consumed_presence_outcome_ids": [],
+              "seen_comment_ids": [], "comment_scan_initialized": False,
+              "followups": [],
               "last_cycle": None
           }
 
@@ -397,7 +439,85 @@ jobs:
                   "created_at": item.get("created_at") if isinstance(item, dict) else None
               }
 
+          # -----------------------------------------------------------
+          # Comments received on NØX's own published posts. The post list comes
+          # from the Presence file. Existing comments are marked as already
+          # handled on the very first scan, so NØX never answers old threads
+          # that were already handled by hand.
+          # -----------------------------------------------------------
+          def age_hours(value):
+              try:
+                  return (datetime.now(timezone.utc) - datetime.fromisoformat(str(value).replace("Z", "+00:00"))).total_seconds() / 3600
+              except Exception:
+                  return None
+
+          own_comment_cases = []
+          comment_ids_to_mark = []
+          threads_ok = 0
+          seen_comments = set(x for x in runtime.get("seen_comment_ids", []) if x)
+          first_comment_scan = not runtime.get("comment_scan_initialized")
+          cutoff_ts = datetime.now(timezone.utc).timestamp() - COMMENT_WINDOW_DAYS * 86400
+          own_posts = []
+          own_post_ids = set()
+          for rec in reversed(presence.get("published_posts", []) if isinstance(presence, dict) else []):
+              if not isinstance(rec, dict) or not rec.get("post_id"):
+                  continue
+              try:
+                  rec_ts = datetime.fromisoformat(str(rec.get("timestamp")).replace("Z", "+00:00")).timestamp()
+              except Exception:
+                  continue
+              if rec_ts < cutoff_ts or str(rec["post_id"]) in own_post_ids:
+                  continue
+              own_post_ids.add(str(rec["post_id"]))
+              own_posts.append(rec)
+              if len(own_posts) >= COMMENT_SCAN_POSTS:
+                  break
+
+          for rec in own_posts:
+              post_id = str(rec["post_id"])
+              try:
+                  thread = client.get_all_comments(post_id)
+                  thread = thread if isinstance(thread, list) else extract(thread, ("items", "comments"))
+                  threads_ok += 1
+              except Exception as exc:
+                  remember(memory, "failures", "Comments of an own post could not be read.", {"post_id": post_id, "error": clean(exc, 300)}, "colony_comments")
+                  continue
+              nox_replied_to = set()
+              for c in thread:
+                  if isinstance(c, dict) and author(c) == username:
+                      parent = str(c.get("parent_id") or c.get("parent_comment_id") or "")
+                      if parent:
+                          nox_replied_to.add(parent)
+              for c in thread:
+                  if not isinstance(c, dict):
+                      continue
+                  cid = str(c.get("id") or c.get("comment_id") or "")
+                  commenter = author(c)
+                  if not cid or cid in seen_comments or not commenter or commenter == username:
+                      continue
+                  if cid in nox_replied_to:
+                      comment_ids_to_mark.append(cid)
+                      continue
+                  if first_comment_scan:
+                      age = age_hours(c.get("created_at"))
+                      recent = COMMENT_BACKFILL_HOURS > 0 and age is not None and age <= COMMENT_BACKFILL_HOURS
+                      if not recent:
+                          comment_ids_to_mark.append(cid)
+                          continue
+                  case = classify(c, "own_post_comment")
+                  if not case:
+                      comment_ids_to_mark.append(cid)
+                      continue
+                  case["id"] = stable("case", "own_post_comment", post_id, cid)
+                  case["target_id"] = post_id
+                  case["comment_id"] = cid
+                  case["comment_author"] = commenter
+                  case["post_title"] = clean(rec.get("title"), 300)
+                  own_comment_cases.append(case)
+
           raw_cases = []
+          # Comments on NØX's own posts come first: they are the people actually talking to NØX.
+          raw_cases.extend(own_comment_cases)
           for item in feed:
               case = classify(item, "for_you")
               if case: raw_cases.append(case)
@@ -520,7 +640,11 @@ jobs:
               reason = "No concrete contribution is justified by the available context."
               action_kind = None
 
-              if case["source"] == "dm" and case["intent"] == "answer_or_research_question" and case["questions"]:
+              if case["source"] == "own_post_comment" and case["intent"] == "contextual_observation":
+                  decision = "comment_reply_direct"
+                  reason = "A substantive comment was left on NØX's own post and needs no new research; reply in the thread, without asserting new facts."
+                  action_kind = "comment_reply"
+              elif case["source"] == "dm" and case["intent"] == "answer_or_research_question" and case["questions"]:
                   question = case["questions"][0]
                   decision = "dm_reply"
                   reason = "A direct question was received in a DM; Core can answer from its observed memory without requiring public research first."
@@ -559,7 +683,8 @@ jobs:
                   "title":case["title"],"author":case["author"],"recipient":case.get("recipient",""),"body":case["body"],"intent":case["intent"],
                   "questions":case["questions"],"evidence_signals":case["evidence_signals"],"conflict_signals":case["conflict_signals"],
                   "memory_hits":memory_context,"uncertainties":case["uncertainty"],"decision":decision,"decision_reason":reason,
-                  "action_kind":action_kind,"outcome":None,"learning":None
+                  "action_kind":action_kind,"outcome":None,"learning":None,
+                  "comment_id":case.get("comment_id",""),"comment_author":case.get("comment_author",""),"post_title":case.get("post_title","")
               }
               add(memory,"cognitive_cases",case_record,MAX_CASES_MEMORY)
               remember(memory,"decisions",f"Decision: {decision}.",{"case_id":case["id"],"target_id":case["target_id"],"reason":reason,"action_kind":action_kind},"cognitive_decision")
@@ -572,6 +697,11 @@ jobs:
                   action_id = stable("action", case["id"], "reply")
                   if not any(isinstance(a,dict) and a.get("action_id") == action_id for a in runtime["pending_actions"]):
                       new_actions.append({"action_id":action_id,"case_id":case["id"],"kind":"reply","target_id":case["target_id"],"title":case["title"],"body":case["body"],"author":case["author"],"reason":reason,"created_at":NOW})
+              elif action_kind == "comment_reply":
+                  action_id = stable("action", case["id"], "comment_reply")
+                  if (case.get("comment_id") and action_id not in resolved_action_ids
+                          and not any(isinstance(a,dict) and a.get("action_id") == action_id for a in runtime["pending_actions"])):
+                      new_actions.append({"action_id":action_id,"case_id":case["id"],"kind":"comment_reply","target_id":case["target_id"],"comment_id":case["comment_id"],"comment_author":case.get("comment_author",""),"title":case.get("post_title",""),"reason":reason,"created_at":NOW})
               elif action_kind == "research":
                   pass
 
@@ -580,6 +710,7 @@ jobs:
           # small share of free-choice topics. One research request per UTC
           # day; the normal research -> quality gate -> publish path applies,
           # so an irrelevant or inconclusive result is never published.
+          # Priority: manual topic (workflow_dispatch) > queued follow-up > topic wheel.
           # -----------------------------------------------------------
           FOCUS_TOPICS = {
               "algorithms": [
@@ -621,27 +752,48 @@ jobs:
           self_topics = runtime.setdefault("self_topics", [])
           if not isinstance(self_topics, list):
               self_topics = runtime["self_topics"] = []
-          if (ENABLE_SELF_TOPICS and not any(isinstance(t, dict) and t.get("day") == today_key for t in self_topics)
-                  and len(runtime.get("work_requests", [])) + len(new_work) < MAX_WORK):
+          followups = runtime.setdefault("followups", [])
+          if not isinstance(followups, list):
+              followups = runtime["followups"] = []
+          if QUEUE_FOLLOWUP and not any(isinstance(f, dict) and f.get("topic") == QUEUE_FOLLOWUP for f in followups):
+              followups.append({"id": stable("followup", QUEUE_FOLLOWUP), "topic": QUEUE_FOLLOWUP, "created_at": NOW, "status": "pending"})
+              print(f"Follow-up queued: {QUEUE_FOLLOWUP}")
+          pending_followup = next((f for f in followups if isinstance(f, dict) and f.get("status") == "pending"), None)
+          topic_done_today = any(isinstance(t, dict) and t.get("day") == today_key for t in self_topics)
+          work_capacity = len(runtime.get("work_requests", [])) + len(new_work) < MAX_WORK
+          if ENABLE_SELF_TOPICS and work_capacity and (TOPIC_OVERRIDE or not topic_done_today):
               used = {t.get("topic") for t in self_topics if isinstance(t, dict)}
-              day_index = int(today_key)
-              area = TOPIC_WHEEL[int(sha256(today_key.encode()).hexdigest(), 16) % len(TOPIC_WHEEL)]
-              pool = [q for q in FOCUS_TOPICS[area] if q not in used] or FOCUS_TOPICS[area]
-              topic = pool[int(sha256(("t" + today_key).encode()).hexdigest(), 16) % len(pool)]
-              self_case_id = f"self-topic-{today_key}"
+              if TOPIC_OVERRIDE:
+                  topic, area = TOPIC_OVERRIDE.rstrip(" ?"), "manual"
+              elif pending_followup:
+                  topic, area = clean(pending_followup.get("topic"), 300).rstrip(" ?"), "followup"
+                  pending_followup["status"] = "scheduled"
+                  pending_followup["scheduled_at"] = NOW
+              else:
+                  area = TOPIC_WHEEL[int(sha256(today_key.encode()).hexdigest(), 16) % len(TOPIC_WHEEL)]
+                  pool = [q for q in FOCUS_TOPICS[area] if q not in used] or FOCUS_TOPICS[area]
+                  topic = pool[int(sha256(("t" + today_key).encode()).hexdigest(), 16) % len(pool)]
+              if area in ("manual", "followup"):
+                  self_case_id = f"self-topic-{today_key}-{sha256(topic.encode()).hexdigest()[:8]}"
+              else:
+                  self_case_id = f"self-topic-{today_key}"
               self_work_id = stable("work", self_case_id)
-              new_work.append({"id": self_work_id, "case_id": self_case_id, "work_type": "research", "question": topic,
-                               "context": "", "memory_context": [], "recipient": "", "created_at": NOW, "status": "pending"})
-              add(memory, "cognitive_cases", {
-                  "timestamp": NOW, "case_id": self_case_id, "source": "self_topic", "target_id": "", "title": topic + "?",
-                  "author": username, "recipient": "", "body": "", "intent": "self_chosen_topic", "questions": [topic],
-                  "evidence_signals": [], "conflict_signals": [], "memory_hits": [], "uncertainties": [],
-                  "decision": "research_self_topic", "decision_reason": f"Daily self-chosen topic ({area}).",
-                  "action_kind": "research", "outcome": None, "learning": None, "topic_area": area
-              }, MAX_CASES_MEMORY)
-              self_topics.append({"day": today_key, "topic": topic, "area": area, "case_id": self_case_id})
-              runtime["self_topics"] = self_topics[-60:]
-              print(f"Self topic [{area}]: {topic}")
+              already_queued = (self_work_id in done_request_ids
+                                or any(isinstance(w, dict) and w.get("id") == self_work_id for w in runtime.get("work_requests", [])))
+              if topic and not already_queued:
+                  new_work.append({"id": self_work_id, "case_id": self_case_id, "work_type": "research", "question": topic,
+                                   "context": "", "memory_context": [], "recipient": "", "created_at": NOW, "status": "pending"})
+                  add(memory, "cognitive_cases", {
+                      "timestamp": NOW, "case_id": self_case_id, "source": "self_topic", "target_id": "", "title": topic + "?",
+                      "author": username, "recipient": "", "body": "", "intent": "self_chosen_topic", "questions": [topic],
+                      "evidence_signals": [], "conflict_signals": [], "memory_hits": [], "uncertainties": [],
+                      "decision": "research_self_topic", "decision_reason": f"Self-chosen topic ({area}).",
+                      "action_kind": "research", "outcome": None, "learning": None, "topic_area": area
+                  }, MAX_CASES_MEMORY)
+                  self_topics.append({"day": today_key, "topic": topic, "area": area, "case_id": self_case_id})
+                  runtime["self_topics"] = self_topics[-60:]
+                  print(f"Self topic [{area}]: {topic}")
+          runtime["followups"] = followups[-30:]
 
           runtime["work_requests"] = (runtime.get("work_requests", []) + new_work)[-MAX_WORK:]
           runtime["pending_actions"] = (runtime.get("pending_actions", []) + new_actions)[-MAX_PENDING:]
@@ -764,6 +916,7 @@ jobs:
                   "action_id": retry_id, "retry_of": original_id,
                   "case_id": retry_case_id, "kind": "publish",
                   "title": retry_title, "body": retry_body,
+                  "colony": previous.get("colony") or colony_for_case(case if isinstance(case, dict) else {}),
                   "reason": "Single controlled retry after HTTP 409; Presence must reconcile an existing identical post before creating anything.",
                   "research_result": retry_result, "created_at": NOW
               })
@@ -820,6 +973,49 @@ jobs:
                   case["reply_queued"] = True
                   reply_actions_created += 1
                   print(f"Research reply queued: case={case.get('case_id')}")
+
+          # Replies to comments left on NØX's own posts. Always on (independent of
+          # ENABLE_RESEARCH_REPLY): these are people answering NØX in its own thread.
+          # A reply built on research needs a bounded, multi-source conclusion;
+          # otherwise NØX stays silent rather than answering without grounds.
+          comment_replies_created = 0
+          for case in reversed(memory.get("cognitive_cases", [])):
+              if comment_replies_created >= MAX_COMMENT_REPLIES:
+                  break
+              if not isinstance(case, dict) or case.get("source") != "own_post_comment":
+                  continue
+              result = case.get("research_result")
+              if not isinstance(result, dict) or case.get("reply_queued"):
+                  continue
+              if case.get("outcome") not in (None, "research_returned"):
+                  continue
+              if result.get("evidence_status") not in ("multi_source_support", "partial_support"):
+                  continue
+              if not case.get("comment_id") or not case.get("target_id"):
+                  continue
+              conclusion = clean(result.get("conclusion"), 1800)
+              sources = [x for x in (result.get("sources") or []) if isinstance(x, dict) and (x.get("url") or x.get("title"))]
+              if len(conclusion) < 180 or len(sources) < 2:
+                  continue
+              if any(marker in conclusion.lower() for marker in REPLY_META_MARKERS):
+                  continue
+              reply_id = stable("action", case.get("case_id"), "comment_reply")
+              if reply_id in resolved_action_ids or any(isinstance(a, dict) and a.get("action_id") == reply_id for a in runtime["pending_actions"]):
+                  case["reply_queued"] = True
+                  continue
+              runtime["pending_actions"].append({
+                  "action_id": reply_id, "case_id": case.get("case_id"), "kind": "comment_reply",
+                  "target_id": case.get("target_id"), "comment_id": case.get("comment_id"),
+                  "comment_author": case.get("comment_author", ""), "title": case.get("post_title", ""),
+                  "conclusion": conclusion, "sources": sources[:4], "research_result": result,
+                  "reason": "A research result answers a comment left on NØX's own post; reply in the thread.",
+                  "created_at": NOW
+              })
+              case["decision"] = "comment_reply_after_research"
+              case["action_kind"] = "comment_reply"
+              case["reply_queued"] = True
+              comment_replies_created += 1
+              print(f"Comment reply queued: case={case.get('case_id')}")
           runtime["pending_actions"] = runtime["pending_actions"][-MAX_PENDING:]
 
           for case in memory.get("cognitive_cases", []):
@@ -890,6 +1086,7 @@ jobs:
               runtime["pending_actions"].append({
                   "action_id": action_id, "case_id": case.get("case_id"), "kind": "publish",
                   "title": title_text, "body": body_text,
+                  "colony": colony_for_case(case),
                   "reason": "Core judged the research conclusion sufficiently concrete, relevant and multi-source-supported for a public contribution.",
                   "research_result": result, "created_at": NOW
               })
@@ -928,6 +1125,7 @@ jobs:
                           f"Evidence recorded: {clean(evidence, 900)}\n\n"
                           "This is a current working learning, not a universal claim. NØX will update it if later observations contradict it."
                       ),
+                      "colony": DEFAULT_COLONY,
                       "reason": "Core selected an evidence-backed learning for public sharing to maintain useful presence.",
                       "learning": learning, "created_at": NOW
                   })
@@ -941,9 +1139,16 @@ jobs:
 
           runtime["run_count"] = int(runtime.get("run_count",0)) + 1
           runtime["last_run"] = NOW
-          runtime["last_cycle"] = {"cases":len(cases),"new_work":len(new_work),"new_actions":len(new_actions),"feed":len(feed),"notifications":len(notifications),"dms":len(messages)}
+          own_comment_cases_taken = [c for c in cases if c["source"] == "own_post_comment"]
+          runtime["last_cycle"] = {"cases":len(cases),"new_work":len(new_work),"new_actions":len(new_actions),"feed":len(feed),"notifications":len(notifications),"dms":len(messages),"own_post_comments":len(own_comment_cases_taken)}
           runtime["processed_post_ids"] = list(dict.fromkeys(runtime.get("processed_post_ids",[]) + [c["target_id"] for c in cases if c["source"]=="for_you" and c["target_id"]]))[-1000:]
           runtime["seen_event_ids"] = list(dict.fromkeys(runtime.get("seen_event_ids",[]) + [c["target_id"] for c in cases if c["source"] in ("notification","dm") and c["target_id"]]))[-1000:]
+          # Comments handled this run (or judged trivial / already answered) are never reconsidered.
+          newly_seen_comments = comment_ids_to_mark + [c["comment_id"] for c in own_comment_cases_taken if c.get("comment_id")]
+          runtime["seen_comment_ids"] = list(dict.fromkeys(runtime.get("seen_comment_ids", []) + newly_seen_comments))[-2000:]
+          # The first scan counts as done only if it could actually read the comment threads.
+          if threads_ok > 0 or not own_posts:
+              runtime["comment_scan_initialized"] = True
 
           memory_changed = json.dumps(memory, sort_keys=True, ensure_ascii=False) != memory_before
           runtime_changed = json.dumps({k: v for k, v in runtime.items() if k not in VOLATILE}, sort_keys=True, ensure_ascii=False) != runtime_before
@@ -955,8 +1160,8 @@ jobs:
           else:
               print("Idle cycle: nothing changed, state files left untouched (no commit).")
 
-          print("=== NØX CORE GENERAL V7 ===")
-          print(f"Feed={len(feed)} Notifications={len(notifications)} DMs={len(messages)}")
+          print("=== NØX CORE GENERAL V8 ===")
+          print(f"Feed={len(feed)} Notifications={len(notifications)} DMs={len(messages)} OwnPostComments={len(own_comment_cases_taken)} (posts scanned={len(own_posts)}, first_scan={first_comment_scan})")
           print(f"Action idempotency: terminal_outcomes={len(resolved_action_ids)}")
           print(f"Pending actions={len(runtime.get('pending_actions', []))} new_actions={len(new_actions)} new_work={len(new_work)} publication_retry={retry_created}")
           print(f"Lightning={payout.get('status')}")
