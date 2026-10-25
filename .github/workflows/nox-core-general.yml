@@ -174,6 +174,8 @@ jobs:
               tmp = path.with_suffix(path.suffix + ".tmp")
               payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
               json.loads(payload)
+              if len(payload.encode("utf-8")) > 90_000_000:
+                  raise SystemExit(f"SIZE SAFETY STOP: {path} would exceed 90 MB; refusing to write it.")
               tmp.write_text(payload, encoding="utf-8")
               os.replace(tmp, path)
 
@@ -203,6 +205,39 @@ jobs:
                   "evidence": evidence or {}, "source": source
               })
 
+          def compact_item(item, limit=240):
+              """Forme compacte et NON imbriquée d'un élément de mémoire. Sans cela, chaque cas
+              recopiait des cas qui contenaient eux-mêmes des cas : taille x4 à chaque cycle."""
+              if not isinstance(item, dict):
+                  return {"summary": clean(item, limit)}
+              summary = item.get("summary") or item.get("title") or item.get("decision_reason") or item.get("body") or ""
+              out = {"summary": clean(summary, limit)}
+              for key in ("case_id", "source", "timestamp"):
+                  if item.get(key):
+                      out[key] = clean(item.get(key), 80)
+              return out
+
+          def shrink_case(case):
+              """Ramène un cas à une taille bornée (idempotent). Répare aussi les anciens fichiers gonflés."""
+              if not isinstance(case, dict):
+                  return
+              hits = case.get("memory_hits")
+              if isinstance(hits, list):
+                  case["memory_hits"] = [compact_item(h) for h in hits[:4]]
+              detail = case.get("outcome_detail")
+              if isinstance(detail, dict):
+                  keep = ("id", "action_id", "status", "kind", "reason", "timestamp", "post_id", "comment_id", "mode", "recipient")
+                  case["outcome_detail"] = {k: (clean(v, 300) if isinstance(v, str) else v) for k, v in detail.items() if k in keep}
+              result = case.get("research_result")
+              if isinstance(result, dict):
+                  result["sources"] = [
+                      {k: clean(s.get(k), 300) for k in ("title", "url", "domain", "snippet") if k in s}
+                      for s in (result.get("sources") or [])[:8] if isinstance(s, dict)
+                  ]
+              for key in ("body", "title"):
+                  if key in case:
+                      case[key] = clean(case.get(key), 3000)
+
           memory = load(MEMORY_FILE, EMPTY_MEMORY)
           runtime = load(RUNTIME_FILE, EMPTY_RUNTIME)
           work = load(WORK_FILE, {"version": 1, "history": [], "completed": []})
@@ -216,7 +251,18 @@ jobs:
                   runtime[key] = json.loads(json.dumps(value))
           memory["version"] = max(7, int(memory.get("version", 1) or 1))
           runtime["version"] = 7
-          VOLATILE = ("run_count", "last_run", "last_rate_limit", "payout_health", "last_cycle")
+
+          # Réparation / garde-fou de taille de la mémoire (voir compact_item).
+          for _case in memory.get("cognitive_cases", []):
+              shrink_case(_case)
+          def _memory_mb():
+              return len(json.dumps(memory, ensure_ascii=False)) / 1e6
+          _size = _memory_mb()
+          while _size > 20 and memory.get("cognitive_cases"):
+              del memory["cognitive_cases"][:10]
+              _size = _memory_mb()
+          print(f"Memory size after compaction: {_size:.2f} MB")
+          VOLATILE =("run_count", "last_run", "last_rate_limit", "payout_health", "last_cycle")
           previous_payout_status = (runtime.get("payout_health") or {}).get("status") if isinstance(runtime.get("payout_health"), dict) else None
 
           if not MEMORY_FILE.exists() and LEGACY_FILE.exists():
@@ -267,7 +313,7 @@ jobs:
                   for item in values:
                       score = sum(1 for term in wanted if term in blob(item))
                       if score:
-                          scored.append({"kind": kind, "score": score, "item": item})
+                          scored.append({"kind": kind, "score": score, "item": compact_item(item)})
               scored.sort(key=lambda x: x["score"], reverse=True)
               return scored[:limit]
 
@@ -1173,6 +1219,12 @@ jobs:
           set -euo pipefail
           git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_core_memory.json memory/nox_core_runtime.json; do
+            if [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 90000000 ]; then
+              echo "SIZE SAFETY STOP: $f exceeds 90 MB, not committing."
+              exit 1
+            fi
+          done
           git add memory/nox_core_memory.json memory/nox_core_runtime.json
           if git diff --cached --quiet; then
             echo "No Core changes."
