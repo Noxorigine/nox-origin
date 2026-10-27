@@ -1,33 +1,42 @@
-name: NØX - Self Evolution
+name: NØX - Evolution Monitor
+
+# Surveillant indépendant de tout le système NØX. Il ne publie rien, ne dépense rien et ne
+# modifie aucun autre workflow : il observe, écrit un rapport (memory/nox_monitor.json + résumé
+# lisible dans l'onglet du run) et ouvre une alerte GitHub (Issue) quand quelque chose casse.
+# Aucune clé secrète n'est nécessaire : il n'utilise que le jeton GitHub du dépôt. Coût : 0 €.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "11 */6 * * *"
+    - cron: "47 */2 * * *"
 
 permissions:
   contents: write
+  actions: read
+  issues: write
 
 concurrency:
-  group: nox-state
+  group: nox-monitor
   cancel-in-progress: false
 
 env:
-  EVOLUTION_FILE: memory/nox_self_evolution.json
-  CORE_RUNTIME_FILE: memory/nox_core_runtime.json
+  MONITOR_FILE: memory/nox_monitor.json
+  MEMORY_FILE: memory/nox_core_memory.json
+  RUNTIME_FILE: memory/nox_core_runtime.json
   WORK_FILE: memory/nox_work_factory.json
   PRESENCE_FILE: memory/nox_colony_presence.json
-  MAX_HISTORY: "200"
-  MIN_REPEATED_FAILURES: "2"
-  PENDING_BACKLOG_ALERT: "50"
+  AI_MODULE: scripts/nox_ai.py
+  RUNS_PER_WORKFLOW: "10"
+  PUBLICATION_WARN_HOURS: "48"
+  PUBLICATION_CRIT_HOURS: "96"
+  ISSUE_TITLE: "NØX Monitor - alertes"
   PROJECT_COST_EUR: "0"
-  GEMINI_USED: "false"
-  EXTERNAL_AI_USED: "false"
+  FREE_AI_ONLY: "true"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -39,264 +48,352 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run self-evolution diagnostics
-        shell: bash
+      - name: Run Evolution Monitor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SELF_WORKFLOW_NAME: ${{ github.workflow }}
         run: |
-          set -euo pipefail
           python3 - <<'PY'
+          import ast
           import hashlib
           import json
           import os
           import re
+          import subprocess
           from datetime import datetime, timezone
           from pathlib import Path
 
-          def now_iso():
-              return datetime.now(timezone.utc).isoformat()
+          NOW = datetime.now(timezone.utc)
+          REPO = os.environ["REPO"]
+          SELF_NAME = os.environ.get("SELF_WORKFLOW_NAME", "")
+          MONITOR_FILE = Path(os.environ["MONITOR_FILE"])
+          RUNS_PER_WORKFLOW = int(os.environ.get("RUNS_PER_WORKFLOW", "10"))
+          PUB_WARN_H = float(os.environ.get("PUBLICATION_WARN_HOURS", "48"))
+          PUB_CRIT_H = float(os.environ.get("PUBLICATION_CRIT_HOURS", "96"))
+          ISSUE_TITLE = os.environ.get("ISSUE_TITLE", "NØX Monitor - alertes")
 
-          def env_int(name, default):
+          for key, expected in {"PROJECT_COST_EUR": "0", "FREE_AI_ONLY": "true", "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false"}.items():
+              if os.environ.get(key, expected).strip().lower() != expected:
+                  raise SystemExit(f"SECURITY STOP: {key} must remain {expected}")
+
+          findings = []  # {"sev": critical|warning|info, "code": str, "subject": str, "detail": str}
+
+          def add(sev, code, subject, detail):
+              findings.append({"sev": sev, "code": code, "subject": subject, "detail": detail})
+
+          def clean(v, n=300):
+              return re.sub(r"\s+", " ", str(v if v is not None else "")).strip()[:n]
+
+          def parse_ts(value):
               try:
-                  return int(os.environ.get(name, str(default)))
-              except (TypeError, ValueError):
-                  return default
+                  return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+              except Exception:
+                  return None
 
-          def check_policy():
-              required = {
-                  "PROJECT_COST_EUR": "0",
-                  "GEMINI_USED": "false",
-                  "EXTERNAL_AI_USED": "false",
-                  "AUTO_PAYMENT": "false",
-                  "AUTO_SPENDING": "false",
-              }
-              for key, expected in required.items():
-                  actual = os.environ.get(key, expected).strip().lower()
-                  if actual != expected:
-                      raise SystemExit(f"Unsafe policy: {key} must remain {expected}")
+          def hours_since(value):
+              ts = parse_ts(value)
+              return None if ts is None else (NOW - ts).total_seconds() / 3600
+
+          def gh(path):
+              out = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  raise RuntimeError(clean(out.stderr or out.stdout, 300))
+              return json.loads(out.stdout)
 
           def load_json(path):
-              path = Path(path)
-              if not path.exists():
-                  return {}
-              raw = path.read_text(encoding="utf-8")
-              if not raw.strip():
-                  return {}
+              p = Path(path)
+              if not p.exists():
+                  return None
               try:
-                  value = json.loads(raw)
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Invalid JSON in {path}: {exc}; refusing to overwrite state")
-              return value if isinstance(value, dict) else {}
+                  value = json.loads(p.read_text(encoding="utf-8"))
+                  return value if isinstance(value, dict) else None
+              except Exception as exc:
+                  add("critical", "state_invalid_json", str(path), f"Fichier d'état illisible : {clean(exc, 160)}")
+                  return None
 
-          def save_json(path, value):
-              path = Path(path)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              tmp = path.with_suffix(path.suffix + ".tmp")
-              payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+          # ------------------------------------------------------------------
+          # 1. Santé des workflows (GitHub Actions)
+          # ------------------------------------------------------------------
+          MAX_AGE_H = (  # ancienneté maximale tolérée du dernier succès, selon le rôle du workflow
+              ("core", 4), ("presence", 6), ("work factory", 9), ("work-factory", 9), ("action", 3),
+              ("knowledge", 6), ("maintenance", 30), ("evolution", 18),
+          )
+          workflow_rows = []
+          try:
+              workflows = gh(f"repos/{REPO}/actions/workflows?per_page=100").get("workflows", [])
+          except Exception as exc:
+              workflows = []
+              add("warning", "api_unavailable", "GitHub API", f"Impossible de lister les workflows : {clean(exc, 200)}")
+
+          names = {}
+          for wf in workflows:
+              if wf.get("state") != "active":
+                  if wf.get("state"):
+                      add("warning", "workflow_not_active", clean(wf.get("name")), f"Workflow désactivé ({wf.get('state')}) : {wf.get('path')}")
+                  continue
+              names.setdefault(clean(wf.get("name")), []).append(wf)
+          for name, group in names.items():
+              if len(group) > 1:
+                  paths = ", ".join(w.get("path", "?") for w in group)
+                  add("critical", "duplicate_workflow_name", name, f"{len(group)} fichiers portent le même nom ({paths}) : ils tournent en double et se gênent.")
+
+          for name, group in names.items():
+              for wf in group:
+                  if name == SELF_NAME:
+                      continue
+                  try:
+                      runs = gh(f"repos/{REPO}/actions/workflows/{wf['id']}/runs?per_page={RUNS_PER_WORKFLOW}").get("workflow_runs", [])
+                  except Exception as exc:
+                      add("warning", "api_unavailable", name, f"Runs illisibles : {clean(exc, 160)}")
+                      continue
+                  done = [r for r in runs if r.get("status") == "completed"]
+                  consecutive_failures = 0
+                  for r in done:
+                      if r.get("conclusion") in ("failure", "timed_out", "startup_failure"):
+                          consecutive_failures += 1
+                      else:
+                          break
+                  last_success = next((r for r in done if r.get("conclusion") == "success"), None)
+                  last_success_h = hours_since(last_success.get("updated_at")) if last_success else None
+                  limit = next((h for key, h in MAX_AGE_H if key in name.lower() or key in str(wf.get("path", "")).lower()), 48)
+                  latest = done[0] if done else None
+                  workflow_rows.append({
+                      "name": name, "path": wf.get("path"), "runs_seen": len(done),
+                      "latest": latest.get("conclusion") if latest else None,
+                      "latest_url": latest.get("html_url") if latest else None,
+                      "consecutive_failures": consecutive_failures,
+                      "hours_since_success": None if last_success_h is None else round(last_success_h, 1),
+                      "max_age_hours": limit,
+                  })
+                  if consecutive_failures >= 3:
+                      add("critical", "workflow_failing", name, f"{consecutive_failures} échecs consécutifs (dernier run : {latest.get('html_url') if latest else '?'}).")
+                  elif consecutive_failures >= 1:
+                      add("warning", "workflow_failing", name, f"Dernier run en échec ({latest.get('html_url') if latest else '?'}).")
+                  if last_success_h is None and done:
+                      add("warning", "workflow_never_succeeded", name, f"Aucun succès parmi les {len(done)} derniers runs.")
+                  elif last_success_h is not None and last_success_h > limit and consecutive_failures == 0:
+                      add("warning", "workflow_stale", name, f"Dernier succès il y a {last_success_h:.0f} h (limite {limit} h) : le workflow ne tourne plus à son rythme.")
+
+          # ------------------------------------------------------------------
+          # 2. Intégrité de l'assistant IA partagé (lecture statique, sans l'importer)
+          # ------------------------------------------------------------------
+          ai_path = Path(os.environ["AI_MODULE"])
+          ai_info = {"exists": ai_path.exists(), "lines": 0, "functions": []}
+          REQUIRED_AI = ("available", "ask_ai", "usage", "is_safe")
+          if not ai_path.exists():
+              add("critical", "nox_ai_missing", str(ai_path), "Le fichier est absent : les workflows IA retombent sur les gabarits.")
+          else:
+              source = ai_path.read_text(encoding="utf-8", errors="replace")
+              ai_info["lines"] = source.count("\n") + 1
+              try:
+                  tree = ast.parse(source)
+                  ai_info["functions"] = sorted(n.name for n in tree.body if isinstance(n, ast.FunctionDef))
+                  missing = [f for f in REQUIRED_AI if f not in ai_info["functions"]]
+                  if missing:
+                      add("critical", "nox_ai_incomplete", str(ai_path), f"Fonctions manquantes : {', '.join(missing)} ({ai_info['lines']} lignes ; fichier tronqué ou remplacé ?).")
+              except SyntaxError as exc:
+                  add("critical", "nox_ai_syntax", str(ai_path), f"Erreur de syntaxe ligne {exc.lineno} : fichier tronqué ou corrompu.")
+
+          # ------------------------------------------------------------------
+          # 3. Garde-fous de politique dans tous les workflows
+          # ------------------------------------------------------------------
+          for wf_file in sorted(Path(".github/workflows").glob("*.y*ml")):
+              text = wf_file.read_text(encoding="utf-8", errors="replace")
+              for flag in ("AUTO_PAYMENT", "AUTO_SPENDING"):
+                  if re.search(rf"^\s*{flag}\s*:\s*[\"']?true[\"']?\s*$", text, re.I | re.M):
+                      add("critical", "policy_violation", wf_file.name, f"{flag} est à true : les dépenses automatiques doivent rester désactivées.")
+              if re.search(r"^\s*PROJECT_COST_EUR\s*:\s*[\"']?(?!0[\"']?\s*$)\S+", text, re.M):
+                  add("critical", "policy_violation", wf_file.name, "PROJECT_COST_EUR n'est pas à 0.")
+
+          # ------------------------------------------------------------------
+          # 4. État de l'agent : publication, file d'attente, recherches bloquées
+          # ------------------------------------------------------------------
+          memory = load_json(os.environ["MEMORY_FILE"]) or {}
+          runtime = load_json(os.environ["RUNTIME_FILE"]) or {}
+          work = load_json(os.environ["WORK_FILE"]) or {}
+          presence = load_json(os.environ["PRESENCE_FILE"]) or {}
+          health = {}
+
+          posts = [p for p in (presence.get("published_posts") or []) if isinstance(p, dict) and p.get("timestamp")]
+          last_post_h = min((h for h in (hours_since(p.get("timestamp")) for p in posts) if h is not None), default=None)
+          health["hours_since_last_publication"] = None if last_post_h is None else round(last_post_h, 1)
+          health["publications_total"] = len(posts)
+          if last_post_h is None:
+              add("warning", "never_published", "publication", "Aucune publication enregistrée.")
+          elif last_post_h > PUB_CRIT_H:
+              add("critical", "no_publication", "publication", f"Aucune publication depuis {last_post_h:.0f} h (seuil critique {PUB_CRIT_H:.0f} h).")
+          elif last_post_h > PUB_WARN_H:
+              add("warning", "no_publication", "publication", f"Aucune publication depuis {last_post_h:.0f} h (seuil {PUB_WARN_H:.0f} h).")
+
+          pending = [a for a in (runtime.get("pending_actions") or []) if isinstance(a, dict)]
+          health["pending_actions"] = len(pending)
+          if len(pending) >= 15:
+              add("warning", "pending_backlog", "file d'actions", f"{len(pending)} actions en attente : Presence ne les exécute pas assez vite.")
+          stale_pending = [a for a in pending if (hours_since(a.get("created_at")) or 0) > 24]
+          health["pending_older_than_24h"] = len(stale_pending)
+          if stale_pending:
+              add("warning", "pending_stale", "file d'actions", f"{len(stale_pending)} action(s) en attente depuis plus de 24 h.")
+
+          requests_pending = [w for w in (runtime.get("work_requests") or []) if isinstance(w, dict)]
+          attempts = work.get("attempts") if isinstance(work.get("attempts"), dict) else {}
+          stuck = [w for w in requests_pending if int(attempts.get(w.get("id"), 0) or 0) >= 3]
+          health["work_requests_pending"] = len(requests_pending)
+          health["work_requests_stuck"] = len(stuck)
+          if len(requests_pending) >= 15:
+              add("warning", "work_backlog", "recherches", f"{len(requests_pending)} demandes de recherche en file (limite 20).")
+          if stuck:
+              add("info", "work_stuck", "recherches", f"{len(stuck)} demande(s) ont épuisé leurs essais et attendent une revue manuelle.")
+
+          history = [h for h in (work.get("history") or []) if isinstance(h, dict) and h.get("evidence_status")]
+          recent = history[-10:]
+          health["recent_research_statuses"] = {s: sum(1 for h in recent if h.get("evidence_status") == s) for s in sorted({h.get("evidence_status") for h in recent})}
+          if len(recent) >= 6 and sum(1 for h in recent if h.get("evidence_status") in ("multi_source_support", "partial_support")) == 0:
+              add("warning", "research_never_conclusive", "recherches", "Aucune des 10 dernières recherches n'est concluante : filtre trop strict ou recherche web dégradée.")
+
+          topics = [t for t in (runtime.get("self_topics") or []) if isinstance(t, dict)]
+          today = NOW.strftime("%Y%m%d")
+          health["self_topic_today"] = any(t.get("day") == today for t in topics)
+          core_age = hours_since(runtime.get("last_run"))
+          health["hours_since_core_run"] = None if core_age is None else round(core_age, 1)
+          if topics and not health["self_topic_today"] and NOW.hour >= 6 and core_age is not None and core_age < 2:
+              add("info", "no_topic_today", "sujet du jour", "Aucun sujet quotidien créé aujourd'hui alors que Core tourne (file pleine ou fonction désactivée ?).")
+
+          outcomes = [o for o in (presence.get("outcomes") or []) if isinstance(o, dict)]
+          day_errors = [o for o in outcomes if o.get("status") == "error" and (hours_since(o.get("timestamp")) or 999) <= 24]
+          health["presence_errors_24h"] = len(day_errors)
+          if len(day_errors) >= 3:
+              add("warning", "presence_errors", "Presence", f"{len(day_errors)} erreurs d'exécution sur 24 h (ex. {clean(day_errors[-1].get('error'), 140)}).")
+
+          for path_key in ("MEMORY_FILE", "RUNTIME_FILE", "WORK_FILE", "PRESENCE_FILE"):
+              p = Path(os.environ[path_key])
+              if p.exists():
+                  size = p.stat().st_size
+                  health.setdefault("file_sizes_kb", {})[p.name] = round(size / 1024)
+                  if size > 50_000_000:
+                      add("critical", "file_too_big", p.name, f"{size / 1e6:.0f} Mo : proche de la limite de 100 Mo de GitHub.")
+                  elif size > 5_000_000:
+                      add("warning", "file_big", p.name, f"{size / 1e6:.1f} Mo : la mémoire grossit.")
+
+          # Diagnostic de la chaîne de publication quand rien ne sort.
+          chain = {r["name"]: r for r in workflow_rows}
+          def failing(keyword):
+              return [r["name"] for r in workflow_rows if keyword in r["name"].lower() and r["consecutive_failures"] >= 1]
+          if any(f["code"] in ("no_publication", "never_published") for f in findings):
+              broken = failing("presence") + failing("work factory") + failing("core")
+              if broken:
+                  add("info", "chain_diagnosis", "chaîne de publication", "Maillon(s) en échec sur le chemin Core -> Work Factory -> Presence : " + ", ".join(sorted(set(broken))) + ".")
+              elif not any(f["sev"] == "critical" and f["code"].startswith("nox_ai") for f in findings):
+                  add("info", "chain_diagnosis", "chaîne de publication", "Aucun workflow en échec : vérifier le filtre de pertinence (recherches non concluantes) et la file d'actions.")
+
+          # ------------------------------------------------------------------
+          # 5. Rapport
+          # ------------------------------------------------------------------
+          order = {"critical": 0, "warning": 1, "info": 2}
+          findings.sort(key=lambda f: (order[f["sev"]], f["code"], f["subject"]))
+          counts = {s: sum(1 for f in findings if f["sev"] == s) for s in order}
+          alerts = [f for f in findings if f["sev"] in ("critical", "warning")]
+          fingerprint = hashlib.sha256(json.dumps([(f["sev"], f["code"], f["subject"]) for f in alerts], sort_keys=True).encode()).hexdigest()[:20]
+          status = "CRITICAL" if counts["critical"] else ("WARNING" if counts["warning"] else "OK")
+
+          report = {"timestamp": NOW.isoformat(), "status": status, "counts": counts, "fingerprint": fingerprint,
+                    "findings": findings, "workflows": workflow_rows, "nox_ai": ai_info, "agent_health": health}
+
+          icons = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+          lines = [f"# NØX Evolution Monitor : {status}", "", f"_{NOW.strftime('%Y-%m-%d %H:%M UTC')}_ - critique {counts['critical']} / alerte {counts['warning']} / info {counts['info']}", ""]
+          if findings:
+              lines += ["## Constats", ""] + [f"- {icons[f['sev']]} **{f['subject']}** ({f['code']}) : {f['detail']}" for f in findings] + [""]
+          else:
+              lines += ["Aucun constat : tout fonctionne à son rythme.", ""]
+          lines += ["## Workflows", "", "| Workflow | Dernier run | Échecs d'affilée | Dernier succès |", "|---|---|---|---|"]
+          for r in sorted(workflow_rows, key=lambda r: r["name"]):
+              ok = "✅" if r["latest"] == "success" else ("❌" if r["latest"] else "-")
+              since = "-" if r["hours_since_success"] is None else f"{r['hours_since_success']} h"
+              lines.append(f"| {r['name']} | {ok} {r['latest'] or '-'} | {r['consecutive_failures']} | {since} |")
+          lines += ["", "## Santé de l'agent", ""] + [f"- {k} : {v}" for k, v in health.items()]
+          summary = "\n".join(lines) + "\n"
+          print(summary)
+          if os.environ.get("GITHUB_STEP_SUMMARY"):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+                  fh.write(summary)
+
+          previous = {}
+          if MONITOR_FILE.exists():
+              try:
+                  previous = json.loads(MONITOR_FILE.read_text(encoding="utf-8"))
+              except Exception:
+                  previous = {}
+          prev_report = previous.get("last_report", {}) if isinstance(previous, dict) else {}
+          changed = prev_report.get("fingerprint") != fingerprint or prev_report.get("status") != status
+          heartbeat_due = (hours_since(prev_report.get("timestamp")) or 999) >= 24
+
+          # ------------------------------------------------------------------
+          # 6. Alerte GitHub (Issue) - uniquement quand la situation change
+          # ------------------------------------------------------------------
+          def gh_write(args):
+              out = subprocess.run(["gh", "api"] + args, capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  raise RuntimeError(clean(out.stderr or out.stdout, 300))
+              return json.loads(out.stdout) if out.stdout.strip() else {}
+
+          issue_note = "no_change"
+          if changed:
+              try:
+                  open_issues = gh(f"repos/{REPO}/issues?state=open&per_page=50")
+                  existing = next((i for i in open_issues if isinstance(i, dict) and "pull_request" not in i and i.get("title") == ISSUE_TITLE), None)
+                  body = summary[:60000]
+                  if alerts:
+                      if existing:
+                          gh_write([f"repos/{REPO}/issues/{existing['number']}/comments", "-f", f"body={body}"])
+                          issue_note = f"commented #{existing['number']}"
+                      else:
+                          created = gh_write([f"repos/{REPO}/issues", "-f", f"title={ISSUE_TITLE}", "-f", f"body={body}"])
+                          issue_note = f"created #{created.get('number')}"
+                  elif existing:
+                      gh_write([f"repos/{REPO}/issues/{existing['number']}/comments", "-f", "body=Tout est revenu à la normale.\n\n" + body])
+                      gh_write(["-X", "PATCH", f"repos/{REPO}/issues/{existing['number']}", "-f", "state=closed"])
+                      issue_note = f"closed #{existing['number']}"
+              except Exception as exc:
+                  issue_note = f"issue_unavailable: {clean(exc, 160)}"
+          print(f"Alert issue: {issue_note}")
+
+          # ------------------------------------------------------------------
+          # 7. Écriture du rapport (seulement si la situation change, ou 1 fois par jour)
+          # ------------------------------------------------------------------
+          if changed or heartbeat_due or not MONITOR_FILE.exists():
+              hist = previous.get("history", []) if isinstance(previous, dict) and isinstance(previous.get("history"), list) else []
+              hist.append({"timestamp": NOW.isoformat(), "status": status, "counts": counts, "fingerprint": fingerprint})
+              state = {"version": 1, "updated_at": NOW.isoformat(), "last_report": report, "history": hist[-100:]}
+              MONITOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+              tmp = MONITOR_FILE.with_suffix(".json.tmp")
+              payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
               json.loads(payload)
               tmp.write_text(payload, encoding="utf-8")
-              os.replace(tmp, path)
-
-          def as_list(value):
-              return value if isinstance(value, list) else []
-
-          def clean(value, limit=240):
-              if value is None:
-                  value = ""
-              elif isinstance(value, (dict, list)):
-                  value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-              else:
-                  value = str(value)
-              value = re.sub(r"\s+", " ", value).strip()
-              return value[:limit]
-
-          def normalized_error(value):
-              value = clean(value, 500).lower()
-              value = re.sub(r"\b[0-9a-f]{8,}\b", "#", value)
-              value = re.sub(r"\d+", "#", value)
-              return value[:160]
-
-          check_policy()
-          now = now_iso()
-          evolution_path = Path(os.environ["EVOLUTION_FILE"])
-          evolution = load_json(evolution_path)
-          presence = load_json(os.environ["PRESENCE_FILE"])
-          work = load_json(os.environ["WORK_FILE"])
-          runtime = load_json(os.environ["CORE_RUNTIME_FILE"])
-          max_history = max(20, env_int("MAX_HISTORY", 200))
-          min_repeated = max(1, env_int("MIN_REPEATED_FAILURES", 2))
-          backlog_limit = max(1, env_int("PENDING_BACKLOG_ALERT", 50))
-
-          signals = []
-          for item in as_list(presence.get("outcomes"))[-500:]:
-              if not isinstance(item, dict):
-                  continue
-              success = item.get("success")
-              status = clean(item.get("status") or item.get("result") or "unknown", 80)
-              error = clean(item.get("error") or item.get("message") or item.get("reason"), 500)
-              if success is False or (not success and error):
-                  signals.append({"source": "presence", "status": status, "error": error})
-
-          # Work Factory V4 writes outcomes to history, not to a top-level failed list.
-          # Inspect both the current schema and the legacy schema without treating
-          # weak search coverage as a verified factual contradiction.
-          work_items = as_list(work.get("history"))[-500:] + as_list(work.get("failed"))[-500:]
-          for item in work_items:
-              if not isinstance(item, dict):
-                  continue
-              status = clean(item.get("status") or item.get("evidence_status") or "unknown", 80)
-              error = clean(item.get("reason") or item.get("error") or item.get("message"), 500)
-              evidence_status = clean(item.get("evidence_status"), 80)
-              if status.lower() in ("failed", "error", "manual_review") or evidence_status in ("no_evidence", "insufficient_verification"):
-                  detail = error or f"research evidence status={evidence_status or status}"
-                  signals.append({"source": "work", "status": evidence_status or status, "error": detail})
-
-          groups = {}
-          for signal in signals:
-              norm = normalized_error(signal["error"])
-              key = (signal["source"], signal["status"].lower(), norm)
-              groups.setdefault(key, {"count": 0, "examples": []})
-              groups[key]["count"] += 1
-              if signal["error"] and signal["error"] not in groups[key]["examples"] and len(groups[key]["examples"]) < 3:
-                  groups[key]["examples"].append(signal["error"])
-
-          advice_rules = [
-              (("409", "duplicate", "already have a post", "already replied"),
-               "Duplicate publication conflict: use a stable action ID and make retries idempotent; do not retry the same payload blindly."),
-              (("self_message", "self_reply", "own username"),
-               "Self-reply filtering may be incomplete: compare normalized author and agent handles before creating a reply action."),
-              (("no_evidence", "insufficient_verification", "weak_evidence"),
-               "Research produced insufficient evidence: separate internal/contextual questions from questions requiring external sources."),
-              (("404", "not found", "403", "forbidden"),
-               "Target may be missing or inaccessible: verify target existence and permission before retrying."),
-              (("429", "rate limit", "too many requests"),
-               "Rate limiting: reduce action throughput and use bounded backoff."),
-              (("missing_body", "missing_recipient", "missing_post_target"),
-               "Action payload is incomplete: validate required fields before adding the action to the queue."),
-              (("timeout", "connection reset", "temporarily unavailable"),
-               "Transient network failure: retry only with a bounded backoff and an idempotency check."),
-          ]
-
-          findings = []
-          for (source, status, error), data in sorted(groups.items(), key=lambda pair: pair[1]["count"], reverse=True):
-              if data["count"] < min_repeated:
-                  continue
-              combined = f"{status} {error}".lower()
-              recommendation = next(
-                  (advice for terms, advice in advice_rules if any(term in combined for term in terms)),
-                  "Repeated failure without a deterministic rule: inspect the originating workflow logs and verify the source fields."
-              )
-              findings.append({
-                  "source": source,
-                  "status": status,
-                  "error_signature": error,
-                  "count": data["count"],
-                  "examples": data["examples"],
-                  "recommendation": recommendation,
-              })
-
-          pending = [item for item in as_list(runtime.get("pending_actions")) if isinstance(item, dict)]
-          if len(pending) >= backlog_limit:
-              findings.append({
-                  "source": "runtime",
-                  "status": "pending_backlog",
-                  "error_signature": "pending_actions_backlog",
-                  "count": len(pending),
-                  "examples": [],
-                  "recommendation": "Pending actions exceed the configured threshold: compare Core creation rate with Presence execution rate and expire stale actions safely.",
-              })
-
-          fingerprint_payload = sorted(
-              (item["source"], item["status"], item["error_signature"], item["count"])
-              for item in findings
-          )
-          fingerprint = hashlib.sha256(
-              json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-          ).hexdigest()[:20]
-
-          runs = as_list(evolution.get("runs"))
-          previous = runs[-1] if runs and isinstance(runs[-1], dict) else {}
-          if previous.get("fingerprint") == fingerprint and previous.get("decision") == ("RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"):
-              print("No change in findings since the previous run; state not rewritten.")
-              print("Fingerprint:", fingerprint)
-              raise SystemExit(0)
-
-          decision = "RECOMMENDATIONS_ONLY" if findings else "NO_REPEATED_FAILURES"
-          record = {
-              "timestamp": now,
-              "status": "observed" if findings else "no_candidate",
-              "decision": decision,
-              "fingerprint": fingerprint,
-              "findings_count": len(findings),
-              "findings": findings,
-              "patch_proposals": [
-                  {
-                      "proposal_id": hashlib.sha256((fingerprint + "|" + item["source"] + "|" + item["error_signature"]).encode("utf-8")).hexdigest()[:20],
-                      "target_area": {"presence":".github/workflows/nox-colony-presence.yml", "work":".github/workflows/nox-work-factory.yml", "runtime":".github/workflows/nox-core-general.yml"}.get(item["source"], ".github/workflows/nox-core-general.yml"),
-                      "problem": item["error_signature"],
-                      "recommendation": item["recommendation"],
-                      "status": "requires_human_review",
-                      "automatic_patch_applied": False,
-                  }
-                  for item in findings
-              ],
-              "policy": {
-                  "project_cost_eur": 0,
-                  "gemini_used": False,
-                  "external_ai_used": False,
-                  "auto_payment": False,
-                  "auto_spending": False,
-              },
-          }
-          evolution["version"] = max(7, int(evolution.get("version", 0) or 0))
-          evolution["runs"] = (runs + [record])[-max_history:]
-          history = as_list(evolution.get("history"))
-          if findings:
-              history.append(record)
-          evolution["history"] = history[-max_history:]
-          evolution["updated_at"] = now
-          save_json(evolution_path, evolution)
-
-          print("=== NØX SELF EVOLUTION ===")
-          print("Signals:", len(signals), "| Findings:", len(findings), "| Fingerprint:", fingerprint)
-          for finding in findings:
-              print(f"- [{finding['count']}x] {finding['source']}/{finding['status']}: {finding['recommendation']}")
-          print("RESULT:", decision)
-          print("NOTE: patch proposals are recorded for review; no workflow code is changed automatically by this diagnostic run.")
-          PY
-
-      - name: Validate evolution state
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          path = Path("memory/nox_self_evolution.json")
-          if path.exists():
-              json.loads(path.read_text(encoding="utf-8"))
-              print("VALID JSON:", path)
+              os.replace(tmp, MONITOR_FILE)
+              print("Monitor report saved.")
           else:
-              print("No state file was written; nothing to validate.")
+              print("Situation unchanged: report file left untouched (no commit).")
           PY
 
-      - name: Commit and push state
-        shell: bash
+      - name: Commit monitor report
         run: |
           set -euo pipefail
           git config user.name "NØX"
           git config user.email "nox@users.noreply.github.com"
-          git add -- memory/nox_self_evolution.json
+          git add -- memory/nox_monitor.json
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No monitor changes."
             exit 0
           fi
-          git commit -m "chore(nox): record self-evolution diagnostics"
+          git commit -m "chore(nox): evolution monitor report"
           for attempt in 1 2 3 4; do
-            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
               echo "Pushed."
               exit 0
             fi
             git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 3))
+            echo "Push attempt $attempt failed, retrying."
+            sleep $((attempt * 4))
           done
-          echo "Push failed after retries."
+          echo "Push failed after 4 attempts."
           exit 1
