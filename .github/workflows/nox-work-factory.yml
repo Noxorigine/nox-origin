@@ -31,8 +31,8 @@ env:
   FREE_AI_ONLY: "true"
   AUTO_PAYMENT: "false"
   AUTO_SPENDING: "false"
-  NOX_AI_MAX_CALLS_PER_RUN: "5"
-  NOX_AI_MAX_TOKENS_PER_RUN: "12000"
+  NOX_AI_MAX_CALLS_PER_RUN: "8"
+  NOX_AI_MAX_TOKENS_PER_RUN: "16000"
   NOX_AI_MAX_GUARD_CALLS_PER_RUN: "30"
 
 jobs:
@@ -186,6 +186,46 @@ jobs:
           def topic_terms(question):
               return [t for t in terms(topic_of(question)) if t not in GENERIC_TERMS]
 
+          # --- fiabilité des sources ------------------------------------------------
+          # high   : recherche, normes, documentation officielle, institutions
+          # medium : encyclopédies, presse, sites non classés
+          # low    : blogs d'éditeurs / marketing, plateformes de publication libre, réseaux sociaux
+          HIGH_DOMAINS = ("arxiv.org","acm.org","ieee.org","nature.com","science.org","sciencedirect.com","springer.com","wiley.com","nih.gov",
+                          "nist.gov","cisa.gov","owasp.org","mitre.org","ietf.org","rfc-editor.org","w3.org","openreview.net","aclanthology.org",
+                          "semanticscholar.org","python.org","kernel.org","mozilla.org","iso.org","europa.eu","oecd.org","who.int")
+          HIGH_SUFFIXES = (".edu",".gov",".ac.uk",".gouv.fr",".int")
+          LOW_DOMAINS = ("medium.com","substack.com","dev.to","linkedin.com","quora.com","reddit.com","facebook.com","x.com","twitter.com",
+                         "youtube.com","pinterest.com","hackernoon.com","towardsdatascience.com")
+          LOW_PATH_HINTS = ("/blog/","/blogs/","/post/","/posts/","/news/","/pricing","/playbook","/ultimate-guide","/top-")
+          LOW_TITLE_HINTS = ("playbook","ultimate guide","top 10","top 5","best tools","vs.","pricing guide","complete guide")
+          TIER_RANK = {"high":0,"medium":1,"low":2}
+
+          def source_tier(url, domain, title=""):
+              d = (domain or "").lower()
+              if any(d == h or d.endswith("." + h) for h in HIGH_DOMAINS) or d.endswith(HIGH_SUFFIXES) or d.startswith(("docs.","developer.","developers.")):
+                  return "high"
+              if "wikipedia.org" in d:
+                  return "medium"
+              path = urlparse(url).path.lower()
+              if any(d == l or d.endswith("." + l) for l in LOW_DOMAINS):
+                  return "low"
+              if any(h in path for h in LOW_PATH_HINTS) or any(h in (title or "").lower() for h in LOW_TITLE_HINTS):
+                  return "low"
+              return "medium"
+
+          def quality_of(scored):
+              rel = [r for r in scored if r.get("relevant")]
+              if not rel:
+                  return "none"
+              if any(r.get("tier") == "high" for r in rel):
+                  return "strong"
+              if any(r.get("tier") == "medium" for r in rel):
+                  return "mixed"
+              return "vendor_only"
+
+          def ordered(rows):
+              return sorted(rows, key=lambda r: (TIER_RANK.get(r.get("tier"), 1), -r.get("query_overlap", 0)))
+
           def search(query):
               try:
                   raw=DDGS(timeout=TIMEOUT).text(query,max_results=MAX_RESULTS,backend="auto")
@@ -200,7 +240,7 @@ jobs:
                   if any(domain==d or domain.endswith("."+d) for d in DENY_DOMAINS): continue
                   blob=(clean(item.get("title"),300)+" "+clean(item.get("body") or item.get("snippet"),1200)).lower()
                   if any(t in blob and t not in query.lower() for t in SENSITIVE_SOURCE_TERMS): continue
-                  results.append({"title":clean(item.get("title"),300),"url":url,"domain":domain,"snippet":clean(item.get("body") or item.get("snippet"),1200)})
+                  results.append({"title":clean(item.get("title"),300),"url":url,"domain":domain,"snippet":clean(item.get("body") or item.get("snippet"),1200),"tier":source_tier(url,domain,item.get("title"))})
               return results,None
 
           def assess(question,results):
@@ -270,11 +310,11 @@ jobs:
               """Conclusion rédigée par l'IA à partir des extraits. None si indisponible ou invalide."""
               if status not in ("multi_source_support","partial_support"):
                   return None
-              ranked=sorted([r for r in scored if r.get("relevant")],key=lambda r:r.get("query_overlap",0),reverse=True)[:4]
+              ranked=ordered([r for r in scored if r.get("relevant")])[:4]
               if len(ranked)<2: return "INSUFFICIENT"
               blocks=[]
               for i,r in enumerate(ranked):
-                  block=f"[{i+1}] {clean(r.get('title'),160)} ({r.get('domain')}): {clean(r.get('snippet'),300)}"
+                  block=f"[{i+1}] {clean(r.get('title'),160)} ({r.get('domain')}, reliability: {r.get('tier','medium')}): {clean(r.get('snippet'),300)}"
                   page=excerpts.get(r.get("url"))
                   if page:
                       block+=f"\n    Page excerpt: {clean(page,EXCERPT_CHARS)}"
@@ -290,6 +330,7 @@ jobs:
                           "and state at least one explicit limitation or open point (use the limitations excerpts if present). Never claim certainty. "
                           "If the excerpts do not actually address the question, reply with exactly the single word INSUFFICIENT. "
                           "Write as NØX's own finding: never say 'the sources you provided', 'the provided excerpts' or 'the excerpts'; say 'the sources reviewed' instead, and never address the reader as having supplied anything. "
+                          "Give more weight to sources marked reliability: high. A claim that appears only in sources marked reliability: low (commercial or vendor blogs) must be presented as a vendor claim, never as an established fact. "
                           "Do not mention searching, search results or coverage. Reply in the language of the question. "
                           "Output plain text only, no title, no list."),
                   user="Write the conclusion for the question and sources below.",
@@ -306,6 +347,24 @@ jobs:
                   return None
               return text
 
+          def ai_question(question, conclusion):
+              """Une question ouverte et précise pour la communauté, tirée du point d'incertitude. None si invalide."""
+              text=nox_ai.ask_ai(
+                  system=("You write ONE open question for practitioners, in the language of the finding, to invite replies on a public forum. "
+                          "It must target the main open point or limitation of the finding, be specific (a concrete scenario, metric or choice), "
+                          "be a single sentence of 80 to 200 characters ending with a question mark, contain no link, no greeting, no mention of sources. "
+                          "Output the question only."),
+                  user="Write the question.",
+                  untrusted=f"Topic: {clean(question,300)}\n\nFinding: {clean(conclusion,900)}",
+                  max_tokens=120,
+              )
+              if not text: return None
+              text=clean(text,300).strip(" \"'")
+              low=text.lower()
+              if not (20<=len(text)<=220 and text.endswith("?")): return None
+              if "http" in low or any(m in low for m in NON_ANSWER_MARKERS) or any(m in low for m in META_MARKERS): return None
+              return text
+
           ai_ok = nox_ai.available()
           print(f"AI helper: {'enabled' if ai_ok else 'disabled (no GROQ_API_KEY)'} | models={nox_ai.MODELS}")
 
@@ -313,7 +372,12 @@ jobs:
               rid=request["id"]; question=clean(request.get("question"),1200)
               queries=[]
               topic=topic_of(question)
-              if topic: queries.append(topic)
+              attempt_no=int(state["attempts"].get(rid,0) or 0)
+              if topic:
+                  queries.append(topic)
+                  # Requête orientée sources fiables ; elle change à chaque nouvel essai.
+                  quality_suffix=(" survey OR documentation OR arxiv"," research paper arxiv survey"," official documentation standards")[min(attempt_no,2)]
+                  queries.append(clean(topic+quality_suffix,300))
               context=clean(request.get("context"),1500)
               if context and len(queries)<3:
                   queries.append(clean(f"{topic} {context[:600]}",1400))
@@ -334,6 +398,10 @@ jobs:
                   if len(results)>=MAX_TOTAL: break
 
               status,scored,domain_count=assess(question,results)
+              source_quality=quality_of(scored)
+              if status in ("multi_source_support","partial_support") and source_quality=="vendor_only":
+                  print("Only vendor/marketing sources found -> insufficient (nothing will be published).")
+                  status="insufficient_verification"
 
               # Requête dédiée aux limites / critiques du sujet (n'influence pas le statut).
               limits=[]
@@ -347,7 +415,7 @@ jobs:
               # Lecture de la page des meilleures sources pertinentes.
               excerpts={}
               if ai_ok and status in ("multi_source_support","partial_support"):
-                  for r in sorted([x for x in scored if x.get("relevant")],key=lambda x:x.get("query_overlap",0),reverse=True)[:MAX_FETCH_PAGES]:
+                  for r in ordered([x for x in scored if x.get("relevant")])[:MAX_FETCH_PAGES]:
                       page=fetch_excerpt(r["url"])
                       if len(page)>=150:
                           excerpts[r["url"]]=page
@@ -380,12 +448,15 @@ jobs:
                   written=None
               if written:
                   conclusion=written; conclusion_source="ai:"+str(nox_ai.usage().get("last_model"))
+              community_question=None
+              if written and status in ("multi_source_support","partial_support"):
+                  community_question=ai_question(question,conclusion)
 
               result_id=f"result-{stable(rid,json.dumps(scored,ensure_ascii=False,sort_keys=True))}"
               result={
                   "id":result_id,"request_id":rid,"case_id":request.get("case_id"),"timestamp":NOW,
                   "question":question,"work_type":"research","queries":dedup,"evidence_status":status,
-                  "source_count":len(scored),"unique_domains":domain_count,"sources":([r for r in scored if r.get("relevant")] if status in ("multi_source_support","partial_support") else scored)[:MAX_TOTAL],
+                  "source_count":len(scored),"unique_domains":domain_count,"source_quality":source_quality,"community_question":community_question,"sources":(ordered([r for r in scored if r.get("relevant")]) if status in ("multi_source_support","partial_support") else scored)[:MAX_TOTAL],
                   "limits_sources":[{"title":r.get("title"),"url":r.get("url")} for r in limits],
                   "pages_read":len(excerpts),
                   "conclusion":conclusion,"conclusion_source":conclusion_source,
