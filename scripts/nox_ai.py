@@ -50,7 +50,12 @@ def usage():
 
 
 def _post(model, messages, max_tokens, temperature=None):
-    body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens}
+    reasoning = model.startswith("openai/gpt-oss")
+    # Les modèles à raisonnement dépensent des jetons "invisibles" : on limite l'effort et on ajoute de la marge,
+    # sinon la réponse visible peut être coupée en plein milieu d'une phrase.
+    body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens + (900 if reasoning else 0)}
+    if reasoning:
+        body["reasoning_effort"] = "low"
     if temperature is not None:
         body["temperature"] = temperature
     return requests.post(
@@ -156,6 +161,7 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
         {"role": "system", "content": system_message},
         {"role": "user", "content": content},
     ]
+    truncated = False
     for model in MODELS:
         try:
             response = _post(model, messages, max_tokens, temperature)
@@ -174,9 +180,14 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
         try:
             data = response.json()
             text = data["choices"][0]["message"].get("content") or ""
+            finish = data["choices"][0].get("finish_reason")
             used = int((data.get("usage") or {}).get("total_tokens") or estimated)
         except Exception as exc:
             _state["last_error"] = f"{model}:bad_response:{type(exc).__name__}"
+            continue
+        if finish == "length":
+            _state["last_error"] = f"{model}:truncated"
+            truncated = True
             continue
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         if not text:
@@ -186,4 +197,6 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
         _state["last_model"] = model
         _state["last_error"] = None
         return text
+    if truncated:
+        _state["last_error"] = "truncated:unavailable"
     return None
