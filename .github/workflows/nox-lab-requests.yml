@@ -1,0 +1,1213 @@
+name: NØX - Lab Requests
+
+# NØX Lab sur demande. Quand un lecteur répond à un rapport du Lab avec un bloc de code Python qui définit
+# solve(...), ce workflow exécute le code dans le même bac à sable que le Lab (sans réseau, sans secret,
+# utilisateur sans privilège, limites de temps et de mémoire), puis prépare une réponse chiffrée que Presence publie.
+#   collect : lit les commentaires des rapports du Lab (clé Colony en lecture seule d'usage, aucun code exécuté ici)
+#   execute : exécute les soumissions dans le bac à sable, sans aucun secret
+#   queue   : compose la réponse à partir des mesures et la met dans la file de Presence (pas de publication directe)
+# Aucun paiement, aucune dépense, coût 0 €.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3 */2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nox-state
+  cancel-in-progress: false
+
+env:
+  RUNTIME_FILE: memory/nox_core_runtime.json
+  PRESENCE_FILE: memory/nox_colony_presence.json
+  LAB_REQ_STATE_FILE: memory/nox_lab_requests.json
+  LAB_GAPS_FILE: memory/nox_lab_gaps.json
+  LAB_MAX_REQUESTS_PER_RUN: "3"
+  LAB_MAX_POSTS_SCANNED: "12"
+  PROJECT_COST_EUR: "0"
+  FREE_AI_ONLY: "true"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    outputs:
+      count: ${{ steps.collect.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Colony SDK
+        run: |
+          python -m pip install --disable-pip-version-check "colony-sdk>=1.37.0,<2.0.0" requests
+
+      - name: Write lab sources
+        run: |
+          mkdir -p lab_src
+          cat > lab_src/lab_specs.py <<'LABPY_SPECS'
+          """NØX Lab - task specifications, reference solutions, test corpora, planted failures.
+          Corpus version: lab-v2 (v2 adds the aliasing check and the scaling probe). Everything here is deterministic (seeded)."""
+          import itertools
+          import random
+          from collections import Counter
+
+          VERSION = "lab-v2"
+
+
+          def _tiny_lists(length, alphabet):
+              for n in range(length + 1):
+                  for combo in itertools.product(alphabet, repeat=n):
+                      yield list(combo)
+
+
+          # ---------------------------------------------------------------- sort_ints
+          def ref_sort(xs):
+              return sorted(xs)
+
+          def tiny_sort():
+              for xs in _tiny_lists(4, [-1, 0, 1, 2]):
+                  yield (xs,)
+
+          def rand_sort(rng):
+              for _ in range(200):
+                  yield ([rng.randint(-50, 50) for _ in range(rng.randint(0, 40))],)
+
+          def held_sort(rng):
+              yield ([],)
+              yield ([5],)
+              yield ([1000] * 50,)
+              yield (list(range(300, 0, -1)),)
+              yield ([2**62, -2**62, 0, 2**62, -1],)
+              yield ([rng.randint(-10**9, 10**9) for _ in range(3000)],)
+              yield ([0, 1] * 500,)
+              yield ([-3, -3, -1, -2, -2, -2],)
+
+          def weak_sort(args, out):
+              return isinstance(out, list) and all(out[i] <= out[i + 1] for i in range(len(out) - 1))
+
+          MUT_SORT = {
+              "drops_duplicates": "def solve(xs):\n    return sorted(set(xs))\n",
+              "drops_last_element": "def solve(xs):\n    return sorted(xs)[:-1]\n",
+              "sorts_descending": "def solve(xs):\n    return sorted(xs, reverse=True)\n",
+              "mutates_input": "def solve(xs):\n    xs.sort()\n    return xs\n",
+              "sorts_by_absolute_value": "def solve(xs):\n    return sorted(xs, key=abs)\n",
+              "returns_input_object_when_already_sorted": "def solve(xs):\n    if all(xs[i] <= xs[i + 1] for i in range(len(xs) - 1)):\n        return xs\n    return sorted(xs)\n",
+          }
+
+          # ----------------------------------------------------------- dedupe_keep_first
+          def ref_dedupe(xs):
+              seen = set()
+              out = []
+              for x in xs:
+                  if x not in seen:
+                      seen.add(x)
+                      out.append(x)
+              return out
+
+          def tiny_dedupe():
+              for xs in _tiny_lists(5, [0, 1, 2]):
+                  yield (xs,)
+
+          def rand_dedupe(rng):
+              for _ in range(200):
+                  yield ([rng.randint(0, 10) for _ in range(rng.randint(0, 40))],)
+
+          def held_dedupe(rng):
+              yield ([],)
+              yield ([7] * 100,)
+              yield ([rng.randint(0, 50) for _ in range(3000)],)
+              yield ([2**61, -5, 2**61, -5, 0],)
+              yield (list(range(500)) + list(range(500)),)
+
+          def weak_dedupe(args, out):
+              return isinstance(out, list) and len(out) == len(set(out)) and set(out) <= set(args[0])
+
+          MUT_DEDUPE = {
+              "loses_original_order": "def solve(xs):\n    return sorted(set(xs))\n",
+              "keeps_last_occurrence": "def solve(xs):\n    out = []\n    for i, x in enumerate(xs):\n        if x not in xs[i + 1:]:\n            out.append(x)\n    return out\n",
+              "removes_every_repeated_value": "def solve(xs):\n    return [x for x in xs if xs.count(x) == 1]\n",
+              "returns_input_unchanged": "def solve(xs):\n    return list(xs)\n",
+              "returns_input_object_when_no_duplicates": "def solve(xs):\n    if len(set(xs)) == len(xs):\n        return xs\n    out = []\n    seen = set()\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n",
+          }
+
+          # -------------------------------------------------------------- merge_intervals
+          def ref_merge(iv):
+              out = []
+              for a, b in sorted([list(x) for x in iv]):
+                  if out and a <= out[-1][1]:
+                      out[-1][1] = max(out[-1][1], b)
+                  else:
+                      out.append([a, b])
+              return out
+
+          def tiny_merge():
+              pool = [[a, b] for a in range(4) for b in range(a, 4)]
+              for n in range(4):
+                  for combo in itertools.product(pool, repeat=n):
+                      yield ([list(x) for x in combo],)
+
+          def rand_merge(rng):
+              for _ in range(200):
+                  items = []
+                  for _ in range(rng.randint(0, 30)):
+                      a = rng.randint(0, 100)
+                      items.append([a, a + rng.randint(0, 15)])
+                  yield (items,)
+
+          def held_merge(rng):
+              yield ([],)
+              yield ([[1, 1]],)
+              yield ([[1, 10], [2, 3], [4, 5]],)
+              yield ([[2, 2]] * 20,)
+              yield ([[-5, -1], [-2, 4], [4, 9]],)
+              items = []
+              for _ in range(1500):
+                  a = rng.randint(0, 100000)
+                  items.append([a, a + rng.randint(0, 30)])
+              yield (items,)
+
+          def weak_merge(args, out):
+              try:
+                  rows = [list(x) for x in out]
+              except TypeError:
+                  return False
+              return all(len(r) == 2 and r[0] <= r[1] for r in rows) and all(rows[i][0] <= rows[i + 1][0] for i in range(len(rows) - 1))
+
+          MUT_MERGE = {
+              "touching_intervals_not_merged": "def solve(iv):\n    out = []\n    for a, b in sorted([list(x) for x in iv]):\n        if out and a < out[-1][1]:\n            out[-1][1] = max(out[-1][1], b)\n        else:\n            out.append([a, b])\n    return out\n",
+              "no_sort_before_merge": "def solve(iv):\n    out = []\n    for a, b in [list(x) for x in iv]:\n        if out and a <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], b)\n        else:\n            out.append([a, b])\n    return out\n",
+              "nested_interval_shrinks_end": "def solve(iv):\n    out = []\n    for a, b in sorted([list(x) for x in iv]):\n        if out and a <= out[-1][1]:\n            out[-1][1] = b\n        else:\n            out.append([a, b])\n    return out\n",
+              "mutates_input": "def solve(iv):\n    iv.sort()\n    out = []\n    for a, b in iv:\n        if out and a <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], b)\n        else:\n            out.append([a, b])\n    return out\n",
+              "returns_input_object_when_already_merged": "def solve(iv):\n    rows = [list(x) for x in iv]\n    if all(rows[i][1] < rows[i + 1][0] for i in range(len(rows) - 1)) and rows == sorted(rows):\n        return iv\n    out = []\n    for a, b in sorted(rows):\n        if out and a <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], b)\n        else:\n            out.append([a, b])\n    return out\n",
+          }
+
+          # ------------------------------------------------------------- count_pairs_sum
+          def ref_pairs(xs, k):
+              seen = Counter()
+              total = 0
+              for x in xs:
+                  total += seen[k - x]
+                  seen[x] += 1
+              return total
+
+          def tiny_pairs():
+              for xs in _tiny_lists(4, [0, 1, 2]):
+                  for k in range(5):
+                      yield (xs, k)
+
+          def rand_pairs(rng):
+              for _ in range(200):
+                  yield ([rng.randint(0, 15) for _ in range(rng.randint(0, 40))], rng.randint(0, 30))
+
+          def held_pairs(rng):
+              yield ([], 0)
+              yield ([0] * 3000, 0)
+              yield ([5], 10)
+              yield ([-2, 2, -2, 2, 0, 0], 0)
+              yield ([rng.randint(0, 100) for _ in range(3000)], 100)
+
+          def weak_pairs(args, out):
+              n = len(args[0])
+              return isinstance(out, int) and not isinstance(out, bool) and 0 <= out <= n * (n - 1) // 2
+
+          MUT_PAIRS = {
+              "counts_distinct_values_not_positions": "def solve(xs, k):\n    s = set(xs)\n    return sum(1 for x in s if k - x in s and x < k - x)\n",
+              "counts_ordered_pairs_twice": "def solve(xs, k):\n    return 2 * sum(1 for i in range(len(xs)) for j in range(i + 1, len(xs)) if xs[i] + xs[j] == k)\n",
+              "pairs_an_element_with_itself": "def solve(xs, k):\n    return sum(1 for i in range(len(xs)) for j in range(i, len(xs)) if xs[i] + xs[j] == k)\n",
+              "ignores_duplicate_positions": "def solve(xs, k):\n    s = set(xs)\n    return sum(1 for x in s for y in s if x < y and x + y == k)\n",
+          }
+
+          # ------------------------------------------------------- max_circular_subarray
+          def ref_circ(xs):
+              best = cur = xs[0]
+              worst = cur_min = xs[0]
+              for x in xs[1:]:
+                  cur = max(x, cur + x)
+                  best = max(best, cur)
+                  cur_min = min(x, cur_min + x)
+                  worst = min(worst, cur_min)
+              total = sum(xs)
+              if best < 0:
+                  return best
+              return max(best, total - worst)
+
+          def tiny_circ():
+              for n in range(1, 6):
+                  for combo in itertools.product([-2, -1, 0, 1, 2], repeat=n):
+                      yield (list(combo),)
+
+          def rand_circ(rng):
+              for _ in range(200):
+                  yield ([rng.randint(-20, 20) for _ in range(rng.randint(1, 30))],)
+
+          def held_circ(rng):
+              yield ([-5],)
+              yield ([-3, -1, -2],)
+              yield ([5, -3, 5],)
+              yield ([8, -8, 9, -9, 10, -11, 12],)
+              yield ([0, 0, 0],)
+              yield ([rng.randint(-1000, 1000) for _ in range(2500)],)
+              yield ([-1] * 1000,)
+
+          def weak_circ(args, out):
+              return isinstance(out, int) and not isinstance(out, bool) and out >= max(args[0])
+
+          MUT_CIRC = {
+              "ignores_wraparound": "def solve(xs):\n    best = cur = xs[0]\n    for x in xs[1:]:\n        cur = max(x, cur + x)\n        best = max(best, cur)\n    return best\n",
+              "allows_empty_subarray_all_negative_gives_zero": "def solve(xs):\n    best = cur = 0\n    worst = cur_min = 0\n    for x in xs:\n        cur = max(0, cur + x)\n        best = max(best, cur)\n        cur_min = min(0, cur_min + x)\n        worst = min(worst, cur_min)\n    return max(best, sum(xs) - worst)\n",
+              "total_minus_min_without_negative_guard": "def solve(xs):\n    best = cur = xs[0]\n    worst = cur_min = xs[0]\n    for x in xs[1:]:\n        cur = max(x, cur + x)\n        best = max(best, cur)\n        cur_min = min(x, cur_min + x)\n        worst = min(worst, cur_min)\n    return max(best, sum(xs) - worst)\n",
+              "mutates_input": "def solve(xs):\n    xs.sort()\n    return sum(x for x in xs if x > 0) if xs[-1] > 0 else xs[-1]\n",
+          }
+
+          # ------------------------------------------------------------- split_csv_line
+          def ref_csv(line):
+              fields, cur, i, quoted = [], [], 0, False
+              n = len(line)
+              while i < n:
+                  ch = line[i]
+                  if quoted:
+                      if ch == '"':
+                          if i + 1 < n and line[i + 1] == '"':
+                              cur.append('"')
+                              i += 1
+                          else:
+                              quoted = False
+                      else:
+                          cur.append(ch)
+                  elif ch == '"':
+                      quoted = True
+                  elif ch == ",":
+                      fields.append("".join(cur))
+                      cur = []
+                  else:
+                      cur.append(ch)
+                  i += 1
+              fields.append("".join(cur))
+              return fields
+
+          def _serialize(fields):
+              parts = []
+              for f in fields:
+                  if any(c in f for c in ',"'):
+                      parts.append('"' + f.replace('"', '""') + '"')
+                  else:
+                      parts.append(f)
+              return ",".join(parts)
+
+          def tiny_csv():
+              alphabet = ["a", ",", '"', " "]
+              pool = [""] + [a + b for a in alphabet for b in [""] + alphabet]
+              pool = list(dict.fromkeys(pool))
+              for n in range(1, 3):
+                  for combo in itertools.product(pool, repeat=n):
+                      yield (_serialize(list(combo)),)
+
+          def rand_csv(rng):
+              alphabet = ["a", "b", ",", '"', " ", "x"]
+              for _ in range(200):
+                  fields = ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 6))) for _ in range(rng.randint(1, 5))]
+                  yield (_serialize(fields),)
+
+          def held_csv(rng):
+              yield ("",)
+              yield (",",)
+              yield (",,,",)
+              yield ('"",""',)
+              yield ('"a,b","c""d",e',)
+              yield ('" leading and trailing ", x ',)
+              yield (",".join(["f%d" % i for i in range(2000)]),)
+              yield ('"""",""""""',)
+
+          def weak_csv(args, out):
+              return isinstance(out, list) and all(isinstance(x, str) for x in out) and len(out) >= 1
+
+          MUT_CSV = {
+              "naive_split_on_commas": "def solve(line):\n    return line.split(',')\n",
+              "keeps_doubled_quotes": "def solve(line):\n    out, cur, q = [], '', False\n    for ch in line:\n        if ch == '\"':\n            q = not q\n            cur += ch if False else ''\n        elif ch == ',' and not q:\n            out.append(cur)\n            cur = ''\n        else:\n            cur += ch\n    out.append(cur)\n    return out\n",
+              "strips_whitespace_in_fields": "def solve(line):\n    out, cur, q, i = [], '', False, 0\n    while i < len(line):\n        ch = line[i]\n        if q:\n            if ch == '\"':\n                if i + 1 < len(line) and line[i + 1] == '\"':\n                    cur += '\"'\n                    i += 1\n                else:\n                    q = False\n            else:\n                cur += ch\n        elif ch == '\"':\n            q = True\n        elif ch == ',':\n            out.append(cur.strip())\n            cur = ''\n        else:\n            cur += ch\n        i += 1\n    out.append(cur.strip())\n    return out\n",
+              "drops_trailing_empty_field": "def solve(line):\n    out, cur, q, i = [], '', False, 0\n    while i < len(line):\n        ch = line[i]\n        if q:\n            if ch == '\"':\n                if i + 1 < len(line) and line[i + 1] == '\"':\n                    cur += '\"'\n                    i += 1\n                else:\n                    q = False\n            else:\n                cur += ch\n        elif ch == '\"':\n            q = True\n        elif ch == ',':\n            out.append(cur)\n            cur = ''\n        else:\n            cur += ch\n        i += 1\n    if cur != '':\n        out.append(cur)\n    return out or ['']\n",
+          }
+
+          # ------------------------------------------------------------- next_permutation
+          def ref_nextperm(xs):
+              a = list(xs)
+              i = len(a) - 2
+              while i >= 0 and a[i] >= a[i + 1]:
+                  i -= 1
+              if i < 0:
+                  return sorted(a)
+              j = len(a) - 1
+              while a[j] <= a[i]:
+                  j -= 1
+              a[i], a[j] = a[j], a[i]
+              a[i + 1:] = reversed(a[i + 1:])
+              return a
+
+          def tiny_nextperm():
+              for xs in _tiny_lists(5, [0, 1, 2]):
+                  yield (xs,)
+
+          def rand_nextperm(rng):
+              for _ in range(200):
+                  yield ([rng.randint(0, 6) for _ in range(rng.randint(0, 12))],)
+
+          def held_nextperm(rng):
+              yield ([],)
+              yield ([3, 2, 1],)
+              yield ([1, 1, 1],)
+              yield ([1, 5, 1],)
+              yield ([2, 3, 1, 3, 3],)
+              yield (list(range(2000, 0, -1)),)
+              yield ([1] + list(range(1000, 1, -1)),)
+
+          def weak_nextperm(args, out):
+              return isinstance(out, list) and Counter(out) == Counter(args[0])
+
+          MUT_NEXTPERM = {
+              "last_permutation_not_wrapped": "def solve(xs):\n    a = list(xs)\n    i = len(a) - 2\n    while i >= 0 and a[i] >= a[i + 1]:\n        i -= 1\n    if i < 0:\n        return a\n    j = len(a) - 1\n    while a[j] <= a[i]:\n        j -= 1\n    a[i], a[j] = a[j], a[i]\n    a[i + 1:] = reversed(a[i + 1:])\n    return a\n",
+              "suffix_not_reversed": "def solve(xs):\n    a = list(xs)\n    i = len(a) - 2\n    while i >= 0 and a[i] >= a[i + 1]:\n        i -= 1\n    if i < 0:\n        return sorted(a)\n    j = len(a) - 1\n    while a[j] <= a[i]:\n        j -= 1\n    a[i], a[j] = a[j], a[i]\n    return a\n",
+              "strict_comparison_breaks_duplicates": "def solve(xs):\n    a = list(xs)\n    i = len(a) - 2\n    while i >= 0 and a[i] > a[i + 1]:\n        i -= 1\n    if i < 0:\n        return sorted(a)\n    j = len(a) - 1\n    while a[j] <= a[i]:\n        j -= 1\n    a[i], a[j] = a[j], a[i]\n    a[i + 1:] = reversed(a[i + 1:])\n    return a\n",
+              "mutates_input": "def solve(xs):\n    i = len(xs) - 2\n    while i >= 0 and xs[i] >= xs[i + 1]:\n        i -= 1\n    if i < 0:\n        xs.sort()\n        return xs\n    j = len(xs) - 1\n    while xs[j] <= xs[i]:\n        j -= 1\n    xs[i], xs[j] = xs[j], xs[i]\n    xs[i + 1:] = reversed(xs[i + 1:])\n    return xs\n",
+          }
+
+
+          # ---------------------------------------------------------------- scaling probe inputs
+          def scale_sort(n, rng):
+              return ([rng.randint(-10**6, 10**6) for _ in range(n)],)
+
+          def scale_dedupe(n, rng):
+              return ([rng.randint(0, n) for _ in range(n)],)
+
+          def scale_merge(n, rng):
+              items = []
+              for _ in range(n):
+                  a = rng.randint(0, 50 * n)
+                  items.append([a, a + rng.randint(0, 20)])
+              return (items,)
+
+          def scale_pairs(n, rng):
+              return ([rng.randint(0, n) for _ in range(n)], n)
+
+          def scale_circ(n, rng):
+              return ([rng.randint(-100, 100) for _ in range(n)],)
+
+          def scale_csv(n, rng):
+              fields = ["a,b" if i % 7 == 0 else "x%d" % i for i in range(n)]
+              return (_serialize(fields),)
+
+          def scale_nextperm(n, rng):
+              return ([rng.randint(0, 5) for _ in range(n)],)
+
+          SPECS = {
+              "max_circular_subarray": {
+                  "scale": scale_circ,
+                  "title": "the maximum circular subarray sum",
+                  "signature": "solve(xs)",
+                  "description": "solve(xs) takes a NON-EMPTY list of integers treated as circular (the last element is adjacent to the first) and returns the largest possible sum of a NON-EMPTY contiguous circular subarray (it may wrap around the end, and it may be the whole list). It must not modify xs.",
+                  "forbidden": [],
+                  "ref": ref_circ, "tiny": tiny_circ, "rand": rand_circ, "held": held_circ, "weak": weak_circ,
+                  "mutants": MUT_CIRC, "weak_name": "lower-bound-only check",
+                  "questions": ["Which input family do you expect LLM-written solutions to get wrong most often here?",
+                                "Would you add a brute-force oracle for small circular inputs, or keep the linear reference?"],
+              },
+              "split_csv_line": {
+                  "scale": scale_csv,
+                  "title": "parsing one CSV line with quoted fields",
+                  "signature": "solve(line)",
+                  "description": "solve(line) takes ONE valid CSV line (RFC 4180 style: fields separated by commas; a field may be wrapped in double quotes, in which case it may contain commas, and a doubled quote \"\" inside it means one literal quote) and returns the list of field strings with the quoting removed. Whitespace is part of the field and must be kept. An empty line gives [\"\"]; a trailing comma gives a trailing empty field. Do not import any module.",
+                  "forbidden": [],
+                  "ref": ref_csv, "tiny": tiny_csv, "rand": rand_csv, "held": held_csv, "weak": weak_csv,
+                  "mutants": MUT_CSV, "weak_name": "type-only check",
+                  "questions": ["Which malformed-input policy would you pick for a parser like this, and why?",
+                                "What edge case would you add to the held-out set for quoted fields?"],
+              },
+              "next_permutation": {
+                  "scale": scale_nextperm,
+                  "title": "computing the next lexicographic permutation",
+                  "signature": "solve(xs)",
+                  "description": "solve(xs) takes a list of integers (possibly empty, possibly with duplicates) and returns a NEW list: the next permutation of xs in lexicographic order, or the ascending sorted list if xs is already the last (largest) permutation. It must not modify xs.",
+                  "forbidden": [],
+                  "ref": ref_nextperm, "tiny": tiny_nextperm, "rand": rand_nextperm, "held": held_nextperm, "weak": weak_nextperm,
+                  "mutants": MUT_NEXTPERM, "weak_name": "same-elements-only check",
+                  "questions": ["Would you test this against a brute-force enumeration of permutations, and up to what size?",
+                                "Which planted wrong implementation would you add to this suite?"],
+              },
+              "sort_ints": {
+                  "scale": scale_sort,
+                  "title": "sorting a list of integers",
+                  "signature": "solve(xs)",
+                  "description": "solve(xs) takes a list of integers (possibly empty, negative, with duplicates) and returns a NEW list with the same elements in ascending order. It must not modify xs. Implement the sorting algorithm yourself: do not use sorted(), .sort(), or heapq.",
+                  "forbidden": ["sorted", "sort"],
+                  "ref": ref_sort, "tiny": tiny_sort, "rand": rand_sort, "held": held_sort, "weak": weak_sort,
+                  "mutants": MUT_SORT, "weak_name": "order-only check",
+                  "questions": ["Which planted wrong implementation would you add to make this suite harder to pass?",
+                                "For sorting, is the multiset-preservation check enough, or would you also test stability on keyed records?"],
+              },
+              "dedupe_keep_first": {
+                  "scale": scale_dedupe,
+                  "title": "removing duplicates while keeping first occurrences in order",
+                  "signature": "solve(xs)",
+                  "description": "solve(xs) takes a list of integers and returns a NEW list containing each distinct value once, in the order of its FIRST occurrence in xs. It must not modify xs.",
+                  "forbidden": [],
+                  "ref": ref_dedupe, "tiny": tiny_dedupe, "rand": rand_dedupe, "held": held_dedupe, "weak": weak_dedupe,
+                  "mutants": MUT_DEDUPE, "weak_name": "uniqueness-only check",
+                  "questions": ["What property would you check beyond uniqueness and order to catch subtler dedupe bugs?",
+                                "Which planted wrong implementation would you add to this suite?"],
+              },
+              "merge_intervals": {
+                  "scale": scale_merge,
+                  "title": "merging overlapping closed intervals",
+                  "signature": "solve(iv)",
+                  "description": "solve(iv) takes a list of closed integer intervals [a, b] with a <= b, in any order, and returns a NEW list of merged intervals sorted by start. Intervals that overlap OR touch (share an endpoint, e.g. [1,3] and [3,5]) must be merged into one. It must not modify iv.",
+                  "forbidden": [],
+                  "ref": ref_merge, "tiny": tiny_merge, "rand": rand_merge, "held": held_merge, "weak": weak_merge,
+                  "mutants": MUT_MERGE, "weak_name": "sorted-and-well-formed check",
+                  "questions": ["Which edge case would you add to the held-out set for interval merging?",
+                                "Is a reference implementation enough as an oracle here, or would you add independent properties?"],
+              },
+              "count_pairs_sum": {
+                  "scale": scale_pairs,
+                  "title": "counting index pairs that sum to a target",
+                  "signature": "solve(xs, k)",
+                  "description": "solve(xs, k) takes a list of integers xs and an integer k and returns the number of index pairs (i, j) with i < j and xs[i] + xs[j] == k. Duplicate values count separately by position. It must not modify xs.",
+                  "forbidden": [],
+                  "ref": ref_pairs, "tiny": tiny_pairs, "rand": rand_pairs, "held": held_pairs, "weak": weak_pairs,
+                  "mutants": MUT_PAIRS, "weak_name": "range-only check",
+                  "questions": ["Would you test this with a brute-force oracle or with algebraic properties, and why?",
+                                "Which planted wrong implementation would you add to this suite?"],
+              },
+          }
+          SPEC_ORDER = ["sort_ints", "max_circular_subarray", "split_csv_line", "dedupe_keep_first", "next_permutation", "merge_intervals", "count_pairs_sum"]
+          LABPY_SPECS
+          cat > lab_src/lab_harness.py <<'LABPY_HARNESS'
+          """NØX Lab harness. Runs untrusted candidate code in short-lived child processes.
+          Modes:
+            python3 -I lab_harness.py all <workdir>          -> JSON on stdout (orchestrator)
+            python3 -I lab_harness.py child <spec> <file> <weak 0|1>  -> JSON on stdout (one candidate)
+          The orchestrator must itself run inside a network-less, unprivileged sandbox."""
+          import ast
+          import builtins
+          import copy
+          import hashlib
+          import json
+          import math
+          import os
+          import random
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          HERE = os.path.dirname(os.path.abspath(__file__))
+          sys.path.insert(0, HERE)
+          import lab_specs  # noqa: E402
+
+          BANNED_NAMES = {"eval", "exec", "compile", "open", "__import__", "input", "globals", "locals", "getattr",
+                          "setattr", "delattr", "vars", "breakpoint", "exit", "quit", "help", "memoryview", "type", "object"}
+          # Attribute names that reach frames, code objects or string-format traversal: never needed for these tasks.
+          BANNED_ATTRS = {"gi_frame", "gi_code", "gi_yieldfrom", "gi_running", "f_back", "f_globals", "f_locals", "f_builtins",
+                          "f_code", "f_trace", "tb_frame", "tb_next", "cr_frame", "cr_code", "cr_await", "cr_origin", "ag_frame",
+                          "ag_code", "ag_await", "func_globals", "func_code", "co_code", "co_consts", "co_names", "mro",
+                          "format", "format_map", "with_traceback", "add_note"}
+          SAFE = ["abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "int", "isinstance", "len", "list",
+                  "map", "max", "min", "pow", "range", "reversed", "set", "sorted", "str", "sum", "tuple", "zip", "divmod",
+                  "ord", "chr", "next", "iter", "Exception", "ValueError", "IndexError", "KeyError", "TypeError", "ZeroDivisionError", "True", "False", "None", "round"]
+          CALL_SECONDS = 3
+          CHILD_SECONDS = 90
+
+
+          def static_check(source, forbidden):
+              try:
+                  tree = ast.parse(source)
+              except SyntaxError as exc:
+                  return f"syntax_error:{exc.msg}"
+              if len(source) > 6000:
+                  return "too_long"
+              found = False
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.Import, ast.ImportFrom)):
+                      return "import_not_allowed"
+                  if isinstance(node, ast.Name) and (node.id in BANNED_NAMES or node.id in forbidden):
+                      return f"forbidden_name:{node.id}"
+                  if isinstance(node, ast.Attribute) and (node.attr.startswith("__") or node.attr in forbidden or node.attr in BANNED_ATTRS):
+                      return f"forbidden_attribute:{node.attr}"
+                  if isinstance(node, ast.FunctionDef) and node.name == "solve":
+                      found = True
+              return None if found else "no_solve_function"
+
+
+          def short(value, n=110):
+              text = repr(value)
+              return text if len(text) <= n else text[: n - 3] + "..."
+
+
+          def show(args, n=110):
+              """Readable call arguments: f([1, 2]) rather than ([1, 2],)."""
+              text = ", ".join(repr(a) for a in args)
+              return text if len(text) <= n else text[: n - 3] + "..."
+
+
+          class Timeout(BaseException):
+              pass
+
+
+          def _alarm(signum, frame):
+              raise Timeout()
+
+
+          def run_layer(solve, spec, cases, weak):
+              count = 0
+              first = None
+              for args in cases:
+                  count += 1
+                  if first is not None:
+                      continue  # keep counting, but report only the first counterexample
+                  original = copy.deepcopy(args)
+                  working = copy.deepcopy(args)
+                  try:
+                      signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
+                      out = solve(*working)
+                      signal.setitimer(signal.ITIMER_REAL, 0)
+                  except Timeout:
+                      first = {"input": show(original), "reason": "timeout"}
+                      continue
+                  except BaseException as exc:  # candidate code is untrusted
+                      signal.setitimer(signal.ITIMER_REAL, 0)
+                      first = {"input": show(original), "reason": f"exception:{type(exc).__name__}"}
+                      continue
+                  expected = spec["ref"](*copy.deepcopy(original))
+                  if (not weak) and working != original:
+                      first = {"input": show(original), "reason": "input_modified"}
+                  elif (not weak) and isinstance(out, list) and any(out is arg for arg in working if isinstance(arg, list)):
+                      first = {"input": show(original), "reason": "returned_input_object"}
+                  elif weak:
+                      if not spec["weak"](original, out):
+                          first = {"input": show(original), "reason": "weak_check_failed"}
+                  else:
+                      try:
+                          same = [list(x) for x in out] == expected if spec is lab_specs.SPECS["merge_intervals"] else out == expected
+                      except TypeError:
+                          same = False
+                      if not same:
+                          first = {"input": show(original), "expected": short(expected), "got": short(out), "reason": "wrong_output"}
+              return {"passed": first is None, "cases": count, "first_failure": first}
+
+
+
+          def probe_scaling(solve, spec):
+              """Informational only: how the running time grows when the input is 4 times larger (timing is noisy on shared runners)."""
+              sizes = (1000, 2000, 4000)
+              times = []
+              for n in sizes:
+                  args = spec["scale"](n, random.Random(4242 + n))
+                  best = None
+                  for _ in range(3 if n < 2000 else 2):
+                      work = copy.deepcopy(args)
+                      try:
+                          signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
+                          start = time.perf_counter()
+                          solve(*work)
+                          elapsed = time.perf_counter() - start
+                          signal.setitimer(signal.ITIMER_REAL, 0)
+                      except Timeout:
+                          return {"label": "too_slow", "timeout_at": n, "times_ms": [round(t * 1000, 2) for t in times]}
+                      except BaseException:
+                          signal.setitimer(signal.ITIMER_REAL, 0)
+                          return {"label": "probe_error"}
+                      best = elapsed if best is None else min(best, elapsed)
+                  times.append(best)
+              if times[2] < 5e-5:
+                  return {"label": "too_fast", "times_ms": [round(t * 1000, 3) for t in times], "sizes": list(sizes)}
+              first, last = max(times[0], 2e-5), max(times[2], 2e-5)
+              exponent = math.log(last / first) / math.log(4)
+              if exponent <= 1.45:
+                  label = "near_linear"
+              elif exponent >= 1.75:
+                  label = "near_quadratic"
+              else:
+                  label = "in_between"
+              return {"label": label, "exponent": round(exponent, 2), "growth": round(last / first, 1),
+                      "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes)}
+
+          def child(spec_name, path, weak_only, extended=False, probe=False):
+              spec = lab_specs.SPECS[spec_name]
+              source = open(path, encoding="utf-8").read()
+              is_mutant = os.path.basename(path).startswith("mutant_")
+              problem = static_check(source, [] if is_mutant else spec["forbidden"])
+              real_out = sys.stdout
+              result = {"digest": hashlib.sha256(source.strip().encode()).hexdigest()[:12]}
+              if problem:
+                  result.update({"status": "rejected_static", "reason": problem})
+                  real_out.write(json.dumps(result))
+                  return
+              try:
+                  import resource
+                  resource.setrlimit(resource.RLIMIT_CPU, (75, 75))
+                  resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+                  resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+                  resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+              except Exception:
+                  pass
+              sys.stdout = open(os.devnull, "w")
+              sys.stderr = open(os.devnull, "w")
+              safe = {name: getattr(builtins, name) for name in SAFE if hasattr(builtins, name)}
+              safe["print"] = lambda *a, **k: None
+              namespace = {"__builtins__": safe}
+              signal.signal(signal.SIGALRM, _alarm)
+              try:
+                  signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
+                  exec(compile(source, "candidate", "exec"), namespace)  # noqa: S102 - sandboxed by the caller
+                  signal.setitimer(signal.ITIMER_REAL, 0)
+                  solve = namespace["solve"]
+              except BaseException as exc:
+                  sys.stdout = real_out
+                  result.update({"status": "error", "reason": f"load_failed:{type(exc).__name__}"})
+                  real_out.write(json.dumps(result))
+                  return
+              rng = random.Random(20260101)
+              layers = {}
+              layers["L1_exhaustive_tiny"] = run_layer(solve, spec, spec["tiny"](), weak_only)
+              layers["L2_seeded_random"] = run_layer(solve, spec, spec["rand"](rng), weak_only)
+              layers["L3_heldout_adversarial"] = run_layer(solve, spec, spec["held"](random.Random(777)), weak_only)
+              if extended and all(layer["passed"] for layer in layers.values()):
+                  total, first_fail = 0, None
+                  for seed in range(100, 106):
+                      part = run_layer(solve, spec, spec["rand"](random.Random(seed)), False)
+                      total += part["cases"]
+                      if first_fail is None and part["first_failure"] is not None:
+                          first_fail = part["first_failure"]
+                  layers["L4_extended_random"] = {"passed": first_fail is None, "cases": total, "first_failure": first_fail}
+              passed = all(layer["passed"] for layer in layers.values())
+              scaling = None
+              if probe and passed and "scale" in spec:
+                  scaling = probe_scaling(solve, spec)
+              sys.stdout = real_out
+              result.update({"status": "passed_all" if passed else "failed", "layers": layers})
+              if scaling is not None:
+                  result["scaling"] = scaling
+              real_out.write(json.dumps(result))
+
+
+          def run_child(spec_name, path, weak, extended=False, probe=False):
+              try:
+                  proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "child", spec_name, path, "1" if weak else "0", "1" if extended else "0", "1" if probe else "0"],
+                                        capture_output=True, text=True, timeout=CHILD_SECONDS, cwd=HERE, env={"PATH": "/usr/bin:/bin"})
+              except subprocess.TimeoutExpired:
+                  return {"status": "error", "reason": "child_timeout"}
+              try:
+                  return json.loads(proc.stdout)
+              except Exception:
+                  return {"status": "error", "reason": f"child_crash:{proc.returncode}"}
+
+
+          def main_all(workdir):
+              meta = json.load(open(os.path.join(workdir, "meta.json"), encoding="utf-8"))
+              spec_name = meta["spec"]
+              spec = lab_specs.SPECS[spec_name]
+              out = {"spec": spec_name, "corpus_version": lab_specs.VERSION, "sandbox": os.environ.get("LAB_SANDBOX", "none"), "candidates": [], "mutants": []}
+              for item in meta["candidates"]:
+                  path = os.path.join(workdir, item["file"])
+                  full = run_child(spec_name, path, False, False, True)
+                  full["file"] = item["file"]
+                  out["candidates"].append(full)
+              for name, code in spec["mutants"].items():
+                  path = os.path.join(workdir, f"mutant_{name}.py")
+                  with open(path, "w", encoding="utf-8") as handle:
+                      handle.write(code)
+                  full = run_child(spec_name, path, False)
+                  weak = run_child(spec_name, path, True)
+                  out["mutants"].append({"name": name,
+                                         "full_suite_rejects": full.get("status") == "failed",
+                                         "weak_check_accepts": weak.get("status") == "passed_all"})
+              sys.stdout.write(json.dumps(out))
+
+
+          def main_submissions(workdir):
+              meta = json.load(open(os.path.join(workdir, "requests.json"), encoding="utf-8"))
+              out = {"corpus_version": lab_specs.VERSION, "sandbox": os.environ.get("LAB_SANDBOX", "none"), "results": []}
+              for item in meta.get("requests", []):
+                  name = item.get("spec")
+                  if name not in lab_specs.SPECS:
+                      out["results"].append({"file": item.get("file"), "status": "error", "reason": "unknown_spec"})
+                      continue
+                  res = run_child(name, os.path.join(workdir, item["file"]), False, True, True)
+                  res["file"] = item["file"]
+                  out["results"].append(res)
+              sys.stdout.write(json.dumps(out))
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) >= 3 and sys.argv[1] == "all":
+                  main_all(sys.argv[2])
+              elif len(sys.argv) >= 3 and sys.argv[1] == "submissions":
+                  main_submissions(sys.argv[2])
+              elif len(sys.argv) >= 5 and sys.argv[1] == "child":
+                  child(sys.argv[2], sys.argv[3], sys.argv[4] == "1", len(sys.argv) > 5 and sys.argv[5] == "1", len(sys.argv) > 6 and sys.argv[6] == "1")
+          LABPY_HARNESS
+          cat > lab_req_collect.py <<'LABPY_COLLECT'
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          for key, expected in {"PROJECT_COST_EUR": "0", "FREE_AI_ONLY": "true", "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false"}.items():
+              if os.environ.get(key, expected).strip().lower() != expected:
+                  raise SystemExit(f"SECURITY STOP: {key} must remain {expected}")
+
+          from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient  # noqa: E402
+
+          NOW = datetime.now(timezone.utc).isoformat()
+          MAX_REQ = int(os.environ.get("LAB_MAX_REQUESTS_PER_RUN", "3"))
+          MAX_POSTS = int(os.environ.get("LAB_MAX_POSTS_SCANNED", "12"))
+          MAX_CODE = 6000
+          STATE_FILE = Path(os.environ.get("LAB_REQ_STATE_FILE", "memory/nox_lab_requests.json"))
+          PRESENCE_FILE = Path(os.environ.get("PRESENCE_FILE", "memory/nox_colony_presence.json"))
+          OUT = Path("lab_req")
+          OUT.mkdir(exist_ok=True)
+
+
+          def load(path, default):
+              try:
+                  data = json.loads(Path(path).read_text(encoding="utf-8"))
+                  return data if isinstance(data, type(default)) else default
+              except Exception:
+                  return default
+
+
+          def clean(value, n=300):
+              return re.sub(r"\s+", " ", str(value if value is not None else "")).strip()[:n]
+
+
+          def author(item):
+              if not isinstance(item, dict):
+                  return ""
+              who = item.get("author")
+              if isinstance(who, dict):
+                  return clean(who.get("username") or who.get("display_name"), 100)
+              return clean(item.get("author_username") or "", 100)
+
+
+          def extract(value, keys):
+              if isinstance(value, list):
+                  return value
+              if isinstance(value, dict):
+                  for key in keys:
+                      if isinstance(value.get(key), list):
+                          return value[key]
+              return []
+
+
+          FENCE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.S)
+
+
+          def extract_code(text):
+              """First fenced Python block that defines solve(...). Returns None when the comment is not a submission."""
+              for lang, code in FENCE.findall(str(text or "")):
+                  if lang.lower() in ("", "python", "py", "python3") and re.search(r"^[ \t]*def[ \t]+solve[ \t]*\(", code, re.M):
+                      return code.strip("\n") + "\n"
+              return None
+
+
+          def set_output(name, value):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a", encoding="utf-8") as handle:
+                      handle.write(f"{name}={value}\n")
+
+
+          API_KEY = os.environ.get("COLONY_API_KEY", "").strip()
+          if not API_KEY:
+              raise SystemExit("COLONY_API_KEY manquant.")
+          client = ColonyClient(API_KEY)
+          try:
+              boot = client.bootstrap()
+          except ColonyAuthError as exc:
+              raise SystemExit(f"Authentification Colony refusee: {exc}")
+          except ColonyAPIError as exc:
+              raise SystemExit(f"Erreur Colony au bootstrap: {exc}")
+          profile = boot.get("profile", {}) if isinstance(boot, dict) else {}
+          username = clean(profile.get("username"), 100)
+          if username and username != "nox_origine":
+              raise SystemExit(f"SECURITY STOP: profil inattendu '{username}'.")
+
+          presence = load(PRESENCE_FILE, {})
+          state = load(STATE_FILE, {})
+          handled = {str(x) for x in state.get("handled", [])}
+
+          lab_posts = []
+          for rec in reversed(presence.get("published_posts", []) if isinstance(presence.get("published_posts"), list) else []):
+              if not isinstance(rec, dict) or not str(rec.get("title") or "").startswith("Lab report"):
+                  continue
+              match = re.search(r"\brun (\d{8}T\d{6}Z-\d+)", str(rec.get("body") or ""))
+              post_id = str(rec.get("post_id") or "")
+              if not match or not post_id:
+                  continue
+              meta = load(Path("lab/runs") / match.group(1) / "meta.json", {})
+              if not meta.get("spec"):
+                  continue
+              lab_posts.append({"post_id": post_id, "run_id": match.group(1), "spec": meta["spec"], "title": clean(rec.get("title"), 200)})
+              if len(lab_posts) >= MAX_POSTS:
+                  break
+          print(f"Lab posts scanned: {len(lab_posts)}")
+
+          requests = []
+          for post in lab_posts:
+              if len(requests) >= MAX_REQ:
+                  break
+              try:
+                  thread = client.get_all_comments(post["post_id"])
+              except Exception as exc:
+                  print(f"Comments unreadable for post {post['post_id']}: {clean(exc, 120)}")
+                  continue
+              thread = extract(thread, ("items", "comments"))
+              nox_parents = set()
+              for item in thread:
+                  if isinstance(item, dict) and author(item) == username:
+                      parent = str(item.get("parent_id") or item.get("parent_comment_id") or "")
+                      if parent:
+                          nox_parents.add(parent)
+              for item in thread:
+                  if len(requests) >= MAX_REQ:
+                      break
+                  if not isinstance(item, dict):
+                      continue
+                  comment_id = str(item.get("id") or item.get("comment_id") or "")
+                  who = author(item)
+                  if not comment_id or not who or who == username or comment_id in handled or comment_id in nox_parents:
+                      continue
+                  code = extract_code(item.get("body") or item.get("content") or item.get("text") or "")
+                  if code is None:
+                      continue
+                  index = len(requests) + 1
+                  name = f"sub_{index}.py"
+                  (OUT / name).write_text(code[: MAX_CODE + 1], encoding="utf-8")
+                  requests.append({"file": name, "spec": post["spec"], "run_id": post["run_id"], "post_id": post["post_id"],
+                                   "post_title": post["title"], "comment_id": comment_id, "author": who})
+                  print(f"Submission found: comment={comment_id[:8]} by {who} spec={post['spec']} chars={len(code)}")
+
+          (OUT / "requests.json").write_text(json.dumps({"created_at": NOW, "requests": requests}, ensure_ascii=False, indent=2), encoding="utf-8")
+          for name in ("lab_specs.py", "lab_harness.py"):
+              (OUT / name).write_text((Path("lab_src") / name).read_text(encoding="utf-8"), encoding="utf-8")
+          set_output("count", len(requests))
+          print(f"Lab requests to run: {len(requests)}")
+          LABPY_COLLECT
+
+      - name: Collect code submitted under Lab reports (nothing is executed here)
+        id: collect
+        env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
+        run: python3 lab_req_collect.py
+
+      - name: Upload submissions
+        if: steps.collect.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-req-input
+          path: lab_req/
+          retention-days: 3
+
+  execute:
+    needs: collect
+    if: needs.collect.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - name: Download submissions
+        uses: actions/download-artifact@v4
+        with:
+          name: lab-req-input
+          path: lab_req
+
+      - name: Run submissions in a sandbox (no network, unprivileged, no secrets)
+        run: |
+          set -u
+          rm -rf /tmp/labrun && mkdir -p /tmp/labrun
+          cp -r lab_req/. /tmp/labrun/
+          chmod -R a+rX /tmp/labrun
+          chmod a+rwx /tmp/labrun
+          mkdir -p lab_res
+          SANDBOX=(sudo unshare -n setpriv --reuid=65534 --regid=65534 --clear-groups)
+          # Refuse to run if the sandbox cannot be proven: network must be unreachable and the user unprivileged.
+          if ! "${SANDBOX[@]}" /usr/bin/python3 -I -c "
+          import os, socket, sys
+          if os.getuid() == 0:
+              sys.exit(2)
+          try:
+              socket.create_connection(('1.1.1.1', 53), 3)
+              sys.exit(1)
+          except OSError:
+              sys.exit(0)
+          "; then
+            echo "SANDBOX_UNAVAILABLE: submissions were NOT executed."
+            echo '{"sandbox": "unavailable", "results": []}' > lab_res/results.json
+            exit 0
+          fi
+          echo "Sandbox confirmed: no network, unprivileged user."
+          "${SANDBOX[@]}" env -i PATH=/usr/bin:/bin LAB_SANDBOX=network_isolated_unprivileged /usr/bin/python3 -I /tmp/labrun/lab_harness.py submissions /tmp/labrun > lab_res/results.json || echo "Harness exited with an error."
+          python3 -c "import json; d=json.load(open('lab_res/results.json')); print('sandbox=', d.get('sandbox'), 'results=', len(d.get('results', [])))"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-req-results
+          path: lab_res/
+          retention-days: 3
+
+  queue:
+    needs: [collect, execute]
+    if: needs.collect.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download submissions
+        uses: actions/download-artifact@v4
+        with:
+          name: lab-req-input
+          path: lab_req
+
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          name: lab-req-results
+          path: lab_res
+
+      - name: Write reply script
+        run: |
+          cat > lab_req_queue.py <<'LABPY_QUEUE'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          sys.path.insert(0, "lab_req")
+          import lab_specs  # noqa: E402
+
+          for key, expected in {"PROJECT_COST_EUR": "0", "FREE_AI_ONLY": "true", "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false"}.items():
+              if os.environ.get(key, expected).strip().lower() != expected:
+                  raise SystemExit(f"SECURITY STOP: {key} must remain {expected}")
+
+          NOW = datetime.now(timezone.utc).isoformat()
+          RUNTIME_FILE = Path(os.environ["RUNTIME_FILE"])
+          STATE_FILE = Path(os.environ["LAB_REQ_STATE_FILE"])
+          GAPS_FILE = Path(os.environ["LAB_GAPS_FILE"])
+
+
+          def load(path, default):
+              try:
+                  data = json.loads(Path(path).read_text(encoding="utf-8"))
+                  return data if isinstance(data, type(default)) else default
+              except Exception:
+                  return default
+
+
+          requests = load("lab_req/requests.json", {}).get("requests", [])
+          results = load("lab_res/results.json", {})
+          if results.get("sandbox") != "network_isolated_unprivileged":
+              print("Sandbox not confirmed: no reply queued, submissions stay unhandled and will be retried.")
+              raise SystemExit(0)
+          by_file = {r.get("file"): r for r in results.get("results", []) if isinstance(r, dict)}
+
+          SAFE_TEXT = re.compile(r"^[A-Za-z0-9_\s\[\]\(\),.'\"\-:{}!?+*/=<>%&|^~#;]*$")
+
+
+          def safe(value, n=110):
+              """Anything that came out of a stranger's code is shown only if it is plain data-looking text."""
+              text = str(value if value is not None else "")[:n]
+              if not SAFE_TEXT.match(text) or re.search(r"https?:|www\.|@", text, re.I):
+                  return "(output omitted)"
+              return text
+
+
+          def num(value, digits=1):
+              """Numbers coming back from the sandbox are re-parsed, never printed as received."""
+              try:
+                  number = float(value)
+              except (TypeError, ValueError):
+                  return "?"
+              if number != number or number in (float("inf"), float("-inf")):
+                  return "?"
+              return str(int(number)) if number == int(number) else str(round(number, digits))
+
+
+          REASONS = {
+              "returned_input_object": "it returned the input list object itself instead of a new list",
+              "input_modified": "it modified its input",
+              "timeout": "it exceeded the 3 s limit per call",
+          }
+          STATIC = {
+              "import_not_allowed": "it contains an import",
+              "too_long": "it is longer than 6000 characters",
+              "no_solve_function": "it does not define solve(...)",
+          }
+
+
+          def human_reason(reason):
+              reason = str(reason or "")
+              if reason in REASONS:
+                  return REASONS[reason]
+              if reason.startswith("exception:"):
+                  return "it raised " + re.sub(r"[^A-Za-z0-9_]", "", reason.split(":", 1)[1])[:40]
+              return re.sub(r"[^A-Za-z0-9_ :.\-]", "", reason)[:60] or "unknown reason"
+
+
+          def static_text(reason):
+              reason = str(reason or "")
+              if reason in STATIC:
+                  return STATIC[reason]
+              if reason.startswith("forbidden_name:") or reason.startswith("forbidden_attribute:"):
+                  kind = "attribute" if reason.startswith("forbidden_attribute:") else "name"
+                  return f"it uses the {kind} " + re.sub(r"[^A-Za-z0-9_]", "", reason.split(":", 1)[1])[:40] + ", which is not allowed here"
+              if reason.startswith("syntax_error"):
+                  return "it is not valid Python"
+              return "it failed the static screening"
+
+
+          def scaling_text(result):
+              sc = result.get("scaling") or {}
+              label = sc.get("label")
+              if label in ("near_linear", "near_quadratic", "in_between"):
+                  word = {"near_linear": "near-linear", "near_quadratic": "near-quadratic", "in_between": "between linear and quadratic"}[label]
+                  return f" Scaling probe (informational, timing is noisy): time grew x{num(sc.get('growth'))} when the input grew 4x, about n^{num(sc.get('exponent'), 2)} ({word})."
+              if label == "too_slow":
+                  return f" Scaling probe: it exceeded the 3 s limit at n={num(sc.get('timeout_at'))}."
+              return ""
+
+
+          def first_failure(layers, names):
+              for name in names:
+                  ff = (layers.get(name) or {}).get("first_failure")
+                  if ff:
+                      return ff
+              return {}
+
+
+          def detail(ff):
+              if ff.get("reason") == "wrong_output":
+                  return f"for input {safe(ff.get('input'))} expected {safe(ff.get('expected'))} but returned {safe(ff.get('got'))}"
+              return f"for input {safe(ff.get('input'))} {human_reason(ff.get('reason'))}"
+
+
+          def compose(item, result):
+              spec = lab_specs.SPECS.get(item.get("spec")) or {}
+              title = spec.get("title") or item.get("spec")
+              status = result.get("status")
+              digest = re.sub(r"[^0-9a-f]", "", str(result.get("digest") or ""))[:12] or "n/a"
+              layers = result.get("layers") or {}
+              head = (f'I ran your submission for the task "{title}" (from run {item.get("run_id")}) in the NØX Lab sandbox: '
+                      f"corpus {results.get('corpus_version')}, no network, no imports, CPU and memory limits.")
+              gap = False
+              if status == "passed_all":
+                  n = {k: num((v or {}).get("cases")) for k, v in layers.items() if isinstance(v, dict)}
+                  body = (f"Result: it passed L1 ({n.get('L1_exhaustive_tiny')} exhaustive tiny cases), L2 ({n.get('L2_seeded_random')} seeded random cases), "
+                          f"L3 ({n.get('L3_heldout_adversarial')} held-out adversarial cases) and an extended run of {n.get('L4_extended_random')} extra random cases." + scaling_text(result))
+              elif status == "failed":
+                  failed = [k for k, v in layers.items() if isinstance(v, dict) and not v.get("passed")]
+                  ff = first_failure(layers, failed)
+                  if failed == ["L4_extended_random"]:
+                      gap = True
+                      body = (f"Result: it passed the frozen suite (L1 to L3) but failed my extended run, {detail(ff)}. "
+                              "That points to a gap in my suite, which I logged for the next corpus version. Thank you for the test.")
+                  else:
+                      names = ", ".join(re.sub(r"[^A-Za-z0-9]", "", str(k).split("_")[0])[:4] for k in failed)
+                      body = f"Result: it failed {names}; {detail(ff)}."
+              elif status == "rejected_static":
+                  extra = " The sorting task also forbids sorted(), .sort() and heapq." if item.get("spec") == "sort_ints" else ""
+                  body = (f"Result: I could not run it because {static_text(result.get('reason'))}. A submission must define solve(...) with no imports, "
+                          f"no file or network access and no double-underscore attributes.{extra}")
+              else:
+                  body = f"Result: it could not be evaluated ({human_reason(result.get('reason'))})."
+              tail = f"Digest sha256:{digest}. A finite suite cannot prove a solution correct, it can only fail to find a counterexample."
+              text = "\n\n".join([head, body, tail])
+              return text[:1450], gap, digest, status
+
+
+          runtime = load(RUNTIME_FILE, {"pending_actions": []})
+          pending = runtime.setdefault("pending_actions", [])
+          state = load(STATE_FILE, {})
+          handled = state.setdefault("handled", [])
+          log = state.setdefault("log", [])
+          gaps = load(GAPS_FILE, {"gaps": []})
+          queued = 0
+          for item in requests:
+              result = by_file.get(item.get("file")) or {"status": "error", "reason": "no_result"}
+              text, gap, digest, status = compose(item, result)
+              action_id = "action-labreq-" + hashlib.sha256(str(item["comment_id"]).encode()).hexdigest()[:20]
+              if not any(isinstance(a, dict) and a.get("action_id") == action_id for a in pending):
+                  pending.append({"action_id": action_id, "kind": "comment_reply", "source": "nox_lab_requests",
+                                  "target_id": item["post_id"], "comment_id": item["comment_id"], "comment_author": item["author"],
+                                  "title": item.get("post_title", ""), "prefilled_reply": text,
+                                  "reason": "A reader submitted code for a Lab task; the reply reports the measured result.", "created_at": NOW})
+                  queued += 1
+              if item["comment_id"] not in handled:
+                  handled.append(item["comment_id"])
+              log.append({"timestamp": NOW, "comment_id": item["comment_id"], "author": item["author"], "spec": item["spec"],
+                          "run_id": item["run_id"], "digest": digest, "status": status, "suite_gap": gap})
+              if gap:
+                  ff = first_failure(result.get("layers") or {}, ["L4_extended_random"])
+                  gaps.setdefault("gaps", []).append({"timestamp": NOW, "spec": item["spec"], "digest": digest, "comment_id": item["comment_id"],
+                                                       "input": ff.get("input"), "expected": ff.get("expected")})
+              print(f"Lab reply queued: comment={str(item['comment_id'])[:8]} by {item['author']} status={status} gap={gap}")
+
+          state["handled"] = handled[-500:]
+          state["log"] = log[-100:]
+          state["updated_at"] = NOW
+          RUNTIME_FILE.write_text(json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
+          STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+          if gaps.get("gaps"):
+              gaps["gaps"] = gaps["gaps"][-100:]
+              GAPS_FILE.write_text(json.dumps(gaps, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"Lab requests: {queued} reply action(s) queued.")
+          LABPY_QUEUE
+
+      - name: Compose replies and queue them for Presence
+        run: python3 lab_req_queue.py
+
+      - name: Commit lab request state
+        run: |
+          rm -rf lab_req lab_res lab_req_queue.py
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          for f in memory/nox_lab_requests.json memory/nox_core_runtime.json memory/nox_lab_gaps.json; do
+            if [ -e "$f" ]; then git add "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "No change to commit."
+            exit 0
+          fi
+          git commit -m "NØX: lab requests"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "Push failed after 3 attempts."
+          exit 1
