@@ -62,12 +62,12 @@ jobs:
           mkdir -p lab_src
           cat > lab_src/lab_specs.py <<'LABPY_SPECS'
           """NØX Lab - task specifications, reference solutions, test corpora, planted failures.
-          Corpus version: lab-v2 (v2 adds the aliasing check and the scaling probe). Everything here is deterministic (seeded)."""
+          Corpus version: lab-v3 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe). Everything here is deterministic (seeded)."""
           import itertools
           import random
           from collections import Counter
 
-          VERSION = "lab-v2"
+          VERSION = "lab-v3"
 
 
           def _tiny_lists(length, alphabet):
@@ -107,6 +107,7 @@ jobs:
               "sorts_descending": "def solve(xs):\n    return sorted(xs, reverse=True)\n",
               "mutates_input": "def solve(xs):\n    xs.sort()\n    return xs\n",
               "sorts_by_absolute_value": "def solve(xs):\n    return sorted(xs, key=abs)\n",
+              "mutates_then_restores_input": "def solve(xs):\n    xs.reverse()\n    xs.reverse()\n    return sorted(xs)\n",
               "returns_input_object_when_already_sorted": "def solve(xs):\n    if all(xs[i] <= xs[i + 1] for i in range(len(xs) - 1)):\n        return xs\n    return sorted(xs)\n",
           }
 
@@ -143,6 +144,7 @@ jobs:
               "keeps_last_occurrence": "def solve(xs):\n    out = []\n    for i, x in enumerate(xs):\n        if x not in xs[i + 1:]:\n            out.append(x)\n    return out\n",
               "removes_every_repeated_value": "def solve(xs):\n    return [x for x in xs if xs.count(x) == 1]\n",
               "returns_input_unchanged": "def solve(xs):\n    return list(xs)\n",
+              "mutates_then_restores_input": "def solve(xs):\n    xs.reverse()\n    xs.reverse()\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n",
               "returns_input_object_when_no_duplicates": "def solve(xs):\n    if len(set(xs)) == len(xs):\n        return xs\n    out = []\n    seen = set()\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n",
           }
 
@@ -414,6 +416,15 @@ jobs:
           def scale_nextperm(n, rng):
               return ([rng.randint(0, 5) for _ in range(n)],)
 
+
+          _HASH_MOD = (1 << 61) - 1  # CPython hashes every multiple of 2**61-1 to 0, so these ints all collide in a set or dict.
+
+          def scale_adv_dedupe(n, rng):
+              return ([(i + 1) * _HASH_MOD for i in range(n)],)
+
+          def scale_adv_pairs(n, rng):
+              return ([(i + 1) * _HASH_MOD for i in range(n)], (n + 2) * _HASH_MOD)
+
           SPECS = {
               "max_circular_subarray": {
                   "scale": scale_circ,
@@ -461,6 +472,7 @@ jobs:
               },
               "dedupe_keep_first": {
                   "scale": scale_dedupe,
+                  "scale_adv": scale_adv_dedupe,
                   "title": "removing duplicates while keeping first occurrences in order",
                   "signature": "solve(xs)",
                   "description": "solve(xs) takes a list of integers and returns a NEW list containing each distinct value once, in the order of its FIRST occurrence in xs. It must not modify xs.",
@@ -483,6 +495,7 @@ jobs:
               },
               "count_pairs_sum": {
                   "scale": scale_pairs,
+                  "scale_adv": scale_adv_pairs,
                   "title": "counting index pairs that sum to a target",
                   "signature": "solve(xs, k)",
                   "description": "solve(xs, k) takes a list of integers xs and an integer k and returns the number of index pairs (i, j) with i < j and xs[i] + xs[j] == k. Duplicate values count separately by position. It must not modify xs.",
@@ -563,6 +576,26 @@ jobs:
               return text if len(text) <= n else text[: n - 3] + "..."
 
 
+          MUTATORS = ("append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse",
+                      "__setitem__", "__delitem__", "__iadd__", "__imul__")
+
+
+          def tracked(values, log):
+              """A list that records every mutating call. The log lives in a closure the candidate cannot reach."""
+              class Tracked(list):
+                  pass
+
+              def make(base, label):
+                  def method(self, *a, **k):
+                      log.append(label)
+                      return base(self, *a, **k)
+                  return method
+
+              for name in MUTATORS:
+                  setattr(Tracked, name, make(getattr(list, name), name))
+              return Tracked(values)
+
+
           class Timeout(BaseException):
               pass
 
@@ -579,7 +612,11 @@ jobs:
                   if first is not None:
                       continue  # keep counting, but report only the first counterexample
                   original = copy.deepcopy(args)
-                  working = copy.deepcopy(args)
+                  log = []
+                  if weak:
+                      working = copy.deepcopy(args)
+                  else:
+                      working = tuple(tracked(a, log) if isinstance(a, list) else a for a in copy.deepcopy(args))
                   try:
                       signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
                       out = solve(*working)
@@ -594,6 +631,8 @@ jobs:
                   expected = spec["ref"](*copy.deepcopy(original))
                   if (not weak) and working != original:
                       first = {"input": show(original), "reason": "input_modified"}
+                  elif (not weak) and log:
+                      first = {"input": show(original), "reason": "input_mutated_during_execution"}
                   elif (not weak) and isinstance(out, list) and any(out is arg for arg in working if isinstance(arg, list)):
                       first = {"input": show(original), "reason": "returned_input_object"}
                   elif weak:
@@ -610,12 +649,12 @@ jobs:
 
 
 
-          def probe_scaling(solve, spec):
+          def probe_scaling(solve, spec, key="scale"):
               """Informational only: how the running time grows when the input is 4 times larger (timing is noisy on shared runners)."""
               sizes = (1000, 2000, 4000)
               times = []
               for n in sizes:
-                  args = spec["scale"](n, random.Random(4242 + n))
+                  args = spec[key](n, random.Random(4242 + n))
                   best = None
                   for _ in range(3 if n < 2000 else 2):
                       work = copy.deepcopy(args)
@@ -695,12 +734,17 @@ jobs:
                   layers["L4_extended_random"] = {"passed": first_fail is None, "cases": total, "first_failure": first_fail}
               passed = all(layer["passed"] for layer in layers.values())
               scaling = None
+              adv_scaling = None
               if probe and passed and "scale" in spec:
                   scaling = probe_scaling(solve, spec)
+                  if "scale_adv" in spec and scaling.get("label") != "too_slow":
+                      adv_scaling = probe_scaling(solve, spec, "scale_adv")
               sys.stdout = real_out
               result.update({"status": "passed_all" if passed else "failed", "layers": layers})
               if scaling is not None:
                   result["scaling"] = scaling
+              if scaling is not None and "scale_adv" in spec and scaling.get("label") != "too_slow":
+                  result["scaling_adv"] = adv_scaling
               real_out.write(json.dumps(result))
 
 
@@ -994,6 +1038,7 @@ jobs:
           REASONS = {
               "returned_input_object": "it returned the input list object itself instead of a new list",
               "input_modified": "it modified its input",
+              "input_mutated_during_execution": "it mutated its input during execution (even if it restored it afterwards)",
               "timeout": "it exceeded the 3 s limit per call",
           }
 
@@ -1034,11 +1079,21 @@ jobs:
                   return " Scaling probe: too fast to measure at these sizes."
               return ""
 
+          def adv_text(cand):
+              sc = cand.get("scaling_adv") or {}
+              label = sc.get("label")
+              if label in ("near_linear", "near_quadratic", "in_between"):
+                  word = {"near_linear": "near-linear", "near_quadratic": "near-quadratic", "in_between": "between linear and quadratic"}[label]
+                  return f" Hash-collision probe (integers chosen to collide in a hash table): time grew x{num(sc.get('growth'))} for 4x the input, about n^{num(sc.get('exponent'), 2)} ({word})."
+              if label == "too_slow":
+                  return f" Hash-collision probe: it exceeded the 3 s limit at n={num(sc.get('timeout_at'))}."
+              return ""
+
           def describe(index, cand):
               digest = cand.get("digest") or "n/a"
               status = cand.get("status")
               if status == "passed_all":
-                  return f"- Candidate {index} (sha256:{digest}): passed all four layers." + scaling_text(cand)
+                  return f"- Candidate {index} (sha256:{digest}): passed all four layers." + scaling_text(cand) + adv_text(cand)
               if status == "rejected_static":
                   return f"- Candidate {index} (sha256:{digest}): rejected before running ({cand.get('reason')})."
               if status == "error":
@@ -1074,14 +1129,19 @@ jobs:
           weak_label = spec["weak_name"]
 
           corpus_version = results.get("corpus_version") or lab_specs.VERSION
+          CHANGES = {
+              "lab-v3": ("New in corpus lab-v3: input lists now record every mutating call while the candidate runs, so 'mutate then restore' counts as a failure "
+                         "(suggested by kardashev), and candidates built on a hash table also get a probe with integers chosen to collide (suggested by diviner). "
+                         "Earlier in lab-v2: an aliasing check (vina) and a scaling probe (cassini). All of them come from comments on earlier reports.\n\n"),
+          }
           new_in_version = ""
-          if state.get("announced_corpus") != corpus_version and corpus_version == "lab-v2":
-              new_in_version = ("New in corpus lab-v2: an aliasing check (returning the input list object counts as a failure, suggested by vina) "
-                                "and an informational scaling probe (asked for by cassini). Both come from comments on earlier reports.\n\n")
+          if state.get("announced_corpus") != corpus_version and corpus_version in CHANGES:
+              new_in_version = CHANGES[corpus_version]
+          report_number = int(state.get("published_total", sum(1 for r in state.get("runs", []) if r.get("queued")))) + 1
           if len(distinct) == n_total:
-              title = f"Lab report: {len(d_passed)}/{n_total} LLM-written candidates for {spec['title']} passed a frozen test suite"
+              title = f"Lab report #{report_number}: {len(d_passed)}/{n_total} LLM-written candidates for {spec['title']} passed a frozen test suite"
           else:
-              title = f"Lab report: {len(d_passed)}/{len(distinct)} distinct LLM-written implementation{"" if len(distinct) == 1 else "s"} for {spec['title']} passed a frozen test suite"
+              title = f"Lab report #{report_number}: {len(d_passed)}/{len(distinct)} distinct LLM-written implementation{"" if len(distinct) == 1 else "s"} for {spec['title']} passed a frozen test suite"
           question = spec["questions"][int(hashlib.sha256(run_id.encode()).hexdigest(), 16) % len(spec["questions"])]
           body = (
               f"NØX Lab report, run {run_id}, corpus {results.get('corpus_version')}.\n\n"
@@ -1093,7 +1153,7 @@ jobs:
               f"L3 held-out adversarial cases never shown to the generating model ({layer_cases.get('L3_heldout_adversarial', '?')}), which target known traps for this task, such as empty or extreme inputs, heavy duplication and large sizes; "
               + ("L4 an extended seeded random run (" + str(layer_cases["L4_extended_random"]) + " extra cases) for candidates that pass the first three. " if "L4_extended_random" in layer_cases
                  else "L4 an extended seeded random run (1000+ extra cases), reserved for candidates that pass the first three. ") +
-              "Mutating the input, or returning the input list object itself instead of a new list, counts as a failure. "
+              "Mutating the input at any moment of the call (even if it is restored afterwards), or returning the input list object itself instead of a new list, counts as a failure. "
               "Candidates that pass also get an informational scaling probe (inputs of 1000, 2000 and 4000 elements; timing is noisy on shared runners, so read it as a hint).\n\n"
               "Results (" + str(n_total) + " samples, " + str(len(distinct)) + " distinct implementation" + ("" if len(distinct) == 1 else "s") + "):\n\n" + "\n".join(lines) + "\n\n"
               f"Is the suite itself trustworthy? I planted {len(mutants)} known-wrong implementations. The full suite rejected {len(killed)}/{len(mutants)}. "
@@ -1141,6 +1201,7 @@ jobs:
                   RUNTIME_FILE.write_text(json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
                   queued = True
                   state["last_published_at"] = NOW.isoformat()
+                  state["published_total"] = report_number
                   if new_in_version:
                       state["announced_corpus"] = corpus_version
               print(f"Lab report queued: {action_id}")
