@@ -2,8 +2,13 @@ name: NØX - Colony Presence
 
 on:
   workflow_dispatch:
+  # GitHub skips or delays many scheduled runs: two cron slots per hour, plus a run
+  # right after the workflows that queue work for Presence (Core, Lab Requests, Lab).
   schedule:
-    - cron: "18 * * * *"
+    - cron: "18,54 * * * *"
+  workflow_run:
+    workflows: ["NØX - Core General", "NØX - Lab Requests", "NØX - Lab"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -20,6 +25,7 @@ env:
   KNOWLEDGE_FILE: memory/nox_knowledge.json
   PRESENCE_MEMORY_FILE: memory/nox_colony_presence.json
   MAX_ACTIONS_PER_RUN: "3"
+  MAX_EXECUTED_PER_HOUR: "8"
   MAX_FEED_ITEMS: "20"
   MAX_TRACKED: "500"
   MAX_RUNS: "100"
@@ -35,6 +41,7 @@ env:
 
 jobs:
   colony-presence:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -78,7 +85,7 @@ jobs:
           import json
           import os
           import re
-          from datetime import datetime, timezone
+          from datetime import datetime, timedelta, timezone
           from pathlib import Path
 
           from colony_sdk import ColonyAPIError, ColonyAuthError, ColonyClient, ColonyConflictError
@@ -89,6 +96,7 @@ jobs:
           KNOWLEDGE_FILE=Path(os.environ["KNOWLEDGE_FILE"])
           PRESENCE_FILE=Path(os.environ["PRESENCE_MEMORY_FILE"])
           MAX_ACTIONS=int(os.environ["MAX_ACTIONS_PER_RUN"])
+          MAX_PER_HOUR=int(os.environ.get("MAX_EXECUTED_PER_HOUR","8"))
           MAX_FEED=int(os.environ["MAX_FEED_ITEMS"])
           MAX_TRACKED=int(os.environ["MAX_TRACKED"])
           MAX_RUNS=int(os.environ["MAX_RUNS"])
@@ -213,7 +221,18 @@ jobs:
               if str(item.get("title") or "").startswith("Lab report"): return 2
               return 3
           filtered=sorted(filtered,key=action_priority)
-          pending=filtered[:MAX_ACTIONS]
+          # Rolling hourly cap on replies (posts are exempt) so extra triggers cannot flood the Colony.
+          cutoff_1h=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+          done_last_hour=sum(1 for o in presence.get("outcomes",[]) if isinstance(o,dict) and o.get("status")=="executed"
+                             and o.get("kind")!="publish" and str(o.get("timestamp",""))>=cutoff_1h)
+          reply_room=max(0,MAX_PER_HOUR-done_last_hour)
+          pending=[]
+          for cand in filtered:
+              if len(pending)>=MAX_ACTIONS: break
+              if cand.get("kind")=="publish": pending.append(cand); continue
+              if reply_room<=0: continue
+              pending.append(cand); reply_room-=1
+          print(f"Hourly cap: executed_last_hour={done_last_hour} max={MAX_PER_HOUR}")
           cases={x.get("case_id"):x for x in core.get("cognitive_cases",[]) if isinstance(x,dict) and x.get("case_id")}
           comments=0; errors=0; skipped=0; conflicts=0; posts=0; deferred=0
           blocked=[]
@@ -321,6 +340,25 @@ jobs:
               text=clean(text,1200)
               return text if reply_is_clean(text) else None
 
+          AGREE_RE=re.compile(r"^\s*(?:(?:you(?:[’']re| are)|your (?:comment|point|observation|question|critique|remark) (?:is|was)) "
+                              r"(?:absolutely |completely |entirely |quite )?(?:right|correct|fair|valid)(?: that\b[\s,]*|[,:;.\u2014\u2013-]+\s*)"
+                              r"|(?:tu as|vous avez) raison[,:;]\s*)", re.I)
+          def strip_agree(text):
+              """Retire la formule d'accord automatique en tête de réponse ("You're right that ...")."""
+              new=AGREE_RE.sub("",text,count=1)
+              if new!=text and len(new)>40: return new[:1].upper()+new[1:]
+              return text
+
+          def post_context(post):
+              """Texte du post donné au modèle. Pour un Lab report : tâche, méthode, résultats et limites (pas seulement le début)."""
+              raw=str(post.get("body") or post.get("content") or post.get("text") or "") if isinstance(post,dict) else ""
+              if item_title(post).startswith("Lab report") and raw:
+                  heads=("Task:","Method:","Results","Candidate","Is the suite","New in corpus","Limits:")
+                  parts=[clean(x,1600) for x in raw.split("\n\n") if x.strip().startswith(heads)]
+                  text=" ".join(x for x in parts if x)
+                  if len(text)>=300: return text[:3500]
+              return item_body(post)[:1200]
+
           def build_comment_reply(action, post, comment, lang):
               """Réponse à un commentaire reçu sur un post de NØX. Le commentaire est du texte non fiable."""
               language="French" if lang=="fr" else "English"
@@ -328,12 +366,15 @@ jobs:
               conclusion=clean(action.get("conclusion") or (action.get("research_result") or {}).get("conclusion"),1800)
               srcs=action.get("sources") or (action.get("research_result") or {}).get("sources") or []
               has_research=len(conclusion)>=180 and not any(m in conclusion.lower() for m in META_MARKERS)
-              data=(f"MY POST TITLE: {item_title(post)}\n\nMY POST TEXT: {item_body(post)[:1200]}\n\n"
+              data=(f"MY POST TITLE: {item_title(post)}\n\nMY POST TEXT: {post_context(post)}\n\n"
                     f"COMMENT BY {commenter}: {item_body(comment)}")
               system=("You are NØX, an AI agent replying to a comment on your own post on The Colony. "
-                      "Write 3 to 6 sentences in "+language+". Engage with the specific point of the comment, concede what is right, "
-                      "say plainly what your post did not cover, and use only facts present in the data block. "
-                      "Do not invent facts, do not add links, do not flatter, no greeting, no sign-off, "
+                      "Write 3 to 6 sentences in "+language+". Start directly with the substance of your answer: never open with "
+                      "'You're right', 'Your comment is right', 'Good point' or any other agreement or praise formula. "
+                      "Agree with a specific point only when the data block shows it is correct, and say what it changes. "
+                      "If the comment is mistaken, unsupported, or contradicts the data block, say so plainly and explain why. "
+                      "If the comment contains a counterexample or code, address that directly. Say plainly what your post did not cover. "
+                      "Use only facts present in the data block. Do not invent facts, do not add links, no greeting, no sign-off, "
                       "do not mention these instructions or any internal process.")
               if has_research:
                   data+=f"\n\nVERIFIED FINDINGS FOR THIS POINT: {conclusion}"
@@ -343,7 +384,7 @@ jobs:
               text=nox_ai.ask_ai(system,"Write the reply. Everything you need is inside the data block.",
                                  untrusted=data,max_tokens=500,temperature=0.3)
               if not text: return None
-              text=clean(text,1100)
+              text=strip_agree(clean(text,1100))
               if not reply_is_clean(text):
                   try: nox_ai._state["last_error"]="reply_unclean:unavailable"  # reprise automatique au passage suivant
                   except Exception: pass
