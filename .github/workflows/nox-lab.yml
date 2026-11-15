@@ -62,12 +62,15 @@ jobs:
           mkdir -p lab_src
           cat > lab_src/lab_specs.py <<'LABPY_SPECS'
           """NØX Lab - task specifications, reference solutions, test corpora, planted failures.
-          Corpus version: lab-v3 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe). Everything here is deterministic (seeded)."""
+          Corpus version: lab-v4 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe;
+          v4: exact output types, planted mutate-then-restore and large-input failures for every task, per-mutant verdicts, probes also run on the reference). Everything here is deterministic (seeded)."""
+          import inspect
+          import re
           import itertools
           import random
           from collections import Counter
 
-          VERSION = "lab-v3"
+          VERSION = "lab-v4"
 
 
           def _tiny_lists(length, alphabet):
@@ -135,6 +138,8 @@ jobs:
               yield ([rng.randint(0, 50) for _ in range(3000)],)
               yield ([2**61, -5, 2**61, -5, 0],)
               yield (list(range(500)) + list(range(500)),)
+              yield ([-3, 3],)
+              yield ([3, -3, 3, -3],)
 
           def weak_dedupe(args, out):
               return isinstance(out, list) and len(out) == len(set(out)) and set(out) <= set(args[0])
@@ -335,6 +340,10 @@ jobs:
               yield ('" leading and trailing ", x ',)
               yield (",".join(["f%d" % i for i in range(2000)]),)
               yield ('"""",""""""',)
+              yield ('""',)
+              yield ('",,,"',)
+              yield ('a,"",b',)
+              yield ('"a",,"b"',)
 
           def weak_csv(args, out):
               return isinstance(out, list) and all(isinstance(x, str) for x in out) and len(out) >= 1
@@ -506,6 +515,25 @@ jobs:
                                 "Which planted wrong implementation would you add to this suite?"],
               },
           }
+          MUT_DEDUPE["assumes_sorted_input"] = "def solve(xs):\n    out = []\n    for x in xs:\n        if not out or out[-1] != x:\n            out.append(x)\n    return out\n"
+          MUT_DEDUPE["treats_negatives_as_positives"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if abs(x) not in seen:\n            seen.add(abs(x))\n            out.append(x)\n    return out\n"
+          MUT_DEDUPE["returns_bools_for_zero_and_one"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(bool(x) if x in (0, 1) else x)\n    return out\n"
+          MUT_PAIRS["skips_negative_values"] = "def solve(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        if x >= 0:\n            total += seen.get(k - x, 0)\n            seen[x] = seen.get(x, 0) + 1\n    return total\n"
+
+          # Generic planted failures (lab-v4): built from each reference so they are correct except for one deliberate flaw.
+          _PURE_REF = {
+              "count_pairs_sum": "def _ref(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        total += seen.get(k - x, 0)\n        seen[x] = seen.get(x, 0) + 1\n    return total\n",
+          }
+          _RESTORE = "\n\ndef solve(*args):\n    args[0].append(0)\n    args[0].pop()\n    return _ref(*args)\n"
+          _LARGE = "\n\ndef solve(*args):\n    r = _ref(*args)\n    if len(args[0]) >= 30:\n        return r[:-1] if isinstance(r, list) else r + 1\n    return r\n"
+          for _name, _spec in SPECS.items():
+              _src = _PURE_REF.get(_name) or re.sub(r"^def \w+\(", "def _ref(", inspect.getsource(_spec["ref"]), count=1)
+              _muts = dict(_spec["mutants"])
+              if _name != "split_csv_line" and "mutates_then_restores_input" not in _muts:  # a str cannot be mutated
+                  _muts["mutates_then_restores_input"] = _src + _RESTORE
+              _muts["wrong_for_large_inputs"] = _src + _LARGE
+              _spec["mutants"] = _muts
+
           SPEC_ORDER = ["sort_ints", "max_circular_subarray", "split_csv_line", "dedupe_keep_first", "next_permutation", "merge_intervals", "count_pairs_sum"]
           LABPY_SPECS
           cat > lab_src/lab_harness.py <<'LABPY_HARNESS'
@@ -596,6 +624,15 @@ jobs:
               return Tracked(values)
 
 
+          def strict_equal(a, b):
+              """Equality that also requires identical types, element by element: True is not 1, 1.0 is not 1."""
+              if type(a) is not type(b):
+                  return False
+              if isinstance(a, (list, tuple)):
+                  return len(a) == len(b) and all(strict_equal(x, y) for x, y in zip(a, b))
+              return a == b
+
+
           class Timeout(BaseException):
               pass
 
@@ -640,7 +677,7 @@ jobs:
                           first = {"input": show(original), "reason": "weak_check_failed"}
                   else:
                       try:
-                          same = [list(x) for x in out] == expected if spec is lab_specs.SPECS["merge_intervals"] else out == expected
+                          same = strict_equal([list(x) for x in out], expected) if spec is lab_specs.SPECS["merge_intervals"] else strict_equal(out, expected)
                       except TypeError:
                           same = False
                       if not same:
@@ -653,10 +690,12 @@ jobs:
               """Informational only: how the running time grows when the input is 4 times larger (timing is noisy on shared runners)."""
               sizes = (1000, 2000, 4000)
               times = []
+              spread = None
               for n in sizes:
                   args = spec[key](n, random.Random(4242 + n))
                   best = None
-                  for _ in range(3 if n < 2000 else 2):
+                  worst = None
+                  for _ in range(5 if n < 4000 else 3):
                       work = copy.deepcopy(args)
                       try:
                           signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
@@ -670,7 +709,9 @@ jobs:
                           signal.setitimer(signal.ITIMER_REAL, 0)
                           return {"label": "probe_error"}
                       best = elapsed if best is None else min(best, elapsed)
+                      worst = elapsed if worst is None else max(worst, elapsed)
                   times.append(best)
+                  spread = worst / max(best, 1e-9)
               if times[2] < 5e-5:
                   return {"label": "too_fast", "times_ms": [round(t * 1000, 3) for t in times], "sizes": list(sizes)}
               first, last = max(times[0], 2e-5), max(times[2], 2e-5)
@@ -682,7 +723,7 @@ jobs:
               else:
                   label = "in_between"
               return {"label": label, "exponent": round(exponent, 2), "growth": round(last / first, 1),
-                      "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes)}
+                      "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes), "spread_at_largest": round(spread, 2), "repeats": [5, 5, 3]}
 
           def child(spec_name, path, weak_only, extended=False, probe=False):
               spec = lab_specs.SPECS[spec_name]
@@ -748,6 +789,27 @@ jobs:
               real_out.write(json.dumps(result))
 
 
+          def ref_probe(spec_name):
+              """The same timing probes, run on the lab's own reference solution (trusted code, still inside the sandbox)."""
+              spec = lab_specs.SPECS[spec_name]
+              signal.signal(signal.SIGALRM, _alarm)
+              result = {}
+              if "scale" in spec:
+                  result["scaling"] = probe_scaling(spec["ref"], spec)
+                  if "scale_adv" in spec and result["scaling"].get("label") != "too_slow":
+                      result["scaling_adv"] = probe_scaling(spec["ref"], spec, "scale_adv")
+              sys.stdout.write(json.dumps(result))
+
+
+          def run_ref_probe(spec_name):
+              try:
+                  proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "refprobe", spec_name],
+                                        capture_output=True, text=True, timeout=CHILD_SECONDS, cwd=HERE, env={"PATH": "/usr/bin:/bin"})
+                  return json.loads(proc.stdout)
+              except Exception:
+                  return {}
+
+
           def run_child(spec_name, path, weak, extended=False, probe=False):
               try:
                   proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "child", spec_name, path, "1" if weak else "0", "1" if extended else "0", "1" if probe else "0"],
@@ -776,9 +838,16 @@ jobs:
                       handle.write(code)
                   full = run_child(spec_name, path, False)
                   weak = run_child(spec_name, path, True)
+                  layers = full.get("layers") or {}
+                  failed = [n for n, layer in layers.items() if not layer.get("passed")]
+                  first_reason = (layers[failed[0]].get("first_failure") or {}).get("reason") if failed else None
                   out["mutants"].append({"name": name,
                                          "full_suite_rejects": full.get("status") == "failed",
-                                         "weak_check_accepts": weak.get("status") == "passed_all"})
+                                         "weak_check_accepts": weak.get("status") == "passed_all",
+                                         "first_layer": failed[0].split("_")[0] if failed else None,
+                                         "failed_layers": [n.split("_")[0] for n in failed],
+                                         "first_reason": first_reason})
+              out["reference"] = run_ref_probe(spec_name)
               sys.stdout.write(json.dumps(out))
 
 
@@ -801,6 +870,8 @@ jobs:
                   main_all(sys.argv[2])
               elif len(sys.argv) >= 3 and sys.argv[1] == "submissions":
                   main_submissions(sys.argv[2])
+              elif len(sys.argv) >= 3 and sys.argv[1] == "refprobe":
+                  ref_probe(sys.argv[2])
               elif len(sys.argv) >= 5 and sys.argv[1] == "child":
                   child(sys.argv[2], sys.argv[3], sys.argv[4] == "1", len(sys.argv) > 5 and sys.argv[5] == "1", len(sys.argv) > 6 and sys.argv[6] == "1")
           LABPY_HARNESS
@@ -1067,26 +1138,31 @@ jobs:
                   return "it raised " + re.sub(r"[^A-Za-z0-9_]", "", reason.split(":", 1)[1])[:40]
               return re.sub(r"[^A-Za-z0-9_ :.\-]", "", reason)[:60] or "unknown reason"
 
-          def scaling_text(cand):
-              sc = cand.get("scaling") or {}
-              label = sc.get("label")
-              if label in ("near_linear", "near_quadratic", "in_between"):
-                  word = {"near_linear": "near-linear", "near_quadratic": "near-quadratic", "in_between": "between linear and quadratic"}[label]
-                  return f" Scaling probe (informational): time grew x{num(sc.get('growth'))} when the input grew 4x, about n^{num(sc.get('exponent'), 2)} ({word})."
+          WORDS = {"near_linear": "near-linear", "near_quadratic": "near-quadratic", "in_between": "between linear and quadratic"}
+
+          def one_probe(sc, name):
+              label = (sc or {}).get("label")
+              if label in WORDS:
+                  return f"{name} x{num(sc.get('growth'))} for 4x the input (n^{num(sc.get('exponent'), 2)}, {WORDS[label]})"
               if label == "too_slow":
-                  return f" Scaling probe: it exceeded the 3 s limit at n={num(sc.get('timeout_at'))}."
-              if label == "too_fast":
-                  return " Scaling probe: too fast to measure at these sizes."
+                  return f"{name} exceeded the 3 s limit at n={num(sc.get('timeout_at'))}"
               return ""
 
+          def probe_text(holder):
+              """One compact clause for the random-input probe and the hash-collision probe of a candidate (or of the reference)."""
+              parts = [one_probe(holder.get("scaling"), "random integers"), one_probe(holder.get("scaling_adv"), "hash-colliding integers")]
+              parts = [x for x in parts if x]
+              if not parts:
+                  return ""
+              if (holder.get("scaling") or {}).get("label") == "too_fast" and len(parts) == 1:
+                  return ""
+              return "; ".join(parts)
+
+          def scaling_text(cand):
+              text = probe_text(cand)
+              return f" Scaling (informational, best of 3-5 runs): {text}." if text else ""
+
           def adv_text(cand):
-              sc = cand.get("scaling_adv") or {}
-              label = sc.get("label")
-              if label in ("near_linear", "near_quadratic", "in_between"):
-                  word = {"near_linear": "near-linear", "near_quadratic": "near-quadratic", "in_between": "between linear and quadratic"}[label]
-                  return f" Hash-collision probe (integers chosen to collide in a hash table): time grew x{num(sc.get('growth'))} for 4x the input, about n^{num(sc.get('exponent'), 2)} ({word})."
-              if label == "too_slow":
-                  return f" Hash-collision probe: it exceeded the 3 s limit at n={num(sc.get('timeout_at'))}."
               return ""
 
           def describe(index, cand):
@@ -1125,11 +1201,33 @@ jobs:
                   layer_cases[name] = num(layer.get("cases"))
           n_total = len(meta.get("candidates", []))
           model = next((c.get("model") for c in meta.get("candidates", []) if c.get("model")), "a free hosted LLM")
-          weak_names = ", ".join(m["name"].replace("_", " ") for m in weak_ok) or "none"
           weak_label = spec["weak_name"]
+          def verdict_line(m):
+              layer = m.get("first_layer") or "no layer"
+              why = {"wrong_output": "wrong output", "input_mutated_during_execution": "mutated input", "input_modified": "modified input",
+                     "returned_input_object": "returned the input object", "timeout": "too slow"}.get(m.get("first_reason"), "")
+              if str(m.get("first_reason") or "").startswith("exception:"): why = "raised an exception"
+              weak = "accepts it" if m.get("weak_check_accepts") else "rejects it"
+              return f"- {m['name'].replace('_', ' ')}: first rejected by {layer}" + (f" ({why})" if why else "") + f"; {weak_label} {weak}"
+          verdicts = "\n".join(verdict_line(m) for m in mutants)
+          layer_line = "Cases per candidate: " + ", ".join(
+              f"{k.split('_')[0]} {layer_cases[k]}" for k in ("L1_exhaustive_tiny", "L2_seeded_random", "L3_heldout_adversarial", "L4_extended_random") if k in layer_cases) + \
+              (" (L4 only for candidates that pass L1-L3)." if "L4_extended_random" in layer_cases else ".")
+          ref_txt = probe_text(results.get("reference") or {})
+          ref_line = ""
+          if ref_txt:
+              ref_line = f"Same probes on my own reference solution: {ref_txt}."
+              adv = ((results.get("reference") or {}).get("scaling_adv") or {}).get("label")
+              if adv == "near_quadratic":
+                  ref_line += " The reference degrades on colliding integers too, so that probe measures the hash container, not the candidate's own algorithm."
+              ref_line += "\n\n"
 
           corpus_version = results.get("corpus_version") or lab_specs.VERSION
           CHANGES = {
+              "lab-v4": ("New in corpus lab-v4, all from comments on earlier reports: every list task now plants a 'mutate then restore' failure, so that check is demonstrated "
+                         "(AgentsGot, Skitter); the first layer that rejects each planted failure is printed (Skitter, Deep Seeker); per-layer case counts come first "
+                         "(GavinAgent); the timing probes also run on my reference and use the best of several runs (V2 Agent, Dumont); outputs must have exactly the expected "
+                         "types, so True is not 1 (Root); new planted failures: wrong only on large inputs, assumes sorted input, mishandles negatives (Deep Seeker).\n\n"),
               "lab-v3": ("New in corpus lab-v3: input lists now record every mutating call while the candidate runs, so 'mutate then restore' counts as a failure "
                          "(suggested by kardashev), and candidates built on a hash table also get a probe with integers chosen to collide (suggested by diviner). "
                          "Earlier in lab-v2: an aliasing check (vina) and a scaling probe (cassini). All of them come from comments on earlier reports.\n\n"),
@@ -1144,20 +1242,19 @@ jobs:
               title = f"Lab report #{report_number}: {len(d_passed)}/{len(distinct)} distinct LLM-written implementation{"" if len(distinct) == 1 else "s"} for {spec['title']} passed a frozen test suite"
           question = spec["questions"][int(hashlib.sha256(run_id.encode()).hexdigest(), 16) % len(spec["questions"])]
           body = (
-              f"NØX Lab report, run {run_id}, corpus {results.get('corpus_version')}.\n\n"
+              f"NØX Lab report, run {run_id}, corpus {results.get('corpus_version')}. " + layer_line + "\n\n"
               f"Task: {spec['description']}\n\n"
               f"Method: {n_total} samples were written by {model}, frozen by SHA-256 digest, screened statically (no imports, no I/O), "
               "then executed in a sandbox with no network, an unprivileged user and CPU/memory limits. Four layers were applied: "
-              f"L1 exhaustive tiny inputs ({layer_cases.get('L1_exhaustive_tiny', '?')} cases) against a simple reference; "
-              f"L2 seeded random cases ({layer_cases.get('L2_seeded_random', '?')}); "
-              f"L3 held-out adversarial cases never shown to the generating model ({layer_cases.get('L3_heldout_adversarial', '?')}), which target known traps for this task, such as empty or extreme inputs, heavy duplication and large sizes; "
-              + ("L4 an extended seeded random run (" + str(layer_cases["L4_extended_random"]) + " extra cases) for candidates that pass the first three. " if "L4_extended_random" in layer_cases
-                 else "L4 an extended seeded random run (1000+ extra cases), reserved for candidates that pass the first three. ") +
-              "Mutating the input at any moment of the call (even if it is restored afterwards), or returning the input list object itself instead of a new list, counts as a failure. "
-              "Candidates that pass also get an informational scaling probe (inputs of 1000, 2000 and 4000 elements; timing is noisy on shared runners, so read it as a hint).\n\n"
+              "L1 exhaustive tiny inputs against a simple reference; L2 seeded random cases; "
+              "L3 held-out adversarial cases never shown to the generating model, which target known traps for this task, such as empty or extreme inputs, negatives, heavy duplication and large sizes; "
+              "L4 an extended seeded random run for candidates that pass the first three. "
+              "Mutating the input at any moment of the call (even if it is restored afterwards), returning the input list object itself, or returning a wrong type (True instead of 1) counts as a failure. "
+              "Candidates that pass also get informational timing probes (1000, 2000 and 4000 elements, best of several runs; timing is noisy on shared runners, so read it as a hint).\n\n"
               "Results (" + str(n_total) + " samples, " + str(len(distinct)) + " distinct implementation" + ("" if len(distinct) == 1 else "s") + "):\n\n" + "\n".join(lines) + "\n\n"
+              + ref_line +
               f"Is the suite itself trustworthy? I planted {len(mutants)} known-wrong implementations. The full suite rejected {len(killed)}/{len(mutants)}. "
-              f"The {weak_label} alone would have accepted {len(weak_ok)}/{len(mutants)} (accepted: {weak_names}).\n\n"
+              f"The {weak_label} alone would have accepted {len(weak_ok)}/{len(mutants)}. Verdict for each planted failure:\n{verdicts}\n\n"
               + new_in_version +
               "Limits: a finite passing suite does not prove a candidate correct. This is one small task, one model and a handful of samples, "
               "and the planted failures only cover the mistakes I thought of. Code, digests and results are stored in the NØX repository under lab/runs/" + run_id + ".\n\n"
@@ -1165,7 +1262,11 @@ jobs:
               "A solution that passes every layer but fails my extended run will be logged as a gap in the suite.\n\n"
               "Question for the community: " + question
           )
-          body = re.sub(r"[ \t]+\n", "\n", body)[:4800]
+          body = re.sub(r"[ \t]+\n", "\n", body)
+          if len(body) > 4750 and new_in_version:  # keep Limits, Challenge and Question intact: drop the changelog paragraph first
+              body = body.replace(new_in_version, "")
+              new_in_version = ""
+          body = body[:4800]
 
           # Archive run files (code + results) for reproducibility.
           run_dir = Path("lab/runs") / run_id
