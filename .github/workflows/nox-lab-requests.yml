@@ -58,12 +58,15 @@ jobs:
           mkdir -p lab_src
           cat > lab_src/lab_specs.py <<'LABPY_SPECS'
           """NØX Lab - task specifications, reference solutions, test corpora, planted failures.
-          Corpus version: lab-v3 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe). Everything here is deterministic (seeded)."""
+          Corpus version: lab-v4 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe;
+          v4: exact output types, planted mutate-then-restore and large-input failures for every task, per-mutant verdicts, probes also run on the reference). Everything here is deterministic (seeded)."""
+          import inspect
+          import re
           import itertools
           import random
           from collections import Counter
 
-          VERSION = "lab-v3"
+          VERSION = "lab-v4"
 
 
           def _tiny_lists(length, alphabet):
@@ -131,6 +134,8 @@ jobs:
               yield ([rng.randint(0, 50) for _ in range(3000)],)
               yield ([2**61, -5, 2**61, -5, 0],)
               yield (list(range(500)) + list(range(500)),)
+              yield ([-3, 3],)
+              yield ([3, -3, 3, -3],)
 
           def weak_dedupe(args, out):
               return isinstance(out, list) and len(out) == len(set(out)) and set(out) <= set(args[0])
@@ -331,6 +336,10 @@ jobs:
               yield ('" leading and trailing ", x ',)
               yield (",".join(["f%d" % i for i in range(2000)]),)
               yield ('"""",""""""',)
+              yield ('""',)
+              yield ('",,,"',)
+              yield ('a,"",b',)
+              yield ('"a",,"b"',)
 
           def weak_csv(args, out):
               return isinstance(out, list) and all(isinstance(x, str) for x in out) and len(out) >= 1
@@ -502,6 +511,25 @@ jobs:
                                 "Which planted wrong implementation would you add to this suite?"],
               },
           }
+          MUT_DEDUPE["assumes_sorted_input"] = "def solve(xs):\n    out = []\n    for x in xs:\n        if not out or out[-1] != x:\n            out.append(x)\n    return out\n"
+          MUT_DEDUPE["treats_negatives_as_positives"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if abs(x) not in seen:\n            seen.add(abs(x))\n            out.append(x)\n    return out\n"
+          MUT_DEDUPE["returns_bools_for_zero_and_one"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(bool(x) if x in (0, 1) else x)\n    return out\n"
+          MUT_PAIRS["skips_negative_values"] = "def solve(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        if x >= 0:\n            total += seen.get(k - x, 0)\n            seen[x] = seen.get(x, 0) + 1\n    return total\n"
+
+          # Generic planted failures (lab-v4): built from each reference so they are correct except for one deliberate flaw.
+          _PURE_REF = {
+              "count_pairs_sum": "def _ref(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        total += seen.get(k - x, 0)\n        seen[x] = seen.get(x, 0) + 1\n    return total\n",
+          }
+          _RESTORE = "\n\ndef solve(*args):\n    args[0].append(0)\n    args[0].pop()\n    return _ref(*args)\n"
+          _LARGE = "\n\ndef solve(*args):\n    r = _ref(*args)\n    if len(args[0]) >= 30:\n        return r[:-1] if isinstance(r, list) else r + 1\n    return r\n"
+          for _name, _spec in SPECS.items():
+              _src = _PURE_REF.get(_name) or re.sub(r"^def \w+\(", "def _ref(", inspect.getsource(_spec["ref"]), count=1)
+              _muts = dict(_spec["mutants"])
+              if _name != "split_csv_line" and "mutates_then_restores_input" not in _muts:  # a str cannot be mutated
+                  _muts["mutates_then_restores_input"] = _src + _RESTORE
+              _muts["wrong_for_large_inputs"] = _src + _LARGE
+              _spec["mutants"] = _muts
+
           SPEC_ORDER = ["sort_ints", "max_circular_subarray", "split_csv_line", "dedupe_keep_first", "next_permutation", "merge_intervals", "count_pairs_sum"]
           LABPY_SPECS
           cat > lab_src/lab_harness.py <<'LABPY_HARNESS'
@@ -592,6 +620,15 @@ jobs:
               return Tracked(values)
 
 
+          def strict_equal(a, b):
+              """Equality that also requires identical types, element by element: True is not 1, 1.0 is not 1."""
+              if type(a) is not type(b):
+                  return False
+              if isinstance(a, (list, tuple)):
+                  return len(a) == len(b) and all(strict_equal(x, y) for x, y in zip(a, b))
+              return a == b
+
+
           class Timeout(BaseException):
               pass
 
@@ -636,7 +673,7 @@ jobs:
                           first = {"input": show(original), "reason": "weak_check_failed"}
                   else:
                       try:
-                          same = [list(x) for x in out] == expected if spec is lab_specs.SPECS["merge_intervals"] else out == expected
+                          same = strict_equal([list(x) for x in out], expected) if spec is lab_specs.SPECS["merge_intervals"] else strict_equal(out, expected)
                       except TypeError:
                           same = False
                       if not same:
@@ -649,10 +686,12 @@ jobs:
               """Informational only: how the running time grows when the input is 4 times larger (timing is noisy on shared runners)."""
               sizes = (1000, 2000, 4000)
               times = []
+              spread = None
               for n in sizes:
                   args = spec[key](n, random.Random(4242 + n))
                   best = None
-                  for _ in range(3 if n < 2000 else 2):
+                  worst = None
+                  for _ in range(5 if n < 4000 else 3):
                       work = copy.deepcopy(args)
                       try:
                           signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
@@ -666,7 +705,9 @@ jobs:
                           signal.setitimer(signal.ITIMER_REAL, 0)
                           return {"label": "probe_error"}
                       best = elapsed if best is None else min(best, elapsed)
+                      worst = elapsed if worst is None else max(worst, elapsed)
                   times.append(best)
+                  spread = worst / max(best, 1e-9)
               if times[2] < 5e-5:
                   return {"label": "too_fast", "times_ms": [round(t * 1000, 3) for t in times], "sizes": list(sizes)}
               first, last = max(times[0], 2e-5), max(times[2], 2e-5)
@@ -678,7 +719,7 @@ jobs:
               else:
                   label = "in_between"
               return {"label": label, "exponent": round(exponent, 2), "growth": round(last / first, 1),
-                      "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes)}
+                      "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes), "spread_at_largest": round(spread, 2), "repeats": [5, 5, 3]}
 
           def child(spec_name, path, weak_only, extended=False, probe=False):
               spec = lab_specs.SPECS[spec_name]
@@ -744,6 +785,27 @@ jobs:
               real_out.write(json.dumps(result))
 
 
+          def ref_probe(spec_name):
+              """The same timing probes, run on the lab's own reference solution (trusted code, still inside the sandbox)."""
+              spec = lab_specs.SPECS[spec_name]
+              signal.signal(signal.SIGALRM, _alarm)
+              result = {}
+              if "scale" in spec:
+                  result["scaling"] = probe_scaling(spec["ref"], spec)
+                  if "scale_adv" in spec and result["scaling"].get("label") != "too_slow":
+                      result["scaling_adv"] = probe_scaling(spec["ref"], spec, "scale_adv")
+              sys.stdout.write(json.dumps(result))
+
+
+          def run_ref_probe(spec_name):
+              try:
+                  proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "refprobe", spec_name],
+                                        capture_output=True, text=True, timeout=CHILD_SECONDS, cwd=HERE, env={"PATH": "/usr/bin:/bin"})
+                  return json.loads(proc.stdout)
+              except Exception:
+                  return {}
+
+
           def run_child(spec_name, path, weak, extended=False, probe=False):
               try:
                   proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "child", spec_name, path, "1" if weak else "0", "1" if extended else "0", "1" if probe else "0"],
@@ -772,9 +834,16 @@ jobs:
                       handle.write(code)
                   full = run_child(spec_name, path, False)
                   weak = run_child(spec_name, path, True)
+                  layers = full.get("layers") or {}
+                  failed = [n for n, layer in layers.items() if not layer.get("passed")]
+                  first_reason = (layers[failed[0]].get("first_failure") or {}).get("reason") if failed else None
                   out["mutants"].append({"name": name,
                                          "full_suite_rejects": full.get("status") == "failed",
-                                         "weak_check_accepts": weak.get("status") == "passed_all"})
+                                         "weak_check_accepts": weak.get("status") == "passed_all",
+                                         "first_layer": failed[0].split("_")[0] if failed else None,
+                                         "failed_layers": [n.split("_")[0] for n in failed],
+                                         "first_reason": first_reason})
+              out["reference"] = run_ref_probe(spec_name)
               sys.stdout.write(json.dumps(out))
 
 
@@ -797,6 +866,8 @@ jobs:
                   main_all(sys.argv[2])
               elif len(sys.argv) >= 3 and sys.argv[1] == "submissions":
                   main_submissions(sys.argv[2])
+              elif len(sys.argv) >= 3 and sys.argv[1] == "refprobe":
+                  ref_probe(sys.argv[2])
               elif len(sys.argv) >= 5 and sys.argv[1] == "child":
                   child(sys.argv[2], sys.argv[3], sys.argv[4] == "1", len(sys.argv) > 5 and sys.argv[5] == "1", len(sys.argv) > 6 and sys.argv[6] == "1")
           LABPY_HARNESS
