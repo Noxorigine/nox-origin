@@ -14,6 +14,7 @@ Principes :
 """
 import os
 import re
+import time
 import unicodedata
 
 import requests
@@ -32,6 +33,7 @@ GUARD_MODEL = os.environ.get("NOX_AI_GUARD_MODEL", "meta-llama/llama-prompt-guar
 MAX_CALLS = int(os.environ.get("NOX_AI_MAX_CALLS_PER_RUN", "3"))
 MAX_GUARD_CALLS = int(os.environ.get("NOX_AI_MAX_GUARD_CALLS_PER_RUN", "10"))
 MAX_TOKENS_PER_RUN = int(os.environ.get("NOX_AI_MAX_TOKENS_PER_RUN", "6000"))
+TPM_LIMIT = int(os.environ.get("NOX_AI_TPM", "6000"))  # jetons par minute visés (quota gratuit Groq : on espace les appels)
 TIMEOUT = int(os.environ.get("NOX_AI_TIMEOUT_SECONDS", "30"))
 GUARD_THRESHOLD = float(os.environ.get("NOX_AI_GUARD_THRESHOLD", "0.5"))
 UNTRUSTED_LIMIT = int(os.environ.get("NOX_AI_UNTRUSTED_LIMIT", "3500"))
@@ -49,13 +51,14 @@ def usage():
     return dict(_state)
 
 
-def _post(model, messages, max_tokens, temperature=None):
+def _post(model, messages, max_tokens, temperature=None, effort="low"):
     reasoning = model.startswith("openai/gpt-oss")
     # Les modèles à raisonnement dépensent des jetons "invisibles" : on limite l'effort et on ajoute de la marge,
     # sinon la réponse visible peut être coupée en plein milieu d'une phrase.
-    body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens + (900 if reasoning else 0)}
+    margin = 900 if effort == "low" else 1800
+    body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens + (margin if reasoning else 0)}
     if reasoning:
-        body["reasoning_effort"] = "low"
+        body["reasoning_effort"] = effort
     if temperature is not None:
         body["temperature"] = temperature
     return requests.post(
@@ -129,7 +132,7 @@ def is_safe(text):
     return True
 
 
-def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
+def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2, effort=None):
     """Renvoie le texte du modèle, ou None (budget, filtre, erreur)."""
     if not available():
         _state["last_error"] = "no_api_key"
@@ -156,6 +159,12 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
         _state["last_error"] = "token_budget_reached"
         return None
 
+    # Espacement : un gros appel vient d'être fait, on attend un peu pour rester sous le quota de jetons par minute.
+    last_used = _state.get("last_used") or 0
+    if last_used:
+        gap = 60.0 * last_used / max(1, TPM_LIMIT) - (time.time() - (_state.get("last_ts") or 0))
+        if gap > 0:
+            time.sleep(min(gap, 30))
     _state["calls"] += 1
     messages = [
         {"role": "system", "content": system_message},
@@ -164,7 +173,7 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
     truncated = False
     for model in MODELS:
         try:
-            response = _post(model, messages, max_tokens, temperature)
+            response = _post(model, messages, max_tokens, temperature, effort or "low")
         except requests.RequestException as exc:
             _state["last_error"] = f"{model}:network:{type(exc).__name__}"
             continue
@@ -194,6 +203,8 @@ def ask_ai(system, user, untrusted="", max_tokens=700, temperature=0.2):
             _state["last_error"] = f"{model}:empty_response"
             continue
         _state["tokens"] += used
+        _state["last_used"] = used
+        _state["last_ts"] = time.time()
         _state["last_model"] = model
         _state["last_error"] = None
         return text
