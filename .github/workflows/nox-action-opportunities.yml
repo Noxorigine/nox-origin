@@ -124,6 +124,9 @@ jobs:
           MAX_DELIVERIES_PER_RUN = int(os.environ.get("MAX_DELIVERIES_PER_RUN", "1"))
           TASK_ENDPOINTS = [x.strip() for x in os.environ.get("TASK_ENDPOINTS", "/marketplace/tasks").split(",") if x.strip()]
           STATE = {"changed": False}
+          BID_FINAL = ("accepted", "rejected", "withdrawn", "cancelled", "canceled", "expired", "completed", "won", "lost", "awarded", "declined")
+          MAX_BID_CHECKS_PER_RUN = int(os.environ.get("MAX_BID_CHECKS_PER_RUN", "5"))
+          KEEP_REJECTED = int(os.environ.get("KEEP_REJECTED", "100"))
           for key, expected in {
               "PROJECT_COST_EUR": "0", "AUTO_PAYMENT": "false", "AUTO_SPENDING": "false",
               "FREE_AI_ONLY": "true"
@@ -312,6 +315,12 @@ jobs:
               STATE["changed"] = True
               return True
 
+          def trim_actions(acts):
+              """Keep the last KEEP_REJECTED 'rejected' records, then cap the whole list. Bids and deliveries are never crowded out by ad noise."""
+              rej = [i for i, a in enumerate(acts) if isinstance(a, dict) and a.get("action") == "rejected"]
+              drop = set(rej[:-KEEP_REJECTED]) if len(rej) > KEEP_REJECTED else set()
+              return [a for i, a in enumerate(acts) if i not in drop][-MAX_MEMORY_ACTIONS:]
+
           def load_memory():
 
               if not MEMORY_FILE.exists():
@@ -320,6 +329,10 @@ jobs:
                   data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
                   if not isinstance(data, dict): raise ValueError("memory root is not an object")
                   if not isinstance(data.get("actions"), list): data["actions"] = []
+                  trimmed = trim_actions(data["actions"])
+                  if len(trimmed) != len(data["actions"]):
+                      data["actions"] = trimmed
+                      STATE["changed"] = True
                   return data
               except Exception as exc:
                   print(f"WARNING: unable to read memory: {exc}")
@@ -327,7 +340,7 @@ jobs:
 
           def save_memory(memory):
               MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-              memory["actions"] = memory.get("actions", [])[-MAX_MEMORY_ACTIONS:]
+              memory["actions"] = trim_actions(memory.get("actions", []))
               memory["updated_at"] = now_iso()
               memory["schema_version"] = "8.0"
               memory["workflow"] = "nox-action-opportunities"
@@ -459,6 +472,60 @@ jobs:
                   if isinstance(value, dict): value = value.get("username") or value.get("handle") or value.get("name")
                   if iname and value and str(value).lower() == str(iname).lower(): return True
               return False
+
+          def tracked_bids(memory):
+              """Bids NØX really submitted: seeded once from the old 'bids' list and from marketplace_bid_submitted actions."""
+              track = memory.setdefault("bid_tracking", {})
+              seed = {}
+              for b in memory.get("bids", []):
+                  if isinstance(b, dict) and b.get("submitted_at") and b.get("task_id"):
+                      seed[b["task_id"]] = {"title": text(b.get("title"))[:120], "amount_sats": b.get("amount_sats"),
+                                            "bid_id": b.get("bid_id") or (b.get("response") or {}).get("id") if isinstance(b.get("response"), dict) else b.get("bid_id"),
+                                            "status": str(b.get("platform_status") or b.get("status") or "pending").lower(),
+                                            "submitted_at": b.get("submitted_at"), "checked_at": None}
+              for a in memory.get("actions", []):
+                  if isinstance(a, dict) and a.get("action") == "marketplace_bid_submitted" and a.get("task_id"):
+                      seed[a["task_id"]] = {"title": text(a.get("title"))[:120], "amount_sats": a.get("proposed_bid_sats"), "bid_id": a.get("bid_id"),
+                                            "status": "pending", "submitted_at": a.get("timestamp"), "checked_at": None}
+              for tid, t in seed.items():
+                  if tid not in track:
+                      track[tid] = t
+                      STATE["changed"] = True
+              return track
+
+          def reconcile_bids(s, ident, memory):
+              """Read-only: ask the API where each still-open bid stands, so an accepted or rejected bid is noticed even after its task left the 50-item list."""
+              track = tracked_bids(memory)
+              now = datetime.now(timezone.utc)
+              open_ids = [tid for tid, t in track.items() if str(t.get("status") or "").lower() not in BID_FINAL]
+              def age_hours(t):
+                  try: return (now - datetime.fromisoformat(t["checked_at"])).total_seconds() / 3600
+                  except Exception: return 1e9
+              due = sorted(open_ids, key=lambda tid: -age_hours(track[tid]))[:MAX_BID_CHECKS_PER_RUN]
+              changes = 0
+              for tid in due:
+                  t = track[tid]
+                  bids = existing_bids(s, tid)
+                  if bids is None:
+                      print(f"Bid check {tid[:8]}: bid list unavailable, will retry.")
+                      continue
+                  t["checked_at"] = now_iso()
+                  mine = [b for b in bids if our_bid(b, ident)]
+                  if not mine:
+                      print(f"Bid check {tid[:8]} ({t.get('title', '')[:50]}): our bid not in the list ({len(bids)} bids).")
+                      continue
+                  bid = mine[-1]
+                  new = str(bid.get("status") or bid.get("state") or "pending").lower()
+                  old = str(t.get("status") or "pending").lower()
+                  print(f"Bid check {tid[:8]} ({t.get('title', '')[:50]}): {new}")
+                  if new != old:
+                      changes += 1
+                      t["status"] = new
+                      t["updated_at"] = bid.get("updated_at")
+                      record(memory, {"timestamp": now_iso(), "action": "bid_status", "task_id": tid, "title": t.get("title"), "status": new, "previous_status": old, "bid_id": bid.get("id") or t.get("bid_id")})
+                      print(f"BID STATUS CHANGE: {old} -> {new} | {t.get('title', '')[:80]}")
+              pending = sum(1 for t in track.values() if str(t.get("status") or "").lower() not in BID_FINAL)
+              return {"bids_tracked": len(track), "bids_open": pending, "bids_checked": len(due), "bid_status_changes": changes}
 
           def bid_amount(reward_sats):
               # No 21-sat floor. Keep the historical 10-sat floor only for a
@@ -605,27 +672,33 @@ jobs:
                       STATE["changed"] = True
               else:
                   print("Tips endpoint unavailable; tip earnings not inferred or fabricated.")
+              rejected_by_reason = {}
+              near_misses = []
+              not_open = {}
               summary = {"tasks_seen": 0, "open_tasks": 0, "blocked": 0, "paid_candidates": 0, "learning_candidates": 0, "low_reward_candidates": 0, "already_bid": 0, "bid_attempts": 0, "bids_submitted": 0, "bid_errors": 0, "bid_limit_reached": 0}
 
               for task in marketplace_tasks:
                   if not isinstance(task, dict): continue
                   summary["tasks_seen"] += 1
                   tid = task_id(task); tt = title(task); st = status(task)
-                  print("\n----------------------------------------------")
-                  print(f"TASK: {tt}\nID: {tid}\nSTATUS: {st or 'unknown'}")
-                  if not tid: print("Decision: SKIP - no task_id"); continue
-                  if st not in ("open", "bidding"): print(f"Decision: SKIP - status={st or 'missing'}"); continue
+                  if not tid: print(f"SKIP - no task_id: {tt[:60]}"); continue
+                  if st not in ("open", "bidding"): not_open[st or "missing"] = not_open.get(st or "missing", 0) + 1; continue
                   summary["open_tasks"] += 1
                   d = evaluate(task)
+                  if d["decision"] == "reject":
+                      summary["blocked"] += 1
+                      key = str(d["reason"]).split(":")[0]
+                      rejected_by_reason[key] = rejected_by_reason.get(key, 0) + 1
+                      if d["total"] > 0: near_misses.append((d["total"], key, tt))
+                      if d["total"] >= 15:  # near misses only: pure ads are counted, not stored
+                          record(memory, {"timestamp": now_iso(), "action": "rejected", "task_id": tid, "title": tt, "reason": d["reason"], "status": "blocked"})
+                      continue
+                  print("\n----------------------------------------------")
+                  print(f"TASK: {tt}\nID: {tid}\nSTATUS: {st or 'unknown'}")
                   print(f"Scores: capability={d['capability']} learning={d['learning']} domain={d['domain_score']} total={d['total']}")
                   print(f"Domain: {d['domain'] or 'general'}")
                   print(f"Reward: {d['reward_sats']} sats | currency={d['reward_currency']} | source={d['reward_source']} | USD={d['usd']}")
                   print(f"Decision: {d['decision']}")
-
-                  if d["decision"] == "reject":
-                      summary["blocked"] += 1
-                      record(memory, {"timestamp": now_iso(), "action": "rejected", "task_id": tid, "title": tt, "reason": d["reason"], "status": "blocked"})
-                      continue
 
                   if d["decision"] in ("learning_candidate_unpaid", "learning_candidate_low_reward"):
                       summary["learning_candidates"] += 1
@@ -671,12 +744,22 @@ jobs:
                   result = submit_bid(s, tid, amount, tt, d["total"], d["reward_currency"], task)
                   if result["success"]:
                       summary["bids_submitted"] += 1
+                      memory.setdefault("bid_tracking", {})[tid] = {"title": tt[:120], "amount_sats": amount, "bid_id": result.get("bid_id"), "status": "pending", "submitted_at": now_iso(), "checked_at": now_iso()}
                       record(memory, {"timestamp": now_iso(), "action": "marketplace_bid_submitted", "task_id": tid, "title": tt, "status": "submitted", "reward_sats": d["reward_sats"], "reward_currency": d["reward_currency"], "reward_source": d["reward_source"], "usd_amount": d["usd"], "proposed_bid_sats": amount, "bid_id": result.get("bid_id"), "http_status": result.get("http_status"), "capability_score": d["capability"], "learning_score": d["learning"], "domain_score": d["domain_score"], "domain": d["domain"], "total_score": d["total"], "payments": "disabled"})
                   else:
                       summary["bid_errors"] += 1
                       record(memory, {"timestamp": now_iso(), "action": "marketplace_bid_error", "task_id": tid, "title": tt, "status": "error", "reward_sats": d["reward_sats"], "reward_currency": d["reward_currency"], "proposed_bid_sats": amount, "http_status": result.get("http_status"), "response": result.get("response")})
                   time.sleep(ACTION_DELAY_SECONDS)
 
+              print("\n----------------------------------------------")
+              print(f"Open tasks rejected: {summary['blocked']}/{summary['open_tasks']}" + (" (" + ", ".join(f"{k}={v}" for k, v in sorted(rejected_by_reason.items(), key=lambda kv: -kv[1])) + ")" if rejected_by_reason else ""))
+              if not_open: print("Not open: " + ", ".join(f"{k}={v}" for k, v in sorted(not_open.items())))
+              for total, key, tt in sorted(near_misses, reverse=True)[:5]:
+                  print(f"  closest rejected: {total}/100 {key} | {tt[:70]}")
+              try:
+                  summary.update(reconcile_bids(s, ident, memory))
+              except Exception as exc:
+                  print(f"Bid reconciliation warning: {exc}")
               deliver_accepted(s, ident, marketplace_tasks, memory)
               summary["ai_usage"] = nox_ai.usage()
               summary["tips_endpoint_available"] = bool(tips_snapshot.get("available"))
