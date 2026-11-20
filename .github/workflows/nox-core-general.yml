@@ -385,37 +385,72 @@ jobs:
               )
 
           messages = []
+          DM_MAX_AGE_DAYS = 30
+          DM_RECENT_HOURS = 72
+          def hours_since(value):
+              try:
+                  return (datetime.now(timezone.utc) - datetime.fromisoformat(str(value).replace("Z", "+00:00"))).total_seconds() / 3600
+              except Exception:
+                  return None
+
           try:
               conversations = list(client.iter_conversations(max_results=50))
+              unreadable = 0
               for conversation in conversations:
                   if len(messages) >= MAX_DMS or not isinstance(conversation, dict):
                       break
+                  # The API nests the other party: conversation["other_user"]["username"].
+                  other_user = conversation.get("other_user")
                   other = (
-                      conversation.get("username")
+                      (other_user.get("username") if isinstance(other_user, dict) else other_user)
+                      or conversation.get("username")
                       or conversation.get("other_username")
                       or conversation.get("with_username")
                       or conversation.get("partner_username")
                   )
                   if not other:
+                      unreadable += 1
                       continue
                   try:
-                      detail = client.get_conversation(str(other))
-                      detail = extract(detail, ("items", "messages"))
-                      for message in detail[-MAX_DMS:]:
-                          if not isinstance(message, dict):
-                              continue
-                          # Only incoming messages are actionable. This also
-                          # makes the detector independent of unread counters.
+                      unread = int(conversation.get("unread_count") or 0)
+                  except (TypeError, ValueError):
+                      unread = 0
+                  recent = (hours_since(conversation.get("last_message_at")) or 1e9) <= DM_RECENT_HOURS
+                  # Only threads that can need an answer: unread, or active in the last 72 hours.
+                  if unread <= 0 and not recent:
+                      continue
+                  try:
+                      detail = extract(client.get_conversation(str(other)), ("items", "messages"))
+                      detail = [m for m in detail if isinstance(m, dict)]
+                      detail.sort(key=lambda m: str(m.get("created_at") or ""))
+                      # Answer only if the last word in the thread is not ours: a thread NØX already answered stays quiet,
+                      # and a message that was marked read without being answered is never lost.
+                      trailing = []
+                      for message in reversed(detail):
                           sender = message_sender(message)
                           if sender and sender == username:
-                              continue
-                          enriched = dict(message)
-                          enriched["_conversation_username"] = str(other)
-                          messages.append(enriched)
-                          if len(messages) >= MAX_DMS:
                               break
+                          trailing.append(message)
+                      trailing.reverse()
+                      if not trailing:
+                          continue
+                      latest = dict(trailing[-1])
+                      age = hours_since(latest.get("created_at"))
+                      if age is not None and age > DM_MAX_AGE_DAYS * 24:
+                          continue
+                      closer = clean(latest.get("body") or latest.get("content") or latest.get("text"), 200).lower()
+                      if (str(other).lower() != "romu" and len(closer) <= 40 and "?" not in closer
+                              and re.match(r"^\W*(merci|thanks|thank you|thx|ok|okay|d'accord|bye|au revoir|ciao|cool|parfait|bien reçu|noted|got it|great|super|top)\b", closer)):
+                          continue  # a closing courtesy needs no answer (avoids endless thank-you loops between agents)
+                      take = trailing[-3:]
+                      if len(take) > 1:
+                          latest["body"] = "\n".join(clean(m.get("body") or m.get("content") or m.get("text"), 700) for m in take)[:2000]
+                      latest["_conversation_username"] = str(other)
+                      messages.append(latest)
                   except Exception as exc:
                       remember(memory, "failures", "A conversation could not be inspected.", {"username":other,"error":clean(exc,500)}, "colony_messages")
+              if conversations and unreadable == len(conversations):
+                  print(f"WARNING: {unreadable} conversations had no readable username; first keys: {sorted(conversations[0].keys())[:12] if isinstance(conversations[0], dict) else type(conversations[0])}")
           except Exception as exc:
               remember(memory, "failures", "Conversation inbox could not be read.", {"error":clean(exc,500)}, "colony_messages")
 
@@ -463,7 +498,7 @@ jobs:
               conflicts = [x for x in ("however","but","yet","contradiction","failed","wrong","false","pourtant","cependant","contradiction","échec","faux") if x in low]
               memory_hits = recall(memory, text)
               has_substance = len(body(item)) >= 120 or bool(qs) or bool(evidence) or bool(conflicts)
-              if not has_substance:
+              if not has_substance and source != "dm":
                   return None
               if conflicts:
                   intent = "reconcile_conflict"
@@ -709,10 +744,10 @@ jobs:
                   decision = "comment_reply_direct"
                   reason = "A substantive comment was left on NØX's own post and needs no new research; reply in the thread, without asserting new facts."
                   action_kind = "comment_reply"
-              elif case["source"] == "dm" and case["intent"] == "answer_or_research_question" and case["questions"]:
-                  question = case["questions"][0]
+              elif case["source"] == "dm":
+                  question = case["questions"][0] if case["questions"] else clean(case["body"], 300)
                   decision = "dm_reply"
-                  reason = "A direct question was received in a DM; Core can answer from its observed memory without requiring public research first."
+                  reason = "A direct message was received; every DM gets an answer (rate-limited per sender by Presence), whatever its form."
                   action_kind = "dm_reply"
               elif case["intent"] == "answer_or_research_question" and case["questions"]:
                   question = case["questions"][0]
