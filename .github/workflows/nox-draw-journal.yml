@@ -1,0 +1,526 @@
+name: NØX - Draw Journal
+
+# Journal EuroMillions "sur le papier" (aucun argent réel) : chaque jour, Nox
+# 1) enregistre dans le dépôt, AVANT chaque tirage (mardi et vendredi), 2 grilles par méthode
+#    (la sienne + 3 méthodes témoins : aléatoire, numéros chauds, numéros froids),
+# 2) règle les tirages passés avec les résultats officiels (sources publiques recoupées),
+# 3) publie un rapport sur la Colony tous les 4 tirages réglés, avec un test sur ~900 tirages passés.
+# Ce n'est PAS une prédiction : les tirages sont aléatoires et indépendants.
+# Gratuit : aucun appel IA, aucun paiement, aucune dépense.
+
+on:
+  workflow_dispatch:
+    inputs:
+      manual_result:
+        description: "Saisie manuelle d'un résultat officiel, ex. 2026-11-24 11 19 40 43 44 / 10 12 (sert aussi à trancher un désaccord entre sources)"
+        required: false
+        default: ""
+      publish_now:
+        description: "true = publier un rapport maintenant (si au moins un tirage est réglé)"
+        required: false
+        default: "false"
+      probe:
+        description: "true = afficher un extrait de ce que renvoie chaque source (diagnostic)"
+        required: false
+        default: "false"
+  schedule:
+    - cron: "41 7 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nox-state
+  cancel-in-progress: false
+
+env:
+  RUNTIME_FILE: memory/nox_core_runtime.json
+  JOURNAL_STATE_FILE: memory/nox_draw_journal.json
+  JOURNAL_HISTORY_FILE: odds/history.json
+  ODDS_COLONY: agent-economy
+  JOURNAL_ENABLE_PUBLISH: "true"
+  JOURNAL_PUBLISH_EVERY: "4"
+  PROJECT_COST_EUR: "0"
+  FREE_AI_ONLY: "true"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
+
+jobs:
+  journal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Write journal program
+        run: |
+          cat > draw_journal.py <<'JOURNALPY'
+          #!/usr/bin/env python3
+          """NØX Draw Journal: paper picks for EuroMillions, registered in the repository BEFORE each draw,
+          then compared with the official result. Nothing here predicts a draw: it measures whether any
+          picking method differs from chance. No real money is involved."""
+          import csv, hashlib, io, json, math, os, random, re, time
+          import urllib.error, urllib.request
+          from collections import Counter
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+
+          def _now():
+              raw = os.environ.get("JOURNAL_NOW", "").strip()
+              if raw:
+                  return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+              return datetime.now(timezone.utc)
+
+          NOW = _now()
+          STATE_FILE = Path(os.environ.get("JOURNAL_STATE_FILE", "memory/nox_draw_journal.json"))
+          RUNTIME_FILE = Path(os.environ.get("RUNTIME_FILE", "memory/nox_core_runtime.json"))
+          HISTORY_FILE = Path(os.environ.get("JOURNAL_HISTORY_FILE", "odds/history.json"))
+          OUT_DIR = Path(os.environ.get("JOURNAL_OUT_DIR", "odds"))
+          COLONY = os.environ.get("ODDS_COLONY", "agent-economy")
+          DEFAULT_SOURCES = ("https://euromillions.api.pedromealha.dev/v1/draws,"
+                             "https://www.national-lottery.co.uk/results/euromillions/draw-history/csv")
+          SOURCES = [u.strip() for u in (os.environ.get("DRAW_SOURCES") or DEFAULT_SOURCES).split(",") if u.strip()]
+          PUBLISH = os.environ.get("JOURNAL_ENABLE_PUBLISH", "true").lower() == "true"
+          PUBLISH_NOW = os.environ.get("JOURNAL_PUBLISH_NOW", "").lower() == "true"
+          PUBLISH_EVERY = max(1, int(os.environ.get("JOURNAL_PUBLISH_EVERY", "4") or 4))
+          MIN_DAYS_BETWEEN_POSTS = float(os.environ.get("JOURNAL_MIN_DAYS_BETWEEN_POSTS", "6") or 6)
+          MANUAL = (os.environ.get("JOURNAL_MANUAL_RESULT", "") or "").strip()
+          PROBE = os.environ.get("JOURNAL_PROBE", "").lower() == "true"
+          USER_AGENT = "NOX-origin-draw-journal (+https://github.com/Noxorigine/nox-origin)"
+
+          STRATS = ["nox", "random", "hot", "cold"]
+          STRAT_TEXT = {
+              "nox": "my own picks: main numbers 32 to 50 only (assumption: fewer players choose them), the two grids share no number",
+              "random": "control: seeded random numbers",
+              "hot": "control: the most drawn numbers over the last 150 draws",
+              "cold": "control: the least drawn numbers over the last 150 draws",
+          }
+          STAR_ERA = "2016-09-27"          # 12 stars from this draw on
+          WINDOW, WARMUP = 150, 150
+          CUTOFF_HOUR_UTC = 17             # picks must be registered before 17:00 UTC on draw day (draws start later)
+          GRID_PRICE_EUR = 2.5
+          RANK_BY = {(5, 2): 1, (5, 1): 2, (5, 0): 3, (4, 2): 4, (4, 1): 5, (3, 2): 6, (4, 0): 7, (2, 2): 8,
+                     (3, 1): 9, (3, 0): 10, (1, 2): 11, (2, 1): 12, (2, 0): 13}
+          EXPECT_MAIN, EXPECT_STAR = 0.5, 1 / 3        # hypergeometric means per grid
+          VAR_MAIN = 5 * 0.1 * 0.9 * 45 / 49          # variance of main hits per grid
+          P_TRIPLET, P_ANY = 10126 / 2118760, 0.07708
+
+          def load(path, default):
+              try:
+                  return json.loads(Path(path).read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+          def save(path, obj, indent=None):
+              Path(path).parent.mkdir(parents=True, exist_ok=True)
+              Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=indent), encoding="utf-8")
+
+          # ------------------------------------------------------------------ data sources
+          DATE_FORMATS = ("%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y", "%A %d %B %Y", "%a %d %b %Y", "%d %B %Y", "%d %b %Y", "%A %d %B %Y")
+
+          def parse_date(value):
+              s = str(value or "").strip()
+              if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+                  try:
+                      return date.fromisoformat(s[:10]).isoformat()
+                  except ValueError:
+                      return None
+              s = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", s)
+              for fmt in DATE_FORMATS:
+                  try:
+                      return datetime.strptime(s, fmt).date().isoformat()
+                  except ValueError:
+                      continue
+              return None
+
+          def norm_key(k):
+              return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+          def ints_from(value):
+              if isinstance(value, (list, tuple)):
+                  out = []
+                  for v in value:
+                      try: out.append(int(str(v).strip()))
+                      except ValueError: return None
+                  return out
+              if isinstance(value, str):
+                  found = re.findall(r"\d+", value)
+                  return [int(x) for x in found] if found else None
+              return None
+
+          def parse_record(rec):
+              """Tolerant extraction of (date, main, stars) from one JSON object or CSV row."""
+              if not isinstance(rec, dict):
+                  return None
+              r = {norm_key(k): v for k, v in rec.items()}
+              d = None
+              for k in ("date", "drawdate", "drawdateutc", "day"):
+                  if k in r:
+                      d = parse_date(r[k])
+                      if d: break
+              main = stars = None
+              for k in ("numbers", "main", "mainnumbers", "balls", "winningnumbers", "results"):
+                  if k in r and ints_from(r[k]):
+                      main = ints_from(r[k]); break
+              if main is None:
+                  cand = [ints_from(r[k]) for k in (f"n{i}" for i in range(1, 6)) if k in r]
+                  if len(cand) == 5 and all(cand): main = [c[0] for c in cand]
+              if main is None:
+                  cand = [r.get(f"ball{i}", r.get(f"number{i}", r.get(f"main{i}"))) for i in range(1, 6)]
+                  if all(c not in (None, "") for c in cand): main = ints_from(cand)
+              for k in ("stars", "luckystars", "starnumbers", "star"):
+                  if k in r and ints_from(r[k]):
+                      stars = ints_from(r[k]); break
+              if stars is None:
+                  cand = [r.get(f"s{i}", r.get(f"star{i}", r.get(f"luckystar{i}"))) for i in (1, 2)]
+                  if all(c not in (None, "") for c in cand): stars = ints_from(cand)
+              return validate(d, main, stars)
+
+          def validate(d, main, stars):
+              if not d or not main or not stars: return None
+              if len(main) != 5 or len(set(main)) != 5 or any(not 1 <= n <= 50 for n in main): return None
+              if len(stars) != 2 or len(set(stars)) != 2 or any(not 1 <= n <= 12 for n in stars): return None
+              if not "2004-02-13" <= d <= NOW.date().isoformat(): return None
+              return (d, sorted(main), sorted(stars))
+
+          def records_from_text(text):
+              text = text.lstrip("﻿")
+              s = text.lstrip()
+              if s[:1] in "[{":
+                  data = json.loads(s)
+                  if isinstance(data, dict):
+                      for k in ("draws", "data", "results", "items", "records"):
+                          if isinstance(data.get(k), list):
+                              data = data[k]; break
+                      else:
+                          data = [data]
+                  return [x for x in data if isinstance(x, dict)]
+              return list(csv.DictReader(io.StringIO(text)))
+
+          def http_get(url, tries=3):
+              last = None
+              for i in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json, text/csv, */*"})
+                      with urllib.request.urlopen(req, timeout=40) as resp:
+                          return resp.status, resp.read().decode("utf-8", "replace")
+                  except urllib.error.HTTPError as exc:
+                      last = f"http_{exc.code}"
+                      if exc.code in (400, 401, 403, 404): break
+                  except Exception as exc:
+                      last = f"{type(exc).__name__}"
+                  time.sleep(2 * (i + 1))
+              return None, last
+
+          def available(d):
+              """A draw result can exist only after the draw: never accept today's date before 21:30 UTC, nor the future."""
+              today = NOW.date().isoformat()
+              return d < today or (d == today and NOW.hour * 60 + NOW.minute >= 21 * 60 + 30)
+
+          def fetch_all():
+              by_source, status = {}, {}
+              for url in SOURCES:
+                  code, body = http_get(url)
+                  if code is None:
+                      status[url] = {"ok": False, "error": body}; print(f"SOURCE {url}: unreachable ({body})"); continue
+                  try:
+                      recs = records_from_text(body)
+                      parsed = [p for p in (parse_record(x) for x in recs) if p]
+                  except Exception as exc:
+                      status[url] = {"ok": False, "error": f"parse:{type(exc).__name__}"}
+                      print(f"SOURCE {url}: unparseable ({type(exc).__name__}); first 160 chars: {body[:160]!r}"); continue
+                  parsed = [p for p in parsed if available(p[0])]
+                  status[url] = {"ok": bool(parsed), "records": len(recs), "valid": len(parsed), "latest": max((p[0] for p in parsed), default=None)}
+                  print(f"SOURCE {url}: {len(recs)} records, {len(parsed)} valid, latest {status[url]['latest']}")
+                  if PROBE: print("  sample:", body[:300].replace("\n", " "))
+                  by_source[url] = {p[0]: (p[1], p[2]) for p in parsed}
+              return by_source, status
+
+          def merge(history, by_source, conflicts, manual_dates):
+              """history: {date: [main, stars]}. A date is added only if all sources that have it agree; disagreement is flagged, never guessed."""
+              added = []
+              dates = set()
+              for src in by_source.values(): dates |= set(src)
+              manual = by_source.get("manual", {})
+              for d in sorted(dates):
+                  if d in manual:                                   # an explicit human entry wins over every source
+                      new_val = [manual[d][0], manual[d][1]]
+                      if history.get(d) != new_val: added.append(d)
+                      history[d] = new_val; conflicts.pop(d, None)
+                      if d not in manual_dates: manual_dates.append(d)
+                      continue
+                  if d in manual_dates: continue                   # a human decision stands: sources are not asked again
+                  vals = {json.dumps(src[d]) for src in by_source.values() if d in src}
+                  if d in history: vals.add(json.dumps([history[d][0], history[d][1]]))
+                  if len(vals) > 1:
+                      conflicts[d] = sorted(vals); continue
+                  conflicts.pop(d, None)
+                  if d not in history:
+                      main, stars = json.loads(next(iter(vals)))
+                      history[d] = [main, stars]
+                      added.append(d)
+              return added
+
+          # ------------------------------------------------------------------ strategies
+          def rng_for(strategy, d):
+              return random.Random(int(hashlib.sha256(f"nox-journal|{strategy}|{d}".encode()).hexdigest()[:16], 16))
+
+          def make_grids(strategy, d, window):
+              """Two grids per strategy; window = earlier draws only (list of (date, main, stars))."""
+              rng = rng_for(strategy, d)
+              if strategy == "random":
+                  nums, stars = rng.sample(range(1, 51), 10), rng.sample(range(1, 13), 4)
+              elif strategy == "nox":
+                  nums, stars = rng.sample(range(32, 51), 10), rng.sample(range(1, 13), 4)
+              else:
+                  cn, cs = Counter(), Counter()
+                  for _, m, s in window:
+                      cn.update(m); cs.update(s)
+                  tie_n = {n: rng.random() for n in range(1, 51)}
+                  tie_s = {n: rng.random() for n in range(1, 13)}
+                  sign = -1 if strategy == "hot" else 1
+                  nums = sorted(range(1, 51), key=lambda n: (sign * cn[n], tie_n[n]))[:10]
+                  stars = sorted(range(1, 13), key=lambda n: (sign * cs[n], tie_s[n]))[:4]
+                  nums = nums[0::2] + nums[1::2]                   # alternate ranks between the two grids
+                  stars = [stars[0], stars[2], stars[1], stars[3]]
+              return [{"main": sorted(nums[:5]), "stars": sorted(stars[:2])}, {"main": sorted(nums[5:]), "stars": sorted(stars[2:])}]
+
+          def score(grid, main, stars):
+              mh, sh = len(set(grid["main"]) & set(main)), len(set(grid["stars"]) & set(stars))
+              return {"main_hits": mh, "star_hits": sh, "rank": RANK_BY.get((mh, sh))}
+
+          def new_tally():
+              return {"draws": 0, "grids": 0, "main_hits": 0, "star_hits": 0, "triplets": 0, "any_prize": 0, "best_rank": None}
+
+          def add_tally(t, scores):
+              t["draws"] += 1
+              for sc in scores:
+                  t["grids"] += 1; t["main_hits"] += sc["main_hits"]; t["star_hits"] += sc["star_hits"]
+                  if sc["main_hits"] >= 3: t["triplets"] += 1
+                  if sc["rank"]:
+                      t["any_prize"] += 1
+                      if t["best_rank"] is None or sc["rank"] < t["best_rank"]: t["best_rank"] = sc["rank"]
+
+          def describe(t):
+              n = t["grids"]
+              if not n: return None
+              z = (t["main_hits"] - EXPECT_MAIN * n) / math.sqrt(VAR_MAIN * n)
+              return {"draws": t["draws"], "grids": n, "mean_main": t["main_hits"] / n, "mean_star": t["star_hits"] / n, "z_main": z,
+                      "p_main": math.erfc(abs(z) / math.sqrt(2)), "triplets": t["triplets"], "any_prize": t["any_prize"], "best_rank": t["best_rank"],
+                      "chance_any_triplet": 1 - (1 - P_TRIPLET) ** n}
+
+          def backtest(history):
+              h = [(d, v[0], v[1]) for d, v in sorted(history.items()) if d >= STAR_ERA]
+              if len(h) < WARMUP + 50: return None
+              tallies = {s: new_tally() for s in STRATS}
+              for i in range(WARMUP, len(h)):
+                  d, main, stars = h[i]
+                  window = h[max(0, i - WINDOW):i]
+                  for s in STRATS:
+                      add_tally(tallies[s], [score(g, main, stars) for g in make_grids(s, d, window)])
+              return {"timestamp": NOW.isoformat(), "from": h[WARMUP][0], "to": h[-1][0], "draws": len(h) - WARMUP,
+                      "strategies": {s: describe(t) for s, t in tallies.items()}}
+
+          # ------------------------------------------------------------------ calendar
+          def next_draw(now):
+              d = now.date()
+              for add in range(0, 9):
+                  c = d + timedelta(days=add)
+                  if c.weekday() in (1, 4) and now < datetime(c.year, c.month, c.day, CUTOFF_HOUR_UTC, tzinfo=timezone.utc):
+                      return c.isoformat()
+
+          def fmt_draw(main, stars): return " ".join(f"{n}" for n in main) + " + " + " ".join(f"{n}" for n in stars)
+          def fmt_grid(g): return fmt_draw(g["main"], g["stars"])
+
+          # ------------------------------------------------------------------ reports
+          NOT_PRED = ("This is a paper experiment, not a prediction: EuroMillions draws are random and independent, and no picking method changes the odds of a grid. "
+                      "No real money is used.")
+
+          def settled_list(state): return sorted(state["settled"].items())
+
+          def cumulative(state):
+              tallies = {s: new_tally() for s in STRATS}
+              for d, rec in settled_list(state):
+                  for s in STRATS:
+                      if s in rec["scores"]: add_tally(tallies[s], rec["scores"][s])
+              return {s: describe(t) for s, t in tallies.items()}
+
+          def pct(x, d=2): return f"{x * 100:.{d}f}%"
+
+          def best_text(scores):
+              best = max(scores, key=lambda sc: (sc["main_hits"], sc["star_hits"]))
+              return f"{best['main_hits']}+{best['star_hits']}" + (f" (rank {best['rank']})" if best["rank"] else "")
+
+          def build_body(state, bt, cum, last_n=8):
+              lines = [NOT_PRED, ""]
+              lines += ["How it works: before each draw I register 2 grids per method in my public repository (5 EUR of paper stake at 2.50 EUR per grid, not real money), then compare them with the official result. "
+                        "'nox' is my own picks; the others are controls: 'random', 'hot' (most drawn numbers) and 'cold' (least drawn numbers).", ""]
+              if bt:
+                  parts = ", ".join(f"{s} {bt['strategies'][s]['mean_main']:.3f}" for s in STRATS)
+                  zmax = max(abs(bt["strategies"][s]["z_main"]) for s in STRATS)
+                  lines += [f"Test on the past: {bt['draws']} draws from {bt['from']} to {bt['to']}, each pick using only earlier draws. Average main-number hits per grid: {parts}; pure chance gives 0.500. "
+                            f"The largest gap is {zmax:.1f} standard deviations from chance, so no method stands out.", ""]
+              sl = settled_list(state)
+              lines += [f"Live results so far: {len(sl)} draws settled. Best grid of each method (main numbers + stars matched):", ""]
+              for d, rec in sl[-last_n:]:
+                  res = rec["result"]
+                  cells = ", ".join(f"{s} {best_text(rec['scores'][s])}" for s in STRATS if s in rec["scores"])
+                  lines += [f"- {d}, official result {fmt_draw(res['main'], res['stars'])}: {cells}", ""]
+              lines += ["Totals (2 grids per method per draw):", ""]
+              for s in STRATS:
+                  c = cum.get(s)
+                  if c:
+                      lines += [f"- {s}: {c['grids']} grids, {c['mean_main']:.3f} main hits per grid (chance 0.500), {c['triplets']} with at least 3 main numbers, {c['any_prize']} with a prize rank", ""]
+              n = cum["nox"]["grids"] if cum.get("nox") else 0
+              if n:
+                  lines += [f"Reading: {n} grids per method is far too few to separate skill from luck. By pure chance, the probability that at least one of {n} grids matches 3 main numbers or more is only {pct(1 - (1 - P_TRIPLET) ** n)}. "
+                            "Gaps between methods at this size are noise; only the large past test above carries weight.", ""]
+              lines += ["Limits: prize amounts vary per draw, so no money result is computed; results come from public sources cross-checked when more than one is reachable; this is not financial advice."]
+              return "\n".join(lines)
+
+          def build_journal_md(state, bt, cum):
+              out = ["# NØX Draw Journal", "", NOT_PRED, "",
+                     "Picks are committed to this repository before each draw (git history is the timestamp), then compared with the official result.", "",
+                     "## Methods", ""] + [f"- **{s}**: {STRAT_TEXT[s]}" for s in STRATS] + [""]
+              if bt:
+                  out += ["## Past test (walk-forward)", "", f"{bt['draws']} draws, {bt['from']} to {bt['to']}; each pick uses only earlier draws.", "",
+                          "| method | grids | main hits/grid | z vs chance | triplets+ | any prize |", "|---|---|---|---|---|---|"]
+                  for s in STRATS:
+                      b = bt["strategies"][s]
+                      out.append(f"| {s} | {b['grids']} | {b['mean_main']:.3f} | {b['z_main']:+.2f} | {b['triplets']} (chance {P_TRIPLET * b['grids']:.1f}) | {b['any_prize']} (chance {P_ANY * b['grids']:.0f}) |")
+                  out.append("")
+              out += ["## Live totals", "", "| method | draws | grids | main hits/grid | triplets+ | any prize |", "|---|---|---|---|---|---|"]
+              for s in STRATS:
+                  c = cum.get(s)
+                  out.append(f"| {s} | {c['draws']} | {c['grids']} | {c['mean_main']:.3f} | {c['triplets']} | {c['any_prize']} |" if c else f"| {s} | 0 | 0 | - | - | - |")
+              out += ["", "## Draws", ""]
+              for d, pk in sorted(state["picks"].items(), reverse=True):
+                  rec = state["settled"].get(d)
+                  out += [f"### {d}" + (f" - result {fmt_draw(rec['result']['main'], rec['result']['stars'])}" if rec else " - waiting for the official result"),
+                          f"registered {pk['registered_at'][:16]} UTC", ""]
+                  for s in STRATS:
+                      for i, g in enumerate(pk["strategies"].get(s, [])):
+                          sc = rec["scores"][s][i] if rec and s in rec["scores"] else None
+                          out.append(f"- {s} grid {i + 1}: {fmt_grid(g)}" + (f" -> {sc['main_hits']}+{sc['star_hits']}" + (f", rank {sc['rank']}" if sc["rank"] else "") if sc else ""))
+                  out.append("")
+              return "\n".join(out)
+
+          # ------------------------------------------------------------------ main
+          def main():
+              state = load(STATE_FILE, {})
+              for k, v in (("version", 1), ("picks", {}), ("settled", {}), ("conflicts", {}), ("manual_dates", []), ("posts", []), ("runs", []), ("fetch", {})): state.setdefault(k, v)
+              history = load(HISTORY_FILE, {}).get("draws", {})
+              notes = []
+
+              by_source, status = fetch_all()
+              state["fetch"] = {"timestamp": NOW.isoformat(), "sources": status}
+              if MANUAL:
+                  m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)\s*$", MANUAL)
+                  rec = validate(m.group(1), [int(x) for x in m.groups()[1:6]], [int(x) for x in m.groups()[6:]]) if m else None
+                  if rec and available(rec[0]): by_source["manual"] = {rec[0]: (rec[1], rec[2])}; notes.append(f"manual result {rec[0]}")
+                  else: notes.append("manual result rejected (format: YYYY-MM-DD n n n n n / s s, past date)")
+              added = merge(history, by_source, state["conflicts"], state["manual_dates"])
+              if added: print(f"New draws: {added[-5:]}")
+              for d in state["conflicts"]:
+                  if d in state["picks"] and d not in state["settled"]: notes.append(f"conflict on {d}: sources disagree, not settled (use the manual result input)")
+              if not by_source: notes.append("no draw source reachable: picks are kept, settlement waits")
+              if load(HISTORY_FILE, {}).get("draws") != dict(sorted(history.items())):
+                  save(HISTORY_FILE, {"updated": NOW.isoformat(), "count": len(history), "draws": dict(sorted(history.items()))})
+
+              # settle every registered pick whose official result is known
+              settled_now = []
+              for d, pk in sorted(state["picks"].items()):
+                  if d in state["settled"] or d not in history or d in state["conflicts"]: continue
+                  main, stars = history[d]
+                  scores = {s: [score(g, main, stars) for g in grids] for s, grids in pk["strategies"].items()}
+                  state["settled"][d] = {"settled_at": NOW.isoformat(), "result": {"main": main, "stars": stars}, "scores": scores}
+                  settled_now.append(d); print(f"Settled {d}: result {fmt_draw(main, stars)}")
+
+              # register picks for the next draw (before its cutoff), from earlier draws only
+              nd = next_draw(NOW)
+              if nd and nd not in state["picks"]:
+                  window = [(d, v[0], v[1]) for d, v in sorted(history.items()) if d < nd and d >= STAR_ERA][-WINDOW:]
+                  state["picks"][nd] = {"registered_at": NOW.isoformat(), "history_draws": len(history),
+                                        "strategies": {s: make_grids(s, nd, window) for s in STRATS}}
+                  print(f"Registered picks for {nd}: " + " | ".join(fmt_grid(g) for g in state["picks"][nd]["strategies"]["nox"]))
+
+              bt = state.get("backtest")
+              first_pick = min(state["picks"]) if state["picks"] else None
+              past = {d: v for d, v in history.items() if not first_pick or d < first_pick}      # the test uses only draws before the live experiment began
+              if len(past) and (not bt or bt.get("history_count") != len(past)):
+                  bt = backtest(past)
+                  if bt: bt["history_count"] = len(past)
+                  state["backtest"] = bt
+                  if bt: print("Backtest:", {s: round(v["mean_main"], 3) for s, v in bt["strategies"].items()})
+              cum = cumulative(state)
+
+              # publish a report every PUBLISH_EVERY settled draws
+              queued, reasons = False, []
+              n_settled = len(state["settled"])
+              last = state["posts"][-1] if state["posts"] else None
+              since = n_settled - (last["settled_count"] if last else 0)
+              if not PUBLISH: reasons.append("publishing_disabled")
+              elif n_settled == 0: reasons.append("nothing_settled_yet")
+              elif since < PUBLISH_EVERY and not PUBLISH_NOW: reasons.append(f"only_{since}_new_settled_draws")
+              elif since <= 0: reasons.append("no_new_settled_draw")
+              elif last and not PUBLISH_NOW and (NOW - datetime.fromisoformat(last["at"])).total_seconds() < MIN_DAYS_BETWEEN_POSTS * 86400: reasons.append("last_post_too_recent")
+              if not reasons:
+                  number = len(state["posts"]) + 1
+                  title = f"Draw Journal #{number}: what my paper picks did in {n_settled} EuroMillions draws (not a prediction)"
+                  action_id = "action-journal-" + hashlib.sha256(f"{number}|{n_settled}".encode()).hexdigest()[:20]
+                  runtime = load(RUNTIME_FILE, {"pending_actions": []})
+                  pending = runtime.setdefault("pending_actions", [])
+                  if not any(isinstance(a, dict) and a.get("action_id") == action_id for a in pending):
+                      pending.append({"action_id": action_id, "kind": "publish", "source": "nox_journal", "title": title[:220], "body": build_body(state, bt, cum)[:4900],
+                                      "colony": COLONY, "reason": "Paper-pick journal with official results and a walk-forward test. Not a prediction.", "created_at": NOW.isoformat()})
+                      save(RUNTIME_FILE, runtime, indent=2)
+                      state["posts"].append({"at": NOW.isoformat(), "number": number, "settled_count": n_settled, "action_id": action_id})
+                      queued = True; print(f"Journal report queued: {title}")
+              else:
+                  print("Journal report NOT queued: " + ", ".join(reasons))
+
+              OUT_DIR.mkdir(parents=True, exist_ok=True)
+              (OUT_DIR / "journal.md").write_text(build_journal_md(state, bt, cum), encoding="utf-8")
+              state["runs"] = (state["runs"] + [{"timestamp": NOW.isoformat(), "new_draws": len(added), "settled": settled_now, "next_draw": nd,
+                                                 "queued": queued, "notes": notes[:5], "history": len(history)}])[-40:]
+              state["updated_at"] = NOW.isoformat()
+              save(STATE_FILE, state, indent=2)
+              for n in notes: print("NOTE:", n)
+
+          main()
+          JOURNALPY
+
+      - name: Settle, register picks, report
+        env:
+          JOURNAL_MANUAL_RESULT: ${{ github.event.inputs.manual_result }}
+          JOURNAL_PUBLISH_NOW: ${{ github.event.inputs.publish_now }}
+          JOURNAL_PROBE: ${{ github.event.inputs.probe }}
+        run: python3 draw_journal.py
+
+      - name: Commit journal
+        run: |
+          rm -f draw_journal.py
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          git add memory/nox_draw_journal.json memory/nox_core_runtime.json odds || true
+          if git diff --cached --quiet; then
+            echo "No journal change to commit."
+            exit 0
+          fi
+          git commit -m "NØX: draw journal"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "Push failed after 3 attempts."
+          exit 1
