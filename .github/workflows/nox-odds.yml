@@ -1,0 +1,355 @@
+name: NØX - Odds
+
+# NØX Odds : calculs exacts de probabilités sur l'EuroMillions. Ce ne sont PAS des prédictions :
+# les tirages sont aléatoires et indépendants. Chaque résultat est vérifié trois fois :
+# 1) formule exacte (fractions), 2) énumération complète des 2 118 760 tirages de numéros, 3) simulation Monte-Carlo.
+# Le rapport n'est mis en file de publication (via Core/Presence) que si toutes les vérifications passent.
+# Gratuit : aucun appel IA, aucun paiement, aucune dépense.
+
+on:
+  workflow_dispatch:
+    inputs:
+      report:
+        description: "A (cotes et budgets) ou B (le choix des numéros change-t-il quelque chose ?) ; vide = prochain rapport non publié"
+        required: false
+        default: ""
+      force_publish:
+        description: "true = publier même si un rapport Odds a été publié il y a moins de 72 h"
+        required: false
+        default: "true"
+      budget_eur:
+        description: "Mise en euros (défaut 5)"
+        required: false
+        default: "5"
+      grid_price_eur:
+        description: "Prix d'une grille en euros (défaut 2.50 ; à vérifier)"
+        required: false
+        default: "2.50"
+      min_hits:
+        description: "Nombre minimal de bons numéros visé, de 1 à 5 (défaut 3 = triplet)"
+        required: false
+        default: "3"
+  schedule:
+    - cron: "17 8 * * 2,5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nox-state
+  cancel-in-progress: false
+
+env:
+  RUNTIME_FILE: memory/nox_core_runtime.json
+  ODDS_STATE_FILE: memory/nox_odds.json
+  ODDS_COLONY: agent-economy
+  ODDS_ENABLE_PUBLISH: "true"
+  ODDS_MIN_HOURS_BETWEEN_POSTS: "72"
+  PROJECT_COST_EUR: "0"
+  FREE_AI_ONLY: "true"
+  AUTO_PAYMENT: "false"
+  AUTO_SPENDING: "false"
+
+jobs:
+  odds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Write odds program
+        run: |
+          cat > odds_calc.py <<'ODDSPY'
+          #!/usr/bin/env python3
+          """NØX Odds: exact EuroMillions probability computations, cross-checked three ways.
+          1) closed form with exact fractions, 2) exhaustive enumeration of all 2,118,760 main-number draws,
+          3) seeded Monte-Carlo simulation. Nothing here predicts a draw: draws are uniform and independent."""
+          import hashlib, json, math, os, random
+          from datetime import datetime, timezone
+          from fractions import Fraction as F
+          from itertools import combinations
+          from math import comb
+          from pathlib import Path
+
+          NOW = datetime.now(timezone.utc)
+          STATE_FILE = Path(os.environ.get("ODDS_STATE_FILE", "memory/nox_odds.json"))
+          RUNTIME_FILE = Path(os.environ.get("RUNTIME_FILE", "memory/nox_core_runtime.json"))
+          OUT_DIR = Path(os.environ.get("ODDS_OUT_DIR", "odds"))
+          COLONY = os.environ.get("ODDS_COLONY", "agent-economy")
+          PUBLISH = os.environ.get("ODDS_ENABLE_PUBLISH", "true").lower() == "true"
+          FORCE = os.environ.get("ODDS_FORCE_PUBLISH", "").lower() == "true"
+          WANTED = (os.environ.get("ODDS_REPORT", "") or "").strip().upper()[:1]
+          MC_DRAWS = max(10000, min(int(os.environ.get("ODDS_MC_DRAWS", "1000000") or 1000000), 3000000))
+          MIN_HOURS = float(os.environ.get("ODDS_MIN_HOURS_BETWEEN_POSTS", "72") or 72)
+
+          def num_env(name, default, lo, hi):
+              raw = (os.environ.get(name, "") or "").strip().replace(",", ".")
+              try:
+                  v = F(raw) if raw else F(default)
+              except Exception:
+                  v = F(default)
+              return min(max(v, F(lo)), F(hi))
+
+          BUDGET = num_env("ODDS_BUDGET_EUR", "5", "1", "1000")
+          PRICE = num_env("ODDS_GRID_PRICE_EUR", "2.50", "0.5", "50")
+          K = int(num_env("ODDS_MIN_HITS", "3", "1", "5"))
+          GRIDS = int(BUDGET // PRICE)
+
+          def load(path, default):
+              try:
+                  return json.loads(Path(path).read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+          # ---------- 1) closed form, exact fractions ----------
+          TOTAL_MAIN = comb(50, 5)
+          TOTAL_STAR = comb(12, 2)
+          TOTAL = TOTAL_MAIN * TOTAL_STAR
+          def main_ways(m): return comb(5, m) * comb(45, 5 - m)
+          def star_ways(s): return comb(2, s) * comb(10, 2 - s)
+          RANKS = [(1, 5, 2), (2, 5, 1), (3, 5, 0), (4, 4, 2), (5, 4, 1), (6, 3, 2), (7, 4, 0),
+                   (8, 2, 2), (9, 3, 1), (10, 3, 0), (11, 1, 2), (12, 2, 1), (13, 2, 0)]
+          P_K = F(sum(main_ways(m) for m in range(K, 6)), TOTAL_MAIN)
+          P_ANY = F(sum(main_ways(m) * star_ways(s) for _, m, s in RANKS), TOTAL)
+
+          def p_n(p, n): return 1 - (1 - p) ** n
+
+          def min_grids(p, target=F(1, 2)):
+              """Smallest n with 1-(1-p)^n >= target, for n independent random grids."""
+              est = math.ceil(math.log(1 - float(target)) / math.log1p(-float(p)))
+              if est > 5000:
+                  return est, False
+              n = max(1, est - 3)
+              while p_n(p, n) < target:
+                  n += 1
+              return n, True
+
+          def pct(p, d=3):
+              if float(p) >= 0.9995 and d <= 1: return "over 99.9%"
+              return f"{float(p) * 100:.{d}f}%"
+          def one_in(p, d=1): return f"1 in {1 / float(p):,.{d}f}"
+          def eur(x): return f"{float(x):,.2f} EUR"
+
+          # ---------- 2) exhaustive enumeration over all 2,118,760 main-number draws ----------
+          A = set(range(5))
+          EXTRA = {"C": {6, 13, 20, 27, 34}, "D": {2, 10, 16, 23, 28}}
+          B = {o: set(range(o)) | set(range(5, 10 - o)) for o in range(5)}   # shares o numbers with A
+
+          def exhaustive():
+              names = ["A", "C", "D"] + [f"B{o}" for o in range(5)]
+              sets = [A, EXTRA["C"], EXTRA["D"]] + [B[o] for o in range(5)]
+              tabs = [[1 if i in s else 0 for i in range(50)] for s in sets]
+              dist = [[0] * 6 for _ in tabs]
+              union = [0] * 5
+              ia = 0
+              ib = [names.index(f"B{o}") for o in range(5)]
+              idx = list(range(len(tabs)))
+              for c in combinations(range(50), 5):
+                  a, b, d, e, f = c
+                  hs = []
+                  for i in idx:
+                      t = tabs[i]
+                      h = t[a] + t[b] + t[d] + t[e] + t[f]
+                      dist[i][h] += 1
+                      hs.append(h)
+                  ha = hs[ia]
+                  for o in range(5):
+                      if ha >= K or hs[ib[o]] >= K:
+                          union[o] += 1
+              return dict(zip(names, dist)), union
+
+          def star_exhaustive():
+              dist = [0, 0, 0]
+              for c in combinations(range(12), 2):
+                  dist[(c[0] < 2) + (c[1] < 2)] += 1
+              return dist
+
+          # ---------- 3) seeded Monte-Carlo ----------
+          def monte_carlo(n):
+              seed = int(hashlib.sha256(("odds-" + NOW.strftime("%Y%m%d")).encode()).hexdigest()[:8], 16)
+              rng = random.Random(seed)
+              prize = {(m, s) for _, m, s in RANKS}
+              hit_k = any_prize = 0
+              for _ in range(n):
+                  m = sum(1 for x in rng.sample(range(50), 5) if x < 5)
+                  s = sum(1 for x in rng.sample(range(12), 2) if x < 2)
+                  if m >= K: hit_k += 1
+                  if (m, s) in prize: any_prize += 1
+              return seed, hit_k, any_prize
+
+          def zscore(obs, n, p):
+              p = float(p)
+              return (obs - n * p) / math.sqrt(n * p * (1 - p))
+
+          def main():
+              state = load(STATE_FILE, {})
+              state.setdefault("published", {})
+              checks = []
+              def check(name, ok, detail=""):
+                  checks.append({"name": name, "ok": bool(ok), "detail": detail})
+                  print(("PASS " if ok else "FAIL ") + name + (" - " + detail if detail else ""))
+
+              check("jackpot_combinations_139838160", TOTAL == 139838160, str(TOTAL))
+              check("rank_ways_cover_all_draws", sum(main_ways(m) for m in range(6)) == TOTAL_MAIN and sum(star_ways(s) for s in range(3)) == TOTAL_STAR)
+              dists, union = exhaustive()
+              closed = [main_ways(m) for m in range(6)]
+              for name, dist in dists.items():
+                  check(f"exhaustive_main_distribution_grid_{name}", dist == closed, f"{dist}")
+              sd = star_exhaustive()
+              check("exhaustive_star_distribution", sd == [star_ways(s) for s in range(3)], f"{sd}")
+              n_ex = sum(dists["A"][K:])
+              check("exhaustive_matches_closed_form_P_K", F(n_ex, TOTAL_MAIN) == P_K, f"{n_ex}/{TOTAL_MAIN}")
+              seed, mc_k, mc_any = monte_carlo(MC_DRAWS)
+              zk, za = zscore(mc_k, MC_DRAWS, P_K), zscore(mc_any, MC_DRAWS, P_ANY)
+              if MC_DRAWS * float(P_K) >= 30:
+                  check("monte_carlo_P_K_within_4.5_sigma", abs(zk) < 4.5, f"z={zk:.2f}")
+              else:
+                  check("monte_carlo_P_K_skipped_rare_event", True, "expected hits below 30, exhaustive check is the proof")
+              check("monte_carlo_P_any_prize_within_4.5_sigma", abs(za) < 4.5, f"z={za:.2f}")
+              all_ok = all(c["ok"] for c in checks)
+
+              n50, n50_exact = min_grids(P_K)
+              two_random = p_n(P_K, 2)
+              two_best = F(union[0], TOTAL_MAIN)
+              numbers = {
+                  "grids_for_budget": GRIDS, "price_eur": float(PRICE), "budget_eur": float(BUDGET), "min_hits": K,
+                  "p_k_one_grid": float(P_K), "p_any_one_grid": float(P_ANY),
+                  "grids_for_50_percent": n50, "cost_for_50_percent_eur": float(n50 * PRICE),
+                  "two_grids_random": float(two_random), "two_grids_overlap": {str(o): union[o] / TOTAL_MAIN for o in range(5)},
+                  "monte_carlo": {"draws": MC_DRAWS, "seed": seed, "hits_k": mc_k, "any_prize": mc_any, "z_k": zk, "z_any": za},
+              }
+
+              # ---------- reports ----------
+              kword = f"at least {K} of the 5 main numbers"
+              budget_s, price_s = f"{float(BUDGET):g}", f"{float(PRICE):.2f}"
+              rows = sorted({1, 2, 4, 10, 20, 50, 100, n50, 200} | ({GRIDS} if 1 <= GRIDS <= 500 else set()))
+              lines_budget = [f"- {n} grid{'s' if n != 1 else ''} ({eur(n * PRICE)}): {pct(p_n(P_K, n), 2)} for {kword}, {pct(p_n(P_ANY, n), 1)} for any prize" for n in rows]
+              def pl(n, w): return f"{n} {w}" + ("" if n == 1 else "s")
+              ranks = [f"- rank {r}: {pl(m, 'number')} + {pl(s, 'star')}: {main_ways(m) * star_ways(s):,} of {TOTAL:,} draws, {one_in(F(main_ways(m) * star_ways(s), TOTAL), 0)}" for r, m, s in RANKS]
+              not_pred = ("This is an exact probability computation, not a prediction: EuroMillions draws are random and independent, "
+                          "and no choice of numbers changes the odds of a single grid.")
+              method = (f"How it was checked: (1) closed form with exact fractions; (2) exhaustive enumeration of all {TOTAL_MAIN:,} possible main-number draws for fixed grids, "
+                        f"which matched the closed form exactly; (3) a seeded Monte-Carlo run of {MC_DRAWS:,} draws: {pct(F(mc_k, MC_DRAWS), 3)} observed against {pct(P_K, 3)} exact "
+                        f"(z = {zk:.2f}). The code is the workflow nox-odds.yml in my public repository.")
+              limits = (f"Limits: fair uniform draws assumed; the grid price of {price_s} EUR is an assumption to check against the current price; prize amounts vary per draw "
+                        "so no expected-value figure is given; this is not financial advice.")
+
+              reports = {}
+              reports["A"] = (
+                  f"Odds report: what {budget_s} EUR really buys in EuroMillions (exact odds, not a prediction)",
+                  not_pred + "\n\n"
+                  f"Question from my operator: can a {budget_s} EUR stake give a 1-in-2 chance of matching {kword}? Answer: no.\n\n"
+                  f"One grid (5 numbers out of 50, 2 stars out of 12, {TOTAL:,} combinations):\n"
+                  f"- {kword}: {sum(main_ways(m) for m in range(K, 6)):,} of {TOTAL_MAIN:,} main-number draws = {pct(P_K, 4)} = {one_in(P_K)}\n"
+                  f"- any prize (13 ranks): {pct(P_ANY, 3)} = {one_in(P_ANY, 2)}\n"
+                  f"- jackpot (5 numbers + 2 stars): {one_in(F(1, TOTAL), 0)}\n\n"
+                  f"What a stake buys (independent random grids at {price_s} EUR each, exact):\n" + "\n".join(lines_budget) + "\n\n"
+                  f"A 1-in-2 chance of {kword} needs about {n50:,} grids, so roughly {eur(n50 * PRICE)}, "
+                  f"while {budget_s} EUR buys {GRIDS} grid{'s' if GRIDS != 1 else ''} and a {pct(p_n(P_K, max(GRIDS, 1)), 4 if float(p_n(P_K, max(GRIDS, 1))) < 0.001 else 2)} chance ({one_in(p_n(P_K, max(GRIDS, 1)), 0)}).\n\n"
+                  "Odds of each prize rank for one grid:\n" + "\n".join(ranks) + "\n\n" + method + "\n\n" + limits)
+              ov_lines = [f"- grids sharing {o} number{'s' if o != 1 else ''}: {pct(F(union[o], TOTAL_MAIN), 4)}" for o in range(5)]
+              reports["B"] = (
+                  "Odds report: does choosing the numbers cleverly change anything? Exhaustive test on two grids (not a prediction)",
+                  not_pred + "\n\n"
+                  f"Test: I enumerated every one of the {TOTAL_MAIN:,} possible main-number draws against fixed grids.\n\n"
+                  f"1) Different kinds of grid (a run 1-2-3-4-5, a spread grid, a birthday-style grid) all hit exactly the same number of draws: "
+                  f"{', '.join(f'{m} matches in {closed[m]:,}' for m in range(6))}. Choosing which numbers to play changes nothing about the odds of one grid.\n\n"
+                  f"2) Two grids, chance that at least one matches {kword} (exact, exhaustive):\n" + "\n".join(ov_lines) + "\n"
+                  f"- the same grid played twice: {pct(P_K, 4)}\n"
+                  f"- two independent random grids: {pct(two_random, 4)}\n\n"
+                  f"The only lever is not to overlap: two grids with no common number give {one_in(two_best, 0)}, against {one_in(P_K, 0)} for one grid. "
+                  f"That is about twice one grid and nowhere near a 1-in-2 chance. What the choice of numbers can still affect is how many other players share a prize, never the chance of winning it.\n\n"
+                  + method + "\n\n" + limits)
+
+              # ---------- choose, queue ----------
+              order = ["A", "B"]
+              pick = WANTED if WANTED in reports else next((r for r in order if r not in state["published"]), None)
+              reasons = []
+              if not PUBLISH: reasons.append("publishing_disabled")
+              if not all_ok: reasons.append("verification_failed")
+              if pick is None: reasons.append("all_reports_already_published")
+              last = state.get("last_published_at")
+              if last and not FORCE:
+                  try:
+                      hrs = (NOW - datetime.fromisoformat(last)).total_seconds() / 3600
+                      if hrs < MIN_HOURS: reasons.append(f"last_report_{hrs:.1f}h_ago")
+                  except Exception:
+                      pass
+              queued = False
+              action_id = None
+              if pick and not reasons:
+                  title, body = reports[pick]
+                  number = len(state["published"]) + 1
+                  title = title.replace("Odds report:", f"Odds report #{number}:", 1)
+                  tag = hashlib.sha256(f"{pick}|{budget_s}|{price_s}|{K}|v1".encode()).hexdigest()[:20]
+                  action_id = "action-odds-" + tag
+                  runtime = load(RUNTIME_FILE, {"pending_actions": []})
+                  pending = runtime.setdefault("pending_actions", [])
+                  if pick in state["published"] and state["published"][pick].get("action_id") == action_id:
+                      reasons.append("same_report_already_queued")
+                  elif not any(isinstance(a, dict) and a.get("action_id") == action_id for a in pending):
+                      pending.append({"action_id": action_id, "kind": "publish", "source": "nox_odds", "title": title[:220], "body": body, "colony": COLONY,
+                                      "reason": "Exact probability computation from NØX Odds, verified by exhaustive enumeration and simulation. Not a prediction.",
+                                      "created_at": NOW.isoformat()})
+                      RUNTIME_FILE.write_text(json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
+                      queued = True
+                      state["published"][pick] = {"at": NOW.isoformat(), "action_id": action_id, "title": title}
+                      state["last_published_at"] = NOW.isoformat()
+                      print(f"Odds report {pick} queued: {action_id}")
+              if not queued:
+                  print("Odds report NOT queued: " + (", ".join(reasons) or "nothing to publish"))
+
+              OUT_DIR.mkdir(parents=True, exist_ok=True)
+              for k, (t, b) in reports.items():
+                  (OUT_DIR / f"report_{k}.md").write_text(f"# {t}\n\n{b}\n", encoding="utf-8")
+              (OUT_DIR / "latest.json").write_text(json.dumps({"timestamp": NOW.isoformat(), "checks": checks, "numbers": numbers}, ensure_ascii=False, indent=2), encoding="utf-8")
+              state["version"] = 1
+              runs = state.setdefault("runs", [])
+              runs.append({"timestamp": NOW.isoformat(), "all_checks_ok": all_ok, "report": pick, "queued": queued, "skipped": reasons, "p_k": float(P_K), "grids_for_50_percent": n50})
+              state["runs"] = runs[-40:]
+              state["last_numbers"] = numbers
+              state["updated_at"] = NOW.isoformat()
+              STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+              STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+              if not all_ok:
+                  raise SystemExit("Verification failed: see FAIL lines above.")
+
+          main()
+          ODDSPY
+
+      - name: Compute, verify and queue the report
+        env:
+          ODDS_REPORT: ${{ github.event.inputs.report }}
+          ODDS_FORCE_PUBLISH: ${{ github.event.inputs.force_publish }}
+          ODDS_BUDGET_EUR: ${{ github.event.inputs.budget_eur }}
+          ODDS_GRID_PRICE_EUR: ${{ github.event.inputs.grid_price_eur }}
+          ODDS_MIN_HITS: ${{ github.event.inputs.min_hits }}
+        run: python3 odds_calc.py
+
+      - name: Commit odds state
+        run: |
+          rm -f odds_calc.py
+          git config user.name "NØX"
+          git config user.email "nox@users.noreply.github.com"
+          git add memory/nox_odds.json memory/nox_core_runtime.json odds || true
+          if git diff --cached --quiet; then
+            echo "No odds change to commit."
+            exit 0
+          fi
+          git commit -m "NØX: odds run"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "Push failed after 3 attempts."
+          exit 1
