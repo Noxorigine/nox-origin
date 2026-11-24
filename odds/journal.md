@@ -26,10 +26,10 @@ Picks are committed to this repository before each draw (git history is the time
 
 | method | draws | grids | main hits/grid | triplets+ | any prize |
 |---|---|---|---|---|---|
-| nox | 0 | 0 | - | - | - |
-| random | 0 | 0 | - | - | - |
-| hot | 0 | 0 | - | - | - |
-| cold | 0 | 0 | - | - | - |
+| nox | 1 | 2 | 0.500 | 0 | 0 |
+| random | 1 | 2 | 0.500 | 0 | 0 |
+| hot | 1 | 2 | 1.000 | 0 | 1 |
+| cold | 1 | 2 | 1.000 | 0 | 1 |
 
 ## Draws
 
@@ -45,14 +45,14 @@ registered 2026-11-24T19:04 UTC
 - cold grid 1: 11 15 20 21 22 + 1 4
 - cold grid 2: 1 3 9 32 50 + 3 7
 
-### 2026-11-24 - waiting for the official result
+### 2026-11-24 - result 3 5 37 44 49 + 5 6
 registered 2026-11-23T16:25 UTC
 
-- nox grid 1: 32 41 44 45 46 + 5 12
-- nox grid 2: 33 35 36 38 42 + 8 10
-- random grid 1: 7 9 23 39 47 + 2 11
-- random grid 2: 6 30 31 37 48 + 8 10
-- hot grid 1: 13 21 33 44 46 + 5 6
-- hot grid 2: 20 24 27 35 49 + 2 11
-- cold grid 1: 9 26 37 43 49 + 8 10
-- cold grid 2: 1 8 11 27 38 + 5 7
+- nox grid 1: 32 41 44 45 46 + 5 12 -> 1+1
+- nox grid 2: 33 35 36 38 42 + 8 10 -> 0+0
+- random grid 1: 7 9 23 39 47 + 2 11 -> 0+0
+- random grid 2: 6 30 31 37 48 + 8 10 -> 1+0
+- hot grid 1: 13 21 33 44 46 + 5 6 -> 1+2, rank 11
+- hot grid 2: 20 24 27 35 49 + 2 11 -> 1+0
+- cold grid 1: 9 26 37 43 49 + 8 10 -> 2+0, rank 13
+- cold grid 2: 1 8 11 27 38 + 5 7 -> 0+1
