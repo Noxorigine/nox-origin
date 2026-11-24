@@ -11,6 +11,17 @@ Picks are committed to this repository before each draw (git history is the time
 - **hot**: control: the most drawn numbers over the last 150 draws
 - **cold**: control: the least drawn numbers over the last 150 draws
 
+## Past test (walk-forward)
+
+905 draws, 2018-03-06 to 2026-11-03; each pick uses only earlier draws.
+
+| method | grids | main hits/grid | z vs chance | triplets+ | any prize |
+|---|---|---|---|---|---|
+| nox | 1810 | 0.510 | +0.66 | 9 (chance 8.7) | 147 (chance 140) |
+| random | 1810 | 0.480 | -1.35 | 6 (chance 8.7) | 140 (chance 140) |
+| hot | 1810 | 0.515 | +0.99 | 13 (chance 8.7) | 158 (chance 140) |
+| cold | 1810 | 0.496 | -0.29 | 14 (chance 8.7) | 136 (chance 140) |
+
 ## Live totals
 
 | method | draws | grids | main hits/grid | triplets+ | any prize |
