@@ -21,7 +21,7 @@ sys.path.insert(0, HERE)
 import lab_specs  # noqa: E402
 
 BANNED_NAMES = {"eval", "exec", "compile", "open", "__import__", "input", "globals", "locals", "getattr",
-                "setattr", "delattr", "vars", "breakpoint", "exit", "quit", "help", "memoryview", "type", "object"}
+                "setattr", "delattr", "vars", "breakpoint", "exit", "quit", "help", "memoryview", "object"}
 # Attribute names that reach frames, code objects or string-format traversal: never needed for these tasks.
 BANNED_ATTRS = {"gi_frame", "gi_code", "gi_yieldfrom", "gi_running", "f_back", "f_globals", "f_locals", "f_builtins",
                 "f_code", "f_trace", "tb_frame", "tb_next", "cr_frame", "cr_code", "cr_await", "cr_origin", "ag_frame",
@@ -42,9 +42,14 @@ def static_check(source, forbidden):
     if len(source) > 6000:
         return "too_long"
     found = False
+    # type(x) with exactly one positional argument only reads the class of a value; any other use of the name is refused.
+    one_arg_type = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "type" and len(n.args) == 1 and not n.keywords}
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return "import_not_allowed"
+        if isinstance(node, ast.Name) and node.id == "type" and id(node) not in one_arg_type:
+            return "forbidden_name:type"
         if isinstance(node, ast.Name) and (node.id in BANNED_NAMES or node.id in forbidden):
             return f"forbidden_name:{node.id}"
         if isinstance(node, ast.Attribute) and (node.attr.startswith("__") or node.attr in forbidden or node.attr in BANNED_ATTRS):
@@ -65,6 +70,35 @@ def show(args, n=110):
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
+MUTATORS = ("append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse",
+            "__setitem__", "__delitem__", "__iadd__", "__imul__")
+
+
+def tracked(values, log):
+    """A list that records every mutating call. The log lives in a closure the candidate cannot reach."""
+    class Tracked(list):
+        pass
+
+    def make(base, label):
+        def method(self, *a, **k):
+            log.append(label)
+            return base(self, *a, **k)
+        return method
+
+    for name in MUTATORS:
+        setattr(Tracked, name, make(getattr(list, name), name))
+    return Tracked(values)
+
+
+def strict_equal(a, b):
+    """Equality that also requires identical types, element by element: True is not 1, 1.0 is not 1."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(strict_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 class Timeout(BaseException):
     pass
 
@@ -73,7 +107,7 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-def run_layer(solve, spec, cases, weak):
+def run_layer(solve, spec, cases, weak, oracle=None):
     count = 0
     first = None
     for args in cases:
@@ -81,7 +115,11 @@ def run_layer(solve, spec, cases, weak):
         if first is not None:
             continue  # keep counting, but report only the first counterexample
         original = copy.deepcopy(args)
-        working = copy.deepcopy(args)
+        log = []
+        if weak:
+            working = copy.deepcopy(args)
+        else:
+            working = tuple(tracked(a, log) if isinstance(a, list) else a for a in copy.deepcopy(args))
         try:
             signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
             out = solve(*working)
@@ -93,9 +131,11 @@ def run_layer(solve, spec, cases, weak):
             signal.setitimer(signal.ITIMER_REAL, 0)
             first = {"input": show(original), "reason": f"exception:{type(exc).__name__}"}
             continue
-        expected = spec["ref"](*copy.deepcopy(original))
+        expected = oracle(original) if oracle else spec["ref"](*copy.deepcopy(original))
         if (not weak) and working != original:
             first = {"input": show(original), "reason": "input_modified"}
+        elif (not weak) and log:
+            first = {"input": show(original), "reason": "input_mutated_during_execution"}
         elif (not weak) and isinstance(out, list) and any(out is arg for arg in working if isinstance(arg, list)):
             first = {"input": show(original), "reason": "returned_input_object"}
         elif weak:
@@ -103,7 +143,7 @@ def run_layer(solve, spec, cases, weak):
                 first = {"input": show(original), "reason": "weak_check_failed"}
         else:
             try:
-                same = [list(x) for x in out] == expected if spec is lab_specs.SPECS["merge_intervals"] else out == expected
+                same = strict_equal([list(x) for x in out], expected) if spec is lab_specs.SPECS["merge_intervals"] else strict_equal(out, expected)
             except TypeError:
                 same = False
             if not same:
@@ -112,14 +152,16 @@ def run_layer(solve, spec, cases, weak):
 
 
 
-def probe_scaling(solve, spec):
+def probe_scaling(solve, spec, key="scale"):
     """Informational only: how the running time grows when the input is 4 times larger (timing is noisy on shared runners)."""
     sizes = (1000, 2000, 4000)
     times = []
+    spread = None
     for n in sizes:
-        args = spec["scale"](n, random.Random(4242 + n))
+        args = spec[key](n, random.Random(4242 + n))
         best = None
-        for _ in range(3 if n < 2000 else 2):
+        worst = None
+        for _ in range(5 if n < 4000 else 3):
             work = copy.deepcopy(args)
             try:
                 signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
@@ -133,7 +175,9 @@ def probe_scaling(solve, spec):
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 return {"label": "probe_error"}
             best = elapsed if best is None else min(best, elapsed)
+            worst = elapsed if worst is None else max(worst, elapsed)
         times.append(best)
+        spread = worst / max(best, 1e-9)
     if times[2] < 5e-5:
         return {"label": "too_fast", "times_ms": [round(t * 1000, 3) for t in times], "sizes": list(sizes)}
     first, last = max(times[0], 2e-5), max(times[2], 2e-5)
@@ -145,7 +189,7 @@ def probe_scaling(solve, spec):
     else:
         label = "in_between"
     return {"label": label, "exponent": round(exponent, 2), "growth": round(last / first, 1),
-            "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes)}
+            "times_ms": [round(t * 1000, 2) for t in times], "sizes": list(sizes), "spread_at_largest": round(spread, 2), "repeats": [5, 5, 3]}
 
 def child(spec_name, path, weak_only, extended=False, probe=False):
     spec = lab_specs.SPECS[spec_name]
@@ -170,6 +214,11 @@ def child(spec_name, path, weak_only, extended=False, probe=False):
     sys.stderr = open(os.devnull, "w")
     safe = {name: getattr(builtins, name) for name in SAFE if hasattr(builtins, name)}
     safe["print"] = lambda *a, **k: None
+
+    def one_arg_type(value):  # the harness wraps the input list in a subclass: show it as a plain list
+        cls = builtins.type(value)
+        return list if cls.__name__ == "Tracked" else cls
+    safe["type"] = one_arg_type
     namespace = {"__builtins__": safe}
     signal.signal(signal.SIGALRM, _alarm)
     try:
@@ -196,14 +245,46 @@ def child(spec_name, path, weak_only, extended=False, probe=False):
                 first_fail = part["first_failure"]
         layers["L4_extended_random"] = {"passed": first_fail is None, "cases": total, "first_failure": first_fail}
     passed = all(layer["passed"] for layer in layers.values())
+    hand_written = None
+    if extended and spec.get("golden"):
+        gold = {repr(a): e for a, e in spec["golden"]}
+        hand_written = run_layer(solve, spec, [a for a, _ in spec["golden"]], weak_only, oracle=lambda a: gold[repr(a)])
     scaling = None
+    adv_scaling = None
     if probe and passed and "scale" in spec:
         scaling = probe_scaling(solve, spec)
+        if "scale_adv" in spec and scaling.get("label") != "too_slow":
+            adv_scaling = probe_scaling(solve, spec, "scale_adv")
     sys.stdout = real_out
     result.update({"status": "passed_all" if passed else "failed", "layers": layers})
+    if hand_written is not None:
+        result["hand_written"] = hand_written
     if scaling is not None:
         result["scaling"] = scaling
+    if scaling is not None and "scale_adv" in spec and scaling.get("label") != "too_slow":
+        result["scaling_adv"] = adv_scaling
     real_out.write(json.dumps(result))
+
+
+def ref_probe(spec_name):
+    """The same timing probes, run on the lab's own reference solution (trusted code, still inside the sandbox)."""
+    spec = lab_specs.SPECS[spec_name]
+    signal.signal(signal.SIGALRM, _alarm)
+    result = {}
+    if "scale" in spec:
+        result["scaling"] = probe_scaling(spec["ref"], spec)
+        if "scale_adv" in spec and result["scaling"].get("label") != "too_slow":
+            result["scaling_adv"] = probe_scaling(spec["ref"], spec, "scale_adv")
+    sys.stdout.write(json.dumps(result))
+
+
+def run_ref_probe(spec_name):
+    try:
+        proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "refprobe", spec_name],
+                              capture_output=True, text=True, timeout=CHILD_SECONDS, cwd=HERE, env={"PATH": "/usr/bin:/bin"})
+        return json.loads(proc.stdout)
+    except Exception:
+        return {}
 
 
 def run_child(spec_name, path, weak, extended=False, probe=False):
@@ -234,9 +315,25 @@ def main_all(workdir):
             handle.write(code)
         full = run_child(spec_name, path, False)
         weak = run_child(spec_name, path, True)
-        out["mutants"].append({"name": name,
+        layers = full.get("layers") or {}
+        failed = [n for n, layer in layers.items() if not layer.get("passed")]
+        first_reason = (layers[failed[0]].get("first_failure") or {}).get("reason") if failed else None
+        first_input = (layers[failed[0]].get("first_failure") or {}).get("input") if failed else None
+        out["mutants"].append({"name": name, "first_input": first_input,
                                "full_suite_rejects": full.get("status") == "failed",
-                               "weak_check_accepts": weak.get("status") == "passed_all"})
+                               "weak_check_accepts": weak.get("status") == "passed_all",
+                               "first_layer": failed[0].split("_")[0] if failed else None,
+                               "failed_layers": [n.split("_")[0] for n in failed],
+                               "first_reason": first_reason})
+    golden = spec.get("golden") or []
+    agree = 0
+    for args, expected in golden:
+        try:
+            agree += 1 if strict_equal(spec["ref"](*copy.deepcopy(args)), expected) else 0
+        except Exception:
+            pass
+    out["hand_written"] = {"cases": len(golden), "reference_agrees": agree}
+    out["reference"] = run_ref_probe(spec_name)
     sys.stdout.write(json.dumps(out))
 
 
@@ -259,5 +356,7 @@ if __name__ == "__main__":
         main_all(sys.argv[2])
     elif len(sys.argv) >= 3 and sys.argv[1] == "submissions":
         main_submissions(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "refprobe":
+        ref_probe(sys.argv[2])
     elif len(sys.argv) >= 5 and sys.argv[1] == "child":
         child(sys.argv[2], sys.argv[3], sys.argv[4] == "1", len(sys.argv) > 5 and sys.argv[5] == "1", len(sys.argv) > 6 and sys.argv[6] == "1")
