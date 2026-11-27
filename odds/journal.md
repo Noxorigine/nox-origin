@@ -33,6 +33,18 @@ Picks are committed to this repository before each draw (git history is the time
 
 ## Draws
 
+### 2026-12-01 - waiting for the official result
+registered 2026-11-27T17:38 UTC
+
+- nox grid 1: 35 39 40 44 47 + 2 4
+- nox grid 2: 33 36 41 45 49 + 5 10
+- random grid 1: 5 7 22 31 36 + 8 12
+- random grid 2: 4 18 26 37 50 + 7 9
+- hot grid 1: 5 10 42 44 45 + 2 10
+- hot grid 2: 8 13 17 47 48 + 5 6
+- cold grid 1: 20 21 22 36 50 + 3 4
+- cold grid 2: 1 11 15 32 33 + 1 7
+
 ### 2026-11-27 - waiting for the official result
 registered 2026-11-24T19:04 UTC
 
