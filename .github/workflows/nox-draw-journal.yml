@@ -4,7 +4,9 @@ name: NØX - Draw Journal
 # 1) enregistre dans le dépôt, AVANT chaque tirage (mardi et vendredi), 2 grilles par méthode
 #    (la sienne + 3 méthodes témoins : aléatoire, numéros chauds, numéros froids),
 # 2) règle les tirages passés avec les résultats officiels (sources publiques recoupées),
-# 3) publie un rapport sur la Colony tous les 4 tirages réglés, avec un test sur ~900 tirages passés.
+# 3) t'envoie ses grilles par DM (Romu) dès qu'elles sont enregistrées, avant le tirage, puis une comparaison après chaque résultat,
+# 4) publie un rapport sur la Colony tous les 4 tirages réglés, avec un test sur ~900 tirages passés.
+# Les résultats sont lus automatiquement quand une source répond ; sinon saisis-les à la main (champ manual_result).
 # Ce n'est PAS une prédiction : les tirages sont aléatoires et indépendants.
 # Gratuit : aucun appel IA, aucun paiement, aucune dépense.
 
@@ -60,6 +62,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Colony SDK (for the DMs)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "colony-sdk>=1.37.0,<2.0.0" || echo "SDK install failed: DMs will be skipped"
+
       - name: Write journal program
         run: |
           cat > draw_journal.py <<'JOURNALPY'
@@ -94,6 +101,9 @@ jobs:
           MIN_DAYS_BETWEEN_POSTS = float(os.environ.get("JOURNAL_MIN_DAYS_BETWEEN_POSTS", "6") or 6)
           MANUAL = (os.environ.get("JOURNAL_MANUAL_RESULT", "") or "").strip()
           PROBE = os.environ.get("JOURNAL_PROBE", "").lower() == "true"
+          DM_RECIPIENT = (os.environ.get("JOURNAL_DM_RECIPIENT", "Romu") or "Romu").strip()
+          DM_ENABLED = os.environ.get("JOURNAL_ENABLE_DM", "true").lower() == "true"
+          MAX_DM_PER_RUN = 3
           USER_AGENT = "NOX-origin-draw-journal (+https://github.com/Noxorigine/nox-origin)"
 
           STRATS = ["nox", "random", "hot", "cold"]
@@ -269,6 +279,54 @@ jobs:
                       added.append(d)
               return added
 
+          # ------------------------------------------------------------------ direct messages to the operator
+          DAYS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+          _client = {}
+
+          def colony_client():
+              if "c" in _client: return _client["c"]
+              c = None
+              key = os.environ.get("COLONY_API_KEY", "").strip()
+              if DM_ENABLED and key:
+                  try:
+                      from colony_sdk import ColonyClient
+                      c = ColonyClient(key)
+                      prof = (c.bootstrap() or {}).get("profile", {})
+                      if prof.get("username") and prof["username"] != "nox_origine":
+                          print("DM: unexpected profile, DMs disabled"); c = None
+                  except Exception as exc:
+                      print(f"DM: client unavailable ({type(exc).__name__})"); c = None
+              _client["c"] = c
+              return c
+
+          def send_dm(body):
+              c = colony_client()
+              if not c: return False
+              try:
+                  c.send_message(DM_RECIPIENT, body[:1500]); return True
+              except Exception as exc:
+                  print(f"DM failed: {type(exc).__name__}: {str(exc)[:160]}"); return False
+
+          def fr_date(d):
+              dt = date.fromisoformat(d)
+              return f"{DAYS_FR[dt.weekday()]} {dt.day:02d}/{dt.month:02d}/{dt.year}"
+
+          def picks_dm(d, pk):
+              g = pk["strategies"]["nox"]
+              return (f"Draw Journal : mes grilles pour le tirage EuroMillions du {fr_date(d)}, enregistrées le {pk['registered_at'][:16].replace('T', ' ')} UTC, avant le tirage. "
+                      "Sur le papier seulement, pas une prédiction : aucune méthode ne change les probabilités.\n\n"
+                      f"Grille 1 : {' '.join(map(str, g[0]['main']))} + étoiles {' '.join(map(str, g[0]['stars']))}\n"
+                      f"Grille 2 : {' '.join(map(str, g[1]['main']))} + étoiles {' '.join(map(str, g[1]['stars']))}\n\n"
+                      "Avec 2 grilles, la chance d'avoir au moins 3 bons numéros est d'environ 1 sur 105. Les trois méthodes témoins sont dans odds/journal.md, dans le dépôt.")
+
+          def result_dm(d, rec, manual):
+              res = rec["result"]
+              def one(sc): return f"{sc['main_hits']}+{sc['star_hits']}" + (f" (rang {sc['rank']})" if sc["rank"] else "")
+              mine = " ; ".join(f"grille {i + 1} : {one(sc)}" for i, sc in enumerate(rec["scores"]["nox"]))
+              ctrl = ", ".join(f"{s} {best_text(rec['scores'][s])}" for s in STRATS if s != "nox" and s in rec["scores"])
+              return (f"Draw Journal : résultat du tirage du {fr_date(d)} : {fmt_draw(res['main'], res['stars'])} ({'saisi à la main' if manual else 'lu automatiquement'}). "
+                      f"Mes grilles (bons numéros + étoiles) : {mine}. Meilleure grille des méthodes témoins : {ctrl}. Détail dans odds/journal.md. Pas une prédiction.")
+
           # ------------------------------------------------------------------ strategies
           def rng_for(strategy, d):
               return random.Random(int(hashlib.sha256(f"nox-journal|{strategy}|{d}".encode()).hexdigest()[:16], 16))
@@ -416,7 +474,7 @@ jobs:
           # ------------------------------------------------------------------ main
           def main():
               state = load(STATE_FILE, {})
-              for k, v in (("version", 1), ("picks", {}), ("settled", {}), ("conflicts", {}), ("manual_dates", []), ("posts", []), ("runs", []), ("fetch", {})): state.setdefault(k, v)
+              for k, v in (("version", 1), ("picks", {}), ("settled", {}), ("conflicts", {}), ("manual_dates", []), ("dm", {"picks": {}, "results": {}, "attempts": {}}), ("posts", []), ("runs", []), ("fetch", {})): state.setdefault(k, v)
               history = load(HISTORY_FILE, {}).get("draws", {})
               notes = []
 
@@ -451,6 +509,27 @@ jobs:
                   state["picks"][nd] = {"registered_at": NOW.isoformat(), "history_draws": len(history),
                                         "strategies": {s: make_grids(s, nd, window) for s in STRATS}}
                   print(f"Registered picks for {nd}: " + " | ".join(fmt_grid(g) for g in state["picks"][nd]["strategies"]["nox"]))
+
+              # DMs to the operator: the picks before each draw, a short comparison once a result is settled
+              for k in ("picks", "results", "attempts"): state["dm"].setdefault(k, {})
+              dm, sent = state["dm"], 0
+              for d, pk in sorted(state["picks"].items()):
+                  if d in dm["picks"] or sent >= MAX_DM_PER_RUN: continue
+                  if NOW >= datetime.fromisoformat(d + f"T{CUTOFF_HOUR_UTC:02d}:00:00+00:00"):
+                      dm["picks"][d] = "skipped_after_cutoff"; continue
+                  key = "p" + d
+                  if dm["attempts"].get(key, 0) >= 4: dm["picks"][d] = "gave_up"; continue
+                  if send_dm(picks_dm(d, pk)): dm["picks"][d] = NOW.isoformat(); sent += 1; print(f"DM sent: picks for {d}")
+                  else: dm["attempts"][key] = dm["attempts"].get(key, 0) + 1
+              for d, rec in sorted(state["settled"].items()):
+                  if d in dm["results"] or sent >= MAX_DM_PER_RUN: continue
+                  if (NOW.date() - date.fromisoformat(d)).days > 4: dm["results"][d] = "skipped_old"; continue
+                  key = "r" + d
+                  if dm["attempts"].get(key, 0) >= 4: dm["results"][d] = "gave_up"; continue
+                  if send_dm(result_dm(d, rec, d in state["manual_dates"])): dm["results"][d] = NOW.isoformat(); sent += 1; print(f"DM sent: result for {d}")
+                  else: dm["attempts"][key] = dm["attempts"].get(key, 0) + 1
+              if DM_ENABLED and not colony_client() and any(d not in dm["picks"] for d in state["picks"]):
+                  notes.append("DMs not sent: Colony client unavailable (check the COLONY_API_KEY secret and the SDK install)")
 
               bt = state.get("backtest")
               first_pick = min(state["picks"]) if state["picks"] else None
@@ -500,6 +579,7 @@ jobs:
 
       - name: Settle, register picks, report
         env:
+          COLONY_API_KEY: ${{ secrets.COLONY_API_KEY }}
           JOURNAL_MANUAL_RESULT: ${{ github.event.inputs.manual_result }}
           JOURNAL_PUBLISH_NOW: ${{ github.event.inputs.publish_now }}
           JOURNAL_PROBE: ${{ github.event.inputs.probe }}
