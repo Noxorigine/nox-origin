@@ -1,10 +1,14 @@
 """NØX Lab - task specifications, reference solutions, test corpora, planted failures.
-Corpus version: lab-v2 (v2 adds the aliasing check and the scaling probe). Everything here is deterministic (seeded)."""
+Corpus version: lab-v4.2 (v2: aliasing check + scaling probe; v3: mutation tracking during execution + hash-collision probe;
+v4: exact output types, planted mutate-then-restore and large-input failures for every task, per-mutant verdicts, probes also run on the reference;
+v4.2: hand-written expected outputs, one planted failure per task that only the held-out layer can reject, first failing input per planted failure). Everything here is deterministic (seeded)."""
+import inspect
+import re
 import itertools
 import random
 from collections import Counter
 
-VERSION = "lab-v2"
+VERSION = "lab-v4.2"
 
 
 def _tiny_lists(length, alphabet):
@@ -44,6 +48,7 @@ MUT_SORT = {
     "sorts_descending": "def solve(xs):\n    return sorted(xs, reverse=True)\n",
     "mutates_input": "def solve(xs):\n    xs.sort()\n    return xs\n",
     "sorts_by_absolute_value": "def solve(xs):\n    return sorted(xs, key=abs)\n",
+    "mutates_then_restores_input": "def solve(xs):\n    xs.reverse()\n    xs.reverse()\n    return sorted(xs)\n",
     "returns_input_object_when_already_sorted": "def solve(xs):\n    if all(xs[i] <= xs[i + 1] for i in range(len(xs) - 1)):\n        return xs\n    return sorted(xs)\n",
 }
 
@@ -71,6 +76,8 @@ def held_dedupe(rng):
     yield ([rng.randint(0, 50) for _ in range(3000)],)
     yield ([2**61, -5, 2**61, -5, 0],)
     yield (list(range(500)) + list(range(500)),)
+    yield ([-3, 3],)
+    yield ([3, -3, 3, -3],)
 
 def weak_dedupe(args, out):
     return isinstance(out, list) and len(out) == len(set(out)) and set(out) <= set(args[0])
@@ -80,6 +87,7 @@ MUT_DEDUPE = {
     "keeps_last_occurrence": "def solve(xs):\n    out = []\n    for i, x in enumerate(xs):\n        if x not in xs[i + 1:]:\n            out.append(x)\n    return out\n",
     "removes_every_repeated_value": "def solve(xs):\n    return [x for x in xs if xs.count(x) == 1]\n",
     "returns_input_unchanged": "def solve(xs):\n    return list(xs)\n",
+    "mutates_then_restores_input": "def solve(xs):\n    xs.reverse()\n    xs.reverse()\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n",
     "returns_input_object_when_no_duplicates": "def solve(xs):\n    if len(set(xs)) == len(xs):\n        return xs\n    out = []\n    seen = set()\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n",
 }
 
@@ -270,6 +278,10 @@ def held_csv(rng):
     yield ('" leading and trailing ", x ',)
     yield (",".join(["f%d" % i for i in range(2000)]),)
     yield ('"""",""""""',)
+    yield ('""',)
+    yield ('",,,"',)
+    yield ('a,"",b',)
+    yield ('"a",,"b"',)
 
 def weak_csv(args, out):
     return isinstance(out, list) and all(isinstance(x, str) for x in out) and len(out) >= 1
@@ -351,6 +363,15 @@ def scale_csv(n, rng):
 def scale_nextperm(n, rng):
     return ([rng.randint(0, 5) for _ in range(n)],)
 
+
+_HASH_MOD = (1 << 61) - 1  # CPython hashes every multiple of 2**61-1 to 0, so these ints all collide in a set or dict.
+
+def scale_adv_dedupe(n, rng):
+    return ([(i + 1) * _HASH_MOD for i in range(n)],)
+
+def scale_adv_pairs(n, rng):
+    return ([(i + 1) * _HASH_MOD for i in range(n)], (n + 2) * _HASH_MOD)
+
 SPECS = {
     "max_circular_subarray": {
         "scale": scale_circ,
@@ -398,6 +419,7 @@ SPECS = {
     },
     "dedupe_keep_first": {
         "scale": scale_dedupe,
+        "scale_adv": scale_adv_dedupe,
         "title": "removing duplicates while keeping first occurrences in order",
         "signature": "solve(xs)",
         "description": "solve(xs) takes a list of integers and returns a NEW list containing each distinct value once, in the order of its FIRST occurrence in xs. It must not modify xs.",
@@ -420,6 +442,7 @@ SPECS = {
     },
     "count_pairs_sum": {
         "scale": scale_pairs,
+        "scale_adv": scale_adv_pairs,
         "title": "counting index pairs that sum to a target",
         "signature": "solve(xs, k)",
         "description": "solve(xs, k) takes a list of integers xs and an integer k and returns the number of index pairs (i, j) with i < j and xs[i] + xs[j] == k. Duplicate values count separately by position. It must not modify xs.",
@@ -430,4 +453,64 @@ SPECS = {
                       "Which planted wrong implementation would you add to this suite?"],
     },
 }
+MUT_DEDUPE["assumes_sorted_input"] = "def solve(xs):\n    out = []\n    for x in xs:\n        if not out or out[-1] != x:\n            out.append(x)\n    return out\n"
+MUT_DEDUPE["treats_negatives_as_positives"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if abs(x) not in seen:\n            seen.add(abs(x))\n            out.append(x)\n    return out\n"
+MUT_DEDUPE["returns_bools_for_zero_and_one"] = "def solve(xs):\n    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(bool(x) if x in (0, 1) else x)\n    return out\n"
+MUT_PAIRS["skips_negative_values"] = "def solve(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        if x >= 0:\n            total += seen.get(k - x, 0)\n            seen[x] = seen.get(x, 0) + 1\n    return total\n"
+
+# Generic planted failures (lab-v4): built from each reference so they are correct except for one deliberate flaw.
+_PURE_REF = {
+    "count_pairs_sum": "def _ref(xs, k):\n    seen = {}\n    total = 0\n    for x in xs:\n        total += seen.get(k - x, 0)\n        seen[x] = seen.get(x, 0) + 1\n    return total\n",
+}
+_RESTORE = "\n\ndef solve(*args):\n    args[0].append(0)\n    args[0].pop()\n    return _ref(*args)\n"
+_LARGE = "\n\ndef solve(*args):\n    r = _ref(*args)\n    if len(args[0]) >= 30:\n        return r[:-1] if isinstance(r, list) else r + 1\n    return r\n"
+for _name, _spec in SPECS.items():
+    _src = _PURE_REF.get(_name) or re.sub(r"^def \w+\(", "def _ref(", inspect.getsource(_spec["ref"]), count=1)
+    _muts = dict(_spec["mutants"])
+    if _name != "split_csv_line" and "mutates_then_restores_input" not in _muts:  # a str cannot be mutated
+        _muts["mutates_then_restores_input"] = _src + _RESTORE
+    _muts["wrong_for_large_inputs"] = _src + _LARGE
+    _spec["mutants"] = _muts
+
+# lab-v4.2: one planted failure per task that passes L1 and L2 and is wrong only on a property the held-out layer L3 targets.
+# Tasks that already had such a plant (dedupe, count pairs, next permutation) are left as they are.
+_L3_ONLY = {
+    "sort_ints": ("mishandles_values_beyond_2_pow_40", None,
+                  "def solve(xs):\n    return sorted(xs, key=lambda v: v if abs(v) < 2**40 else 0)\n"),
+    "merge_intervals": ("fails_on_ten_or_more_identical_intervals", "_ref",
+                        "\n\ndef solve(iv):\n    r = _ref(iv)\n    if len(iv) >= 10 and all(x == iv[0] for x in iv):\n        return r + r\n    return r\n"),
+    "max_circular_subarray": ("wrong_for_long_all_negative_lists", "_ref",
+                              "\n\ndef solve(xs):\n    r = _ref(xs)\n    if len(xs) >= 100 and max(xs) < 0:\n        return r - 1\n    return r\n"),
+    "split_csv_line": ("drops_last_field_on_very_wide_lines", "_ref",
+                       "\n\ndef solve(line):\n    r = _ref(line)\n    return r[:-1] if len(r) >= 500 else r\n"),
+}
+for _name, (_mname, _needs_ref, _body) in _L3_ONLY.items():
+    _src = _PURE_REF.get(_name) or re.sub(r"^def \w+\(", "def _ref(", inspect.getsource(SPECS[_name]["ref"]), count=1)
+    _muts = dict(SPECS[_name]["mutants"])
+    _muts[_mname] = (_src + _body) if _needs_ref else _body
+    SPECS[_name]["mutants"] = _muts
+
+# lab-v4.2: hand-written expected outputs. They are computed by hand, NOT by the reference: they are checked against the reference
+# (a disagreement stops the publication) and run against every candidate, so a reading of the task shared with the reference shows up.
+GOLDEN = {
+    "sort_ints": [(([3, 1, 2],), [1, 2, 3]), (([-1, -1, 0],), [-1, -1, 0]), (([5],), [5]), (([2, 2, 1, 1],), [1, 1, 2, 2]), (([10, -10, 0],), [-10, 0, 10])],
+    "dedupe_keep_first": [(([1, 2, 1, 3, 2],), [1, 2, 3]), (([5, 5, 5],), [5]), (([],), []), (([3, -3, 3],), [3, -3]), (([0, 1, 0, 1],), [0, 1])],
+    "merge_intervals": [
+        (([[1, 3], [2, 6], [8, 10], [15, 18]],), [[1, 6], [8, 10], [15, 18]]),
+        (([[1, 3], [3, 5]],), [[1, 5]]),                      # touching at an endpoint merges
+        (([[1, 3], [4, 5]],), [[1, 3], [4, 5]]),              # adjacent integers do not touch
+        (([[4, 6], [0, 2], [2, 4]],), [[0, 6]]),              # a chain that only merges transitively
+        (([[1, 10], [2, 3]],), [[1, 10]]),
+        (([[-2, 0], [0, 3]],), [[-2, 3]]),
+        (([[5, 5], [5, 5], [5, 5]],), [[5, 5]]),
+    ],
+    "count_pairs_sum": [(([1, 1, 1], 2), 3), (([1, 2, 3], 4), 1), (([0, 0, 0, 0], 0), 6), (([5], 10), 0), (([-1, 1, 0], 0), 1), (([2, 2, 3, 3], 5), 4)],
+    "max_circular_subarray": [(([5, -3, 5],), 10), (([-3, -1, -2],), -1), (([1],), 1), (([3, -1, 2, -1],), 4), (([5, -100, 4, 3],), 12), (([0, 0, 0],), 0), (([-2, -3, -1],), -1)],
+    "split_csv_line": [(('a,b,c',), ['a', 'b', 'c']), (('',), ['']), ((',',), ['', '']), (('"a,b",c',), ['a,b', 'c']), (('"x""y"',), ['x"y']),
+                       (('a,"",b',), ['a', '', 'b']), (('" a ",b ',), [' a ', 'b '])],
+    "next_permutation": [(([1, 2, 3],), [1, 3, 2]), (([3, 2, 1],), [1, 2, 3]), (([1, 1, 5],), [1, 5, 1]), (([],), []), (([1, 3, 2],), [2, 1, 3]), (([2, 3, 1, 3, 3],), [2, 3, 3, 1, 3])],
+}
+for _name, _cases in GOLDEN.items():
+    SPECS[_name]["golden"] = _cases
+
 SPEC_ORDER = ["sort_ints", "max_circular_subarray", "split_csv_line", "dedupe_keep_first", "next_permutation", "merge_intervals", "count_pairs_sum"]
